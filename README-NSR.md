@@ -11,7 +11,8 @@ Changes from upstream:
   in-game netplay stub (milestone 1: delay-based lockstep over ENet).
 - `Source/Core/Core/HLE/HLE.cpp`: registers the hook when `NSR_NETPLAY` is set.
 - `Source/Core/Core/CMakeLists.txt`, `Source/Core/DolphinLib.props`: build lists.
-- `.github/workflows/nsr-windows.yml`: Windows x64 build artifact.
+- `.github/workflows/nsr-windows.yml`: Windows x64 build artifact, including
+  the **NSR Netplay** launcher (`Tools/NSR`, vendored from NFLStreet).
 
 Design, the game-side patch, and test tooling live in the NFLStreet repo
 (`docs/poc-milestone1.md`, `tools/isopatch.py`, `tools/detrun.py`).

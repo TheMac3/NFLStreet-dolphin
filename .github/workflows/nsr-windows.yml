@@ -1,6 +1,6 @@
 # NFLStreet POC: Windows x64 build of Dolphin + the NSR netplay hook.
 # Produces a downloadable zip of Binary/x64 (Dolphin.exe with Qt UI and all
-# DLLs) for friends to test with. Build mirrors Dolphin's own Windows steps
+# DLLs, plus the "NSR Netplay.exe" launcher built from Tools/NSR) for friends. Build mirrors Dolphin's own Windows steps
 # (MSBuild on dolphin-emu.sln, VS 2022 / v143, bundled Qt from Externals).
 name: NSR Windows build
 
@@ -68,6 +68,17 @@ jobs:
           # Portable mode: never read or write the shared Documents\Dolphin
           # Emulator folder (or any other Dolphin's settings, e.g. Reborn's).
           Set-Content -Encoding ascii Binary/x64/portable.txt ""
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build the NSR Netplay launcher
+        run: |
+          python -m pip install pyinstaller
+          pyinstaller --onefile --windowed --name "NSR Netplay" --paths Tools/NSR Tools/NSR/nsr_launcher.py
+          python Tools/NSR/nsr_launcher.py --selftest
+          Copy-Item "dist/NSR Netplay.exe" Binary/x64/
 
       - uses: actions/upload-artifact@v4
         with:
