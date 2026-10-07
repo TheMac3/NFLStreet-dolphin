@@ -16,3 +16,6 @@ Changes from upstream:
 Design, the game-side patch, and test tooling live in the NFLStreet repo
 (`docs/poc-milestone1.md`, `tools/isopatch.py`, `tools/detrun.py`).
 Without `NSR_NETPLAY` set, this build behaves like stock Dolphin.
+
+CI: `.github/workflows/nsr-windows.yml` builds Release x64 on every push to
+`nsr-netplay`; download the `NFLStreet-dolphin-windows-x64` artifact from the run.
