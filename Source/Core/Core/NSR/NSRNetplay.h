@@ -16,15 +16,18 @@
 // deterministic. (Spinning inside the game would burn emulated cycles a
 // different number of times on each machine.)
 //
-// Up to 4 players (the game's controller-port limit), one per machine, in a
-// full mesh: player k owns game port k+1, binds NSR_PORT, connects to every
-// lower-numbered player, and accepts the higher-numbered ones.
+// Up to 4 players (the game's controller-port limit), one per machine; player
+// k owns game port k+1. Topology (NSR_TOPOLOGY):
+//   star (default) everyone connects to player 0, who relays packets; only
+//                  player 0 needs a reachable UDP port.
+//   mesh           everyone connects to every lower-numbered player.
 //
 // Configuration (POC; environment variables, read at boot):
 //   NSR_NETPLAY = 1 | host | client  enables the hook (unset: stub stays a no-op)
 //   NSR_PLAYER  = our index k (0-based)       NSR_PLAYERS = 2..4
 //   NSR_PORT    = UDP port to bind (default 51515)
-//   NSR_PEERS   = ip:port,... of players 0..k-1, in order
+//   NSR_PEERS   = ip:port of player 0 (star), or of players 0..k-1 in order (mesh)
+//   NSR_TOPOLOGY = star | mesh
 //   (shortcut: host = player 0 of 2; client = player 1 of 2 with NSR_PEER=ip:port)
 //   NSR_DELAY   = input delay in frames (default 2)
 //   NSR_LOG     = path for a text log (default: stderr)

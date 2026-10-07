@@ -87,6 +87,12 @@ struct Session
 {
   bool initialized = false;
   bool enabled = false;
+  // Star (default): everyone connects only to player 0, who relays every
+  // packet to the others, so only player 0 needs a reachable port. Mesh:
+  // everyone connects to every lower-numbered player (lower latency between
+  // non-host players, but players 0..n-2 all need reachable ports).
+  bool star = true;
+  bool exchanged_once = false;  // first frame may wait the full connect window
   u32 me = 0;          // our player index = our game port (0-based)
   u32 players = 2;
   u32 delay = 2;
@@ -199,7 +205,11 @@ bool ReadConfig(Session& s, std::vector<std::string>* lower_peers)
       *lower_peers = Split(Env("NSR_PEERS"), ',');
   }
   s.players = std::clamp<u32>(s.players, 2, MAX_PLAYERS);
-  if (s.me >= s.players || lower_peers->size() != s.me)
+  s.star = Env("NSR_TOPOLOGY", "star") != "mesh";
+  if (s.star && lower_peers->size() > 1)
+    lower_peers->resize(1);  // star: only player 0's address is needed
+  const size_t needed = s.star ? (s.me > 0 ? 1 : 0) : s.me;
+  if (s.me >= s.players || lower_peers->size() != needed)
   {
     Log("bad config: player {} of {} with {} lower-player addresses", s.me, s.players,
         lower_peers->size());
@@ -233,7 +243,8 @@ bool Setup()
   addr.host = ENET_HOST_ANY;
   const std::string port = Env("NSR_PORT");
   addr.port = port.empty() ? DEFAULT_PORT : static_cast<u16>(std::atoi(port.c_str()));
-  s.host = enet_host_create(s.me == s.players - 1 ? nullptr : &addr, MAX_PLAYERS, 1, 0, 0);
+  const bool listens = s.star ? s.me == 0 : s.me != s.players - 1;
+  s.host = enet_host_create(listens ? &addr : nullptr, MAX_PLAYERS, 1, 0, 0);
   if (!s.host)
   {
     Log("enet_host_create failed (port {})", addr.port);
@@ -252,7 +263,8 @@ bool Setup()
     if (s.peers[i])
       s.peers[i]->data = reinterpret_cast<void*>(static_cast<uintptr_t>(i + 1));
   }
-  Log("player {} of {} delay={} port={}", s.me, s.players, s.delay, addr.port);
+  Log("player {} of {} delay={} port={} topology={}", s.me, s.players, s.delay, addr.port,
+      s.star ? "star" : "mesh");
   return true;
 }
 
@@ -261,12 +273,23 @@ u32 PeerIndex(const ENetPeer* peer)
   return static_cast<u32>(reinterpret_cast<uintptr_t>(peer->data)) - 1;  // 0 = unknown
 }
 
+bool Linked(u32 i)
+{
+  const Session& s = s_session;
+  return s.peers[i] && s.peers[i]->state == ENET_PEER_STATE_CONNECTED;
+}
+
+// Connections this machine itself must hold: in a star, player 0 links to
+// everyone and everyone else links only to player 0; in a mesh, everyone.
 bool AllConnected()
 {
   const Session& s = s_session;
   for (u32 i = 0; i < s.players; ++i)
   {
-    if (i != s.me && (!s.peers[i] || s.peers[i]->state != ENET_PEER_STATE_CONNECTED))
+    if (i == s.me)
+      continue;
+    const bool needed = !s.star || s.me == 0 || i == 0;
+    if (needed && !Linked(i))
       return false;
   }
   return true;
@@ -319,6 +342,19 @@ void HandlePacket(const ENetPacket* packet)
       p.sender == s.me)
   {
     return;
+  }
+  // Star hub: pass the packet on, unchanged, to every other player.
+  if (s.star && s.me == 0)
+  {
+    for (u32 i = 1; i < s.players; ++i)
+    {
+      if (i != p.sender && Linked(i))
+      {
+        enet_peer_send(s.peers[i], 0,
+                       enet_packet_create(packet->data, packet->dataLength,
+                                          ENET_PACKET_FLAG_UNSEQUENCED));
+      }
+    }
   }
   for (u32 i = 0; i < p.count; ++i)
   {
@@ -395,7 +431,7 @@ void SendLatest(u32 latest_frame)
   const size_t size = offsetof(Packet, pads) + n * sizeof(Pad);
   for (u32 i = 0; i < s.players; ++i)
   {
-    if (i == s.me || !s.peers[i] || s.peers[i]->state != ENET_PEER_STATE_CONNECTED)
+    if (i == s.me || !Linked(i))
       continue;
     enet_peer_send(s.peers[i], 0, enet_packet_create(&p, size, ENET_PACKET_FLAG_UNSEQUENCED));
   }
@@ -551,13 +587,20 @@ void Hook(const Core::CPUThreadGuard& guard)
       SendLatest(frame + s.delay);  // cover packet loss
       last_send = now;
     }
-    if (s.failed || now - start > std::chrono::milliseconds(PEER_TIMEOUT_MS))
+    // Until the first frame completes, allow the full connect window: in a
+    // star, a player can't see whether the others have joined the hub yet.
+    const int limit_ms = s.exchanged_once ? PEER_TIMEOUT_MS : CONNECT_TIMEOUT_MS;
+    if (s.failed || now - start > std::chrono::milliseconds(limit_ms))
     {
       Log("a player went silent at frame {}; continuing offline", frame);
       s.failed = true;
       return;
     }
   }
+
+  s.exchanged_once = true;
+  if (s.star && s.me == 0)
+    enet_host_flush(s.host);  // push relayed packets out promptly
 
   // 3. Agree on every player's pad and write them to ports 0..players-1.
   std::array<Pad, MAX_PLAYERS> pads{};
