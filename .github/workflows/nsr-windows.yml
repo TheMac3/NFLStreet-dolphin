@@ -1,0 +1,51 @@
+# NFLStreet POC: Windows x64 build of Dolphin + the NSR netplay hook.
+# Produces a downloadable zip of Binary/x64 (Dolphin.exe with Qt UI and all
+# DLLs) for friends to test with. Build mirrors Dolphin's own Windows steps
+# (MSBuild on dolphin-emu.sln, VS 2022 / v143, bundled Qt from Externals).
+name: NSR Windows build
+
+on:
+  push:
+    branches: [nsr-netplay]
+  workflow_dispatch:
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0   # Dolphin's ScmRevGen uses git describe for the version string
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build (Release x64)
+        working-directory: Source
+        run: msbuild dolphin-emu.sln /m /v:minimal /p:Configuration=Release /p:Platform=x64
+
+      - name: Add netplay launch helper
+        shell: pwsh
+        run: |
+          @'
+          @echo off
+          rem NFLStreet POC netplay launcher (milestone 1: delay-based lockstep).
+          rem Usage:  nsr-netplay.bat host  <patched-iso>
+          rem         nsr-netplay.bat client <patched-iso> <host-ip>
+          rem The host must forward UDP port 51515. Both players need the same
+          rem patched image (tools/isopatch.py ... freeze seed input netplay)
+          rem and the same Dolphin build.
+          set NSR_NETPLAY=%1
+          set NSR_PORT=51515
+          set NSR_PEER=%3:51515
+          set NSR_DELAY=2
+          set NSR_LOG=%~dp0nsr-%1.log
+          "%~dp0Dolphin.exe" -C Dolphin.Core.CPUThread=False -C Dolphin.Core.EnableCustomRTC=True -C Dolphin.Core.CustomRTCValue=0x30000000 -C Dolphin.Core.SIDevice1=6 -e "%~2"
+          '@ | Set-Content -Encoding ascii Binary/x64/nsr-netplay.bat
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NFLStreet-dolphin-windows-x64
+          path: Binary/x64
+          if-no-files-found: error

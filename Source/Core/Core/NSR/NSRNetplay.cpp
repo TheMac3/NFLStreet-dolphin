@@ -358,8 +358,7 @@ std::optional<Pad> ScriptPad(const Core::CPUThreadGuard& guard, u32 counter)
   return std::nullopt;
 }
 
-void WritePad(Core::System& system, const Core::CPUThreadGuard& guard, u32 buf, u32 port,
-              const Pad& pad)
+void WritePad(const Core::CPUThreadGuard& guard, u32 buf, u32 port, const Pad& pad)
 {
   for (u32 i = 0; i < PAD_SIZE; ++i)
     PowerPC::MMU::HostWrite<u8>(guard, pad[i], buf + port * PAD_SIZE + i);
@@ -392,8 +391,8 @@ void Hook(const Core::CPUThreadGuard& guard)
   // polls once directly at init). Re-apply what was agreed for that frame.
   if (auto it = s.applied.find(frame); it != s.applied.end())
   {
-    WritePad(system, guard, buf, 0, it->second.first);
-    WritePad(system, guard, buf, 1, it->second.second);
+    WritePad(guard, buf, 0, it->second.first);
+    WritePad(guard, buf, 1, it->second.second);
     return;
   }
 
@@ -454,8 +453,8 @@ void Hook(const Core::CPUThreadGuard& guard)
   const Pad host_pad = s.role == Role::Host ? mine : theirs;
   const Pad client_pad = s.role == Role::Host ? theirs : mine;
   s.applied.emplace(frame, std::make_pair(host_pad, client_pad));
-  WritePad(system, guard, buf, 0, host_pad);
-  WritePad(system, guard, buf, 1, client_pad);
+  WritePad(guard, buf, 0, host_pad);
+  WritePad(guard, buf, 1, client_pad);
 
   // 4. Periodic desync check: hash MEM1 after the agreed pads are in the
   //    buffer (same emulated instant on both; before that, the buffer still
