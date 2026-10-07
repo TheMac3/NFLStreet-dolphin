@@ -31,26 +31,31 @@ jobs:
           @'
           @echo off
           rem NFLStreet POC netplay launcher (delay-based lockstep, 2-4 players).
-          rem Usage:  nsr-netplay.bat PLAYER PLAYERS ISO [PEERS]
+          rem First run NSR-Patcher.exe in this folder once; it makes nsr-net.iso.
+          rem Usage:  nsr-netplay.bat PLAYER PLAYERS [PEERS]
           rem   PLAYER  your number, 0..PLAYERS-1 (0 = the player everyone connects to)
           rem   PLAYERS 2, 3 or 4
-          rem   ISO     the patched image (same file for everyone):
-          rem           tools/isopatch.py ... freeze seed input netplay
           rem   PEERS   ip:port of players 0..PLAYER-1, comma-separated, in order
           rem           (player 0 leaves this out)
           rem Examples (4 players):
-          rem   nsr-netplay.bat 0 4 nsr-net.iso
-          rem   nsr-netplay.bat 1 4 nsr-net.iso 203.0.113.5:51515
-          rem   nsr-netplay.bat 3 4 nsr-net.iso 203.0.113.5:51515,198.51.100.7:51515,192.0.2.9:51515
+          rem   nsr-netplay.bat 0 4
+          rem   nsr-netplay.bat 1 4 203.0.113.5:51515
+          rem   nsr-netplay.bat 3 4 203.0.113.5:51515,198.51.100.7:51515,192.0.2.9:51515
           rem Every player except the last must forward UDP port 51515.
+          rem Everyone must have the same NSR-Patcher fingerprint.
+          if not exist "%~dp0nsr-net.iso" (
+            echo nsr-net.iso not found. Run NSR-Patcher.exe in this folder first.
+            pause
+            exit /b 1
+          )
           set NSR_NETPLAY=1
           set NSR_PLAYER=%1
           set NSR_PLAYERS=%2
           set NSR_PORT=51515
-          set NSR_PEERS=%~4
+          set NSR_PEERS=%~3
           set NSR_DELAY=2
           set NSR_LOG=%~dp0nsr-p%1.log
-          "%~dp0Dolphin.exe" -C Dolphin.Core.CPUThread=False -C Dolphin.Core.EnableCustomRTC=True -C Dolphin.Core.CustomRTCValue=0x30000000 -C Dolphin.Core.SIDevice1=6 -C Dolphin.Core.SIDevice2=6 -C Dolphin.Core.SIDevice3=6 -e "%~3"
+          "%~dp0Dolphin.exe" -C Dolphin.Core.CPUThread=False -C Dolphin.Core.EnableCustomRTC=True -C Dolphin.Core.CustomRTCValue=0x30000000 -C Dolphin.Core.SIDevice1=6 -C Dolphin.Core.SIDevice2=6 -C Dolphin.Core.SIDevice3=6 -e "%~dp0nsr-net.iso"
           '@ | Set-Content -Encoding ascii Binary/x64/nsr-netplay.bat
 
       - uses: actions/upload-artifact@v4
