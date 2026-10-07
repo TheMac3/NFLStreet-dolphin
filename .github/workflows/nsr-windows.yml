@@ -80,6 +80,11 @@ jobs:
           python Tools/NSR/nsr_launcher.py --selftest
           Copy-Item "dist/NSR Netplay.exe" Binary/x64/
 
+      - name: Room server address (if configured)
+        if: ${{ vars.NSR_RENDEZVOUS != '' }}
+        shell: pwsh
+        run: Set-Content -Encoding ascii Binary/x64/nsr-rendezvous.txt "${{ vars.NSR_RENDEZVOUS }}"
+
       - uses: actions/upload-artifact@v4
         with:
           name: NFLStreet-dolphin-windows-x64

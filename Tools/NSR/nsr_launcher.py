@@ -6,9 +6,11 @@ NFLStreet-dolphin folder (next to Dolphin.exe) and does three things:
 
   1. Game: find NFL Street Reborn's NSR.iso (or browse to it), build the
      netplay image (nsr_patcher.prepare_image), and show its fingerprint.
-  2. Play: Host (shows the address to share, lists who joined, Start) or Join
-     (paste the host's address, wait for Start), via nsr_lobby. Then it starts
-     the netplay Dolphin with every setting filled in.
+  2. Play: Host (Create room: shows a code like NSR-4K7QX, lists who joined,
+     Start) or Join (type the code, wait for Start), via the rendezvous server
+     (room codes + hole punching, so usually no router setup). "Host by IP
+     address" / typing an IP is the advanced fallback. Then it starts the
+     netplay Dolphin with every setting filled in.
   3. Practice offline, and "Set up controllers" (opens Dolphin's own window).
 
 Reborn is never modified: its files are only read, this Dolphin runs in
@@ -83,12 +85,38 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
             "NSR_DELAY": str(start.delay),
             "NSR_LOG": os.path.join(folder, f"nsr-p{start.player}.log"),
         })
-        if start.player > 0:
+        if start.rendezvous:
+            # Room code: hole punching through the rendezvous server.
+            env.update({"NSR_RENDEZVOUS": start.rendezvous, "NSR_ROOM": start.room,
+                        "NSR_KEY": start.key, "NSR_LAN_IP": lan_address()})
+            env.pop("NSR_PORT", None)
+        elif start.player > 0:
             env["NSR_PEERS"] = f"{start.host_address}:{lobby.PORT}"
     if not os.environ.get("NSR_DOLPHIN"):
         args.append("-b")  # Dolphin closes when the game stops (Qt build)
     args += ["-e", os.path.join(folder, patcher.OUTPUT_NAME)]
     return args, env
+
+
+RENDEZVOUS_FILE = "nsr-rendezvous.txt"
+
+
+def rendezvous_server(folder: str) -> str | None:
+    """Room-server address ("host:port"): NSR_RENDEZVOUS_SERVER, else the
+    nsr-rendezvous.txt shipped next to the launcher. None: room codes off."""
+    if os.environ.get("NSR_RENDEZVOUS_SERVER"):
+        return os.environ["NSR_RENDEZVOUS_SERVER"]
+    try:
+        with open(os.path.join(folder, RENDEZVOUS_FILE)) as f:
+            value = f.read().strip()
+            return value or None
+    except OSError:
+        return None
+
+
+def looks_like_ip(text: str) -> bool:
+    """Join box: an IP/hostname with dots means direct mode; else a room code."""
+    return "." in text or text.count(":") > 1
 
 
 def lan_address() -> str:
@@ -208,25 +236,38 @@ def run_gui(selftest: bool = False) -> int:
     tabs.add(solo_tab, text="Practice offline")
 
     # Host tab
-    host_info = ttk.Label(host_tab, text="Start a lobby, then share your address with friends.",
-                          style="Panel.TLabel", wraplength=500, justify="left")
-    host_info.grid(row=0, column=0, columnspan=3, sticky="w")
+    rv_server = rendezvous_server(folder)
+    host_info = ttk.Label(host_tab, text=(
+        "Create a room and give your friends the code. No router setup needed."
+        if rv_server else "Room codes aren't set up in this download (no room server). "
+                          "Use “Host by IP address” below."),
+        style="Panel.TLabel", wraplength=500, justify="left")
+    host_info.grid(row=0, column=0, columnspan=4, sticky="w")
+    code_var = tk.StringVar(value="")
+    code_label = ttk.Label(host_tab, textvariable=code_var, style="Title.TLabel")
+    code_label.configure(background=panel)
+    code_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+    btn_copy = ttk.Button(host_tab, text="Copy code",
+                          command=lambda: (root.clipboard_clear(), root.clipboard_append(code_var.get())))
     roster_host = tk.Listbox(host_tab, height=4, bg=bg, fg=fg, highlightthickness=0, borderwidth=0)
-    roster_host.grid(row=1, column=0, columnspan=3, sticky="we", pady=8)
-    btn_open = ttk.Button(host_tab, text="Host a lobby", style="Accent.TButton")
+    roster_host.grid(row=2, column=0, columnspan=4, sticky="we", pady=8)
+    btn_open = ttk.Button(host_tab, text="Create room", style="Accent.TButton",
+                          state="normal" if rv_server else "disabled")
     btn_start = ttk.Button(host_tab, text="Start game", style="Accent.TButton", state="disabled")
-    btn_close = ttk.Button(host_tab, text="Close lobby", state="disabled")
-    btn_open.grid(row=2, column=0, sticky="w")
-    btn_start.grid(row=2, column=1, sticky="w", padx=6)
-    btn_close.grid(row=2, column=2, sticky="w")
+    btn_close = ttk.Button(host_tab, text="Close", state="disabled")
+    btn_open_ip = ttk.Button(host_tab, text="Host by IP address (advanced)")
+    btn_open.grid(row=3, column=0, sticky="w")
+    btn_start.grid(row=3, column=1, sticky="w", padx=6)
+    btn_close.grid(row=3, column=2, sticky="w")
+    btn_open_ip.grid(row=3, column=3, sticky="e", padx=(12, 0))
     delay_var = tk.IntVar(value=int(cfg.get("delay", DEFAULT_DELAY)))
     ttk.Label(host_tab, text="Input delay (frames, raise if laggy):", style="Muted.TLabel") \
-        .grid(row=3, column=0, sticky="w", pady=(10, 0))
+        .grid(row=4, column=0, sticky="w", pady=(10, 0))
     ttk.Spinbox(host_tab, from_=0, to=8, textvariable=delay_var, width=4) \
-        .grid(row=3, column=1, sticky="w", pady=(10, 0))
+        .grid(row=4, column=1, sticky="w", pady=(10, 0))
 
     # Join tab
-    ttk.Label(join_tab, text="Host's address", style="Panel.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(join_tab, text="Room code (or host IP)", style="Panel.TLabel").grid(row=0, column=0, sticky="w")
     addr_var = tk.StringVar(value=cfg.get("last_host", ""))
     ttk.Entry(join_tab, textvariable=addr_var, width=30).grid(row=0, column=1, sticky="w", padx=6)
     join_info = ttk.Label(join_tab, text="", style="Panel.TLabel", wraplength=500, justify="left")
@@ -335,15 +376,51 @@ def run_gui(selftest: bool = False) -> int:
             messagebox.showerror(APP_TITLE, f"Couldn't start Dolphin ({args[0]}): {e}")
 
     # --- host -----------------------------------------------------------------
-    def host_open():
+    def roster_changed(names):
+        ui(lambda: (set_roster(roster_host, names),
+                    btn_start.state(["!disabled"] if len(names) > 1 else ["disabled"])))
+
+    def hosting_ui(active: bool):
+        for b in (btn_open, btn_open_ip):
+            b.state(["disabled"] if active or (b is btn_open and not rv_server) else ["!disabled"])
+        btn_close.state(["!disabled"] if active else ["disabled"])
+        if not active:
+            btn_start.state(["disabled"])
+            code_var.set("")
+            btn_copy.grid_forget()
+            set_roster(roster_host, [])
+
+    def host_room():
+        if need_game():
+            return
+        cfg["name"] = name_var.get().strip() or "Host"
+        save_config(folder, cfg)
+        hosting_ui(True)
+        host_info.configure(text="Creating a room…")
+        h = lobby.RoomHost(rv_server, cfg["name"], state["fingerprint"], on_change=roster_changed,
+                           on_error=lambda why: ui(lambda: host_info.configure(text=why)))
+
+        def work():
+            try:
+                code = h.open()
+            except ConnectionError as e:
+                ui(lambda e=e: (host_info.configure(text=f"{e}\nYou can still “Host by IP address”."),
+                                hosting_ui(False)))
+                return
+            state["host"] = h
+            ui(lambda: (code_var.set(code), btn_copy.grid(row=1, column=2, sticky="w"),
+                        host_info.configure(text="Room open. Give your friends this code; "
+                                                 "click Start when everyone's listed.")))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def host_ip():
         if need_game():
             return
         cfg["name"] = name_var.get().strip() or "Host"
         save_config(folder, cfg)
         try:
-            h = lobby.LobbyHost(cfg["name"], state["fingerprint"],
-                                on_change=lambda names: ui(lambda: (set_roster(roster_host, names),
-                                    btn_start.state(["!disabled"] if len(names) > 1 else ["disabled"]))),
+            h = lobby.LobbyHost(cfg["name"], state["fingerprint"], on_change=roster_changed,
                                 on_reject=lambda who, why: ui(lambda: host_info.configure(
                                     text=f"Refused {who}: {why}")))
             h.open()
@@ -351,7 +428,7 @@ def run_gui(selftest: bool = False) -> int:
             messagebox.showerror(APP_TITLE, f"Couldn't open the lobby on port {lobby.PORT}: {e}")
             return
         state["host"] = h
-        btn_open.state(["disabled"]); btn_close.state(["!disabled"])
+        hosting_ui(True)
         lan = lan_address()
         host_info.configure(text=f"Lobby open. Same network? Friends join with:  {lan}\n"
                                  "Finding your internet address…")
@@ -359,37 +436,44 @@ def run_gui(selftest: bool = False) -> int:
         def find_public():
             pub = public_address()
             ui(lambda: host_info.configure(text=(
-                f"Lobby open. Friends join with your address:\n"
+                f"Lobby open (by IP). Friends join with your address:\n"
                 f"   Internet:  {pub}      Same network:  {lan}\n"
                 f"For internet play, forward TCP and UDP port {lobby.PORT} on your router to this PC.")
-                if pub else f"Lobby open. Same network? Friends join with:  {lan}\n"
+                if pub else f"Lobby open (by IP). Same network? Friends join with:  {lan}\n"
                             f"(Couldn't look up your internet address.)"))
 
         threading.Thread(target=find_public, daemon=True).start()
 
     def host_start():
         h = state["host"]
-        try:
-            me = h.start(delay=delay_var.get())
-        except ValueError as e:
-            messagebox.showinfo(APP_TITLE, str(e))
+        if not h:
             return
-        cfg["delay"] = delay_var.get()
-        save_config(folder, cfg)
-        state["host"] = None
-        btn_open.state(["!disabled"]); btn_start.state(["disabled"]); btn_close.state(["disabled"])
-        host_info.configure(text=f"Started a {me.players}-player game. Have fun!")
-        launch(me)
+        btn_start.state(["disabled"])
+
+        def work():
+            try:
+                me = h.start(delay=delay_var.get())
+            except (ValueError, ConnectionError) as e:
+                ui(lambda e=e: (messagebox.showinfo(APP_TITLE, str(e)), btn_start.state(["!disabled"])))
+                return
+            cfg["delay"] = delay_var.get()
+            save_config(folder, cfg)
+            state["host"] = None
+            ui(lambda: (hosting_ui(False),
+                        host_info.configure(text=f"Started a {me.players}-player game. Have fun!"),
+                        launch(me)))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def host_close():
         if state["host"]:
             state["host"].close()
             state["host"] = None
-        btn_open.state(["!disabled"]); btn_start.state(["disabled"]); btn_close.state(["disabled"])
-        set_roster(roster_host, [])
-        host_info.configure(text="Lobby closed.")
+        hosting_ui(False)
+        host_info.configure(text="Closed.")
 
-    btn_open.configure(command=host_open)
+    btn_open.configure(command=host_room)
+    btn_open_ip.configure(command=host_ip)
     btn_start.configure(command=host_start)
     btn_close.configure(command=host_close)
 
@@ -397,23 +481,32 @@ def run_gui(selftest: bool = False) -> int:
     def do_join():
         if need_game():
             return
-        address = addr_var.get().strip()
-        if not address:
-            join_info.configure(text="Paste the host's address first.")
+        target = addr_var.get().strip()
+        if not target:
+            join_info.configure(text="Type the room code from the host.")
+            return
+        direct = looks_like_ip(target)
+        if not direct and not rv_server:
+            join_info.configure(text="Room codes aren't set up in this download. Ask the host for "
+                                     "their IP address instead.")
             return
         cfg["name"] = name_var.get().strip() or "Player"
-        cfg["last_host"] = address
+        cfg["last_host"] = target
         save_config(folder, cfg)
         cancel = threading.Event()
         state["join_cancel"] = cancel
         btn_join.state(["disabled"]); btn_leave.state(["!disabled"])
-        join_info.configure(text=f"Joining {address}… waiting for the host to start.")
+        join_info.configure(text=f"Joining {target}… waiting for the host to start.")
+        on_lobby = lambda names: ui(lambda: set_roster(roster_join, names))  # noqa: E731
 
         def work():
             try:
-                start = lobby.join(address, cfg["name"], state["fingerprint"],
-                                   on_lobby=lambda names: ui(lambda: set_roster(roster_join, names)),
-                                   cancel=cancel)
+                if direct:
+                    start = lobby.join(target, cfg["name"], state["fingerprint"],
+                                       on_lobby=on_lobby, cancel=cancel)
+                else:
+                    start = lobby.join_room(rv_server, target, cfg["name"], state["fingerprint"],
+                                            on_lobby=on_lobby, cancel=cancel)
                 ui(lambda: (join_info.configure(
                     text=f"Starting! You're player {start.player + 1} of {start.players}."),
                     launch(start)))

@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """nsr_lobby.py: host/join lobby for NFLStreet netplay (2-4 players).
 
+Two ways to meet:
+  - Room codes (default): through the rendezvous server
+    (services/rendezvous/nsr_rendezvous.py). The host gets a code like
+    NSR-4K7QX, friends type it in, and Dolphin hole-punches the game traffic,
+    so usually nobody forwards ports. See RoomHost / join_room below.
+  - Direct (advanced fallback): the host's PC runs the lobby itself and
+    friends join by IP address; the host forwards TCP+UDP 51515. LobbyHost /
+    join below.
+
 The launcher's "Host" and "Join" buttons use this. It only assigns player
 numbers and agrees on settings; the game traffic itself is Dolphin's
 (NSRNetplay, UDP, star topology: everyone talks to the host). The host's
@@ -38,7 +47,11 @@ class StartInfo:
     player: int          # our player number (0 = host)
     players: int         # total players
     delay: int           # input delay in frames
-    host_address: str    # where to send game traffic ("" for the host itself)
+    host_address: str    # where to send game traffic ("" for the host itself;
+                         # unused with a rendezvous: hole punching finds peers)
+    rendezvous: str = ""  # "host:port" of the rendezvous server (room codes)
+    room: str = ""        # room id for UDP registration
+    key: str = ""         # our per-player secret for UDP registration
 
 
 def _send(sock: socket.socket, msg: dict) -> None:
@@ -223,5 +236,132 @@ def join(host: str, name: str, fingerprint: str,
                 elif kind == "start":
                     return StartInfo(int(msg["player"]), int(msg["players"]),
                                      int(msg.get("delay", 2)), address)
+    finally:
+        sock.close()
+
+
+# --- room codes via the rendezvous server ------------------------------------
+RENDEZVOUS_PORT = 51600
+RENDEZVOUS_VERSION = 2
+
+
+def _split(addr: str, default_port: int) -> tuple[str, int]:
+    if ":" in addr:
+        host, port = addr.rsplit(":", 1)
+        return host, int(port)
+    return addr, default_port
+
+
+@dataclass
+class RoomHost:
+    """Creates a room on the rendezvous server. open() returns the room code;
+    on_change(names) fires on roster changes; start() returns our StartInfo."""
+
+    rendezvous: str
+    name: str
+    fingerprint: str
+    on_change: Callable[[list[str]], None] = lambda names: None
+    on_error: Callable[[str], None] = lambda reason: None
+    code: str = ""
+    _sock: socket.socket | None = None
+    _start: StartInfo | None = None
+    _started: threading.Event = field(default_factory=threading.Event)
+
+    def open(self) -> str:
+        host, port = _split(self.rendezvous, RENDEZVOUS_PORT)
+        try:
+            self._sock = socket.create_connection((host, port), timeout=10)
+        except OSError as e:
+            raise ConnectionError(f"Couldn't reach the room server ({self.rendezvous}): "
+                                  f"{e.strerror or e}") from e
+        _send(self._sock, {"type": "create", "name": self.name, "fingerprint": self.fingerprint,
+                           "version": RENDEZVOUS_VERSION})
+        lines = _lines(self._sock)
+        first = next(lines, None)
+        if not first or first.get("type") != "room":
+            raise ConnectionError((first or {}).get("reason", "The room server refused the room."))
+        self.code = first["code"]
+        self._sock.settimeout(None)
+        threading.Thread(target=self._read, args=(lines,), daemon=True).start()
+        return self.code
+
+    def _read(self, lines) -> None:
+        try:
+            for msg in lines:
+                kind = msg.get("type")
+                if kind == "lobby":
+                    self.on_change(list(msg["players"]))
+                elif kind == "error":
+                    self.on_error(msg.get("reason", "error"))
+                elif kind == "start":
+                    self._start = _start_info(msg, self.rendezvous)
+                    self._started.set()
+                    return
+        except OSError:
+            pass
+        if not self._started.is_set():
+            self.on_error("Lost the connection to the room server.")
+
+    def start(self, delay: int = 2, timeout: float = 10) -> StartInfo:
+        _send(self._sock, {"type": "start", "delay": delay})
+        if not self._started.wait(timeout):
+            raise ConnectionError("The room server didn't confirm the start.")
+        return self._start
+
+    def close(self) -> None:
+        if self._sock:
+            # shutdown() first: a plain close() while the reader thread is
+            # blocked in recv() may never send FIN, so the server (and the
+            # joiners waiting in this room) wouldn't learn the host left.
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+
+
+def _start_info(msg: dict, rendezvous: str) -> StartInfo:
+    return StartInfo(int(msg["player"]), int(msg["players"]), int(msg.get("delay", 2)), "",
+                     rendezvous=rendezvous, room=str(msg["room"]), key=str(msg["key"]))
+
+
+def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
+              on_lobby: Callable[[list[str]], None] = lambda names: None,
+              cancel: threading.Event | None = None) -> StartInfo:
+    """Join a room by code and wait for the host's Start. Raises
+    ConnectionError with a readable reason if refused, closed, or unreachable."""
+    host, port = _split(rendezvous, RENDEZVOUS_PORT)
+    try:
+        sock = socket.create_connection((host, port), timeout=10)
+    except OSError as e:
+        raise ConnectionError(f"Couldn't reach the room server ({rendezvous}): {e.strerror or e}") from e
+    sock.settimeout(0.5)
+    _send(sock, {"type": "join", "code": code, "name": name, "fingerprint": fingerprint,
+                 "version": RENDEZVOUS_VERSION})
+    buf = b""
+    try:
+        while True:
+            if cancel and cancel.is_set():
+                raise ConnectionError("Cancelled.")
+            try:
+                chunk = sock.recv(4096)
+            except (TimeoutError, socket.timeout):
+                continue
+            if not chunk:
+                raise ConnectionError("The room server closed the connection.")
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                msg = json.loads(line)
+                kind = msg.get("type")
+                if kind == "lobby":
+                    on_lobby(list(msg["players"]))
+                elif kind in ("reject", "closed"):
+                    raise ConnectionError(msg.get("reason", "Refused."))
+                elif kind == "start":
+                    return _start_info(msg, rendezvous)
     finally:
         sock.close()

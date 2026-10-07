@@ -93,6 +93,21 @@ struct Session
   // non-host players, but players 0..n-2 all need reachable ports).
   bool star = true;
   bool exchanged_once = false;  // first frame may wait the full connect window
+
+  // Hole punching via the rendezvous server (NSR_RENDEZVOUS set): every
+  // player binds an ephemeral port, registers it with the server from that
+  // same socket, learns the peers' public + LAN addresses, and both sides
+  // send punch packets so their NATs open before ENet connects.
+  struct Punch
+  {
+    bool enabled = false;
+    ENetAddress server{};
+    std::string room, key, lan_ip;
+    bool have_peers = false;
+    std::array<ENetAddress, MAX_PLAYERS> target{}, alt{};
+    std::array<bool, MAX_PLAYERS> needed{};
+    u32 connect_attempts = 0;
+  } punch;
   u32 me = 0;          // our player index = our game port (0-based)
   u32 players = 2;
   u32 delay = 2;
@@ -175,6 +190,76 @@ u64 HashMem1(Core::System& system)
   return h;
 }
 
+bool ParseAddress(const std::string& text, ENetAddress* out)
+{
+  const auto colon = text.rfind(':');
+  if (colon == std::string::npos)
+    return false;
+  if (enet_address_set_host_ip(out, text.substr(0, colon).c_str()) != 0 &&
+      enet_address_set_host(out, text.substr(0, colon).c_str()) != 0)
+  {
+    return false;
+  }
+  out->port = static_cast<u16>(std::atoi(text.substr(colon + 1).c_str()));
+  return out->port != 0;
+}
+
+std::string HostOf(const std::string& endpoint)
+{
+  return endpoint.substr(0, endpoint.rfind(':'));
+}
+
+// "NSRP <you-public> <k>=<public>/<lan> ..." from the rendezvous server.
+void HandlePeerList(const std::string& text)
+{
+  Session& s = s_session;
+  const auto parts = Split(text, ' ');
+  if (parts.size() < 3 || s.punch.have_peers)
+    return;
+  const std::string my_public_ip = HostOf(parts[1]);
+  for (size_t i = 2; i < parts.size(); ++i)
+  {
+    const auto eq = parts[i].find('=');
+    const auto slash = parts[i].find('/');
+    if (eq == std::string::npos || slash == std::string::npos)
+      continue;
+    const u32 k = static_cast<u32>(std::atoi(parts[i].substr(0, eq).c_str()));
+    if (k >= s.players || k == s.me || !s.punch.needed[k])
+      continue;
+    const std::string pub = parts[i].substr(eq + 1, slash - eq - 1);
+    const std::string lan = parts[i].substr(slash + 1);
+    // Same public IP = same router: talk over the LAN (many routers don't
+    // hairpin). Otherwise the public (NAT-mapped) address, LAN as fallback.
+    const bool same_router = HostOf(pub) == my_public_ip;
+    ParseAddress(same_router ? lan : pub, &s.punch.target[k]);
+    ParseAddress(same_router ? pub : lan, &s.punch.alt[k]);
+    Log("player {} at {} (alt {})", k, same_router ? lan : pub, same_router ? pub : lan);
+  }
+  s.punch.have_peers = true;
+}
+
+int ENET_CALLBACK Intercept(ENetHost* host, ENetEvent* /*event*/)
+{
+  const auto* data = reinterpret_cast<const char*>(host->receivedData);
+  const size_t size = host->receivedDataLength;
+  if (size >= 4 && std::memcmp(data, "NSRH", 4) == 0)
+    return 1;  // a peer's punch packet: its job (opening our NAT) is done
+  if (size >= 5 && std::memcmp(data, "NSRP ", 5) == 0)
+  {
+    HandlePeerList(std::string(data, size));
+    return 1;
+  }
+  return 0;  // ENet traffic
+}
+
+void SendRaw(const ENetAddress& to, const std::string& payload)
+{
+  ENetBuffer buffer;
+  buffer.data = const_cast<char*>(payload.data());
+  buffer.dataLength = payload.size();
+  enet_socket_send(s_session.host->socket, &to, &buffer, 1);
+}
+
 // Configuration. Either the 2-player shortcut
 //   NSR_NETPLAY=host                (player 0 of 2, binds NSR_PORT)
 //   NSR_NETPLAY=client NSR_PEER=ip:port   (player 1 of 2)
@@ -206,6 +291,26 @@ bool ReadConfig(Session& s, std::vector<std::string>* lower_peers)
   }
   s.players = std::clamp<u32>(s.players, 2, MAX_PLAYERS);
   s.star = Env("NSR_TOPOLOGY", "star") != "mesh";
+  if (const std::string rv = Env("NSR_RENDEZVOUS"); !rv.empty())
+  {
+    if (!s.star)
+    {
+      Log("hole punching needs the star topology");
+      return false;
+    }
+    s.punch.enabled = ParseAddress(rv, &s.punch.server);
+    s.punch.room = Env("NSR_ROOM");
+    s.punch.key = Env("NSR_KEY");
+    s.punch.lan_ip = Env("NSR_LAN_IP", "0.0.0.0");
+    if (!s.punch.enabled || s.punch.room.empty() || s.punch.key.empty())
+    {
+      Log("bad rendezvous config ({})", rv);
+      return false;
+    }
+    for (u32 i = 0; i < s.players; ++i)
+      s.punch.needed[i] = i != s.me && (s.me == 0 || i == 0);
+    return true;  // addresses come from the server, not NSR_PEERS
+  }
   if (s.star && lower_peers->size() > 1)
     lower_peers->resize(1);  // star: only player 0's address is needed
   const size_t needed = s.star ? (s.me > 0 ? 1 : 0) : s.me;
@@ -218,6 +323,10 @@ bool ReadConfig(Session& s, std::vector<std::string>* lower_peers)
   s.delay = static_cast<u32>(std::max(0, std::atoi(Env("NSR_DELAY", "2").c_str())));
   return true;
 }
+
+bool SetupPunch();
+void SendPunches();
+void ConnectToHost();
 
 bool Setup()
 {
@@ -236,6 +345,9 @@ bool Setup()
     Log("enet_initialize failed");
     return false;
   }
+
+  if (s.punch.enabled)
+    return SetupPunch();
 
   // Everyone binds (higher-numbered players connect to us); if we're the
   // last player nobody connects in, but binding is harmless.
@@ -399,6 +511,16 @@ void Service(int timeout_ms)
       enet_packet_destroy(event.packet);
       break;
     case ENET_EVENT_TYPE_DISCONNECT:
+      // A client's connect attempt timed out (NAT not open yet): retry,
+      // alternating the address, a few times before giving up.
+      if (s.punch.enabled && s.me != 0 && !s.exchanged_once && s.peers[0] == event.peer &&
+          s.punch.connect_attempts < 4)
+      {
+        Log("connect attempt {} to the host failed; retrying", s.punch.connect_attempts);
+        SendPunches();
+        ConnectToHost();
+        break;
+      }
       if (event.peer->data)
         Log("player {} disconnected", PeerIndex(event.peer));
       s.failed = true;
@@ -407,6 +529,73 @@ void Service(int timeout_ms)
       break;
     }
   }
+}
+
+void SendPunches()
+{
+  Session& s = s_session;
+  for (u32 i = 0; i < s.players; ++i)
+  {
+    if (s.punch.needed[i] && !Linked(i))
+    {
+      SendRaw(s.punch.target[i], "NSRH");
+      SendRaw(s.punch.alt[i], "NSRH");
+    }
+  }
+}
+
+void ConnectToHost()
+{
+  Session& s = s_session;
+  // Alternate between the chosen address and the fallback on retries.
+  const ENetAddress& to = (s.punch.connect_attempts % 2 == 0) ? s.punch.target[0] : s.punch.alt[0];
+  ++s.punch.connect_attempts;
+  s.peers[0] = enet_host_connect(s.host, &to, 1, s.me);
+  if (s.peers[0])
+    s.peers[0]->data = reinterpret_cast<void*>(static_cast<uintptr_t>(1));
+}
+
+bool SetupPunch()
+{
+  Session& s = s_session;
+  ENetAddress any{};
+  any.host = ENET_HOST_ANY;
+  any.port = 0;  // ephemeral: the server tells peers our NAT-mapped port
+  s.host = enet_host_create(&any, MAX_PLAYERS, 1, 0, 0);
+  if (!s.host)
+  {
+    Log("enet_host_create failed");
+    return false;
+  }
+  s.host->intercept = Intercept;
+  ENetAddress local{};
+  enet_socket_get_address(s.host->socket, &local);
+  const std::string reg = fmt::format("NSRR {} {} {} {}:{}", s.punch.room, s.me, s.punch.key,
+                                      s.punch.lan_ip, local.port);
+  Log("player {} of {} delay={} topology=star punch via rendezvous (local port {})", s.me,
+      s.players, s.delay, local.port);
+
+  const auto start = std::chrono::steady_clock::now();
+  auto last = start - std::chrono::seconds(1);
+  while (!s.punch.have_peers)
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last > std::chrono::milliseconds(250))
+    {
+      SendRaw(s.punch.server, reg);
+      last = now;
+    }
+    Service(20);
+    if (now - start > std::chrono::milliseconds(CONNECT_TIMEOUT_MS))
+    {
+      Log("rendezvous: not every player registered within {} ms", CONNECT_TIMEOUT_MS);
+      return false;
+    }
+  }
+  SendPunches();
+  if (s.me != 0)
+    ConnectToHost();
+  return true;
 }
 
 void SendLatest(u32 latest_frame)
@@ -442,9 +631,15 @@ bool WaitForConnection()
 {
   Session& s = s_session;
   const auto start = std::chrono::steady_clock::now();
+  auto last_punch = start;
   while (!AllConnected() && !s.failed)
   {
     Service(10);
+    if (s.punch.enabled && std::chrono::steady_clock::now() - last_punch > std::chrono::milliseconds(100))
+    {
+      SendPunches();
+      last_punch = std::chrono::steady_clock::now();
+    }
     if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(CONNECT_TIMEOUT_MS))
     {
       Log("not all {} players connected within {} ms; giving up (playing offline)", s.players,

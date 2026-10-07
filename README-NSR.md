@@ -8,7 +8,9 @@ patched by the NFL Street Reborn mod. Base: Dolphin tag `2512`. Work branch:
 Changes from upstream:
 
 - `Source/Core/Core/NSR/NSRNetplay.{h,cpp}`: HLE hook for the NFLStreet
-  in-game netplay stub (milestone 1: delay-based lockstep over ENet).
+  in-game netplay stub (milestone 1: delay-based lockstep over ENet, 2-4
+  players, star topology with host relay, room-code hole punching through the
+  NFLStreet rendezvous server when `NSR_RENDEZVOUS` is set).
 - `Source/Core/Core/HLE/HLE.cpp`: registers the hook when `NSR_NETPLAY` is set.
 - `Source/Core/Core/CMakeLists.txt`, `Source/Core/DolphinLib.props`: build lists.
 - `.github/workflows/nsr-windows.yml`: Windows x64 build artifact, including
@@ -17,6 +19,9 @@ Changes from upstream:
 Design, the game-side patch, and test tooling live in the NFLStreet repo
 (`docs/poc-milestone1.md`, `tools/isopatch.py`, `tools/detrun.py`).
 Without `NSR_NETPLAY` set, this build behaves like stock Dolphin.
+
+Room codes: set the repository Actions variable `NSR_RENDEZVOUS` to the room
+server's `host:port` and CI ships it as `nsr-rendezvous.txt` in the download.
 
 CI: `.github/workflows/nsr-windows.yml` builds Release x64 on every push to
 `nsr-netplay`; download the `NFLStreet-dolphin-windows-x64` artifact from the run.
