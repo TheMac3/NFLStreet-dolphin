@@ -43,6 +43,8 @@ jobs:
           rem   nsr-netplay.bat 3 4 203.0.113.5:51515,198.51.100.7:51515,192.0.2.9:51515
           rem Every player except the last must forward UDP port 51515.
           rem Everyone must have the same NSR-Patcher fingerprint.
+          rem This Dolphin is separate from Reborn: portable.txt + -u keep its settings
+          rem and saves in .\User. Reborn's install is only read (HD textures).
           if not exist "%~dp0nsr-net.iso" (
             echo nsr-net.iso not found. Run NSR-Patcher.exe in this folder first.
             pause
@@ -55,8 +57,17 @@ jobs:
           set NSR_PEERS=%~3
           set NSR_DELAY=2
           set NSR_LOG=%~dp0nsr-p%1.log
-          "%~dp0Dolphin.exe" -C Dolphin.Core.CPUThread=False -C Dolphin.Core.EnableCustomRTC=True -C Dolphin.Core.CustomRTCValue=0x30000000 -C Dolphin.Core.SIDevice1=6 -C Dolphin.Core.SIDevice2=6 -C Dolphin.Core.SIDevice3=6 -e "%~dp0nsr-net.iso"
+          set TEXTURES=
+          set REBORN=
+          if exist "%~dp0nsr-reborn.txt" (
+            set /p REBORN=<"%~dp0nsr-reborn.txt"
+          )
+          if defined REBORN set TEXTURES=-C "Dolphin.General.LoadPath=%REBORN%\content" -C GFX.Settings.HiresTextures=True
+          "%~dp0Dolphin.exe" -u "%~dp0User" %TEXTURES% -C Dolphin.Core.CPUThread=False -C Dolphin.Core.EnableCustomRTC=True -C Dolphin.Core.CustomRTCValue=0x30000000 -C Dolphin.Core.SIDevice1=6 -C Dolphin.Core.SIDevice2=6 -C Dolphin.Core.SIDevice3=6 -e "%~dp0nsr-net.iso"
           '@ | Set-Content -Encoding ascii Binary/x64/nsr-netplay.bat
+          # Portable mode: never read or write the shared Documents\Dolphin
+          # Emulator folder (or any other Dolphin's settings, e.g. Reborn's).
+          Set-Content -Encoding ascii Binary/x64/portable.txt ""
 
       - uses: actions/upload-artifact@v4
         with:
