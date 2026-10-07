@@ -134,6 +134,8 @@ add_library(core
   HLE/HLE_Misc.cpp
   HLE/HLE_Misc.h
   HLE/HLE_OS.cpp
+  NSR/NSRNetplay.cpp
+  NSR/NSRNetplay.h
   HLE/HLE_OS.h
   HLE/HLE_VarArgs.cpp
   HLE/HLE_VarArgs.h
