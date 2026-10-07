@@ -375,8 +375,8 @@ bool Setup()
     if (s.peers[i])
       s.peers[i]->data = reinterpret_cast<void*>(static_cast<uintptr_t>(i + 1));
   }
-  Log("player {} of {} delay={} port={} topology={}", s.me, s.players, s.delay, addr.port,
-      s.star ? "star" : "mesh");
+  Log("player {} of {} delay={} port={} topology={} seed={}", s.me, s.players, s.delay,
+      addr.port, s.star ? "star" : "mesh", Env("NSR_SEED", "(image default)"));
   return true;
 }
 
@@ -572,8 +572,8 @@ bool SetupPunch()
   enet_socket_get_address(s.host->socket, &local);
   const std::string reg = fmt::format("NSRR {} {} {} {}:{}", s.punch.room, s.me, s.punch.key,
                                       s.punch.lan_ip, local.port);
-  Log("player {} of {} delay={} topology=star punch via rendezvous (local port {})", s.me,
-      s.players, s.delay, local.port);
+  Log("player {} of {} delay={} topology=star punch via rendezvous (local port {}) seed={}", s.me,
+      s.players, s.delay, local.port, Env("NSR_SEED", "(image default)"));
 
   const auto start = std::chrono::steady_clock::now();
   auto last = start - std::chrono::seconds(1);
@@ -706,7 +706,8 @@ void WritePads(const Core::CPUThreadGuard& guard, u32 buf, const std::array<Pad,
 
 bool IsEnabled()
 {
-  static const bool enabled = std::getenv("NSR_NETPLAY") != nullptr;
+  static const bool enabled =
+      std::getenv("NSR_NETPLAY") != nullptr || std::getenv("NSR_SEED") != nullptr;
   return enabled;
 }
 
@@ -717,6 +718,22 @@ void Hook(const Core::CPUThreadGuard& guard)
   const u32 buf = ppc_state.gpr[3];
   const u32 frame = ppc_state.gpr[4];
   ppc_state.npc = LR(ppc_state);  // Replace hook: return to caller
+
+  // Per-session RNG seed: install it once, at the first poll, which happens at
+  // the same emulated instant on every machine (before any match loads and
+  // GRand re-seeds from it).
+  static bool seed_written = false;
+  if (!seed_written)
+  {
+    seed_written = true;
+    if (const std::string seed = Env("NSR_SEED"); !seed.empty())
+    {
+      const u32 value = static_cast<u32>(std::strtoul(seed.c_str(), nullptr, 0));
+      PowerPC::MMU::HostWrite<u32>(guard, value, SEED_ADDRESS);
+    }
+  }
+  if (std::getenv("NSR_NETPLAY") == nullptr)
+    return;  // seed-only mode (offline practice)
 
   Session& s = s_session;
   if (!s.initialized)

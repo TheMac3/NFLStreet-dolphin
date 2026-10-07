@@ -22,7 +22,7 @@ JSON messages.
   host -> joiner  {"type": "reject", "reason": str}                 (then closes)
   host -> all     {"type": "lobby", "players": [name, ...]}          (on any change;
                                                                     index = player number)
-  host -> joiner  {"type": "start", "player": k, "players": n, "delay": d}
+  host -> joiner  {"type": "start", "player": k, "players": n, "delay": d, "seed": u32}
   host -> joiner  {"type": "closed"}                                (host cancelled)
 
 The host is always player 0. Players keep their join order. A joiner whose
@@ -32,6 +32,7 @@ starts, since lockstep needs byte-identical images.
 from __future__ import annotations
 
 import json
+import secrets
 import socket
 import threading
 from dataclasses import dataclass, field
@@ -52,6 +53,7 @@ class StartInfo:
     rendezvous: str = ""  # "host:port" of the rendezvous server (room codes)
     room: str = ""        # room id for UDP registration
     key: str = ""         # our per-player secret for UDP registration
+    seed: int = 0x13579BDF  # per-match RNG seed, identical for every player
 
 
 def _send(sock: socket.socket, msg: dict) -> None:
@@ -174,11 +176,13 @@ class LobbyHost:
         if players < 2:
             self._closed = False
             raise ValueError("Need at least one other player to start.")
+        seed = secrets.randbits(32)  # per-match RNG seed, sent to everyone
         for k, j in enumerate(joiners, start=1):
-            _send(j.sock, {"type": "start", "player": k, "players": players, "delay": delay})
+            _send(j.sock, {"type": "start", "player": k, "players": players, "delay": delay,
+                           "seed": seed})
             j.sock.close()
         self._server.close()
-        return StartInfo(0, players, delay, "")
+        return StartInfo(0, players, delay, "", seed=seed)
 
     def close(self) -> None:
         self._closed = True
@@ -235,7 +239,8 @@ def join(host: str, name: str, fingerprint: str,
                     raise ConnectionError("The host closed the lobby.")
                 elif kind == "start":
                     return StartInfo(int(msg["player"]), int(msg["players"]),
-                                     int(msg.get("delay", 2)), address)
+                                     int(msg.get("delay", 2)), address,
+                                     seed=int(msg.get("seed", 0x13579BDF)))
     finally:
         sock.close()
 
@@ -324,8 +329,12 @@ class RoomHost:
 
 
 def _start_info(msg: dict, rendezvous: str) -> StartInfo:
+    room = str(msg["room"])
+    # Older room servers didn't send a seed; the room id is shared by every
+    # player, so deriving one from it still keeps all machines identical.
+    seed = int(msg["seed"]) if "seed" in msg else int(room[:8], 16)
     return StartInfo(int(msg["player"]), int(msg["players"]), int(msg.get("delay", 2)), "",
-                     rendezvous=rendezvous, room=str(msg["room"]), key=str(msg["key"]))
+                     rendezvous=rendezvous, room=room, key=str(msg["key"]), seed=seed)
 
 
 def join_room(rendezvous: str, code: str, name: str, fingerprint: str,

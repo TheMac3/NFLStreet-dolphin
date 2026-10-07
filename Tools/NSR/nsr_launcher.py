@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import secrets
 import shlex
 import socket
 import subprocess
@@ -75,6 +76,9 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
              "-C", "Dolphin.Core.CustomRTCValue=0x30000000"]
     for port in range(4):  # controllers in ports 1..players; the rest empty
         args += ["-C", f"Dolphin.Core.SIDevice{port}={6 if port < players else 0}"]
+    # Per-match RNG seed: agreed in the lobby for netplay; fresh per launch
+    # offline, so Quick Play differs every time either way.
+    env["NSR_SEED"] = str(start.seed if start else secrets.randbits(32))
     if start:
         env.update({
             "NSR_NETPLAY": "1",

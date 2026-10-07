@@ -17,8 +17,12 @@ Patches (GN7E69 rev 0, Reborn 3.0 main.dol `6dccf385…`):
           0x80411F04 (N = 0: never) it disables interrupts and spins, so RAM
           stops changing. Otherwise it tail-jumps to the original call.
           The harness sets N at runtime through Dolphin's RAM file.
-  seed    Make fn_801CF7AC (the shared OSGetTick RNG seed source) return a
-          constant, 0x13579BDF.
+  seed    Make fn_801CF7AC (the shared OSGetTick RNG seed source) deterministic:
+          it returns the seed word at 0x804114F4 (initially 0x13579BDF) and
+          then advances it by 0x9E3779B9, so each RNG seeded in a session gets
+          a different but reproducible value. NFLStreet-dolphin overwrites the
+          word with a per-session seed agreed in the lobby (NSR_SEED), so every
+          match differs while all machines stay identical.
   input   Scripted controller input (and the shape of the netplay input
           hook). Replaces Reborn's `bl 0x80411400` (remap + PADClamp) in the
           pad poll at 0x801E2730 with a routine at 0x80411880 that calls it,
@@ -75,7 +79,9 @@ FREEZE_COUNTER = 0x80411F00  # +4 = target N
 DISPATCH_CALL = 0x801CE26C
 ORIGINAL_CALLEE = 0x801F7B04
 SEED_FN = 0x801CF7AC
-SEED = 0x13579BDF
+SEED = 0x13579BDF            # default seed word value (offline/harness runs)
+SEED_WORD = 0x804114F4       # must match NSRNetplay::SEED_ADDRESS
+SEED_STEP = 0x9E3779B9       # Weyl increment between successive seeds
 SEEDLOG_CODE = 0x80411960    # after the input routine
 NETPLAY_STUB = 0x804119AC     # must match NSRNetplay::STUB_ADDRESS
 NETPLAY_CODE = 0x804119B0
@@ -130,6 +136,7 @@ def cmplw(ra, rb): return (31 << 26) | (ra << 16) | (rb << 11) | (32 << 1)
 def stfd(fs, d, ra): return (54 << 26) | (fs << 21) | (ra << 16) | (d & 0xFFFF)
 def lfd(fd, d, ra): return (50 << 26) | (fd << 21) | (ra << 16) | (d & 0xFFFF)
 def addic_(rd, ra, imm): return (13 << 26) | (rd << 21) | (ra << 16) | (imm & 0xFFFF)
+def addis(rd, ra, imm): return (15 << 26) | (rd << 21) | (ra << 16) | (imm & 0xFFFF)
 def subf(rd, ra, rb): return (31 << 26) | (rd << 21) | (ra << 16) | (rb << 11) | (40 << 1)
 def divwu(rd, ra, rb): return (31 << 26) | (rd << 21) | (ra << 16) | (rb << 11) | (459 << 1)
 def mullw(rd, ra, rb): return (31 << 26) | (rd << 21) | (ra << 16) | (rb << 11) | (235 << 1)
@@ -146,6 +153,21 @@ def bc(src: int, dst: int, bo: int, bi: int) -> int:
 
 
 def rlwinm(ra, rs, sh, mb, me): return (21 << 26) | (rs << 21) | (ra << 16) | (sh << 11) | (mb << 6) | (me << 1)
+
+
+def seed_routine() -> list[int]:
+    """fn_801CF7AC replacement: r3 = *SEED_WORD; *SEED_WORD += SEED_STEP."""
+    hi, lo = SEED_WORD >> 16, SEED_WORD & 0xFFFF
+    assert lo < 0x8000  # lwz/stw displacement is signed
+    step_lo = SEED_STEP & 0xFFFF
+    step_hi = (SEED_STEP >> 16) + (1 if step_lo & 0x8000 else 0)  # addi sign-extends
+    # r11 as scratch, not r0: in addi/addis a source register of r0 means
+    # the literal 0, so "addi r0, r0, x" would be "li r0, x".
+    return [
+        lis(12, hi), lwz(3, lo, 12),
+        addis(11, 3, step_hi), addi(11, 11, step_lo),
+        stw(11, lo, 12), blr(),
+    ]
 
 
 def freeze_routine() -> list[int]:
@@ -395,8 +417,9 @@ def apply_patches(iso, patches: set[str]) -> None:
         write_words(iso, DISPATCH_CALL, [b(DISPATCH_CALL, FREEZE_CODE, link=True)],
                     expect=[b(DISPATCH_CALL, ORIGINAL_CALLEE, link=True)])
     if "seed" in patches:
-        write_words(iso, SEED_FN, [lis(3, SEED >> 16), ori(3, 3, SEED & 0xFFFF), blr()],
-                    expect=[0x9421FFF8, 0x7C0802A6, 0x9001000C])
+        write_words(iso, SEED_FN, seed_routine(),
+                    expect=[0x9421FFF8, 0x7C0802A6, 0x9001000C, 0x4806EFF5, 0x8001000C, 0x7C0803A6])
+        write_words(iso, SEED_WORD, [SEED], expect=[0])
     if "seedlog" in patches:
         routine = seedlog_routine()
         write_words(iso, SEEDLOG_CODE, routine, expect=[0] * len(routine))

@@ -32,6 +32,9 @@
 //   NSR_DELAY   = input delay in frames (default 2)
 //   NSR_LOG     = path for a text log (default: stderr)
 //   NSR_DUMP_PREFIX = write MEM1 at the first desync frame (diagnostics)
+//   NSR_SEED    = per-session RNG seed (decimal or 0x hex), agreed in the lobby;
+//                 written to SEED_ADDRESS on the first hook call, so every
+//                 match differs while all machines stay identical
 //
 // Deferred (revisit at milestone 2, rollback): replace env vars with Dolphin
 // config + a launcher UI, add time sync / frame skipping, matchmaking.
@@ -49,8 +52,12 @@ namespace NSRNetplay
 // Address of the in-game stub the hook replaces. Must match isopatch.py's
 // NETPLAY_STUB.
 constexpr unsigned int STUB_ADDRESS = 0x804119AC;
+// The patched RNG seed source (fn_801CF7AC) returns this word and advances
+// it; must match isopatch.py's SEED_WORD.
+constexpr unsigned int SEED_ADDRESS = 0x804114F4;
 
-// True when NSR_NETPLAY is set (checked once).
+// True when NSR_NETPLAY or NSR_SEED is set (checked once). NSR_SEED alone
+// (offline practice) only installs the per-session RNG seed.
 bool IsEnabled();
 
 // HLE hook body (HookType::Replace).

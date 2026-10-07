@@ -40,9 +40,10 @@ REBORN_PATH_NAME = "nsr-reborn.txt"
 # image each one produces. Add a row when Reborn ships an update and the
 # patches still apply (isopatch's byte checks will refuse otherwise).
 KNOWN_INPUTS = {
-    # Reborn 3.0.0 launcher, game-patch chain label "2026.09.12"
+    # Reborn 3.0.0 launcher, game-patch chain label "2026.09.12".
+    # Output = netplay patch set as of the seed-word patch (2026-10-07).
     "9a6fdedbdff2b2f4ebcc346ccf0bacc97e0489a15be80c648249d0b36c6270ce":
-        ("Reborn 2026.09.12", "839b1d8dfd66f8e14b6802d3fd35895635c9a8a1f7dc8f6078cdecce576e0b15"),
+        ("Reborn 2026.09.12", "f3fe3498d43d4e346419352b3b376810dbc675d82eb5cc1d1ee517e9193601d8"),
 }
 
 
