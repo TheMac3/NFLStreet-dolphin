@@ -22,6 +22,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <enet/enet.h>
@@ -702,6 +703,338 @@ void WritePads(const Core::CPUThreadGuard& guard, u32 buf, const std::array<Pad,
       PowerPC::MMU::HostWrite<u8>(guard, pads[port][i], buf + port * PAD_SIZE + i);
   }
 }
+
+// --- Rollback (milestone 2, stage 1) ----------------------------------------
+// See NSRNetplay.h. The game-side tick routine calls RollbackTickHook before
+// every sim tick (sim part 1 + part 2, which also read the controllers), so
+// the state at that call is "the state before tick t". Snapshots are host-side
+// copies of MEM1 taken there: zero emulated time, like the lockstep wait.
+
+constexpr u32 RB_PAD_BUF = 0x803E92CC;  // the game's PADStatus[4]
+constexpr u32 RB_GRANULE = 64;          // mismatch-report resolution
+
+// RAM a restore leaves alone and a comparison ignores (physical offsets):
+//   - main-thread stack (_stack_end.._stack_addr from the boot code: r1 =
+//     0x803FE4C0, 64 KB). The tick hook runs inside it; restoring it would
+//     overwrite live return addresses. Below r1 it is dead scratch.
+//   - HASH_SKIP: card work areas, raw SI input, the NFLStreet patch area
+//     (retrace counter, test scripts).
+//   - the rollback patch area (stubs, PADRead scratch, routines).
+//   - the trace ring (diagnostic images only).
+//   - Dolphin SDK driver state (OS threads/errors, DVD, VI, SI, AX audio, AR,
+//     DSP, ...), which follows the hardware and real time, not game ticks.
+//     Ranges from the mitsevox/nflstreet2 decomp's symbol evidence: SDK
+//     .data 0x802FC0D0..0x802FF4A0, .bss 0x803A3A70 (OSError) ..0x803C2980
+//     (end of __AXDramImage), .sdata 0x803EC160..0x803EC5C0, .sbss
+//     0x803ED0B0..0x803ED5E8. The SI driver state at 0x803A6940 differed after
+//     every re-simulation before this was excluded.
+constexpr std::array<std::pair<u32, u32>, 10> RB_KEEP{{
+    {0x003EE4C0, 0x003FE4C0},
+    {0x00384C00, 0x00398E00},
+    {0x00411A00, 0x00412000},
+    {0x00416900, 0x00416A80},
+    {0x004132C0, 0x00413E00},
+    {0x002FC0D0, 0x002FF4A0},
+    {0x003A3A70, 0x003C2980},  // includes the raw SI input (0x003A69C0)
+    {0x003EC160, 0x003EC5C0},
+    {0x003ED0B0, 0x003ED5E8},
+    {0x00000000, 0x00003100},  // low memory: OS globals (time, arena, current thread)
+}};
+
+using Pads = std::array<Pad, MAX_PLAYERS>;
+
+struct Rollback
+{
+  bool initialized = false;
+  u32 force = 0;          // NSR_RB_FORCE: ticks to roll back before every live tick
+  u32 force_from = 0;     // NSR_RB_FORCE_FROM: first live tick that is rolled back
+  bool hash_log = false;  // NSR_RB_HASH_LOG
+  std::vector<u32> dump_at;
+  std::vector<std::pair<u32, u32>> segments;  // RAM ranges restored/compared
+
+  Pads latest{};  // most recent processed local sample (from the poll)
+
+  u32 live = 0;    // index of the next live tick
+  u32 cursor = 0;  // index of the tick about to run (< live while re-simulating)
+  bool rolled = false;
+  std::map<u32, Pads> pads;              // tick -> pads it ran with
+  std::vector<std::vector<u8>> ring;     // ring[t % (force + 1)] = state before tick t
+
+  u64 checks = 0, mismatched_checks = 0, rollbacks = 0, resim_ticks = 0;
+  std::map<u32, u32> granule_hits;  // granule index -> checks it differed in
+  u32 logged_mismatches = 0;
+
+  // NSR_RB_PROFILE: per-granule write counts inside / outside the sim.
+  std::string profile_path;
+  u32 pgran = RB_GRANULE;  // NSR_RB_GRANULE: profile resolution in bytes (4..4096)
+  std::vector<u8> at_start, at_end;  // RAM at the last tick start / tick end
+  bool have_end = false;
+  std::vector<u32> inside, outside;
+};
+
+Rollback s_rb;
+
+std::optional<u32> ParseU32(const std::string& text)
+{
+  if (text.empty())
+    return std::nullopt;
+  char* end = nullptr;
+  const unsigned long v = std::strtoul(text.c_str(), &end, 0);
+  if (end == text.c_str() || *end != '\0')
+    return std::nullopt;
+  return static_cast<u32>(v);
+}
+
+void RbInit(Core::System& system)
+{
+  Rollback& r = s_rb;
+  r.initialized = true;
+  if (const std::string path = Env("NSR_LOG"); !path.empty() && s_session.log == stderr)
+  {
+    if (FILE* f = std::fopen(path.c_str(), "a"))
+      s_session.log = f;
+  }
+  r.force = ParseU32(Env("NSR_RB_FORCE")).value_or(0);
+  r.force_from = ParseU32(Env("NSR_RB_FORCE_FROM")).value_or(0);
+  r.hash_log = !Env("NSR_RB_HASH_LOG").empty();
+  for (const std::string& t : Split(Env("NSR_RB_DUMP_AT"), ','))
+  {
+    if (const auto v = ParseU32(t))
+      r.dump_at.push_back(*v);
+  }
+
+  // Segments = MEM1 minus the keep ranges (defaults + NSR_RB_KEEP).
+  std::vector<std::pair<u32, u32>> keep(RB_KEEP.begin(), RB_KEEP.end());
+  for (const std::string& item : Split(Env("NSR_RB_KEEP"), ','))
+  {
+    const auto parts = Split(item, '-');
+    if (parts.size() != 2)
+      continue;
+    const auto lo = ParseU32(parts[0]), hi = ParseU32(parts[1]);
+    if (lo && hi)
+      keep.emplace_back(*lo & 0x01FFFFFF, *hi & 0x01FFFFFF);
+  }
+  std::sort(keep.begin(), keep.end());
+  const u32 size = system.GetMemory().GetRamSizeReal();
+
+  // Candidate ranges: all of MEM1, or the NSR_RB_RANGES list.
+  std::vector<std::pair<u32, u32>> candidates;
+  if (const std::string path = Env("NSR_RB_RANGES"); !path.empty())
+  {
+    if (FILE* f = std::fopen(path.c_str(), "r"))
+    {
+      char line[256];
+      while (std::fgets(line, sizeof(line), f))
+      {
+        unsigned long lo = 0, hi = 0;
+        if (line[0] != '#' && std::sscanf(line, "%lx %lx", &lo, &hi) == 2 && hi > lo)
+          candidates.emplace_back(static_cast<u32>(lo) & 0x01FFFFFF,
+                                  std::min<u32>(static_cast<u32>(hi - lo) + (lo & 0x01FFFFFF), size));
+      }
+      std::fclose(f);
+    }
+    std::sort(candidates.begin(), candidates.end());
+    Log("restore ranges from {}: {}", path, candidates.size());
+  }
+  else
+  {
+    candidates.emplace_back(0, size);
+  }
+  // segments = candidates minus keep ranges
+  for (auto [lo, hi] : candidates)
+  {
+    for (const auto& [klo, khi] : keep)
+    {
+      if (khi <= lo || klo >= hi)
+        continue;
+      if (klo > lo)
+        r.segments.emplace_back(lo, klo);
+      lo = std::max(lo, khi);
+      if (lo >= hi)
+        break;
+    }
+    if (lo < hi)
+      r.segments.emplace_back(lo, hi);
+  }
+  u64 total = 0;
+  for (const auto& [lo, hi] : r.segments)
+    total += hi - lo;
+  Log("rollback state: {} ranges, {} bytes", r.segments.size(), total);
+
+  r.profile_path = Env("NSR_RB_PROFILE");
+  if (!r.profile_path.empty())
+  {
+    r.force = 0;  // profiling only; NSR_RB_FORCE_FROM still sets where it starts
+    r.at_start.resize(size);
+    r.at_end.resize(size);
+    r.pgran = std::clamp<u32>(ParseU32(Env("NSR_RB_GRANULE")).value_or(RB_GRANULE), 4, 4096);
+    r.inside.assign(size / r.pgran, 0);
+    r.outside.assign(size / r.pgran, 0);
+  }
+
+  if (r.force > 0)
+    r.ring.assign(r.force + 1, std::vector<u8>(size));
+  Log("rollback image: force={} keep-ranges={} hash-log={}", r.force, keep.size(), r.hash_log);
+}
+
+void RbSave(const u8* ram, std::vector<u8>& slot)
+{
+  for (const auto& [lo, hi] : s_rb.segments)
+    std::memcpy(slot.data() + lo, ram + lo, hi - lo);
+}
+
+void RbRestore(u8* ram, const std::vector<u8>& slot)
+{
+  for (const auto& [lo, hi] : s_rb.segments)
+    std::memcpy(ram + lo, slot.data() + lo, hi - lo);
+}
+
+// Compare RAM (re-simulated state before tick t) with the original state
+// before tick t, granule by granule; record and log what differs.
+void RbCheck(u32 tick, const u8* ram, const std::vector<u8>& original)
+{
+  Rollback& r = s_rb;
+  ++r.checks;
+  u32 differing = 0;
+  std::vector<std::pair<u32, u32>> ranges;  // coalesced, for the log
+  for (const auto& [lo, hi] : r.segments)
+  {
+    for (u32 g = lo; g < hi; g += RB_GRANULE)
+    {
+      const u32 len = std::min(RB_GRANULE, hi - g);
+      if (std::memcmp(ram + g, original.data() + g, len) == 0)
+        continue;
+      ++differing;
+      ++r.granule_hits[g / RB_GRANULE];
+      if (!ranges.empty() && ranges.back().second == g)
+        ranges.back().second = g + len;
+      else
+        ranges.emplace_back(g, g + len);
+    }
+  }
+  if (differing == 0)
+    return;
+  ++r.mismatched_checks;
+  if (r.logged_mismatches < 20)
+  {
+    ++r.logged_mismatches;
+    std::string list;
+    for (size_t i = 0; i < ranges.size() && i < 12; ++i)
+      list += fmt::format(" {:08x}-{:08x}", 0x80000000 | ranges[i].first, 0x80000000 | ranges[i].second);
+    Log("re-sim mismatch before tick {}: {} granules in {} ranges:{}{}", tick, differing,
+        ranges.size(), list, ranges.size() > 12 ? " ..." : "");
+  }
+}
+
+void RbReport(size_t limit)
+{
+  Rollback& r = s_rb;
+  Log("rollback summary: live ticks {}, rollbacks {}, re-simulated ticks {}, checks {}, "
+      "mismatched {}",
+      r.live, r.rollbacks, r.resim_ticks, r.checks, r.mismatched_checks);
+  // Coalesce granules into ranges, ordered by how often they differed.
+  std::vector<std::tuple<u32, u32, u32>> ranges;  // lo, hi, max hits
+  for (const auto& [g, hits] : r.granule_hits)
+  {
+    const u32 lo = g * RB_GRANULE;
+    if (!ranges.empty() && std::get<1>(ranges.back()) == lo)
+    {
+      std::get<1>(ranges.back()) = lo + RB_GRANULE;
+      std::get<2>(ranges.back()) = std::max(std::get<2>(ranges.back()), hits);
+    }
+    else
+    {
+      ranges.emplace_back(lo, lo + RB_GRANULE, hits);
+    }
+  }
+  std::sort(ranges.begin(), ranges.end(),
+            [](const auto& a, const auto& b) { return std::get<2>(a) > std::get<2>(b); });
+  for (size_t i = 0; i < ranges.size() && i < limit; ++i)
+  {
+    const auto& [lo, hi, hits] = ranges[i];
+    Log("  differs {:08x}-{:08x} ({} bytes) in {} checks", 0x80000000 | lo, 0x80000000 | hi,
+        hi - lo, hits);
+  }
+}
+
+u64 RbHash(const u8* ram)
+{
+  u64 h = 1469598103934665603ULL;
+  for (const auto& [lo, hi] : s_rb.segments)
+  {
+    for (u32 off = lo; off + 8 <= hi; off += 8)
+    {
+      u64 w;
+      std::memcpy(&w, ram + off, 8);
+      h = (h ^ w) * 1099511628211ULL;
+    }
+  }
+  return h;
+}
+
+void RbWritePads(const Core::CPUThreadGuard& guard, u32 buf, const Pads& pads)
+{
+  for (u32 port = 0; port < MAX_PLAYERS; ++port)
+  {
+    for (u32 i = 0; i < PAD_SIZE; ++i)
+      PowerPC::MMU::HostWrite<u8>(guard, pads[port][i], buf + port * PAD_SIZE + i);
+  }
+}
+
+// Count granules (within segments) that differ between RAM and `before`.
+void RbCountWrites(const u8* ram, const std::vector<u8>& before, std::vector<u32>& counts)
+{
+  const u32 gran = s_rb.pgran;
+  for (const auto& [lo, hi] : s_rb.segments)
+  {
+    for (u32 g = lo - lo % gran; g < hi; g += gran)
+    {
+      const u32 a = std::max(g, lo), b = std::min(g + gran, hi);
+      if (std::memcmp(ram + a, before.data() + a, b - a) != 0)
+        ++counts[g / gran];
+    }
+  }
+}
+
+void RbWriteProfile()
+{
+  Rollback& r = s_rb;
+  FILE* f = std::fopen(r.profile_path.c_str(), "w");
+  if (!f)
+    return;
+  std::fprintf(f, "# NSR rollback write profile after %u ticks: lo hi inside outside "
+               "(%u-byte granules coalesced while both counts stay equal)\n", r.live, r.pgran);
+  u32 g = 0;
+  const u32 n = static_cast<u32>(r.inside.size());
+  while (g < n)
+  {
+    if (r.inside[g] == 0 && r.outside[g] == 0)
+    {
+      ++g;
+      continue;
+    }
+    u32 end = g + 1;
+    while (end < n && r.inside[end] == r.inside[g] && r.outside[end] == r.outside[g])
+      ++end;
+    std::fprintf(f, "%08x %08x %u %u\n", 0x80000000u | (g * r.pgran),
+                 0x80000000u | (end * r.pgran), r.inside[g], r.outside[g]);
+    g = end;
+  }
+  std::fclose(f);
+}
+
+// Per-session RNG seed: install it once, at the first poll, which happens at
+// the same emulated instant on every machine (before any match loads and
+// GRand re-seeds from it).
+void InstallSeedOnce(const Core::CPUThreadGuard& guard)
+{
+  static bool seed_written = false;
+  if (seed_written)
+    return;
+  seed_written = true;
+  if (const auto value = ParseU32(Env("NSR_SEED")))
+    PowerPC::MMU::HostWrite<u32>(guard, *value, SEED_ADDRESS);
+}
 }  // namespace
 
 bool IsEnabled()
@@ -719,19 +1052,7 @@ void Hook(const Core::CPUThreadGuard& guard)
   const u32 frame = ppc_state.gpr[4];
   ppc_state.npc = LR(ppc_state);  // Replace hook: return to caller
 
-  // Per-session RNG seed: install it once, at the first poll, which happens at
-  // the same emulated instant on every machine (before any match loads and
-  // GRand re-seeds from it).
-  static bool seed_written = false;
-  if (!seed_written)
-  {
-    seed_written = true;
-    if (const std::string seed = Env("NSR_SEED"); !seed.empty())
-    {
-      const u32 value = static_cast<u32>(std::strtoul(seed.c_str(), nullptr, 0));
-      PowerPC::MMU::HostWrite<u32>(guard, value, SEED_ADDRESS);
-    }
-  }
+  InstallSeedOnce(guard);
   if (std::getenv("NSR_NETPLAY") == nullptr)
     return;  // seed-only mode (offline practice)
 
@@ -855,9 +1176,146 @@ void Hook(const Core::CPUThreadGuard& guard)
     Log("frame {} ok (desyncs so far: {})", frame, s.desyncs);
 }
 
+void RollbackPollHook(const Core::CPUThreadGuard& guard)
+{
+  auto& system = guard.GetSystem();
+  auto& ppc_state = system.GetPPCState();
+  const u32 scratch = ppc_state.gpr[3];
+  const u32 retrace = ppc_state.gpr[4];
+  const u32 phase = ppc_state.gpr[5];
+  ppc_state.npc = LR(ppc_state);
+  InstallSeedOnce(guard);
+  Rollback& r = s_rb;
+  if (!r.initialized)
+    RbInit(system);
+
+  if (phase == 0)
+  {
+    // Raw pads, before Reborn's remap: the test script replaces port 0.
+    if (auto scripted = ScriptPad(guard, retrace))
+    {
+      (*scripted)[10] = 0;  // err: connected
+      for (u32 i = 0; i < PAD_SIZE; ++i)
+        PowerPC::MMU::HostWrite<u8>(guard, (*scripted)[i], scratch + i);
+    }
+    return;
+  }
+
+  // Processed pads: the local sample for the next live tick. The game's pad
+  // buffer gets them now, as in the unpatched poll, unless ticks are being
+  // re-simulated (then each re-simulated tick has its own pads in there).
+  for (u32 port = 0; port < MAX_PLAYERS; ++port)
+  {
+    for (u32 i = 0; i < PAD_SIZE; ++i)
+      r.latest[port][i] = PowerPC::MMU::HostRead<u8>(guard, scratch + port * PAD_SIZE + i);
+  }
+  if (r.cursor == r.live)
+    RbWritePads(guard, RB_PAD_BUF, r.latest);
+}
+
+void RollbackTickHook(const Core::CPUThreadGuard& guard)
+{
+  auto& system = guard.GetSystem();
+  auto& ppc_state = system.GetPPCState();
+  const u32 buf = ppc_state.gpr[3];
+  ppc_state.npc = LR(ppc_state);
+  Rollback& r = s_rb;
+  if (!r.initialized)
+    RbInit(system);
+  u8* ram = system.GetMemory().GetRAM();
+  const u32 slots = r.force + 1;
+
+  if (r.cursor == r.live)
+  {
+    if (r.rolled)
+    {
+      // Re-simulation reached the live tick again: the state must match what
+      // it was before the rollback.
+      RbCheck(r.live, ram, r.ring[r.live % slots]);
+    }
+    else if (r.force > 0 && r.live >= r.force + r.force_from)
+    {
+      // Forced rollback (stage 1 test): keep the state before this tick, go
+      // back `force` ticks, and re-run them with the pads they had.
+      RbSave(ram, r.ring[r.live % slots]);
+      RbRestore(ram, r.ring[(r.live - r.force) % slots]);
+      r.cursor = r.live - r.force;
+      r.rolled = true;
+      ++r.rollbacks;
+    }
+  }
+
+  if (r.cursor < r.live)
+  {
+    // Re-simulated tick.
+    RbSave(ram, r.ring[r.cursor % slots]);
+    RbWritePads(guard, buf, r.pads.at(r.cursor));
+    ++r.cursor;
+    ++r.resim_ticks;
+    ppc_state.gpr[3] = 1;  // run another tick after this one
+    return;
+  }
+
+  // Live tick.
+  const u32 t = r.live;
+  if (!r.profile_path.empty() && t >= r.force_from)  // NSR_RB_FORCE_FROM = profile start
+  {
+    if (r.have_end)
+      RbCountWrites(ram, r.at_end, r.outside);
+    RbSave(ram, r.at_start);
+    if (t % 600 == 0 && t > 0)
+      RbWriteProfile();
+  }
+  if (std::find(r.dump_at.begin(), r.dump_at.end(), t) != r.dump_at.end())
+  {
+    const std::string path = Env("NSR_DUMP_PREFIX", "nsr") + "-tick-" + std::to_string(t) + ".bin";
+    if (FILE* f = std::fopen(path.c_str(), "wb"))
+    {
+      std::fwrite(ram, 1, system.GetMemory().GetRamSizeReal(), f);
+      std::fclose(f);
+      Log("wrote {}", path);
+    }
+  }
+  if (r.hash_log && t % 60 == 0)
+    Log("tick {} hash {:016x}", t, RbHash(ram));
+  if (r.force > 0)
+    RbSave(ram, r.ring[t % slots]);
+  r.pads[t] = r.latest;
+  RbWritePads(guard, buf, r.pads[t]);
+  r.live = t + 1;
+  r.cursor = r.live;
+  r.rolled = false;
+  if (t >= 600)
+    r.pads.erase(r.pads.begin(), r.pads.lower_bound(t - 600));
+  if (t % 600 == 0)
+  {
+    Log("tick {}: rollbacks {}, re-simulated {}, mismatched checks {}/{}", t, r.rollbacks,
+        r.resim_ticks, r.mismatched_checks, r.checks);
+    if (r.mismatched_checks > 0)
+      RbReport(15);  // Dolphin is usually killed, not shut down: report as we go
+  }
+  ppc_state.gpr[3] = 0;  // this was the last tick for now
+}
+
+void RollbackTickEndHook(const Core::CPUThreadGuard& guard)
+{
+  auto& system = guard.GetSystem();
+  auto& ppc_state = system.GetPPCState();
+  ppc_state.npc = LR(ppc_state);
+  Rollback& r = s_rb;
+  if (r.profile_path.empty() || r.cursor != r.live || r.live <= r.force_from)
+    return;
+  const u8* ram = system.GetMemory().GetRAM();
+  RbCountWrites(ram, r.at_start, r.inside);
+  RbSave(ram, r.at_end);
+  r.have_end = true;
+}
+
 void Shutdown()
 {
   Session& s = s_session;
+  if (s_rb.initialized && s_rb.force > 0)
+    RbReport(40);
   if (s.host)
   {
     for (ENetPeer* peer : s.peers)
@@ -870,5 +1328,6 @@ void Shutdown()
   if (s.log && s.log != stderr)
     std::fclose(s.log);
   s = Session{};
+  s_rb = Rollback{};
 }
 }  // namespace NSRNetplay

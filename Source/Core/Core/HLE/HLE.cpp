@@ -11,6 +11,7 @@
 #include "Common/Config/Config.h"
 
 #include "Core/Config/MainSettings.h"
+#include "Core/ConfigManager.h"
 #include "Core/Core.h"
 #include "Core/GeckoCode.h"
 #include "Core/HLE/HLE_Misc.h"
@@ -29,7 +30,7 @@ namespace HLE
 static std::map<u32, u32> s_hooked_addresses;
 
 // clang-format off
-constexpr std::array<Hook, 24> os_patches{{
+constexpr std::array<Hook, 27> os_patches{{
     // Placeholder, os_patches[0] is the "non-existent function" index
     {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
 
@@ -63,6 +64,9 @@ constexpr std::array<Hook, 24> os_patches{{
     {"GeckoHandlerReturnTrampoline", HLE_Misc::GeckoReturnTrampoline,       HookType::Replace, HookFlag::Fixed},
     {"AppLoaderReport",              HLE_OS::HLE_GeneralDebugPrint,         HookType::Start,   HookFlag::Fixed}, // apploader needs OSReport-like function
     {"NSR_Netplay",                  NSRNetplay::Hook,                      HookType::Replace, HookFlag::Fixed}, // NFLStreet POC lockstep input exchange
+    {"NSR_RollbackPoll",             NSRNetplay::RollbackPollHook,          HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: pad poll
+    {"NSR_RollbackTick",             NSRNetplay::RollbackTickHook,          HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: sim tick
+    {"NSR_RollbackTickEnd",          NSRNetplay::RollbackTickEndHook,       HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: after sim tick
 }};
 // clang-format on
 
@@ -113,6 +117,15 @@ void PatchFixedFunctions(Core::System& system)
   // installed when NSR_NETPLAY is set; otherwise the stub's `blr` runs.
   if (NSRNetplay::IsEnabled())
     Patch(system, NSRNetplay::STUB_ADDRESS, "NSR_Netplay");
+  // Rollback images (isopatch `rollback`) route every pad poll and sim tick
+  // through these stubs, so they're always installed for NFL Street 2. In
+  // other images that RAM is unused data that never runs.
+  if (SConfig::GetInstance().GetGameID() == "GN7E69")
+  {
+    Patch(system, NSRNetplay::RB_POLL_STUB, "NSR_RollbackPoll");
+    Patch(system, NSRNetplay::RB_TICK_STUB, "NSR_RollbackTick");
+    Patch(system, NSRNetplay::RB_TICK_END_STUB, "NSR_RollbackTickEnd");
+  }
 }
 
 void PatchFunctions(Core::System& system)
