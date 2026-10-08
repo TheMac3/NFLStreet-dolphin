@@ -52,6 +52,12 @@
 //   NSR_RB_DUMP_AT = t,...    write MEM1 before live tick t
 //                             (NSR_DUMP_PREFIX-tick-t.bin)
 //   NSR_RB_HASH_LOG = 1       log a MEM1 hash every 60 live ticks
+//   NSR_RB_VTIME_FROM = t     virtual (tick-based) time for game code in
+//                             ticks from live tick t on (see OSGetTimeHook)
+//   NSR_RB_RECORD / NSR_RB_REPLAY = path
+//                             write / read each live tick's pads, so two runs
+//                             see identical input per tick whatever their
+//                             timing (compare them with NSR_RB_DUMP_AT)
 //   NSR_RB_PROFILE = path     (no rollback) classify every 64-byte granule of
 //                             MEM1 by who writes it: the sim (between tick
 //                             start and tick end) or the rest of the frame
@@ -66,6 +72,8 @@
 // config + a launcher UI, add time sync / frame skipping, matchmaking.
 
 #pragma once
+
+#include <vector>
 
 namespace Core
 {
@@ -86,6 +94,10 @@ constexpr unsigned int SEED_ADDRESS = 0x804114F4;
 constexpr unsigned int RB_POLL_STUB = 0x80416900;
 constexpr unsigned int RB_TICK_STUB = 0x80416904;
 constexpr unsigned int RB_TICK_END_STUB = 0x80416908;
+constexpr unsigned int RB_TIME_STUB = 0x8041690C;
+// SDK time functions in GN7E69 (replaced so ticks can see tick-based time).
+constexpr unsigned int OS_GET_TIME = 0x8023E794;
+constexpr unsigned int OS_GET_TICK = 0x8023E7AC;
 
 // True when NSR_NETPLAY or NSR_SEED is set (checked once). NSR_SEED alone
 // (offline practice) only installs the per-session RNG seed.
@@ -102,6 +114,20 @@ void RollbackPollHook(const Core::CPUThreadGuard& guard);
 void RollbackTickHook(const Core::CPUThreadGuard& guard);
 // Called after each tick's sim part 2 (no arguments).
 void RollbackTickEndHook(const Core::CPUThreadGuard& guard);
+// Time sources. Inside a tick, for game code, from NSR_RB_VTIME_FROM on,
+// they return virtual time: base + (tick - start) * one 60 Hz frame +
+// 64 * (call index within the tick), so a re-simulated tick sees exactly the
+// time it saw the first time and every machine sees the same time.
+// Everything else (SDK callers, outside ticks) gets the real time base.
+void OSGetTimeHook(const Core::CPUThreadGuard& guard);   // u64 in r3:r4
+void OSGetTickHook(const Core::CPUThreadGuard& guard);   // u32 in r3
+void RollbackTimeHook(const Core::CPUThreadGuard& guard);  // TBL in r3 (mftb site)
+// Diagnostics: NSR_RB_PROBES=addr,... installs ProbeHook (HookType::Start)
+// at those function entries; inside the NSR_RB_WATCH window it logs each
+// change of the watched word together with the probes before and after it.
+std::vector<unsigned int> ProbeAddresses();
+void ProbeHook(const Core::CPUThreadGuard& guard);
+void SetHookPc(unsigned int pc);  // set by HLE::Execute before each hook
 
 // Tear down the network session (called on emulation shutdown).
 void Shutdown();

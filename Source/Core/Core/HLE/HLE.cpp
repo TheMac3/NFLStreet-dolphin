@@ -4,6 +4,7 @@
 #include "Core/HLE/HLE.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <map>
 
@@ -30,7 +31,7 @@ namespace HLE
 static std::map<u32, u32> s_hooked_addresses;
 
 // clang-format off
-constexpr std::array<Hook, 27> os_patches{{
+constexpr std::array<Hook, 31> os_patches{{
     // Placeholder, os_patches[0] is the "non-existent function" index
     {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
 
@@ -67,6 +68,10 @@ constexpr std::array<Hook, 27> os_patches{{
     {"NSR_RollbackPoll",             NSRNetplay::RollbackPollHook,          HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: pad poll
     {"NSR_RollbackTick",             NSRNetplay::RollbackTickHook,          HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: sim tick
     {"NSR_RollbackTickEnd",          NSRNetplay::RollbackTickEndHook,       HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: after sim tick
+    {"NSR_RollbackTime",             NSRNetplay::RollbackTimeHook,          HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: game mftb
+    {"NSR_OSGetTime",                NSRNetplay::OSGetTimeHook,             HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: tick time
+    {"NSR_OSGetTick",                NSRNetplay::OSGetTickHook,             HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: tick time
+    {"NSR_Probe",                    NSRNetplay::ProbeHook,                 HookType::Start,   HookFlag::Fixed}, // NFLStreet POC diagnostics
 }};
 // clang-format on
 
@@ -125,6 +130,14 @@ void PatchFixedFunctions(Core::System& system)
     Patch(system, NSRNetplay::RB_POLL_STUB, "NSR_RollbackPoll");
     Patch(system, NSRNetplay::RB_TICK_STUB, "NSR_RollbackTick");
     Patch(system, NSRNetplay::RB_TICK_END_STUB, "NSR_RollbackTickEnd");
+    Patch(system, NSRNetplay::RB_TIME_STUB, "NSR_RollbackTime");
+    for (const u32 probe : NSRNetplay::ProbeAddresses())  // (diagnostics)
+      Patch(system, probe, "NSR_Probe");
+    if (!std::getenv("NSR_RB_NO_TIME_HOOKS"))  // (diagnostics)
+    {
+      Patch(system, NSRNetplay::OS_GET_TIME, "NSR_OSGetTime");
+      Patch(system, NSRNetplay::OS_GET_TICK, "NSR_OSGetTick");
+    }
   }
 }
 
@@ -187,6 +200,7 @@ void Execute(const Core::CPUThreadGuard& guard, u32 current_pc, u32 hook_index)
   hook_index &= 0xFFFFF;
   if (hook_index > 0 && hook_index < os_patches.size())
   {
+    NSRNetplay::SetHookPc(current_pc);  // NFLStreet probes: which address fired
     os_patches[hook_index].function(guard);
   }
   else
