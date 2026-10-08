@@ -113,6 +113,12 @@ bool Interpreter::HandleFunctionHooking(u32 address)
   if (!result)
     return false;
 
+  if (result.type == HLE::HookType::Gate)
+  {
+    m_ppc_state.npc = address;  // the hook changes npc to skip the function
+    HLEFunction(*this, result.hook_index);
+    return m_ppc_state.npc != address;
+  }
   HLEFunction(*this, result.hook_index);
 
   return result.type != HLE::HookType::Start;

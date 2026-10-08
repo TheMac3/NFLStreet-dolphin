@@ -1366,6 +1366,19 @@ bool Jit64::HandleFunctionHooking(u32 address)
   if (!result)
     return false;
 
+  if (result.type == HLE::HookType::Gate)
+  {
+    // npc = hooked address; the hook changes it to skip the function.
+    MOV(32, PPCSTATE(npc), Imm32(address));
+    HLEFunction(result.hook_index);
+    MOV(32, R(RSCRATCH), PPCSTATE(npc));
+    CMP(32, R(RSCRATCH), Imm32(address));
+    FixupBranch run_original = J_CC(CC_E, Jump::Near);
+    WriteExitDestInRSCRATCH();
+    SetJumpTarget(run_original);
+    return false;
+  }
+
   HLEFunction(result.hook_index);
 
   if (result.type != HLE::HookType::Replace)

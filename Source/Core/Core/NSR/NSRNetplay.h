@@ -73,6 +73,7 @@
 
 #pragma once
 
+#include <array>
 #include <vector>
 
 namespace Core
@@ -122,6 +123,34 @@ void RollbackTickEndHook(const Core::CPUThreadGuard& guard);
 void OSGetTimeHook(const Core::CPUThreadGuard& guard);   // u64 in r3:r4
 void OSGetTickHook(const Core::CPUThreadGuard& guard);   // u32 in r3
 void RollbackTimeHook(const Core::CPUThreadGuard& guard);  // TBL in r3 (mftb site)
+// Audio gate (rollback). Game code calls into the audio middleware (its
+// state is live, never rewound). During a live tick each such call runs and
+// its result (r3, r4, f1) is recorded; during re-simulation the call is
+// skipped and the recorded result returned, so sounds aren't started twice
+// and the game gets the same handles. Entry points: functions in
+// 0x80263000..0x80285A90 (audio middleware, between the SDK text chunks)
+// called from code below 0x8025E000 (game, EA engine). Generated from
+// main.dol call sites. Opt-in: NSR_RB_AUDIO_GATE=1 (sound-start path only)
+// or =addr,... (gating every entry crashes; see AudioGateHook).
+constexpr std::array<unsigned int, 75> AUDIO_GATE_ENTRIES{{
+    0x80266CB8, 0x80266D00, 0x802692B8, 0x802697D8, 0x8026A2DC, 0x8026A4D4,
+    0x8026A870, 0x8026A96C, 0x8026A980, 0x8026A9F4, 0x8026AAF0, 0x8026AB88,
+    0x8026B124, 0x8026B250, 0x8026B4D8, 0x8026C18C, 0x8026C23C, 0x8026C280,
+    0x8026C39C, 0x8026C3BC, 0x8026C9BC, 0x8026CA50, 0x8026CAA8, 0x8026D0AC,
+    0x8026D0EC, 0x8026E280, 0x8026E2A8, 0x8026E364, 0x8026E388, 0x8026E4C0,
+    0x8026E8FC, 0x8026EA80, 0x8026EAC0, 0x8026EBBC, 0x8026ED1C, 0x8026EDC4,
+    0x8026EE24, 0x8026EE6C, 0x8026EEB0, 0x8026EF0C, 0x8026EF38, 0x8026EF88,
+    0x8026F1E8, 0x8026F5F8, 0x8026F710, 0x8026F788, 0x8026F894, 0x8026F908,
+    0x8026F97C, 0x8026FBCC, 0x8026FBFC, 0x8026FCAC, 0x802703A0, 0x80270458,
+    0x802714A8, 0x8027555C, 0x8027D3AC, 0x8027ECD8, 0x8027ED6C, 0x8027EFAC,
+    0x8027F000, 0x8027F030, 0x8027F0DC, 0x8027F21C, 0x8027F2C0, 0x8027F2EC,
+    0x8027F3A4, 0x8027F77C, 0x8027F7B0, 0x8027F880, 0x8027F910, 0x8027FAB8,
+    0x802856D8, 0x8028572C, 0x802857D8,
+}};
+constexpr unsigned int RB_GATE_RETURN = 0x80416910;  // gated calls return here (HLE)
+void AudioGateHook(const Core::CPUThreadGuard& guard);
+void AudioGateReturnHook(const Core::CPUThreadGuard& guard);
+
 // Diagnostics: NSR_RB_PROBES=addr,... installs ProbeHook (HookType::Start)
 // at those function entries; inside the NSR_RB_WATCH window it logs each
 // change of the watched word together with the probes before and after it.

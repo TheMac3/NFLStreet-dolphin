@@ -31,7 +31,7 @@ namespace HLE
 static std::map<u32, u32> s_hooked_addresses;
 
 // clang-format off
-constexpr std::array<Hook, 31> os_patches{{
+constexpr std::array<Hook, 33> os_patches{{
     // Placeholder, os_patches[0] is the "non-existent function" index
     {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
 
@@ -72,6 +72,8 @@ constexpr std::array<Hook, 31> os_patches{{
     {"NSR_OSGetTime",                NSRNetplay::OSGetTimeHook,             HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: tick time
     {"NSR_OSGetTick",                NSRNetplay::OSGetTickHook,             HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: tick time
     {"NSR_Probe",                    NSRNetplay::ProbeHook,                 HookType::Start,   HookFlag::Fixed}, // NFLStreet POC diagnostics
+    {"NSR_AudioGate",                NSRNetplay::AudioGateHook,             HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: audio side effects
+    {"NSR_AudioGateReturn",          NSRNetplay::AudioGateReturnHook,       HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: record audio results
 }};
 // clang-format on
 
@@ -131,6 +133,12 @@ void PatchFixedFunctions(Core::System& system)
     Patch(system, NSRNetplay::RB_TICK_STUB, "NSR_RollbackTick");
     Patch(system, NSRNetplay::RB_TICK_END_STUB, "NSR_RollbackTickEnd");
     Patch(system, NSRNetplay::RB_TIME_STUB, "NSR_RollbackTime");
+    if (std::getenv("NSR_RB_AUDIO_GATE"))  // opt-in while it's being tuned
+    {
+      for (const u32 entry : NSRNetplay::AUDIO_GATE_ENTRIES)
+        Patch(system, entry, "NSR_AudioGate");
+      Patch(system, NSRNetplay::RB_GATE_RETURN, "NSR_AudioGateReturn");
+    }
     for (const u32 probe : NSRNetplay::ProbeAddresses())  // (diagnostics)
       Patch(system, probe, "NSR_Probe");
     if (!std::getenv("NSR_RB_NO_TIME_HOOKS"))  // (diagnostics)
@@ -256,7 +264,7 @@ TryReplaceFunctionResult TryReplaceFunction(PPCSymbolDB& ppc_symbol_db, u32 addr
     return {};
 
   const HookType type = GetHookTypeByIndex(hook_index);
-  if (type != HookType::Start && type != HookType::Replace)
+  if (type != HookType::Start && type != HookType::Replace && type != HookType::Gate)
     return {};
 
   const HookFlag flags = GetHookFlagsByIndex(hook_index);

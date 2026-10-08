@@ -736,7 +736,7 @@ constexpr u32 RB_GRANULE = 64;          // mismatch-report resolution
 //   - low memory: OS globals (time, arena, thread queue, current context).
 // Live OS objects elsewhere (game-created threads and their stacks, queued
 // alarms, the GX FIFO) are found at restore time; see RbLiveRanges.
-constexpr std::array<std::pair<u32, u32>, 20> RB_KEEP{{
+constexpr std::array<std::pair<u32, u32>, 21> RB_KEEP{{
     {0x003EE4C0, 0x003FE4C0},  // main-thread stack
     {0x00384C00, 0x00398E00},  // memory-card work areas
     {0x00411A00, 0x00412000},  // NFLStreet patch area (counters, scripts)
@@ -762,6 +762,7 @@ constexpr std::array<std::pair<u32, u32>, 20> RB_KEEP{{
     {0x003A3A70, 0x003D4760},
     {0x00381C00, 0x00381C18},  // game disc worker's two OSSemaphores (Codex audit)
     {0x003D55E0, 0x003D55FC},  // game disc worker descriptor (Codex audit)
+    {0x003D5600, 0x003D7600},  // its DVD staging buffer (reads are <= 0x2000 here)
     {0x003EC160, 0x003EC5C0},  // SDK .sdata
     {0x003ED020, 0x003ED5F0},  // SDK .sbss (incl. the OS alarm queue)
 }};
@@ -803,9 +804,27 @@ struct Rollback
   bool initialized = false;
   u32 force = 0;          // NSR_RB_FORCE: ticks to roll back before every live tick
   u32 force_from = 0;     // NSR_RB_FORCE_FROM: first live tick that is rolled back
+  u32 force_to = 0xFFFFFFFF;  // NSR_RB_FORCE_TO: last one (diagnostics)
   u32 perturb_at = 0;     // NSR_RB_PERTURB_AT: diagnostics, see RollbackTickHook
   u32 vtime_from = 0;     // NSR_RB_VTIME_FROM (0 = off)
   bool in_tick = false;   // between the tick stub and the tick-end stub
+  bool in_resim = false;  // the running tick is a re-simulation
+  // Audio gate: per tick, the gated calls in order with their results.
+  struct GateCall
+  {
+    u32 entry = 0, r3 = 0, r4 = 0;
+    u64 f1 = 0;
+    bool done = false;
+  };
+  std::map<u32, std::vector<GateCall>> gate_log;
+  struct GatePending
+  {
+    u32 lr, tick;
+    size_t index;
+  };
+  std::vector<GatePending> gate_pending;
+  size_t gate_index = 0;  // gated calls so far in the running re-simulated tick
+  u64 gate_replayed = 0, gate_mismatched = 0, gate_recorded = 0;
   u32 tick_running = 0;   // index of the tick currently running
   u64 vtime_base = 0;     // real time base at live tick vtime_from
   bool vtime_on = false;
@@ -817,6 +836,9 @@ struct Rollback
   std::vector<std::pair<u32, u32>> segments;  // RAM ranges restored/compared
 
   Pads latest{};  // most recent processed local sample (from the poll)
+  u32 ticks_since_poll = 0;  // tick-mode detection (see RollbackPollHook)
+  u32 idle_polls = 0;
+  bool tick_mode = false;
   FILE* record = nullptr;          // NSR_RB_RECORD: live tick pads out
   std::map<u32, Pads> replay;      // NSR_RB_REPLAY: live tick pads in
 
@@ -840,6 +862,31 @@ struct Rollback
 };
 
 Rollback s_rb;
+
+// Disc-streaming destinations (GN7E69): the game's disc worker (descriptor at
+// 0x803D55E0: destination +0x10, bytes +0x18) streams audio (EA audio driver,
+// commentary) into heap buffers during play. That data and its completion
+// follow real time like the rest of audio, so every destination seen is kept
+// live for the rest of the session. Sampled at every poll and tick, from the
+// start of the rollback session (NSR_RB_VTIME_FROM) on.
+std::map<u32, u32> s_io_ranges;  // physical start -> end
+
+void RbSampleIo(const Core::CPUThreadGuard& guard)
+{
+  // Only loads during the rollback session (in-match streaming). Loading
+  // screens fill gameplay memory (models, animations) through the same
+  // worker; those destinations are game state and must be restored.
+  if (!s_rb.vtime_on)
+    return;
+  const u32 dest = PowerPC::MMU::HostRead<u32>(guard, 0x803D55F0);
+  const u32 bytes = PowerPC::MMU::HostRead<u32>(guard, 0x803D55F8);
+  if ((dest >> 24) != 0x80 || bytes == 0 || bytes > 0x100000)
+    return;
+  const u32 lo = dest & 0x01FFFFFF, hi = lo + ((bytes + 31) & ~31u);
+  auto [it, inserted] = s_io_ranges.try_emplace(lo, hi);
+  if (!inserted)
+    it->second = std::max(it->second, hi);
+}
 std::atomic<s64> s_rb_last_tick_ms{0};  // host time of the last tick hook (watchdog)
 
 std::optional<u32> ParseU32(const std::string& text)
@@ -881,6 +928,7 @@ void RbInit(Core::System& system)
     Log("replaying pads for {} ticks", r.replay.size());
   }
   r.force_from = ParseU32(Env("NSR_RB_FORCE_FROM")).value_or(0);
+  r.force_to = ParseU32(Env("NSR_RB_FORCE_TO")).value_or(0xFFFFFFFF);
   r.perturb_at = ParseU32(Env("NSR_RB_PERTURB_AT")).value_or(0);
   r.vtime_from = ParseU32(Env("NSR_RB_VTIME_FROM")).value_or(0);
   // Diagnostics: NSR_RB_MEMWATCH=addr logs every write to that word
@@ -1119,6 +1167,9 @@ std::vector<std::pair<u32, u32>> RbLiveRanges(Core::System& system, const u8* ra
   if (const u32 outer = rd(TICK_CLOCK_PTR); valid(outer))
     keep(rd(outer + 0xC), 0x10);
   // GX FIFO, from the command processor's registers.
+  for (const auto& [lo, hi] : s_io_ranges)
+    if (hi <= mem_size)
+      live.emplace_back(lo, hi);
   auto& fifo = system.GetCommandProcessor().GetFifo();
   const u32 fb = fifo.CPBase.load() & 0x01FFFFFF, fe = fifo.CPEnd.load() & 0x01FFFFFF;
   if (fe > fb && fe < mem_size)
@@ -1439,6 +1490,7 @@ void RollbackPollHook(const Core::CPUThreadGuard& guard)
   if (!r.initialized)
     RbInit(system);
 
+  RbSampleIo(guard);
   if (phase == 0)
   {
     // Raw pads, before Reborn's remap: the test script replaces port 0.
@@ -1459,7 +1511,24 @@ void RollbackPollHook(const Core::CPUThreadGuard& guard)
     for (u32 i = 0; i < PAD_SIZE; ++i)
       r.latest[port][i] = PowerPC::MMU::HostRead<u8>(guard, scratch + port * PAD_SIZE + i);
   }
-  if (r.cursor == r.live)
+  // While the game is ticking (a match), the pad buffer belongs to the
+  // ticks: each tick writes its own pads, and UI code that reads the buffer
+  // between ticks (e.g. the play-call menu, in the frame tail) sees the last
+  // tick's pads, not whatever the poll sampled at that retrace. Otherwise UI
+  // input would depend on frame timing, which rollback re-simulation (and
+  // every machine) changes. Two polls without a tick end tick mode (menus,
+  // loading), where the poll feeds the buffer as in the unpatched game.
+  if (r.ticks_since_poll > 0)
+  {
+    r.tick_mode = true;
+    r.idle_polls = 0;
+  }
+  else if (r.tick_mode && ++r.idle_polls >= 2)
+  {
+    r.tick_mode = false;
+  }
+  r.ticks_since_poll = 0;
+  if (!r.tick_mode && r.cursor == r.live)
     RbWritePads(guard, RB_PAD_BUF, r.latest);
 }
 
@@ -1477,6 +1546,8 @@ void RollbackTickHook(const Core::CPUThreadGuard& guard)
                        .count();
   u8* ram = system.GetMemory().GetRAM();
   const u32 slots = r.force + 1;
+  ++r.ticks_since_poll;
+  RbSampleIo(guard);
 
   // NSR_RB_MEMWATCH: armed at the start of the NSR_RB_WATCH window (memchecks
   // make the JIT very slow, so not from boot).
@@ -1522,7 +1593,7 @@ void RollbackTickHook(const Core::CPUThreadGuard& guard)
         std::memcpy(r.ring[r.live % slots].data() + lo, ram + lo, hi - lo);
       RbCheck(r.live, ram, r.ring[r.live % slots]);
     }
-    else if (r.force > 0 && r.live >= r.force + r.force_from)
+    else if (r.force > 0 && r.live >= r.force + r.force_from && r.live <= r.force_to)
     {
       // Forced rollback (stage 1 test): keep the state before this tick, go
       // back `force` ticks, and re-run them with the pads they had.
@@ -1549,8 +1620,10 @@ void RollbackTickHook(const Core::CPUThreadGuard& guard)
     RbSave(ram, r.ring[r.cursor % slots]);
     RbWritePads(guard, buf, r.pads.at(r.cursor));
     r.in_tick = true;
+    r.in_resim = true;
     r.tick_running = r.cursor;
     r.vtime_calls = 0;
+    r.gate_index = 0;
     ++r.cursor;
     ++r.resim_ticks;
     ppc_state.gpr[3] = 1;  // run another tick after this one
@@ -1559,6 +1632,39 @@ void RollbackTickHook(const Core::CPUThreadGuard& guard)
 
   // Live tick.
   const u32 t = r.live;
+  // Diagnostics: NSR_RB_TRANSPLANT=dump:ranges:tick copies the listed ranges
+  // ("lo hi" per line) from a MEM1 dump into RAM before that live tick, to
+  // find which state differences matter (bisect the ranges).
+  if (static const auto spec = Split(Env("NSR_RB_TRANSPLANT"), ':'); spec.size() == 3 &&
+      ParseU32(spec[2]).value_or(0) == t)
+  {
+    std::vector<u8> dump(system.GetMemory().GetRamSizeReal());
+    size_t moved = 0;
+    if (FILE* f = std::fopen(spec[0].c_str(), "rb"))
+    {
+      const size_t n = std::fread(dump.data(), 1, dump.size(), f);
+      std::fclose(f);
+      if (FILE* rf = n == dump.size() ? std::fopen(spec[1].c_str(), "r") : nullptr)
+      {
+        char line[128];
+        while (std::fgets(line, sizeof(line), rf))
+        {
+          unsigned long lo = 0, hi = 0;
+          if (std::sscanf(line, "%lx %lx", &lo, &hi) != 2)
+            continue;
+          lo &= 0x01FFFFFF;
+          hi = std::min<unsigned long>(hi & 0x01FFFFFF, dump.size());
+          if (hi > lo)
+          {
+            std::memcpy(ram + lo, dump.data() + lo, hi - lo);
+            moved += hi - lo;
+          }
+        }
+        std::fclose(rf);
+      }
+    }
+    Log("transplanted {} bytes before tick {}", moved, t);
+  }
   if (r.perturb_at && t + 1 == r.perturb_at)
     RbSave(ram, r.prev);
   if (r.perturb_at && t == r.perturb_at)
@@ -1610,8 +1716,11 @@ void RollbackTickHook(const Core::CPUThreadGuard& guard)
     Log("virtual tick time from tick {} (base {:016x})", t, r.vtime_base);
   }
   r.in_tick = true;
+  r.in_resim = false;
   r.tick_running = t;
   r.vtime_calls = 0;
+  r.gate_index = 0;
+  r.gate_log.erase(t);  // a live tick runs once; record it afresh
   r.live = t + 1;
   r.cursor = r.live;
   r.rolled = false;
@@ -1619,13 +1728,27 @@ void RollbackTickHook(const Core::CPUThreadGuard& guard)
   {
     r.pads.erase(r.pads.begin(), r.pads.lower_bound(t - 600));
     r.counters.erase(r.counters.begin(), r.counters.lower_bound(t - 600));
+    r.gate_log.erase(r.gate_log.begin(), r.gate_log.lower_bound(t - 600));
   }
   if (t % 600 == 0)
   {
-    Log("tick {}: rollbacks {}, re-simulated {}, mismatched checks {}/{}", t, r.rollbacks,
-        r.resim_ticks, r.mismatched_checks, r.checks);
+    Log("tick {}: rollbacks {}, re-simulated {}, mismatched checks {}/{}; audio gate: "
+        "recorded {}, replayed {}, mismatched {}",
+        t, r.rollbacks, r.resim_ticks, r.mismatched_checks, r.checks, r.gate_recorded,
+        r.gate_replayed, r.gate_mismatched);
     if (r.mismatched_checks > 0)
       RbReport(15);  // Dolphin is usually killed, not shut down: report as we go
+    if (r.gate_recorded > 0)
+    {
+      std::map<u32, u32> census;  // gated entry -> calls in the kept window
+      for (const auto& [tick, calls] : r.gate_log)
+        for (const auto& c : calls)
+          ++census[c.entry];
+      std::string line;
+      for (const auto& [entry, n] : census)
+        line += fmt::format(" {:08x}x{}", entry, n);
+      Log("audio gate calls:{}", line);
+    }
   }
   ppc_state.gpr[3] = 0;  // this was the last tick for now
 }
@@ -1694,6 +1817,80 @@ void SetHookPc(unsigned int pc)
   s_hook_pc = pc;
 }
 
+void AudioGateHook(const Core::CPUThreadGuard& guard)
+{
+  Rollback& r = s_rb;
+  auto& ppc = guard.GetSystem().GetPPCState();
+  // Only calls from game code on the main thread, inside a tick, during the
+  // rollback session. Audio's own thread and interrupt callbacks run normally.
+  if (!r.vtime_on || !r.in_tick || LR(ppc) >= 0x8025E000 ||
+      PowerPC::MMU::HostRead<u32>(guard, 0x800000E4) != 0x803A3F30)
+    return;  // npc unchanged: run the function
+  const u32 entry = s_hook_pc;
+  // NSR_RB_AUDIO_GATE=1 gates the sound-start path only (0x8026AAF0, called
+  // from fn_801F4050); =addr,... gates exactly those entries. Gating every
+  // entry crashes (some return pointers or fill out-parameters in game
+  // memory that a skipped call leaves unwritten).
+  static const std::vector<unsigned int> only = [] {
+    std::vector<unsigned int> v;
+    const std::string spec = Env("NSR_RB_AUDIO_GATE");
+    if (spec == "1")
+      return std::vector<unsigned int>{0x8026AAF0};
+    for (const std::string& a : Split(spec, ','))
+      if (const auto x = ParseU32(a))
+        v.push_back(*x);
+    return v;
+  }();
+  if (!only.empty() && std::find(only.begin(), only.end(), entry) == only.end())
+    return;
+  if (!r.in_resim)
+  {
+    auto& log = r.gate_log[r.tick_running];
+    r.gate_pending.push_back({LR(ppc), r.tick_running, log.size()});
+    log.push_back({entry});
+    LR(ppc) = RB_GATE_RETURN;  // record the result when it returns
+    ++r.gate_recorded;
+    return;
+  }
+  const auto it = r.gate_log.find(r.tick_running);
+  const size_t k = r.gate_index++;
+  if (it != r.gate_log.end() && k < it->second.size() && it->second[k].entry == entry &&
+      it->second[k].done)
+  {
+    const auto& c = it->second[k];
+    ppc.gpr[3] = c.r3;
+    ppc.gpr[4] = c.r4;
+    ppc.ps[1].SetPS0(c.f1);
+    ppc.npc = LR(ppc);  // skip the call
+    ++r.gate_replayed;
+    return;
+  }
+  ++r.gate_mismatched;  // different calls than the live tick made: run it
+}
+
+void AudioGateReturnHook(const Core::CPUThreadGuard& guard)
+{
+  Rollback& r = s_rb;
+  auto& ppc = guard.GetSystem().GetPPCState();
+  if (r.gate_pending.empty())
+  {
+    ppc.npc = LR(ppc);  // shouldn't happen
+    return;
+  }
+  const auto p = r.gate_pending.back();
+  r.gate_pending.pop_back();
+  if (const auto it = r.gate_log.find(p.tick); it != r.gate_log.end() && p.index < it->second.size())
+  {
+    auto& c = it->second[p.index];
+    c.r3 = ppc.gpr[3];
+    c.r4 = ppc.gpr[4];
+    c.f1 = ppc.ps[1].PS0AsU64();
+    c.done = true;
+  }
+  ppc.npc = p.lr;
+  LR(ppc) = p.lr;
+}
+
 std::vector<unsigned int> ProbeAddresses()
 {
   std::vector<unsigned int> out;
@@ -1740,5 +1937,6 @@ void Shutdown()
     std::fclose(s.log);
   s = Session{};
   s_rb = Rollback{};
+  s_io_ranges.clear();
 }
 }  // namespace NSRNetplay

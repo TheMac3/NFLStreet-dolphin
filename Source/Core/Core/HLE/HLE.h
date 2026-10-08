@@ -29,6 +29,10 @@ enum class HookType
   None,     // Do not hook the function
   Start,    // Hook the beginning of the function and execute the function afterwards
   Replace,  // Replace the function with the HLE version
+  Gate,     // NFLStreet: run the HLE function, then either execute the original
+            // function (npc left at the hooked address) or skip it (npc changed,
+            // e.g. to LR). Honoured by Jit64 and the interpreter; other cores
+            // treat it like Start (always execute the original).
 };
 
 enum class HookFlag
