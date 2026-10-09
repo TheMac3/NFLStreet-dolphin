@@ -737,20 +737,25 @@ constexpr u32 RB_GRANULE = 64;          // mismatch-report resolution
 //   - low memory: OS globals (time, arena, thread queue, current context).
 // Live OS objects elsewhere (game-created threads and their stacks, queued
 // alarms, the GX FIFO) are found at restore time; see RbLiveRanges.
-constexpr std::array<std::pair<u32, u32>, 23> RB_KEEP{{
+constexpr std::array<std::pair<u32, u32>, 22> RB_KEEP{{
     {0x003EE4C0, 0x003FE4C0},  // main-thread stack
     {0x00384C00, 0x00398E00},  // memory-card work areas
     {0x00411A00, 0x00412000},  // NFLStreet patch area (counters, scripts)
     {0x00416900, 0x00416A80},  // rollback patch area
     {0x004132C0, 0x00413E00},  // trace ring
     {0x00000000, 0x00003100},  // low memory
-    {0x00289A00, 0x00289B00},  // SDK .data
-    {0x002B6000, 0x002B7B00},
-    {0x002C1900, 0x002C2900},
-    {0x002C7000, 0x002C7200},
-    {0x002FB400, 0x002FFE00},
-    {0x00300800, 0x00301900},
-    {0x00302400, 0x00306100},
+    // SDK .data, only the words SDK code references (lis/addi pairs, see
+    // NFLStreet docs/research-log.md 2026-10-09). The old blocks
+    // (0x802B6000.., 0x802FB400..0x802FFE00, 0x80300800.., 0x80302400..) also
+    // held game/EA-engine data (restored) and audio-middleware data (moved to
+    // AUDIO_KEEP); keeping those live leaked state set by later frames into
+    // re-simulated ones (EA floats at 0x802FB45C changed at a play start).
+    {0x002B7240, 0x002B7260},
+    {0x002C7000, 0x002C7200},  // no direct references found; kept as before
+    {0x002FB468, 0x002FE350},
+    {0x002FE440, 0x002FE444},  // referenced by game and SDK code
+    {0x002FE4C0, 0x002FF4A0},
+    {0x00302500, 0x00306100},
     {0x003A0100, 0x003A0300},  // SDK .bss
     {0x003A0700, 0x003A0800},
     // SDK + audio .bss, by owner (decomp evidence + which code references
@@ -810,7 +815,14 @@ constexpr u32 PENDING_LOADS = 0x803EBD84;  // -0x651C(r13): game loads in flight
 // sound layer, the middleware, its heap pools and generated code), only when
 // the audio thread is asleep at its usual wait point. Cost: an audible
 // hiccup on rollback, never a logic difference.
-constexpr std::array<std::pair<u32, u32>, 4> AUDIO_KEEP{{
+constexpr std::array<std::pair<u32, u32>, 10> AUDIO_KEEP{{
+    // Audio-middleware .data (referenced only from 0x8025E000..0x80285A90).
+    {0x00289A00, 0x00289B00},
+    {0x002B7260, 0x002B7B00},
+    {0x002C1900, 0x002C2900},
+    {0x002FF4A0, 0x002FFE00},
+    {0x00300800, 0x00301900},
+    {0x00302400, 0x00302500},
     {0x003A6A08, 0x003BD980},
     {0x003C29D0, 0x003D4400},
     {0x003ED510, 0x003ED568},
@@ -877,11 +889,25 @@ struct Rollback
   u64 vtime_base = 0;     // real time base at live tick vtime_from
   bool vtime_on = false;
   u32 vtime_calls = 0;    // time reads so far in this tick
+  u64 disc_commands = 0;       // DVD commands executed (NoteDiscCommand)
+  u64 disc_commands_seen = 0;  // ... as of the previous unit start
   u32 watch = 0, watch_from = 0, watch_to = 0;  // NSR_RB_WATCH=addr:from:to (diagnostics)
   std::vector<u8> prev;   // state before the previous live tick (perturb mode)
   bool hash_log = false;  // NSR_RB_HASH_LOG
   std::vector<u32> dump_at;
   std::vector<std::pair<u32, u32>> segments;  // RAM ranges restored/compared
+  // Dolphin's fake VMEM (0x7E000000.., GameCube without MMU emulation): GN7E69
+  // keeps its EA database heap there (base 0x7E000000, 0x104000 bytes, set up
+  // at 0x80024778): tables, indexes, cursors, query bindings and the heap's own
+  // block headers. The sim queries and modifies it every frame (team/playbook
+  // selects, depth-chart delete+insert), and MEM1 holds pointers into it, so
+  // it is game state: snapshots carry its first `vmem_bytes` after MEM1
+  // (rb-div-4594: leaving it live made a re-simulated frame's DB select
+  // return another row, fn_8016BAD8 skipped its RNG draw, and k=2/k=4
+  // forced rollbacks diverged).
+  u8* vmem = nullptr;
+  u32 vmem_bytes = 0;  // NSR_RB_VMEM_BYTES (default 0x104000; 0 = off)
+  u32 mem1_size = 0;   // snapshot offset of the VMEM copy
 
   Pads latest{};  // most recent processed local sample (from the poll)
   u32 ticks_since_poll = 0;  // tick-mode detection (see RollbackPollHook)
@@ -1059,6 +1085,14 @@ void RbInit(Core::System& system)
   for (const auto& [lo, hi] : r.segments)
     total += hi - lo;
   Log("rollback state: {} ranges, {} bytes", r.segments.size(), total);
+  r.mem1_size = size;
+  if (u8* vmem = system.GetMemory().GetFakeVMEM())
+  {
+    r.vmem = vmem;
+    r.vmem_bytes = std::min<u32>(ParseU32(Env("NSR_RB_VMEM_BYTES")).value_or(0x104000),
+                                 system.GetMemory().GetFakeVMemSize());
+    Log("rollback state: + fake VMEM 7e000000..{:08x}", 0x7E000000 + r.vmem_bytes);
+  }
 
   r.profile_path = Env("NSR_RB_PROFILE");
   if (!r.profile_path.empty())
@@ -1077,7 +1111,7 @@ void RbInit(Core::System& system)
     if (r.force > 0)
       r.ring.assign(r.io_idle_mode ? std::max<u32>(r.force + 1, ParseU32(Env("NSR_RB_RING")).value_or(24))
                                    : r.force + 1,
-                    std::vector<u8>(size));
+                    std::vector<u8>(size + r.vmem_bytes));
     // Diagnostics: if ticks stop after rollbacks began (the game hung), log
     // where the CPU is once and dump MEM1 (NSR_DUMP_PREFIX-hang.bin).
     std::thread([&system] {
@@ -1228,6 +1262,9 @@ void RbSave(const u8* ram, std::vector<u8>& slot)
 {
   for (const auto& [lo, hi] : s_rb.segments)
     std::memcpy(slot.data() + lo, ram + lo, hi - lo);
+  // Fake VMEM (EA database heap), only into slots sized for it (the ring).
+  if (s_rb.vmem_bytes && slot.size() >= s_rb.mem1_size + s_rb.vmem_bytes)
+    std::memcpy(slot.data() + s_rb.mem1_size, s_rb.vmem, s_rb.vmem_bytes);
 }
 
 // OS objects that live in game memory but follow real time, found by
@@ -1388,6 +1425,9 @@ void RbRestore(Core::System& system, u8* ram, const std::vector<u8>& slot)
   }
   for (size_t i = 0; i < live.size(); ++i)
     std::memcpy(ram + live[i].first, keep[i].data(), keep[i].size());
+  // Fake VMEM holds data only (the database heap): no JIT invalidation needed.
+  if (s_rb.vmem_bytes && slot.size() >= s_rb.mem1_size + s_rb.vmem_bytes)
+    std::memcpy(s_rb.vmem, slot.data() + s_rb.mem1_size, s_rb.vmem_bytes);
   auto& jit = system.GetJitInterface();
   for (const u32 page : changed)
     jit.InvalidateICache(0x80000000 | page, PAGE, true);
@@ -1416,6 +1456,23 @@ void RbCheck(u32 tick, const u8* ram, const std::vector<u8>& original)
         ranges.emplace_back(g, g + len);
     }
   }
+  // Fake VMEM: counted with the rest, reported by its own address range.
+  u32 vmem_differing = 0, vmem_first = 0;
+  if (r.vmem_bytes && original.size() >= r.mem1_size + r.vmem_bytes)
+  {
+    for (u32 g = 0; g < r.vmem_bytes; g += RB_GRANULE)
+    {
+      const u32 len = std::min(RB_GRANULE, r.vmem_bytes - g);
+      if (std::memcmp(r.vmem + g, original.data() + r.mem1_size + g, len) == 0)
+        continue;
+      if (vmem_differing++ == 0)
+        vmem_first = 0x7E000000 + g;
+    }
+    if (vmem_differing && r.logged_mismatches < 20)
+      Log("re-sim mismatch before tick {}: fake VMEM {} granules from {:08x}", tick,
+          vmem_differing, vmem_first);
+  }
+  differing += vmem_differing;
   if (differing == 0)
     return;
   ++r.mismatched_checks;
@@ -1472,6 +1529,12 @@ u64 RbHash(const u8* ram)
       std::memcpy(&w, ram + off, 8);
       h = (h ^ w) * 1099511628211ULL;
     }
+  }
+  for (u32 off = 0; off + 8 <= s_rb.vmem_bytes; off += 8)
+  {
+    u64 w;
+    std::memcpy(&w, s_rb.vmem + off, 8);
+    h = (h ^ w) * 1099511628211ULL;
   }
   return h;
 }
@@ -1540,6 +1603,25 @@ void InstallSeedOnce(const Core::CPUThreadGuard& guard)
     PowerPC::MMU::HostWrite<u32>(guard, *value, SEED_ADDRESS);
 }
 }  // namespace
+
+long long DiscLatency(long long ticks)
+{
+  static const bool instant = !Env("NSR_RB_INSTANT_DISC").empty();
+  return instant && s_rb.vtime_on ? 0 : ticks;
+}
+
+void NoteDiscCommand()
+{
+  ++s_rb.disc_commands;
+}
+
+void LogMemHit(u32 pc, u32 lr, bool write, size_t size, u64 value, u32 addr)
+{
+  if (!s_session.log)
+    return;
+  Log("MBP live {} cursor {} rolled {}: pc {:08x} lr {:08x} {}{} {:x} at {:08x}", s_rb.live,
+      s_rb.cursor, s_rb.rolled, pc, lr, write ? "write" : "read", size * 8, value, addr);
+}
 
 bool IsEnabled()
 {
@@ -1736,9 +1818,78 @@ void RollbackPollHook(const Core::CPUThreadGuard& guard)
 }
 
 // One step of the rollback state machine, run at the start of every rollback
-// unit (a sim tick, or a whole InGame frame in frame mode) with the game's pad
+// unit (a sim tick, or a whole main-loop frame in frame mode) with the game's pad
 // buffer address. Returns 1 if another unit must run right after this one
 // (re-simulation in progress), else 0.
+// Diagnostics: NSR_RB_TRANSPLANT=dump:ranges:when copies the listed ranges
+// ("lo hi" per line) from a MEM1 dump into RAM right before a unit runs, to
+// find which state differences matter (bisect the ranges). `when` is a live
+// tick ("3637"), or "live/frame" for a re-simulated frame during that live
+// tick's step ("3637/3633").
+static void RbTransplant(Core::System& system, u8* ram, u32 live, u32 frame)
+{
+  static const auto spec = Split(Env("NSR_RB_TRANSPLANT"), ':');
+  if (spec.size() != 3)
+    return;
+  const std::string key =
+      live == frame ? std::to_string(live) : std::to_string(live) + "/" + std::to_string(frame);
+  if (spec[2] != key)
+    return;
+  std::vector<u8> dump(system.GetMemory().GetRamSizeReal());
+  size_t moved = 0;
+  if (FILE* f = std::fopen(spec[0].c_str(), "rb"))
+  {
+    const size_t n = std::fread(dump.data(), 1, dump.size(), f);
+    std::fclose(f);
+    if (FILE* rf = n == dump.size() ? std::fopen(spec[1].c_str(), "r") : nullptr)
+    {
+      char line[128];
+      while (std::fgets(line, sizeof(line), rf))
+      {
+        unsigned long lo = 0, hi = 0;
+        if (std::sscanf(line, "%lx %lx", &lo, &hi) != 2)
+          continue;
+        lo &= 0x01FFFFFF;
+        hi = std::min<unsigned long>(hi & 0x01FFFFFF, dump.size());
+        if (hi > lo)
+        {
+          std::memcpy(ram + lo, dump.data() + lo, hi - lo);
+          moved += hi - lo;
+        }
+      }
+      std::fclose(rf);
+    }
+  }
+  Log("transplanted {} bytes before {}", moved, key);
+}
+
+// Diagnostics: NSR_RB_DUMP_UNIT=live:frame,... writes all of MEM1 right
+// before frame `frame` runs during live frame `live`'s step (live == frame
+// for the live frame itself), to NSR_DUMP_PREFIX-unit-<live>-<frame>.bin.
+static void RbDumpUnit(Core::System& system, const u8* ram, u32 live, u32 frame)
+{
+  static const std::vector<std::string> wanted = Split(Env("NSR_RB_DUMP_UNIT"), ',');
+  const std::string key = std::to_string(live) + ":" + std::to_string(frame);
+  if (std::find(wanted.begin(), wanted.end(), key) == wanted.end())
+    return;
+  const std::string path = Env("NSR_DUMP_PREFIX", "local/nsr") + "-unit-" + std::to_string(live) +
+                           "-" + std::to_string(frame) + ".bin";
+  if (FILE* f = std::fopen(path.c_str(), "wb"))
+  {
+    std::fwrite(ram, 1, system.GetMemory().GetRamSizeReal(), f);
+    std::fclose(f);
+    Log("wrote {}", path);
+  }
+  if (s_rb.vmem_bytes)
+  {
+    if (FILE* f = std::fopen((path + ".vmem").c_str(), "wb"))
+    {
+      std::fwrite(s_rb.vmem, 1, s_rb.vmem_bytes, f);
+      std::fclose(f);
+    }
+  }
+}
+
 u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
 {
   auto& system = guard.GetSystem();
@@ -1752,6 +1903,13 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
   const u32 slots = r.ring.empty() ? 1 : static_cast<u32>(r.ring.size());
   ++r.ticks_since_poll;
   RbSampleIo(guard);
+  if (r.disc_commands != r.disc_commands_seen)
+  {
+    if (static const bool trace = !Env("NSR_RB_DISC_TRACE").empty(); trace && r.vtime_on)
+      Log("disc commands before unit live {} cursor {} rolled {}: {}", r.live, r.cursor, r.rolled,
+          r.disc_commands - r.disc_commands_seen);
+    r.disc_commands_seen = r.disc_commands;
+  }
 
   // NSR_RB_MEMWATCH: armed at the start of the NSR_RB_WATCH window (memchecks
   // make the JIT very slow, so not from boot).
@@ -1848,6 +2006,8 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     if (r.io_idle_mode)
       r.io_idle[r.cursor] = IsIoIdle(ram);
     RbWritePads(guard, buf, r.pads.at(r.cursor));
+    RbDumpUnit(system, ram, r.live, r.cursor);
+    RbTransplant(system, ram, r.live, r.cursor);
     r.in_unit = true;
     r.in_resim = true;
     r.tick_running = r.cursor;
@@ -1860,39 +2020,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
 
   // Live tick.
   const u32 t = r.live;
-  // Diagnostics: NSR_RB_TRANSPLANT=dump:ranges:tick copies the listed ranges
-  // ("lo hi" per line) from a MEM1 dump into RAM before that live tick, to
-  // find which state differences matter (bisect the ranges).
-  if (static const auto spec = Split(Env("NSR_RB_TRANSPLANT"), ':'); spec.size() == 3 &&
-      ParseU32(spec[2]).value_or(0) == t)
-  {
-    std::vector<u8> dump(system.GetMemory().GetRamSizeReal());
-    size_t moved = 0;
-    if (FILE* f = std::fopen(spec[0].c_str(), "rb"))
-    {
-      const size_t n = std::fread(dump.data(), 1, dump.size(), f);
-      std::fclose(f);
-      if (FILE* rf = n == dump.size() ? std::fopen(spec[1].c_str(), "r") : nullptr)
-      {
-        char line[128];
-        while (std::fgets(line, sizeof(line), rf))
-        {
-          unsigned long lo = 0, hi = 0;
-          if (std::sscanf(line, "%lx %lx", &lo, &hi) != 2)
-            continue;
-          lo &= 0x01FFFFFF;
-          hi = std::min<unsigned long>(hi & 0x01FFFFFF, dump.size());
-          if (hi > lo)
-          {
-            std::memcpy(ram + lo, dump.data() + lo, hi - lo);
-            moved += hi - lo;
-          }
-        }
-        std::fclose(rf);
-      }
-    }
-    Log("transplanted {} bytes before tick {}", moved, t);
-  }
+  RbTransplant(system, ram, t, t);
   if (r.perturb_at && t + 1 == r.perturb_at)
     RbSave(ram, r.prev);
   if (r.perturb_at && t == r.perturb_at)
@@ -1939,6 +2067,16 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
   if (r.io_idle_mode)
   {
     r.io_idle[t] = IsIoIdle(ram);
+    if (static const bool qt = !Env("NSR_RB_QUIET_TRACE").empty(); qt)
+    {
+      auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
+      const bool dvd = rd(0x803ED118) == 0;
+      const bool worker = (rd(DISC_WORKER_THREAD + 0x2C8) >> 16) == 4 && rd(DISC_SEM_B) == 0 &&
+                          rd(DISC_SEM_A) == DISC_SLOTS_IDLE;
+      const bool loads = rd(PENDING_LOADS) == 0;
+      const bool audio = (rd(AUDIO_THREAD + 0x2C8) >> 16) == 4 && rd(AUDIO_THREAD + 0x2DC) == AUDIO_THREAD_QUEUE;
+      Log("q {} {} dvd {} worker {} loads {} audio {}", t, r.io_idle[t] ? 1 : 0, dvd, worker, loads, audio);
+    }
     if (t >= 600)
       r.io_idle.erase(r.io_idle.begin(), r.io_idle.lower_bound(t - 600));
   }
@@ -1955,6 +2093,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     std::fflush(r.record);
   }
   RbWritePads(guard, buf, r.pads[t]);
+  RbDumpUnit(system, ram, t, t);
   if (r.vtime_from && t == r.vtime_from && !r.vtime_on)
   {
     r.vtime_on = true;
@@ -1986,6 +2125,21 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
         r.skipped_busy);
     if (r.mismatched_checks > 0)
       RbReport(15);  // Dolphin is usually killed, not shut down: report as we go
+    // Revisit NSR_RB_VMEM_BYTES if the game ever uses fake VMEM past it.
+    if (r.vmem && r.vmem_bytes)
+    {
+      const u32 total = system.GetMemory().GetFakeVMemSize();
+      for (u32 off = r.vmem_bytes; off < total; off += 0x1000)
+      {
+        const u8* p = r.vmem + off;
+        if (std::any_of(p, p + 0x1000, [](u8 b) { return b != 0; }))
+        {
+          Log("WARNING: fake VMEM in use at {:08x}, past the rolled-back {:#x} bytes",
+              0x7E000000 + off, r.vmem_bytes);
+          break;
+        }
+      }
+    }
     if (r.gate_recorded > 0)
     {
       std::map<u32, u32> census;  // gated entry -> calls in the kept window
@@ -2074,6 +2228,11 @@ void TickCountHook(const Core::CPUThreadGuard& guard)
   ppc.npc = LR(ppc);
 }
 
+namespace
+{
+u32 s_hook_pc = 0;
+}
+
 // Frame mode: re-simulated frames skip the world draw (RENDER_FN; the render
 // pass costs ~3x the sim and is mostly this; Slippi skips rendering too)
 // and don't wait for the next retrace (VIWaitForRetrace returns at once). Everything else in the frame runs,
@@ -2084,7 +2243,10 @@ void PresentHook(const Core::CPUThreadGuard& guard)
 {
   Rollback& r = s_rb;
   auto& ppc = guard.GetSystem().GetPPCState();
-  if (r.frame_mode && r.in_unit && r.in_resim)
+  // Diagnostics: NSR_RB_RESIM_VSYNC=1 keeps the vsync wait in re-simulated
+  // frames (each then takes a live frame's emulated time).
+  static const bool keep_vsync = !Env("NSR_RB_RESIM_VSYNC").empty();
+  if (r.frame_mode && r.in_unit && r.in_resim && !(keep_vsync && s_hook_pc == VI_WAIT_FOR_RETRACE))
     ppc.npc = LR(ppc);
 }
 
@@ -2143,10 +2305,6 @@ void RollbackTimeHook(const Core::CPUThreadGuard& guard)
   OSGetTickHook(guard);  // the patched `mftb r3` wants TBL in r3
 }
 
-namespace
-{
-u32 s_hook_pc = 0;
-}
 
 void SetHookPc(unsigned int pc)
 {
@@ -2290,8 +2448,8 @@ void ProbeHook(const Core::CPUThreadGuard& guard)
   const u32 v = PowerPC::MMU::HostRead<u32>(guard, r.watch);
   static const bool all = !Env("NSR_RB_PROBE_ALL").empty();
   if (all)
-    Log("probe hit {:08x} from {:08x}: [{:08x}] = {:08x}; live {} cursor {} resim {}", s_hook_pc,
-        LR(ppc) - 4, r.watch, v, r.live, r.cursor, r.in_resim);
+    Log("probe hit {:08x} from {:08x}: [{:08x}] = {:08x}; live {} cursor {} resim {} r3 {:08x} r4 {:08x}",
+        s_hook_pc, LR(ppc) - 4, r.watch, v, r.live, r.cursor, r.in_resim, ppc.gpr[3], ppc.gpr[4]);
   if (v != last_value)
     Log("probe: [{:08x}] {:08x} -> {:08x} after {:08x} (called from {:08x}), before {:08x} "
         "(called from {:08x}); live {} cursor {}",

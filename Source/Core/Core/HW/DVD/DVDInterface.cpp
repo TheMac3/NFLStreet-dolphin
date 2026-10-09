@@ -45,6 +45,7 @@
 #include "DiscIO/Enums.h"
 #include "DiscIO/VolumeDisc.h"
 #include "DiscIO/VolumeWii.h"
+#include "Core/NSR/NSRNetplay.h"
 
 #include "VideoCommon/OnScreenDisplay.h"
 
@@ -750,6 +751,7 @@ bool DVDInterface::ExecuteReadCommand(u64 dvd_offset, u32 output_address, u32 dv
 // with the userdata set to the interrupt type.
 void DVDInterface::ExecuteCommand(ReplyType reply_type)
 {
+  NSRNetplay::NoteDiscCommand();
   DIInterruptType interrupt_type = DIInterruptType::TCINT;
   bool command_handled_by_thread = false;
 
@@ -1190,7 +1192,8 @@ void DVDInterface::ExecuteCommand(ReplyType reply_type)
   {
     // TODO: Needs testing to determine if MINIMUM_COMMAND_LATENCY_US is accurate for this
     m_system.GetCoreTiming().ScheduleEvent(
-        MINIMUM_COMMAND_LATENCY_US * (m_system.GetSystemTimers().GetTicksPerSecond() / 1000000),
+        NSRNetplay::DiscLatency(
+            MINIMUM_COMMAND_LATENCY_US * (m_system.GetSystemTimers().GetTicksPerSecond() / 1000000)),
         m_finish_executing_command, PackFinishExecutingCommandUserdata(reply_type, interrupt_type));
   }
 }
@@ -1211,7 +1214,8 @@ void DVDInterface::PerformDecryptingRead(u32 position, u32 length, u32 output_ad
   {
     // TODO: Needs testing to determine if MINIMUM_COMMAND_LATENCY_US is accurate for this
     m_system.GetCoreTiming().ScheduleEvent(
-        MINIMUM_COMMAND_LATENCY_US * (m_system.GetSystemTimers().GetTicksPerSecond() / 1000000),
+        NSRNetplay::DiscLatency(
+            MINIMUM_COMMAND_LATENCY_US * (m_system.GetSystemTimers().GetTicksPerSecond() / 1000000)),
         m_finish_executing_command, PackFinishExecutingCommandUserdata(reply_type, interrupt_type));
   }
 }
@@ -1228,7 +1232,8 @@ void DVDInterface::ForceOutOfBoundsRead(ReplyType reply_type)
   // TODO: Needs testing to determine if MINIMUM_COMMAND_LATENCY_US is accurate for this
   const DIInterruptType interrupt_type = DIInterruptType::DEINT;
   m_system.GetCoreTiming().ScheduleEvent(
-      MINIMUM_COMMAND_LATENCY_US * (m_system.GetSystemTimers().GetTicksPerSecond() / 1000000),
+      NSRNetplay::DiscLatency(
+            MINIMUM_COMMAND_LATENCY_US * (m_system.GetSystemTimers().GetTicksPerSecond() / 1000000)),
       m_finish_executing_command, PackFinishExecutingCommandUserdata(reply_type, interrupt_type));
 }
 
@@ -1476,7 +1481,8 @@ void DVDInterface::ScheduleReads(u64 offset, u32 length, const DiscIO::Partition
     // Schedule this read to complete at the appropriate time
     const ReplyType chunk_reply_type = chunk_length == length ? reply_type : ReplyType::NoReply;
     dvd_thread.StartReadToEmulatedRAM(output_address, offset, chunk_length, partition,
-                                      chunk_reply_type, ticks_until_completion);
+                                      chunk_reply_type,
+                                      NSRNetplay::DiscLatency(ticks_until_completion));
 
     // Advance the read window
     output_address += chunk_length;

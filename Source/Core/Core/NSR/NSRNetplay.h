@@ -74,7 +74,10 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <vector>
+
+#include "Common/CommonTypes.h"
 
 namespace Core
 {
@@ -96,9 +99,12 @@ constexpr unsigned int RB_POLL_STUB = 0x80416900;
 constexpr unsigned int RB_TICK_STUB = 0x80416904;
 constexpr unsigned int RB_TICK_END_STUB = 0x80416908;
 constexpr unsigned int RB_TIME_STUB = 0x8041690C;
-// Frame mode (isopatch rollback, frame routine around InGame::fn_8002854C):
-// Dolphin is asked before and after every InGame frame; rollback re-runs
-// whole frames (Slippi's model), skipping the present on re-simulated ones.
+// Frame mode (isopatch rollback, frame routine around the main-loop
+// iteration fn_80026AD0: message dispatch incl. the draw pass, then the group
+// updates incl. InGame::fn_8002854C): Dolphin is asked before and after every
+// main-loop frame; rollback re-runs whole frames (Slippi's model), skipping
+// the vsync wait and heavy world draws on re-simulated ones. (Wrapping only
+// InGame left the draw pass's state, e.g. camera smoothing, behind.)
 constexpr unsigned int RB_FRAME_STUB = 0x80416914;
 constexpr unsigned int RB_FRAME_END_STUB = 0x80416918;
 constexpr unsigned int TICK_COUNT_FN = 0x802378C8;  // fn_802378C8 (gated)
@@ -140,6 +146,20 @@ void LoadBarrierHook(const Core::CPUThreadGuard& guard);  // HookType::Start  //
 void PresentHook(const Core::CPUThreadGuard& guard);    // HookType::Gate
 // Called after each tick's sim part 2 (no arguments).
 void RollbackTickEndHook(const Core::CPUThreadGuard& guard);
+// Rollback session with NSR_RB_INSTANT_DISC: DVD commands complete with
+// zero latency, i.e. at the end of the JIT block that issued them, so game
+// code observes disc I/O completing at the same point of its own execution
+// in live and re-simulated frames. (With emulated latency, even with
+// FastDiscSpeed, completions land at emulated times; re-simulated frames run
+// faster (no vsync wait, fewer draws), so a read issued in frame F completed
+// in F's vsync wait live but in F+1 when re-simulated: the game branched
+// differently and diverged at play starts.) Returns the latency to use.
+long long DiscLatency(long long ticks);
+// Counts DVD commands (DVDInterface::ExecuteCommand), so rollback can tell
+// which frames had disc I/O in flight.
+void NoteDiscCommand();
+// Diagnostics: memcheck hits (NSR_RB_MEMWATCH), logged with the rollback tick.
+void LogMemHit(u32 pc, u32 lr, bool write, size_t size, u64 value, u32 addr);
 // Time sources. Inside a tick, for game code, from NSR_RB_VTIME_FROM on,
 // they return virtual time: base + (tick - start) * one 60 Hz frame +
 // 64 * (call index within the tick), so a re-simulated tick sees exactly the

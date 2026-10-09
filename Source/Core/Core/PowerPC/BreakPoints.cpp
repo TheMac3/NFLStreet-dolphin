@@ -15,6 +15,7 @@
 #include "Common/Logging/Log.h"
 #include "Core/Core.h"
 #include "Core/Debugger/DebugInterface.h"
+#include "Core/NSR/NSRNetplay.h"
 #include "Core/PowerPC/Expression.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/MMU.h"
@@ -421,6 +422,9 @@ bool TMemCheck::Action(Core::System& system, u64 value, u32 addr, bool write, si
       NOTICE_LOG_FMT(MEMMAP, "MBP {:08x} ({}) {}{} {:x} at {:08x} ({})", pc,
                      ppc_symbol_db.GetDescription(pc), write ? "Write" : "Read", size * 8, value,
                      addr, ppc_symbol_db.GetDescription(addr));
+      // NSR diagnostics (NSR_RB_MEMWATCH): also log to the NSR log, with LR,
+      // since headless runs don't write Dolphin's own log.
+      NSRNetplay::LogMemHit(pc, system.GetPPCState().spr[SPR_LR], write, size, value, addr);
     }
     if (break_on_hit)
       return true;
