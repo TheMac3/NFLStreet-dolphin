@@ -31,7 +31,7 @@ namespace HLE
 static std::map<u32, u32> s_hooked_addresses;
 
 // clang-format off
-constexpr std::array<Hook, 33> os_patches{{
+constexpr std::array<Hook, 38> os_patches{{
     // Placeholder, os_patches[0] is the "non-existent function" index
     {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
 
@@ -72,6 +72,11 @@ constexpr std::array<Hook, 33> os_patches{{
     {"NSR_OSGetTime",                NSRNetplay::OSGetTimeHook,             HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: tick time
     {"NSR_OSGetTick",                NSRNetplay::OSGetTickHook,             HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: tick time
     {"NSR_Probe",                    NSRNetplay::ProbeHook,                 HookType::Start,   HookFlag::Fixed}, // NFLStreet POC diagnostics
+    {"NSR_RollbackFrame",            NSRNetplay::RollbackFrameHook,         HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: frame start
+    {"NSR_RollbackFrameEnd",         NSRNetplay::RollbackFrameEndHook,      HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: frame end
+    {"NSR_TickCount",                NSRNetplay::TickCountHook,             HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: one tick per frame
+    {"NSR_Present",                  NSRNetplay::PresentHook,               HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: no vsync wait in re-sim
+    {"NSR_LoadBarrier",              NSRNetplay::LoadBarrierHook,           HookType::Start,   HookFlag::Fixed}, // NFLStreet POC rollback: disc load barrier
     {"NSR_AudioGate",                NSRNetplay::AudioGateHook,             HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: audio side effects
     {"NSR_AudioGateReturn",          NSRNetplay::AudioGateReturnHook,       HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: record audio results
 }};
@@ -133,11 +138,29 @@ void PatchFixedFunctions(Core::System& system)
     Patch(system, NSRNetplay::RB_TICK_STUB, "NSR_RollbackTick");
     Patch(system, NSRNetplay::RB_TICK_END_STUB, "NSR_RollbackTickEnd");
     Patch(system, NSRNetplay::RB_TIME_STUB, "NSR_RollbackTime");
+    Patch(system, NSRNetplay::RB_FRAME_STUB, "NSR_RollbackFrame");
+    Patch(system, NSRNetplay::RB_FRAME_END_STUB, "NSR_RollbackFrameEnd");
+    Patch(system, NSRNetplay::TICK_COUNT_FN, "NSR_TickCount");
+    Patch(system, NSRNetplay::VI_WAIT_FOR_RETRACE, "NSR_Present");
+    // Functions skipped in re-simulated frames: NSR_RB_SKIP_RESIM=addr,...
+    // overrides the default (RENDER_FN); NSR_RB_RENDER_RESIM draws everything.
+    if (!std::getenv("NSR_RB_RENDER_RESIM"))
+    {
+      for (const u32 f : NSRNetplay::ResimSkipList())
+        Patch(system, f, "NSR_Present");
+    }
+    // Side-effect gate for other game->subsystem calls (e.g. disc load
+    // requests): NSR_RB_EFFECT_GATE=addr,... (same record/replay as audio).
+    for (const u32 entry : NSRNetplay::EffectGateList())
+      Patch(system, entry, "NSR_AudioGate");
+    Patch(system, NSRNetplay::LOAD_START_FN, "NSR_LoadBarrier");
+    Patch(system, NSRNetplay::LOAD_DONE_FN, "NSR_LoadBarrier");
+    // Gated calls (audio or effect) return through this stub: always install.
+    Patch(system, NSRNetplay::RB_GATE_RETURN, "NSR_AudioGateReturn");
     if (std::getenv("NSR_RB_AUDIO_GATE"))  // opt-in while it's being tuned
     {
       for (const u32 entry : NSRNetplay::AUDIO_GATE_ENTRIES)
         Patch(system, entry, "NSR_AudioGate");
-      Patch(system, NSRNetplay::RB_GATE_RETURN, "NSR_AudioGateReturn");
     }
     for (const u32 probe : NSRNetplay::ProbeAddresses())  // (diagnostics)
       Patch(system, probe, "NSR_Probe");

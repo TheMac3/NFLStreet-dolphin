@@ -96,6 +96,18 @@ constexpr unsigned int RB_POLL_STUB = 0x80416900;
 constexpr unsigned int RB_TICK_STUB = 0x80416904;
 constexpr unsigned int RB_TICK_END_STUB = 0x80416908;
 constexpr unsigned int RB_TIME_STUB = 0x8041690C;
+// Frame mode (isopatch rollback, frame routine around InGame::fn_8002854C):
+// Dolphin is asked before and after every InGame frame; rollback re-runs
+// whole frames (Slippi's model), skipping the present on re-simulated ones.
+constexpr unsigned int RB_FRAME_STUB = 0x80416914;
+constexpr unsigned int RB_FRAME_END_STUB = 0x80416918;
+constexpr unsigned int TICK_COUNT_FN = 0x802378C8;  // fn_802378C8 (gated)
+constexpr unsigned int VI_WAIT_FOR_RETRACE = 0x80243B18;  // SDK (skipped in re-sim)
+// The world draw inside InGame's render pass (fn_802285CC -> node draw
+// 0x80228594 -> fn_801DD140): ~98% of the pass's CPU time in a call-tree
+// profile. Skipped in re-simulated frames. The rest of the pass is a UI/scene
+// traversal that also runs UI logic (play-call menu), so it must keep running.
+constexpr unsigned int RENDER_FN = 0x801DD140;
 // SDK time functions in GN7E69 (replaced so ticks can see tick-based time).
 constexpr unsigned int OS_GET_TIME = 0x8023E794;
 constexpr unsigned int OS_GET_TICK = 0x8023E7AC;
@@ -113,6 +125,19 @@ void Hook(const Core::CPUThreadGuard& guard);
 // another tick after this one (re-simulation in progress), else 0.
 void RollbackPollHook(const Core::CPUThreadGuard& guard);
 void RollbackTickHook(const Core::CPUThreadGuard& guard);
+void RollbackFrameHook(const Core::CPUThreadGuard& guard);     // r3 = 1: run another frame
+void RollbackFrameEndHook(const Core::CPUThreadGuard& guard);
+void TickCountHook(const Core::CPUThreadGuard& guard);  // HookType::Gate
+std::vector<unsigned int> ResimSkipList();
+std::vector<unsigned int> EffectGateList();  // NSR_RB_EFFECT_GATE
+// Load barrier (GN7E69): the game's disc-load start (fn_801ED634, main
+// thread) and completion (fn_801EC914, disc worker) are handshakes with the
+// live disc system; no rollback may cross them. Rollback targets are clamped
+// to after the last such event (netplay: confirm inputs before a load).
+constexpr unsigned int LOAD_START_FN = 0x801ED634;
+constexpr unsigned int LOAD_DONE_FN = 0x801EC914;
+void LoadBarrierHook(const Core::CPUThreadGuard& guard);  // HookType::Start  // functions skipped in re-simulated frames
+void PresentHook(const Core::CPUThreadGuard& guard);    // HookType::Gate
 // Called after each tick's sim part 2 (no arguments).
 void RollbackTickEndHook(const Core::CPUThreadGuard& guard);
 // Time sources. Inside a tick, for game code, from NSR_RB_VTIME_FROM on,

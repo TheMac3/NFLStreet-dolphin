@@ -36,6 +36,7 @@
 #include "Core/HW/Memmap.h"
 #include "Core/HW/SystemTimers.h"
 #include "Core/PowerPC/BreakPoints.h"
+#include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
@@ -736,7 +737,7 @@ constexpr u32 RB_GRANULE = 64;          // mismatch-report resolution
 //   - low memory: OS globals (time, arena, thread queue, current context).
 // Live OS objects elsewhere (game-created threads and their stacks, queued
 // alarms, the GX FIFO) are found at restore time; see RbLiveRanges.
-constexpr std::array<std::pair<u32, u32>, 21> RB_KEEP{{
+constexpr std::array<std::pair<u32, u32>, 23> RB_KEEP{{
     {0x003EE4C0, 0x003FE4C0},  // main-thread stack
     {0x00384C00, 0x00398E00},  // memory-card work areas
     {0x00411A00, 0x00412000},  // NFLStreet patch area (counters, scripts)
@@ -759,12 +760,16 @@ constexpr std::array<std::pair<u32, u32>, 21> RB_KEEP{{
     // the middleware while AX stays live corrupts the AX voice list. The
     // block before it, 0x803A2800..0x803A3A70, belongs to the EA engine
     // (code 0x80236000..0x8023873C: rings, tick accumulator) and is restored.
-    {0x003A3A70, 0x003D4760},
-    {0x00381C00, 0x00381C18},  // game disc worker's two OSSemaphores (Codex audit)
-    {0x003D55E0, 0x003D55FC},  // game disc worker descriptor (Codex audit)
-    {0x003D5600, 0x003D7600},  // its DVD staging buffer (reads are <= 0x2000 here)
+    {0x003A3A70, 0x003A6A08},  // OS, DVD, VI, GX FIFO object, CARD, EXI, SI
+    {0x003D4400, 0x003D4760},  // GBA controls
+    // Audio hardware handshake, live even when audio rolls back: AX DSP
+    // command list, output DMA buffers, DSP DRAM image, DSP task.
+    {0x003BD980, 0x003C29D0},
     {0x003EC160, 0x003EC5C0},  // SDK .sdata
-    {0x003ED020, 0x003ED5F0},  // SDK .sbss (incl. the OS alarm queue)
+    {0x003ED020, 0x003ED4E0},  // SDK .sbss (incl. the OS alarm queue), up to DSP
+    {0x003ED4E0, 0x003ED510},  // DSP task globals (hardware handshake)
+    {0x003ED568, 0x003ED574},  // AX output frame / AI DMA frame / DSP ready
+    {0x003ED584, 0x003ED58C},  // AX DSP init/done flags
 }};
 
 using Pads = std::array<Pad, MAX_PLAYERS>;
@@ -778,6 +783,41 @@ using Pads = std::array<Pad, MAX_PLAYERS>;
 // each re-simulated tick. The inner accumulator (outer+0xC -> 0x10 bytes)
 // follows real time and is never restored.
 constexpr u32 TICK_CLOCK_PTR = 0x803EC138;  // -0x6168(r13)
+
+// The game's disc worker (GN7E69): thread, its semaphores (request queue at
+// 0x80381C10), descriptor and DVD staging buffer (Codex audit). In I/O-idle
+// mode (NSR_RB_IO_IDLE) they are restored with everything else, because
+// rollback only ever restores snapshots taken while the disc system was idle
+// and only restores while it is idle now. Otherwise they are kept live.
+constexpr u32 DISC_WORKER_THREAD = 0x8037F8C0;
+// Its two OSSemaphores: B (0x80381C0C, queue 0x80381C10) is what the worker
+// sleeps on, A (0x80381C00) counts free read slots: 21 when no read is
+// anywhere in its pipeline, 20 while one is outstanding (observed in play).
+constexpr u32 DISC_WORKER_QUEUE = 0x80381C10;
+constexpr u32 DISC_SEM_A = 0x80381C00, DISC_SEM_B = 0x80381C0C, DISC_SLOTS_IDLE = 21;
+constexpr std::array<std::pair<u32, u32>, 3> DISC_KEEP{{
+    {0x00381C00, 0x00381C18},  // the worker's two OSSemaphores
+    {0x003D55E0, 0x003D55FC},  // its descriptor
+    {0x003D5600, 0x003D7600},  // its DVD staging buffer (reads are <= 0x2000 here)
+}};
+constexpr u32 PENDING_LOADS = 0x803EBD84;  // -0x651C(r13): game loads in flight
+
+// Audio software state: the audio middleware and AX library .bss/.sbss
+// (excluding the hardware handshake kept in RB_KEEP), the audio thread
+// (OSThread and stack live in that .bss). Kept live by default. With
+// NSR_RB_AUDIO_ROLLBACK it rolls back with the game instead: everything
+// audio-related rewinds together (consistent pointers between the game's
+// sound layer, the middleware, its heap pools and generated code), only when
+// the audio thread is asleep at its usual wait point. Cost: an audible
+// hiccup on rollback, never a logic difference.
+constexpr std::array<std::pair<u32, u32>, 4> AUDIO_KEEP{{
+    {0x003A6A08, 0x003BD980},
+    {0x003C29D0, 0x003D4400},
+    {0x003ED510, 0x003ED568},
+    {0x003ED58C, 0x003ED5F0},
+}};
+constexpr u32 AUDIO_THREAD = 0x803AA828;
+constexpr u32 AUDIO_THREAD_QUEUE = 0x803AAB40;  // where it sleeps between audio frames
 
 // Per-frame counters that live outside the sim but are read by it. They
 // advance between sim calls (tick loop bookkeeping) or in the frame tail, so
@@ -807,7 +847,15 @@ struct Rollback
   u32 force_to = 0xFFFFFFFF;  // NSR_RB_FORCE_TO: last one (diagnostics)
   u32 perturb_at = 0;     // NSR_RB_PERTURB_AT: diagnostics, see RollbackTickHook
   u32 vtime_from = 0;     // NSR_RB_VTIME_FROM (0 = off)
-  bool in_tick = false;   // between the tick stub and the tick-end stub
+  bool in_unit = false;   // inside a rollback unit: a tick (tick mode) or a frame
+  bool frame_mode = false;  // the image has the frame routine (rollback unit = frame)
+  bool frame_tick_done = false;  // frame mode: this frame's one tick was handed out
+  bool io_idle_mode = false;  // NSR_RB_IO_IDLE: roll back only to I/O-idle snapshots
+  bool audio_rollback = false;  // NSR_RB_AUDIO_ROLLBACK (see AUDIO_KEEP)
+  std::map<u32, bool> io_idle;  // unit -> disc system idle at its start (live)
+  u64 skipped_busy = 0;       // forced rollbacks skipped: disc busy now / no idle target
+  u32 barrier = 0;          // no rollback may restore a snapshot older than this unit
+  u64 barrier_events = 0, barrier_resim = 0, clamped = 0;
   bool in_resim = false;  // the running tick is a re-simulation
   // Audio gate: per tick, the gated calls in order with their results.
   struct GateCall
@@ -876,7 +924,7 @@ void RbSampleIo(const Core::CPUThreadGuard& guard)
   // Only loads during the rollback session (in-match streaming). Loading
   // screens fill gameplay memory (models, animations) through the same
   // worker; those destinations are game state and must be restored.
-  if (!s_rb.vtime_on)
+  if (!s_rb.vtime_on || s_rb.io_idle_mode)
     return;
   const u32 dest = PowerPC::MMU::HostRead<u32>(guard, 0x803D55F0);
   const u32 bytes = PowerPC::MMU::HostRead<u32>(guard, 0x803D55F8);
@@ -899,6 +947,8 @@ std::optional<u32> ParseU32(const std::string& text)
     return std::nullopt;
   return static_cast<u32>(v);
 }
+
+bool IsIoIdle(const u8* ram);  // defined with the restore helpers
 
 void RbInit(Core::System& system)
 {
@@ -951,6 +1001,9 @@ void RbInit(Core::System& system)
 
   // Segments = MEM1 minus the keep ranges (defaults + NSR_RB_KEEP).
   std::vector<std::pair<u32, u32>> keep(RB_KEEP.begin(), RB_KEEP.end());
+  r.audio_rollback = !Env("NSR_RB_AUDIO_ROLLBACK").empty();
+  if (!r.audio_rollback)
+    keep.insert(keep.end(), AUDIO_KEEP.begin(), AUDIO_KEEP.end());
   for (const std::string& item : Split(Env("NSR_RB_KEEP"), ','))
   {
     const auto parts = Split(item, '-');
@@ -1018,9 +1071,13 @@ void RbInit(Core::System& system)
     r.outside.assign(size / r.pgran, 0);
   }
 
-  if (r.force > 0)
+  r.io_idle_mode = !Env("NSR_RB_IO_IDLE").empty();
+  if (r.force > 0 || !Env("NSR_RB_SAMPLE").empty() || !Env("NSR_RB_STACKS").empty())
   {
-    r.ring.assign(r.force + 1, std::vector<u8>(size));
+    if (r.force > 0)
+      r.ring.assign(r.io_idle_mode ? std::max<u32>(r.force + 1, ParseU32(Env("NSR_RB_RING")).value_or(24))
+                                   : r.force + 1,
+                    std::vector<u8>(size));
     // Diagnostics: if ticks stop after rollbacks began (the game hung), log
     // where the CPU is once and dump MEM1 (NSR_DUMP_PREFIX-hang.bin).
     std::thread([&system] {
@@ -1031,6 +1088,72 @@ void RbInit(Core::System& system)
         const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now().time_since_epoch())
                             .count();
+        // NSR_RB_SAMPLE: profile where the CPU is during rollbacks (every 2 s).
+        static const bool sample = !Env("NSR_RB_SAMPLE").empty();
+        // NSR_RB_STACKS=path: append raw call stacks (pc, then return
+        // addresses) for an offline call-tree profile, 400 samples every 2 s.
+        static FILE* stacks = [] {
+          const std::string path = Env("NSR_RB_STACKS");
+          return path.empty() ? nullptr : std::fopen(path.c_str(), "w");
+        }();
+        if (stacks)
+        {
+          auto& p = system.GetPPCState();
+          const u8* m = system.GetMemory().GetRAM();
+          auto rd2 = [&](u32 a) { return Common::swap32(m + (a & 0x01FFFFFF)); };
+          for (int k = 0; k < 400; ++k)
+          {
+            std::string line = fmt::format("{:08x} {:08x}", p.pc, LR(p));
+            u32 sp = p.gpr[1];
+            for (int i = 0; i < 24 && (sp >> 24) == 0x80; ++i)
+            {
+              sp = rd2(sp);
+              if ((sp >> 24) != 0x80)
+                break;
+              line += fmt::format(" {:08x}", rd2(sp + 4));
+            }
+            std::fprintf(stacks, "%u %s\n", s_rb.live, line.c_str());
+            std::this_thread::sleep_for(std::chrono::milliseconds(3));
+          }
+          std::fflush(stacks);
+          continue;
+        }
+        if (sample && (s_rb.rollbacks > 0 || s_rb.force == 0))
+        {
+          auto& p = system.GetPPCState();
+          const u8* m = system.GetMemory().GetRAM();
+          auto rd2 = [&](u32 a) { return Common::swap32(m + (a & 0x01FFFFFF)); };
+          std::map<u32, int> hits;
+          for (int k = 0; k < 200; ++k)
+          {
+            // Attribute to the InGame call site on the stack (its LR inside
+            // InGame::fn_8002854C), or the PC if not inside InGame.
+            u32 sp = p.gpr[1], site = 0;
+            u32 lr0 = LR(p);
+            if (lr0 >= 0x8002854C && lr0 < 0x80028744)
+              site = lr0;
+            for (int i = 0; i < 24 && !site && (sp >> 24) == 0x80; ++i)
+            {
+              sp = rd2(sp);
+              if ((sp >> 24) != 0x80)
+                break;
+              const u32 ra = rd2(sp + 4);
+              if (ra >= 0x8002854C && ra < 0x80028744)
+                site = ra;
+            }
+            ++hits[site ? site : (p.pc | 1)];
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+          }
+          std::vector<std::pair<int, u32>> top;
+          for (const auto& [pc, n] : hits)
+            top.emplace_back(n, pc);
+          std::sort(top.rbegin(), top.rend());
+          std::string line;
+          for (size_t i = 0; i < top.size() && i < 8; ++i)
+            line += fmt::format(" {:08x}x{}", top[i].second, top[i].first);
+          Log("sample (InGame call site, odd = outside InGame) live {}:{}", s_rb.live, line);
+          continue;
+        }
         if (s_rb.rollbacks == 0 || last == 0 || now - last < 5000)
           continue;
         auto& ppc = system.GetPPCState();
@@ -1054,6 +1177,16 @@ void RbInit(Core::System& system)
           std::this_thread::sleep_for(std::chrono::milliseconds(40));
         }
         Log("HANG: no tick for {} ms after {} rollbacks; CPU samples:", now - last, s_rb.rollbacks);
+        {
+          // Thread dump: every active thread's state, wait queue, saved pc/lr.
+          u32 th = rd(0x800000DC);
+          for (int n = 0; n < 16 && (th >> 24) == 0x80; ++n, th = rd(th + 0x2FC))
+            Log("  thread {:08x} state {} prio {} queue {:08x} srr0 {:08x} lr {:08x} sp {:08x}", th,
+                rd(th + 0x2C8) >> 16, rd(th + 0x2D0), rd(th + 0x2DC), rd(th + 0x198), rd(th + 0x84),
+                rd(th + 4));
+          Log("  dvd executing {:08x}; pending loads {}; io idle {}; disc worker sem counts {} {}",
+              rd(0x803ED118), rd(PENDING_LOADS), IsIoIdle(ram), rd(0x80381C00), rd(0x80381C0C));
+        }
         // In __OSUnhandledException (GN7E69 0x8023AF0C): r24 = exception,
         // r25 = context, r26 = DSISR, r27 = DAR.
         const u32 c = ppc.gpr[25];
@@ -1123,6 +1256,10 @@ std::vector<std::pair<u32, u32>> RbLiveRanges(Core::System& system, const u8* ra
   u32 t = rd(0x800000DC);
   for (int n = 0; n < 32 && valid(t); ++n, t = rd(t + 0x2FC))
   {
+    if (t == DISC_WORKER_THREAD && s_rb.io_idle_mode)
+      continue;  // restored with everything else in I/O-idle mode
+    if (t == AUDIO_THREAD && s_rb.audio_rollback)
+      continue;  // restored with the rest of audio
     if (t != 0x803A3F30)  // main thread: its OSThread and stack are kept statically
     {
       keep(t, 0x318);
@@ -1163,13 +1300,28 @@ std::vector<std::pair<u32, u32>> RbLiveRanges(Core::System& system, const u8* ra
   }
   keep(rd(0x803ED2F0), 0x20);
   keep(rd(0x803ED2F4), 0x20);
+  // Audio middleware callback list (GN7E69): head at 0x803A6BCC (kept), walked
+  // by fn_80269C70 on the audio thread, nodes {next, ?, callback, arg} living
+  // in game memory. A restore that rewound a still-linked node left a null
+  // callback (crash on the audio thread).
+  if (!s_rb.audio_rollback)
+  {
+    u32 node = rd(0x803A6BCC);
+    for (int n = 0; n < 256 && valid(node); ++n, node = rd(node))
+      keep(node, 0x10);
+  }
   // The game's real-time tick accumulator (see TICK_CLOCK_PTR).
   if (const u32 outer = rd(TICK_CLOCK_PTR); valid(outer))
     keep(rd(outer + 0xC), 0x10);
   // GX FIFO, from the command processor's registers.
-  for (const auto& [lo, hi] : s_io_ranges)
-    if (hi <= mem_size)
+  if (!s_rb.io_idle_mode)
+  {
+    for (const auto& [lo, hi] : s_io_ranges)
+      if (hi <= mem_size)
+        live.emplace_back(lo, hi);
+    for (const auto& [lo, hi] : DISC_KEEP)
       live.emplace_back(lo, hi);
+  }
   auto& fifo = system.GetCommandProcessor().GetFifo();
   const u32 fb = fifo.CPBase.load() & 0x01FFFFFF, fe = fifo.CPEnd.load() & 0x01FFFFFF;
   if (fe > fb && fe < mem_size)
@@ -1177,17 +1329,68 @@ std::vector<std::pair<u32, u32>> RbLiveRanges(Core::System& system, const u8* ra
   return live;
 }
 
+// Disc system idle: no DVD command executing or queued, the game's disc
+// worker asleep on its request queue, no game loads in flight.
+bool IsIoIdle(const u8* ram)
+{
+  auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
+  if (rd(0x803ED118) != 0)
+    return false;
+  for (u32 i = 0; i < 4; ++i)
+  {
+    const u32 sentinel = 0x803A55D8 + 8 * i;
+    if (rd(sentinel) != sentinel && rd(sentinel) != 0)
+      return false;
+  }
+  const u16 state = static_cast<u16>(rd(DISC_WORKER_THREAD + 0x2C8) >> 16);
+  if (state != 4 || rd(DISC_WORKER_THREAD + 0x2DC) != DISC_WORKER_QUEUE)
+    return false;
+  // No read anywhere in the worker's pipeline (a read can be finished at the
+  // DVD but not yet consumed by the worker: that gap lost completions).
+  if (rd(DISC_SEM_B) != 0 || rd(DISC_SEM_A) != DISC_SLOTS_IDLE)
+    return false;
+  if (rd(PENDING_LOADS) != 0)
+    return false;
+  if (s_rb.audio_rollback)
+  {
+    const u16 astate = static_cast<u16>(rd(AUDIO_THREAD + 0x2C8) >> 16);
+    if (astate != 4 || rd(AUDIO_THREAD + 0x2DC) != AUDIO_THREAD_QUEUE)
+      return false;
+  }
+  return true;
+}
+
 void RbRestore(Core::System& system, u8* ram, const std::vector<u8>& slot)
 {
   // Restore the game state, then put the live OS objects back as they are now.
+  // Copy page by page and tell the JIT about every page whose bytes changed:
+  // restored memory can hold code (e.g. code the audio engine generates in the
+  // heap), and compiled blocks for the old bytes must not keep running.
   const auto live = RbLiveRanges(system, ram);
   std::vector<std::vector<u8>> keep;
   for (const auto& [lo, hi] : live)
     keep.emplace_back(ram + lo, ram + hi);
+  constexpr u32 PAGE = 0x1000;
+  std::vector<u32> changed;
   for (const auto& [lo, hi] : s_rb.segments)
-    std::memcpy(ram + lo, slot.data() + lo, hi - lo);
+  {
+    for (u32 a = lo; a < hi;)
+    {
+      const u32 b = std::min(hi, (a & ~(PAGE - 1)) + PAGE);
+      if (std::memcmp(ram + a, slot.data() + a, b - a) != 0)
+      {
+        std::memcpy(ram + a, slot.data() + a, b - a);
+        if (changed.empty() || changed.back() != (a & ~(PAGE - 1)))
+          changed.push_back(a & ~(PAGE - 1));
+      }
+      a = b;
+    }
+  }
   for (size_t i = 0; i < live.size(); ++i)
     std::memcpy(ram + live[i].first, keep[i].data(), keep[i].size());
+  auto& jit = system.GetJitInterface();
+  for (const u32 page : changed)
+    jit.InvalidateICache(0x80000000 | page, PAGE, true);
 }
 
 // Compare RAM (re-simulated state before tick t) with the original state
@@ -1532,12 +1735,13 @@ void RollbackPollHook(const Core::CPUThreadGuard& guard)
     RbWritePads(guard, RB_PAD_BUF, r.latest);
 }
 
-void RollbackTickHook(const Core::CPUThreadGuard& guard)
+// One step of the rollback state machine, run at the start of every rollback
+// unit (a sim tick, or a whole InGame frame in frame mode) with the game's pad
+// buffer address. Returns 1 if another unit must run right after this one
+// (re-simulation in progress), else 0.
+u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
 {
   auto& system = guard.GetSystem();
-  auto& ppc_state = system.GetPPCState();
-  const u32 buf = ppc_state.gpr[3];
-  ppc_state.npc = LR(ppc_state);
   Rollback& r = s_rb;
   if (!r.initialized)
     RbInit(system);
@@ -1545,7 +1749,7 @@ void RollbackTickHook(const Core::CPUThreadGuard& guard)
                        std::chrono::steady_clock::now().time_since_epoch())
                        .count();
   u8* ram = system.GetMemory().GetRAM();
-  const u32 slots = r.force + 1;
+  const u32 slots = r.ring.empty() ? 1 : static_cast<u32>(r.ring.size());
   ++r.ticks_since_poll;
   RbSampleIo(guard);
 
@@ -1571,7 +1775,7 @@ void RollbackTickHook(const Core::CPUThreadGuard& guard)
     Log("watch tick-start live {} cursor {} rolled {}: [{:08x}] = {:08x}", r.live, r.cursor,
         r.rolled, r.watch, PowerPC::MMU::HostRead<u32>(guard, r.watch));
   std::array<u32, TICK_COUNTERS.size()> counter_addr{};
-  for (size_t i = 0; i < TICK_COUNTERS.size(); ++i)
+  for (size_t i = 0; i < TICK_COUNTERS.size() && !r.frame_mode; ++i)
   {
     const u32 obj = PowerPC::MMU::HostRead<u32>(guard, TICK_COUNTERS[i].cell);
     counter_addr[i] = (obj >> 24) == 0x80 ? obj + TICK_COUNTERS[i].offset : 0;
@@ -1595,13 +1799,34 @@ void RollbackTickHook(const Core::CPUThreadGuard& guard)
     }
     else if (r.force > 0 && r.live >= r.force + r.force_from && r.live <= r.force_to)
     {
-      // Forced rollback (stage 1 test): keep the state before this tick, go
-      // back `force` ticks, and re-run them with the pads they had.
-      RbSave(ram, r.ring[r.live % slots]);
-      RbRestore(system, ram, r.ring[(r.live - r.force) % slots]);
-      r.cursor = r.live - r.force;
-      r.rolled = true;
-      ++r.rollbacks;
+      // Forced rollback (stage 1 test): keep the state before this unit, go
+      // back `force` units (not past the load barrier), and re-run them with
+      // the pads they had.
+      u32 target = std::max(r.live - r.force, r.barrier);
+      if (r.io_idle_mode)
+      {
+        // Only while idle now, to the newest idle snapshot at or before the
+        // target still in the ring.
+        target = r.live - r.force;
+        const u32 oldest = r.live >= slots - 1 ? r.live - (slots - 1) : 0;
+        while (target >= oldest && target > 0 && !(r.io_idle.contains(target) && r.io_idle[target]))
+          --target;
+        if (!IsIoIdle(ram) || target < oldest || !r.io_idle.contains(target))
+        {
+          ++r.skipped_busy;
+          target = r.live;  // no rollback this unit
+        }
+      }
+      if (target < r.live)
+      {
+        if (target != r.live - r.force)
+          ++r.clamped;
+        RbSave(ram, r.ring[r.live % slots]);
+        RbRestore(system, ram, r.ring[target % slots]);
+        r.cursor = target;
+        r.rolled = true;
+        ++r.rollbacks;
+      }
     }
   }
 
@@ -1616,18 +1841,21 @@ void RollbackTickHook(const Core::CPUThreadGuard& guard)
 
   if (r.cursor < r.live)
   {
-    // Re-simulated tick.
+    // Re-simulated unit. Its snapshot is re-saved, so its I/O-idle flag must
+    // be re-evaluated too: re-simulation runs faster (no drawing), so disc
+    // I/O can complete at different unit boundaries than live.
     RbSave(ram, r.ring[r.cursor % slots]);
+    if (r.io_idle_mode)
+      r.io_idle[r.cursor] = IsIoIdle(ram);
     RbWritePads(guard, buf, r.pads.at(r.cursor));
-    r.in_tick = true;
+    r.in_unit = true;
     r.in_resim = true;
     r.tick_running = r.cursor;
     r.vtime_calls = 0;
     r.gate_index = 0;
     ++r.cursor;
     ++r.resim_ticks;
-    ppc_state.gpr[3] = 1;  // run another tick after this one
-    return;
+    return 1;  // run another unit after this one
   }
 
   // Live tick.
@@ -1696,6 +1924,24 @@ void RollbackTickHook(const Core::CPUThreadGuard& guard)
   }
   if (r.hash_log && t % 60 == 0)
     Log("tick {} hash {:016x}", t, RbHash(ram));
+  if (static const bool trace = !Env("NSR_RB_IO_TRACE").empty(); trace && t % 5 == 0)
+  {
+    auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
+    Log("io unit {}: dvd exec {:08x} q0 {:08x} worker state {} queue {:08x} srr0 {:08x} semA {} semB {} "
+        "pending {} idle {}",
+        t, rd(0x803ED118), rd(0x803A55D8), rd(DISC_WORKER_THREAD + 0x2C8) >> 16,
+        rd(DISC_WORKER_THREAD + 0x2DC), rd(DISC_WORKER_THREAD + 0x198), rd(0x80381C00),
+        rd(0x80381C0C), rd(PENDING_LOADS), IsIoIdle(ram));
+    Log("io unit {}: mq@80381C00 {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+        t, rd(0x80381C00), rd(0x80381C04), rd(0x80381C08), rd(0x80381C0C), rd(0x80381C10),
+        rd(0x80381C14), rd(0x80381C18), rd(0x80381C1C), rd(0x80381C20), rd(0x80381C24));
+  }
+  if (r.io_idle_mode)
+  {
+    r.io_idle[t] = IsIoIdle(ram);
+    if (t >= 600)
+      r.io_idle.erase(r.io_idle.begin(), r.io_idle.lower_bound(t - 600));
+  }
   if (r.force > 0)
     RbSave(ram, r.ring[t % slots]);
   if (const auto it = r.replay.find(t); it != r.replay.end())
@@ -1715,7 +1961,7 @@ void RollbackTickHook(const Core::CPUThreadGuard& guard)
     r.vtime_base = system.GetSystemTimers().GetFakeTimeBase();
     Log("virtual tick time from tick {} (base {:016x})", t, r.vtime_base);
   }
-  r.in_tick = true;
+  r.in_unit = true;
   r.in_resim = false;
   r.tick_running = t;
   r.vtime_calls = 0;
@@ -1733,9 +1979,11 @@ void RollbackTickHook(const Core::CPUThreadGuard& guard)
   if (t % 600 == 0)
   {
     Log("tick {}: rollbacks {}, re-simulated {}, mismatched checks {}/{}; audio gate: "
-        "recorded {}, replayed {}, mismatched {}",
+        "recorded {}, replayed {}, mismatched {}; load barriers {} (clamped {}, in re-sim {}); "
+        "io-idle skips {}",
         t, r.rollbacks, r.resim_ticks, r.mismatched_checks, r.checks, r.gate_recorded,
-        r.gate_replayed, r.gate_mismatched);
+        r.gate_replayed, r.gate_mismatched, r.barrier_events, r.clamped, r.barrier_resim,
+        r.skipped_busy);
     if (r.mismatched_checks > 0)
       RbReport(15);  // Dolphin is usually killed, not shut down: report as we go
     if (r.gate_recorded > 0)
@@ -1750,7 +1998,94 @@ void RollbackTickHook(const Core::CPUThreadGuard& guard)
       Log("audio gate calls:{}", line);
     }
   }
-  ppc_state.gpr[3] = 0;  // this was the last tick for now
+  r.frame_tick_done = false;
+  return 0;  // this was the last unit for now
+}
+
+void RollbackTickHook(const Core::CPUThreadGuard& guard)
+{
+  auto& ppc_state = guard.GetSystem().GetPPCState();
+  const u32 buf = ppc_state.gpr[3];
+  ppc_state.npc = LR(ppc_state);
+  Rollback& r = s_rb;
+  if (r.frame_mode)
+  {
+    // The frame stub already handled rollback for this frame; the tick just
+    // gets the frame's pads (one tick per frame during the session).
+    ++r.ticks_since_poll;
+    if (const auto it = r.pads.find(r.tick_running); it != r.pads.end())
+      RbWritePads(guard, buf, it->second);
+    ppc_state.gpr[3] = 0;
+    return;
+  }
+  ppc_state.gpr[3] = RbStep(guard, buf);
+}
+
+void RollbackFrameHook(const Core::CPUThreadGuard& guard)
+{
+  auto& ppc_state = guard.GetSystem().GetPPCState();
+  ppc_state.npc = LR(ppc_state);
+  Rollback& r = s_rb;
+  r.frame_mode = true;
+  r.frame_tick_done = false;
+  ppc_state.gpr[3] = RbStep(guard, RB_PAD_BUF);
+}
+
+void RollbackFrameEndHook(const Core::CPUThreadGuard& guard)
+{
+  auto& ppc_state = guard.GetSystem().GetPPCState();
+  ppc_state.npc = LR(ppc_state);
+  s_rb.in_unit = false;
+}
+
+// Frame mode, during the session: exactly one tick per frame. Replaces the
+// real-time accumulator drain fn_802378C8 (which returns the ticks due and
+// adds them to the game clock outer+4): the first call in a frame returns
+// the fixed step and advances the clock; later calls return 0. Frames, not
+// wall-clock time, then drive the game, as on every machine (Slippi's model).
+void TickCountHook(const Core::CPUThreadGuard& guard)
+{
+  Rollback& r = s_rb;
+  auto& ppc = guard.GetSystem().GetPPCState();
+  if (!r.frame_mode || !r.vtime_on)
+    return;  // run the original
+  using PowerPC::MMU;
+  const u32 outer = MMU::HostRead<u32>(guard, TICK_CLOCK_PTR);
+  if ((outer >> 24) != 0x80)
+    return;
+  const u32 inner = MMU::HostRead<u32>(guard, outer + 0xC);
+  u32 step = (inner >> 24) == 0x80 ? MMU::HostRead<u32>(guard, inner + 4) : 1;
+  if (step == 0)
+    step = 1;
+  u32 n = 0;
+  if (!r.frame_tick_done)
+  {
+    r.frame_tick_done = true;
+    n = step;
+    if ((inner >> 24) == 0x80)
+    {
+      // Keep the live accumulator drained so the game doesn't catch up later.
+      MMU::HostWrite<u32>(guard, MMU::HostRead<u32>(guard, inner + 0xC) % step, inner + 0xC);
+      MMU::HostWrite<u32>(guard, step, inner + 8);
+    }
+    MMU::HostWrite<u32>(guard, MMU::HostRead<u32>(guard, outer + 4) + n, outer + 4);
+  }
+  ppc.gpr[3] = n;
+  ppc.npc = LR(ppc);
+}
+
+// Frame mode: re-simulated frames skip the world draw (RENDER_FN; the render
+// pass costs ~3x the sim and is mostly this; Slippi skips rendering too)
+// and don't wait for the next retrace (VIWaitForRetrace returns at once). Everything else in the frame runs,
+// including the present's bookkeeping (framebuffer flip): skipping
+// the whole present (fn_801CE82C) left that game state out of step and broke
+// matches. Extra flips within one retrace are invisible: VI shows the last.
+void PresentHook(const Core::CPUThreadGuard& guard)
+{
+  Rollback& r = s_rb;
+  auto& ppc = guard.GetSystem().GetPPCState();
+  if (r.frame_mode && r.in_unit && r.in_resim)
+    ppc.npc = LR(ppc);
 }
 
 void RollbackTickEndHook(const Core::CPUThreadGuard& guard)
@@ -1759,7 +2094,8 @@ void RollbackTickEndHook(const Core::CPUThreadGuard& guard)
   auto& ppc_state = system.GetPPCState();
   ppc_state.npc = LR(ppc_state);
   Rollback& r = s_rb;
-  r.in_tick = false;
+  if (!r.frame_mode)
+    r.in_unit = false;
   if (r.watch && r.live >= r.watch_from && r.live <= r.watch_to)
     Log("watch tick-end   live {} cursor {}: [{:08x}] = {:08x}", r.live, r.cursor, r.watch,
         PowerPC::MMU::HostRead<u32>(guard, r.watch));
@@ -1777,7 +2113,7 @@ namespace
 std::optional<u64> VirtualTime(const PowerPC::PowerPCState& ppc)
 {
   Rollback& r = s_rb;
-  if (!r.vtime_on || !r.in_tick || LR(ppc) >= 0x80230000)  // SDK callers: real time
+  if (!r.vtime_on || !r.in_unit || LR(ppc) >= 0x80230000)  // SDK callers: real time
     return std::nullopt;
   constexpr u64 TB_PER_TICK = 40500000 / 60;  // GameCube time base, one 60 Hz frame
   return r.vtime_base + u64(r.tick_running - r.vtime_from) * TB_PER_TICK + 64 * u64(r.vtime_calls++);
@@ -1823,7 +2159,7 @@ void AudioGateHook(const Core::CPUThreadGuard& guard)
   auto& ppc = guard.GetSystem().GetPPCState();
   // Only calls from game code on the main thread, inside a tick, during the
   // rollback session. Audio's own thread and interrupt callbacks run normally.
-  if (!r.vtime_on || !r.in_tick || LR(ppc) >= 0x8025E000 ||
+  if (!r.vtime_on || !r.in_unit || LR(ppc) >= 0x8025E000 ||
       PowerPC::MMU::HostRead<u32>(guard, 0x800000E4) != 0x803A3F30)
     return;  // npc unchanged: run the function
   const u32 entry = s_hook_pc;
@@ -1841,7 +2177,9 @@ void AudioGateHook(const Core::CPUThreadGuard& guard)
         v.push_back(*x);
     return v;
   }();
-  if (!only.empty() && std::find(only.begin(), only.end(), entry) == only.end())
+  static const std::vector<unsigned int> effects = EffectGateList();
+  if (!only.empty() && std::find(only.begin(), only.end(), entry) == only.end() &&
+      std::find(effects.begin(), effects.end(), entry) == effects.end())
     return;
   if (!r.in_resim)
   {
@@ -1891,6 +2229,46 @@ void AudioGateReturnHook(const Core::CPUThreadGuard& guard)
   LR(ppc) = p.lr;
 }
 
+std::vector<unsigned int> ResimSkipList()
+{
+  const std::string spec = Env("NSR_RB_SKIP_RESIM");
+  if (spec.empty())
+    return {RENDER_FN};
+  std::vector<unsigned int> out;
+  for (const std::string& a : Split(spec, ','))
+    if (const auto v = ParseU32(a))
+      out.push_back(*v);
+  return out;
+}
+
+void LoadBarrierHook(const Core::CPUThreadGuard& guard)
+{
+  Rollback& r = s_rb;
+  if (!r.initialized || r.io_idle_mode)
+    return;
+  if (r.in_resim)
+  {
+    // A re-simulated unit reached a load: with identical inputs this can't
+    // happen (the barrier forbids re-running load frames); with corrected
+    // inputs it means the rollback crossed into new I/O. Count it.
+    ++r.barrier_resim;
+    return;
+  }
+  // The event happens during unit live-1 (or between units): snapshots taken
+  // before it are no longer valid rollback targets.
+  r.barrier = std::max(r.barrier, r.live);
+  ++r.barrier_events;
+}
+
+std::vector<unsigned int> EffectGateList()
+{
+  std::vector<unsigned int> out;
+  for (const std::string& a : Split(Env("NSR_RB_EFFECT_GATE"), ','))
+    if (const auto v = ParseU32(a))
+      out.push_back(*v);
+  return out;
+}
+
 std::vector<unsigned int> ProbeAddresses()
 {
   std::vector<unsigned int> out;
@@ -1910,6 +2288,10 @@ void ProbeHook(const Core::CPUThreadGuard& guard)
   static u32 last_value = 0, last_pc = 0, last_lr = 0;
   auto& ppc = guard.GetSystem().GetPPCState();
   const u32 v = PowerPC::MMU::HostRead<u32>(guard, r.watch);
+  static const bool all = !Env("NSR_RB_PROBE_ALL").empty();
+  if (all)
+    Log("probe hit {:08x} from {:08x}: [{:08x}] = {:08x}; live {} cursor {} resim {}", s_hook_pc,
+        LR(ppc) - 4, r.watch, v, r.live, r.cursor, r.in_resim);
   if (v != last_value)
     Log("probe: [{:08x}] {:08x} -> {:08x} after {:08x} (called from {:08x}), before {:08x} "
         "(called from {:08x}); live {} cursor {}",
