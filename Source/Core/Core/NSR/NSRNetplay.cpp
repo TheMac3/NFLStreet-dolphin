@@ -2344,6 +2344,10 @@ void RollbackFrameEndHook(const Core::CPUThreadGuard& guard)
 {
   auto& ppc_state = guard.GetSystem().GetPPCState();
   ppc_state.npc = LR(ppc_state);
+  static const bool async_present = !Env("NSR_RB_ASYNC_PRESENT").empty();
+  if (s_rb.vtime_on && !async_present)
+    PowerPC::MMU::HostWrite<u32>(guard, PowerPC::MMU::HostRead<u32>(guard, VI_POST_COUNTER) + 1,
+                                 VI_POST_COUNTER);
   s_rb.in_unit = false;
 }
 
@@ -2417,6 +2421,20 @@ void PresentHook(const Core::CPUThreadGuard& guard)
 {
   Rollback& r = s_rb;
   auto& ppc = guard.GetSystem().GetPPCState();
+  static const bool async_present = !Env("NSR_RB_ASYNC_PRESENT").empty();  // old behavior
+  if (s_hook_pc == VI_POST_COUNTER_FN)
+  {
+    if (!async_present && r.vtime_on)
+      ppc.npc = LR(ppc);  // counted per frame in RollbackFrameEndHook
+    return;
+  }
+  if (s_hook_pc == GX_ENABLE_BREAKPT)
+  {
+    if (!async_present && r.frame_mode && r.in_unit && r.vtime_on &&
+        LR(ppc) == PRESENT_BREAKPT_RETURN)
+      ppc.npc = r.in_resim ? LR(ppc) : VI_WAIT_FOR_RETRACE;
+    return;
+  }
   // Diagnostics: NSR_RB_RESIM_VSYNC=1 keeps the vsync wait in re-simulated
   // frames (each then takes a live frame's emulated time).
   static const bool keep_vsync = !Env("NSR_RB_RESIM_VSYNC").empty();

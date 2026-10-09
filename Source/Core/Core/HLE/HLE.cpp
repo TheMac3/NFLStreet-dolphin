@@ -148,6 +148,10 @@ void PatchFixedFunctions(Core::System& system)
     Patch(system, NSRNetplay::RB_FRAME_END_STUB, "NSR_RollbackFrameEnd");
     Patch(system, NSRNetplay::TICK_COUNT_FN, "NSR_TickCount");
     Patch(system, NSRNetplay::VI_WAIT_FOR_RETRACE, "NSR_Present");
+    // Present paces with a GX FIFO breakpoint released by the next VI post
+    // callback; its counter is game state (see PresentHook).
+    Patch(system, NSRNetplay::GX_ENABLE_BREAKPT, "NSR_Present");
+    Patch(system, NSRNetplay::VI_POST_COUNTER_FN, "NSR_Present");
     Patch(system, NSRNetplay::PEEK_Z_FN, "NSR_PeekZ");
     Patch(system, NSRNetplay::VI_PRE_CB, "NSR_ViCallback");
     // Functions skipped in re-simulated frames: NSR_RB_SKIP_RESIM=addr,...

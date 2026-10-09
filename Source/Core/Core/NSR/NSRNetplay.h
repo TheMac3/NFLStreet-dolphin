@@ -155,6 +155,17 @@ void PeekZHook(const Core::CPUThreadGuard& guard);  // HookType::Gate
 // rollback frame routine also calls it once per frame. During the session
 // only that call runs (counters follow frames: a frame may take several
 // retraces, differently on each peer); before it, only the interrupt's.
+// Present fn_801CE82C paces frames with a GX FIFO breakpoint (GXEnableBreakPt,
+// called at 0x801CE818) that only the VI post-retrace callback releases; the
+// next frame's GXDrawDone sleeps until then, so every frame (re-simulated
+// too) cost a retrace. During the session that call becomes a plain retrace
+// wait in live frames and is skipped in re-simulated ones. The VI post
+// callback's game counter (fn_801F7B04: ++*(u32*)0x803EBE48) then advances
+// once per frame instead (found by Codex, local/work/codex/resim-cost).
+constexpr unsigned int GX_ENABLE_BREAKPT = 0x8024C5D0;
+constexpr unsigned int PRESENT_BREAKPT_RETURN = 0x801CE81C;
+constexpr unsigned int VI_POST_COUNTER_FN = 0x801F7B04;
+constexpr unsigned int VI_POST_COUNTER = 0x803EBE48;
 constexpr unsigned int VI_PRE_CB = 0x801F7DF4;
 constexpr unsigned int RB_FRAME_CODE = 0x80416A80;  // isopatch frame routine (calls VI_PRE_CB)
 void ViCallbackHook(const Core::CPUThreadGuard& guard);  // HookType::Gate
