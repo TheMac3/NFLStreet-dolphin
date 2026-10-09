@@ -210,6 +210,32 @@ constexpr unsigned int RB_GATE_RETURN = 0x80416910;  // gated calls return here 
 void AudioGateHook(const Core::CPUThreadGuard& guard);
 void AudioGateReturnHook(const Core::CPUThreadGuard& guard);
 
+// Audio clock (NFLStreet docs: audioclock report). Diagnostics first:
+// NSR_AC_LOG=path logs the audio clock model's decisions and the RNG words at
+// every frame start; with NSR_AC_CALLS=1 it also logs every game->audio-middleware call made from a frame
+// (diagnostics only: results are captured through a return stub, so a call
+// the JIT inlined by branch following, both bl and blr, is missed)
+// during the session (frame, re-simulated, entry, call site, wrapper call
+// site, r3..r5 -> r3 and out-parameters), plus RNG words at every frame
+// start, so a reference run and a rollback run can be compared call by call.
+constexpr unsigned int AC_RETURN_STUB = 0x80416AFC;  // `blr` written by Dolphin (free patch data)
+void AudioCallLogHook(const Core::CPUThreadGuard& guard);     // HookType::Start
+void AudioCallReturnHook(const Core::CPUThreadGuard& guard);  // HookType::Replace
+void AudioClockFrameLog(const Core::CPUThreadGuard& guard);
+// Audio clock model (during the rollback session, NSR_AC != 0): the sim's
+// view of audio progress is a deterministic function of frames and game data,
+// kept in MEM1 (restored by rollback); see NSRNetplay.cpp "Audio clock model".
+//   Queries (HookType::Gate, answered and skipped): speech queue status,
+//   speech event position, sound handle finished, stream volume, bank upload
+//   ready. Effects (HookType::Start, real call still runs): sound start and
+//   speech queue (their results become virtual ids), handle/id translation for
+//   stop/fade/skip, stream stop/volume bookkeeping.
+void AudioClockSessionStart(const Core::CPUThreadGuard& guard);
+void AudioClockQueryHook(const Core::CPUThreadGuard& guard);   // HookType::Gate
+void AudioClockEffectHook(const Core::CPUThreadGuard& guard);  // HookType::Start
+std::vector<unsigned int> AudioClockQueryHooks();
+std::vector<unsigned int> AudioClockEffectHooks();
+
 // Diagnostics: NSR_RB_PROBES=addr,... installs ProbeHook (HookType::Start)
 // at those function entries; inside the NSR_RB_WATCH window it logs each
 // change of the watched word together with the probes before and after it.

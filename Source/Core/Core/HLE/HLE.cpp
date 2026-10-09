@@ -31,7 +31,7 @@ namespace HLE
 static std::map<u32, u32> s_hooked_addresses;
 
 // clang-format off
-constexpr std::array<Hook, 40> os_patches{{
+constexpr std::array<Hook, 44> os_patches{{
     // Placeholder, os_patches[0] is the "non-existent function" index
     {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
 
@@ -81,6 +81,10 @@ constexpr std::array<Hook, 40> os_patches{{
     {"NSR_LoadBarrier",              NSRNetplay::LoadBarrierHook,           HookType::Start,   HookFlag::Fixed}, // NFLStreet POC rollback: disc load barrier
     {"NSR_AudioGate",                NSRNetplay::AudioGateHook,             HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: audio side effects
     {"NSR_AudioGateReturn",          NSRNetplay::AudioGateReturnHook,       HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: record audio results
+    {"NSR_AudioCallLog",             NSRNetplay::AudioCallLogHook,          HookType::Start,   HookFlag::Fixed}, // NFLStreet POC rollback: audio clock diagnostics
+    {"NSR_AudioCallReturn",          NSRNetplay::AudioCallReturnHook,       HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: audio clock diagnostics
+    {"NSR_AudioClockQuery",          NSRNetplay::AudioClockQueryHook,       HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: frame-based audio answers
+    {"NSR_AudioClockEffect",         NSRNetplay::AudioClockEffectHook,      HookType::Start,   HookFlag::Fixed}, // NFLStreet POC rollback: frame-based audio bookkeeping
 }};
 // clang-format on
 
@@ -165,6 +169,19 @@ void PatchFixedFunctions(Core::System& system)
     {
       for (const u32 entry : NSRNetplay::AUDIO_GATE_ENTRIES)
         Patch(system, entry, "NSR_AudioGate");
+    }
+    // Audio clock: the sim's view of audio follows frames (always installed;
+    // inactive outside the rollback session; NSR_AC=0 turns it off).
+    for (const u32 a : NSRNetplay::AudioClockQueryHooks())
+      Patch(system, a, "NSR_AudioClockQuery");
+    for (const u32 a : NSRNetplay::AudioClockEffectHooks())
+      Patch(system, a, "NSR_AudioClockEffect");
+    if (std::getenv("NSR_AC_CALLS"))  // audio clock diagnostics: log game->audio calls
+    {
+      for (const u32 entry : NSRNetplay::AUDIO_GATE_ENTRIES)
+        Patch(system, entry, "NSR_AudioCallLog");
+      Patch(system, NSRNetplay::AC_RETURN_STUB, "NSR_AudioCallReturn");
+      system.GetMemory().Write_U32(0x4E800020, NSRNetplay::AC_RETURN_STUB);  // blr
     }
     for (const u32 probe : NSRNetplay::ProbeAddresses())  // (diagnostics)
       Patch(system, probe, "NSR_Probe");

@@ -1920,6 +1920,45 @@ static void RbDumpUnit(Core::System& system, const u8* ram, u32 live, u32 frame)
   }
 }
 
+// Diagnostics: NSR_RB_ADOPT=dump:frame makes this run adopt another run's
+// game state right before live frame `frame` runs (taken there with
+// NSR_RB_DUMP_UNIT=frame:frame; dump.vmem is used too if present), the way a
+// rollback restore does (live OS objects and kept ranges stay). Two runs
+// with different emulated timing (e.g. CPU overclock) then start the session
+// from identical game state, like netplay peers after a lockstep phase, and
+// can be compared frame by frame inside the session.
+static void RbAdopt(Core::System& system, u8* ram, u32 live)
+{
+  static const auto spec = Split(Env("NSR_RB_ADOPT"), ':');
+  if (spec.size() != 2 || ParseU32(spec[1]).value_or(0xFFFFFFFF) != live)
+    return;
+  std::vector<u8> slot(s_rb.mem1_size + s_rb.vmem_bytes);
+  size_t got = 0, got_vmem = 0;
+  if (FILE* f = std::fopen(spec[0].c_str(), "rb"))
+  {
+    got = std::fread(slot.data(), 1, s_rb.mem1_size, f);
+    std::fclose(f);
+  }
+  if (s_rb.vmem_bytes)
+  {
+    if (FILE* f = std::fopen((spec[0] + ".vmem").c_str(), "rb"))
+    {
+      got_vmem = std::fread(slot.data() + s_rb.mem1_size, 1, s_rb.vmem_bytes, f);
+      std::fclose(f);
+    }
+  }
+  if (got != s_rb.mem1_size)
+  {
+    Log("adopt: could not read {}", spec[0]);
+    return;
+  }
+  if (got_vmem != s_rb.vmem_bytes)
+    slot.resize(s_rb.mem1_size);  // MEM1 only
+  RbRestore(system, ram, slot);
+  Log("adopted {} before live frame {} (io idle now {}; vmem {})", spec[0], live, IsIoIdle(ram),
+      got_vmem == s_rb.vmem_bytes);
+}
+
 // Forced-rollback depth for a live unit: NSR_RB_FORCE, or with
 // NSR_RB_FORCE_RANDOM=seed a pseudo-random depth in 0..NSR_RB_FORCE per unit
 // (0 = no rollback), like netplay's varying misprediction depths. Two runs
@@ -2201,6 +2240,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     std::fflush(r.record);
   }
   RbWritePads(guard, buf, r.pads[t]);
+  RbAdopt(system, ram, t);
   RbDumpUnit(system, ram, t, t);
   if (r.vtime_from && t == r.vtime_from && !r.vtime_on)
   {
@@ -2212,6 +2252,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     r.vtime_base = ParseU64(Env("NSR_RB_VTIME_BASE")).value_or(TB_PER_FRAME << 37) /
                    TB_PER_FRAME * TB_PER_FRAME;
     Log("virtual tick time from tick {} (base {:016x})", t, r.vtime_base);
+    AudioClockSessionStart(guard);
   }
   r.in_unit = true;
   r.in_resim = false;
@@ -2296,6 +2337,7 @@ void RollbackFrameHook(const Core::CPUThreadGuard& guard)
   r.frame_mode = true;
   r.frame_tick_done = false;
   ppc_state.gpr[3] = RbStep(guard, RB_PAD_BUF);
+  AudioClockFrameLog(guard);
 }
 
 void RollbackFrameEndHook(const Core::CPUThreadGuard& guard)
@@ -2525,6 +2567,752 @@ void AudioGateReturnHook(const Core::CPUThreadGuard& guard)
   }
   ppc.npc = p.lr;
   LR(ppc) = p.lr;
+}
+
+// ---------------------------------------------------------------------------
+// Audio clock (see NSRNetplay.h, "Audio clock").
+// ---------------------------------------------------------------------------
+namespace
+{
+struct AcPending
+{
+  u32 lr, entry, site, r3, r4, r5;
+  u32 frame;
+  bool resim;
+};
+std::vector<AcPending> s_ac_pending;
+
+FILE* AcLog()
+{
+  static FILE* f = [] {
+    const std::string path = Env("NSR_AC_LOG");
+    return path.empty() ? nullptr : std::fopen(path.c_str(), "w");
+  }();
+  return f;
+}
+
+// The return stub is a `blr` in free patch data (zero in the image); its
+// HLE hook does the work, the word only has to decode.
+void AcEnsureReturnStub(const Core::CPUThreadGuard& guard)
+{
+  if (PowerPC::MMU::HostRead<u32>(guard, AC_RETURN_STUB) != 0x4E800020)
+    PowerPC::MMU::HostWrite<u32>(guard, 0x4E800020, AC_RETURN_STUB);
+}
+
+bool AcGameCaller(const Core::CPUThreadGuard& guard, const PowerPC::PowerPCState& ppc)
+{
+  const Rollback& r = s_rb;
+  return r.vtime_on && r.in_unit && LR(ppc) < 0x8025E000 &&
+         PowerPC::MMU::HostRead<u32>(guard, 0x800000E4) == 0x803A3F30;
+}
+}  // namespace
+
+void AudioCallLogHook(const Core::CPUThreadGuard& guard)
+{
+  auto& ppc = guard.GetSystem().GetPPCState();
+  if (!AcLog() || !AcGameCaller(guard, ppc))
+    return;
+  // The wrapper's own return address: saved in its caller's frame (EABI).
+  const u32 back = PowerPC::MMU::HostRead<u32>(guard, ppc.gpr[1]);
+  const u32 site = (back >> 24) == 0x80 ? PowerPC::MMU::HostRead<u32>(guard, back + 4) : 0;
+  s_ac_pending.push_back({LR(ppc), s_hook_pc, site, ppc.gpr[3], ppc.gpr[4], ppc.gpr[5],
+                          s_rb.tick_running, s_rb.in_resim});
+  AcEnsureReturnStub(guard);
+  LR(ppc) = AC_RETURN_STUB;
+}
+
+void AudioCallReturnHook(const Core::CPUThreadGuard& guard)
+{
+  auto& ppc = guard.GetSystem().GetPPCState();
+  if (s_ac_pending.empty())
+  {
+    ppc.npc = LR(ppc);
+    return;
+  }
+  const AcPending p = s_ac_pending.back();
+  s_ac_pending.pop_back();
+  if (FILE* f = AcLog())
+  {
+    std::string out;
+    u32 words = 0;
+    if (p.entry == 0x8026F1E8)
+      words = 3;
+    else if (p.entry == 0x8026EF88)
+      words = 4;
+    for (u32 i = 0; i < words; ++i)
+      out += fmt::format(" {:08x}", PowerPC::MMU::HostRead<u32>(guard, p.r4 + 4 * i));
+    std::fprintf(f, "C %u %d %08x %08x %08x %08x %08x %08x -> %08x%s\n", p.frame, p.resim ? 1 : 0,
+                 p.entry, p.lr - 4, p.site - 4, p.r3, p.r4, p.r5, ppc.gpr[3], out.c_str());
+  }
+  ppc.npc = p.lr;
+  LR(ppc) = p.lr;
+}
+
+void AudioClockFrameLog(const Core::CPUThreadGuard& guard)
+{
+  FILE* f = AcLog();
+  if (!f || !s_rb.vtime_on)
+    return;
+  std::fprintf(f, "F %u %d %08x %08x\n", s_rb.tick_running, s_rb.in_resim ? 1 : 0,
+               PowerPC::MMU::HostRead<u32>(guard, 0x80481888),
+               PowerPC::MMU::HostRead<u32>(guard, 0x80481904));
+}
+
+// ---------------------------------------------------------------------------
+// Audio clock model: what the sim sees of audio, as a function of frames.
+//
+// Why: the audio thread (OSThread 0x803AA828) and the DSP advance on emulated
+// time, which differs between peers and between a live frame and its
+// re-simulation. Game code polls audio progress (speech queue drained? sound
+// handle finished? bank uploaded?) and branches on it; the sound-start rate
+// limiter fn_8006C8A4 even draws RNG stream 1 only while a handle still plays.
+// Rolling audio memory back with the game cannot fix that: the answers depend
+// on *when* the audio thread ran relative to game code.
+//
+// What: during the rollback session, every audio *query* the game makes
+// through its sound-layer wrappers is answered from this model instead of the
+// middleware, and every handle/id the game gets back is a virtual one the
+// model hands out. Real calls still run for every *effect* (start, stop,
+// queue, volume), with virtual ids translated back to this machine's real
+// ones, so audio output keeps working; it may drift from what the sim
+// believes (e.g. a sound the model thinks ended still plays): an audible
+// difference, never a logic one.
+//
+// The model state lives in MEM1 free patch data (AC_BASE, inside the Reborn
+// DOL's zero-filled data10 section, unreferenced), so rollback restores it
+// with the game and every peer computes the same bytes from the same frames.
+// The only per-machine state is the host-side map from virtual to real ids,
+// which a re-simulated start simply overwrites.
+//
+// Durations are deterministic functions of game data:
+//   - sound effects: the patch's sample count and rate (EA 'PT' tags 0x85 /
+//     0x84, default 22050 Hz) from the BNKb bank header in RAM; a patch with
+//     a loop start (tag 0x86) never ends by itself;
+//   - speech items: a fixed NSR_AC_SPEECH_FRAMES (default 75; see
+//     AcSpeechFrames for why and what is deferred);
+//   - bank uploads: ready NSR_AC_BANK_FRAMES frames after the game first polls.
+//
+// Env: NSR_AC=0 disables (real answers, nondeterministic); NSR_AC=shadow
+// computes and logs model answers (NSR_AC_LOG) but returns the real ones
+// (calibration). Deferred: exact speech durations from the stream headers on
+// disc (revisit if commentary pacing feels off), pitch-dependent SFX length.
+// ---------------------------------------------------------------------------
+namespace
+{
+constexpr u32 AC_BASE = 0x80416B00;
+constexpr u32 AC_END = 0x80417000;
+constexpr u32 AC_MAGIC = 0x41434C4B;  // 'ACLK'
+// +0x00 magic, +0x04 next sound seq, +0x08 next speech seq
+constexpr u32 AC_STREAMS = 8, AC_ITEMS = 6, AC_STREAM_SIZE = 0x40;
+// Per stream: +0x00 head start frame, +0x04 queued count, +0x08 volume,
+// +0x10 items[AC_ITEMS] {virtual id, frames}
+constexpr u32 AC_STREAM = AC_BASE + 0x10;
+constexpr u32 AC_BANK = AC_STREAM + AC_STREAMS * AC_STREAM_SIZE;  // {record, first poll frame}
+constexpr u32 AC_BANK_SLOTS = 8;
+constexpr u32 AC_SFX = AC_BANK + AC_BANK_SLOTS * 8;  // {virtual handle, start, end}
+constexpr u32 AC_SFX_SLOTS = 48;
+static_assert(AC_SFX + AC_SFX_SLOTS * 12 <= AC_END);
+constexpr u32 AC_LOOP = 0xFFFFFFFF;  // end frame of a sound that never ends by itself
+constexpr u32 AC_VIRTUAL_SFX = 0x40000000;
+constexpr u32 SND_FLAGS = 0x8039AEC4;  // the sound layer's "initialised/enabled" bytes (+1, +2)
+
+// Game sound-layer wrappers (GN7E69) and the call sites whose results are made virtual.
+constexpr u32 W_SPEECH_STATUS = 0x801F4834;  // (stream*, out[3]: count, head id, ms)
+constexpr u32 W_EVENT_STATUS = 0x801F4934;   // (item id, out[4]) -> r3
+constexpr u32 W_SFX_FINISHED = 0x801F41A0;   // (handle) -> 1 finished/invalid, 0 playing
+constexpr u32 W_STREAM_VOLUME = 0x801F48B8;  // (stream*) -> volume
+constexpr u32 C_BANK_READY = 0x801F360C;     // `bl 0x8026A96C` in the bank service fn_801F35B4
+constexpr u32 W_SFX_START = 0x801F4050;      // (bank*, sound, opts) -> handle
+constexpr u32 R_SFX_START = 0x8006C988;      // after its only call (rate limiter)
+constexpr u32 W_SPEECH_QUEUE = 0x801F4580;   // (stream*, desc {archive, index}, ...) -> id
+constexpr std::array<u32, 2> R_SPEECH_QUEUE{0x80073D6C, 0x801861A8};
+constexpr u32 W_SPEECH_SKIP = 0x801F4AB0;    // (item id, ...)
+constexpr u32 W_STREAM_STOP = 0x801F4638;    // (stream*)
+constexpr u32 W_STREAM_DESTROY = 0x801F45D4;  // (stream*)
+constexpr u32 W_STREAM_SETVOL = 0x801F4770;  // (stream*, volume)
+constexpr u32 W_STREAM_FADE = 0x801F4678;    // (stream*, time, volume)
+constexpr u32 W_SFX_FADE = 0x801F4294;       // (handle, time, volume)
+constexpr u32 W_SFX_STOP = 0x801F421C;       // (handle, ...)
+constexpr u32 W_SFX_PARAM = 0x801F4314;      // (handle, value)
+constexpr u32 W_SFX_STOP2 = 0x801F4130;      // (handle)
+// After calls of the handle wrappers whose result reaches game code.
+constexpr std::array<u32, 4> R_SFX_HANDLE{0x8006CA70, 0x8006CA08, 0x8006E2E4, 0x8006E9E0};
+
+enum class AcMode
+{
+  Off,
+  On,
+  Shadow
+};
+AcMode AcModeNow()
+{
+  static const AcMode mode = [] {
+    const std::string v = Env("NSR_AC", "1");
+    return v == "0" ? AcMode::Off : v == "shadow" ? AcMode::Shadow : AcMode::On;
+  }();
+  return mode;
+}
+
+struct AcMem
+{
+  const Core::CPUThreadGuard& guard;
+  u32 rd(u32 a) const { return PowerPC::MMU::HostRead<u32>(guard, a); }
+  u16 rd16(u32 a) const { return PowerPC::MMU::HostRead<u16>(guard, a); }
+  u8 rd8(u32 a) const { return PowerPC::MMU::HostRead<u8>(guard, a); }
+  void wr(u32 a, u32 v) const { PowerPC::MMU::HostWrite<u32>(guard, v, a); }
+};
+
+bool AcPtr(u32 a)
+{
+  return a >= 0x80003100 && a < 0x81800000;
+}
+
+std::map<u32, u32> s_ac_real;  // virtual id/handle -> this machine's real one
+struct AcStash
+{
+  bool valid = false;
+  u32 frame = 0, a = 0, b = 0, c = 0;
+};
+AcStash s_ac_sfx_start, s_ac_queue, s_ac_handle;
+
+void AcLogLine(const std::string& line)
+{
+  if (FILE* f = AcLog())
+    std::fprintf(f, "%s\n", line.c_str());
+}
+
+// Model active for this hook: session on, inside a frame, main thread, game caller.
+bool AcActive(const Core::CPUThreadGuard& guard, const PowerPC::PowerPCState& ppc)
+{
+  if (AcModeNow() == AcMode::Off || !AcGameCaller(guard, ppc))
+    return false;
+  return PowerPC::MMU::HostRead<u32>(guard, AC_BASE) == AC_MAGIC;
+}
+
+bool AcSoundLayerOn(const AcMem& m)
+{
+  return (m.rd(SND_FLAGS) & 0x00FFFF00) == 0x00010100;
+}
+
+u32 AcFramesToMs(u32 frames)
+{
+  return static_cast<u32>(u64(frames) * 1000 / 60);
+}
+
+// --- speech streams --------------------------------------------------------
+u32 AcStreamBase(u32 s)
+{
+  return AC_STREAM + s * AC_STREAM_SIZE;
+}
+
+// Pops the items that have finished by frame f (items play back to back).
+void AcSpeechAdvance(const AcMem& m, u32 s, u32 f)
+{
+  const u32 b = AcStreamBase(s);
+  u32 start = m.rd(b), count = std::min(m.rd(b + 4), AC_ITEMS);
+  bool changed = false;
+  while (count > 0)
+  {
+    const u32 dur = m.rd(b + 0x14);
+    if (static_cast<s32>(f - start) < static_cast<s32>(dur))
+      break;
+    start += dur;
+    for (u32 i = 0; i + 1 < count; ++i)
+    {
+      m.wr(b + 0x10 + 8 * i, m.rd(b + 0x18 + 8 * i));
+      m.wr(b + 0x14 + 8 * i, m.rd(b + 0x1C + 8 * i));
+    }
+    --count;
+    m.wr(b + 0x10 + 8 * count, 0);
+    m.wr(b + 0x14 + 8 * count, 0);
+    changed = true;
+  }
+  if (changed)
+  {
+    m.wr(b, start);
+    m.wr(b + 4, count);
+  }
+}
+
+// Frames a speech item plays. Deferred: the real length is in the clip's
+// EA stream header (SCHl, 'PT' tag 0x85 samples / 0x84 rate) on disc, which
+// the host could read once the stream source has resolved the clip's disc
+// position (fn_801F10B0); the DIR1 entry sizes do not predict it (one entry
+// holds several clips: same entry, 46..86 frames in a reference run). Until
+// then a fixed length near the median of a reference match (75 frames;
+// lines measured 25..491). Revisit if commentary pacing feels off.
+u32 AcSpeechFrames()
+{
+  static const u32 frames = ParseU32(Env("NSR_AC_SPEECH_FRAMES")).value_or(75);
+  return std::max<u32>(1, frames);
+}
+
+void AcSpeechQueue(const AcMem& m, u32 s, u32 vid, u32 frames, u32 f)
+{
+  static const u32 lead = ParseU32(Env("NSR_AC_SPEECH_LEAD")).value_or(0);
+  AcSpeechAdvance(m, s, f);
+  const u32 b = AcStreamBase(s);
+  const u32 count = m.rd(b + 4);
+  if (count >= AC_ITEMS)
+    return;  // the game never queues this deep; drop (deterministically)
+  if (count == 0)
+    m.wr(b, f + lead);
+  m.wr(b + 0x10 + 8 * count, vid);
+  m.wr(b + 0x14 + 8 * count, frames);
+  m.wr(b + 4, count + 1);
+}
+
+void AcSpeechRemove(const AcMem& m, u32 vid, u32 f)
+{
+  const u32 s = vid & 0xFF;
+  if (s >= AC_STREAMS)
+    return;
+  AcSpeechAdvance(m, s, f);
+  const u32 b = AcStreamBase(s);
+  const u32 count = m.rd(b + 4);
+  for (u32 i = 0; i < count; ++i)
+  {
+    if (m.rd(b + 0x10 + 8 * i) != vid)
+      continue;
+    if (i == 0)
+      m.wr(b, f);  // the next item starts now
+    for (u32 j = i; j + 1 < count; ++j)
+    {
+      m.wr(b + 0x10 + 8 * j, m.rd(b + 0x18 + 8 * j));
+      m.wr(b + 0x14 + 8 * j, m.rd(b + 0x1C + 8 * j));
+    }
+    m.wr(b + 0x10 + 8 * (count - 1), 0);
+    m.wr(b + 0x14 + 8 * (count - 1), 0);
+    m.wr(b + 4, count - 1);
+    return;
+  }
+}
+
+void AcStreamClear(const AcMem& m, u32 s)
+{
+  if (s >= AC_STREAMS)
+    return;
+  const u32 b = AcStreamBase(s);
+  for (u32 a = b; a < b + AC_STREAM_SIZE; a += 4)
+  {
+    if (a != b + 8)  // keep the volume
+      m.wr(a, 0);
+  }
+}
+
+// --- sound effects ---------------------------------------------------------
+// Frames a sound plays: longest sample of the patch (EA 'PT' tags), or
+// AC_LOOP if it loops. Bank table: *(0x803A6DF4) + 0xC * bank, header 'BNKb',
+// patch offsets at +0x14 relative to their own slot (fn_8026A6A8).
+u32 AcSfxFrames(const AcMem& m, u32 bank_struct, u32 sound)
+{
+  static const u32 fallback = ParseU32(Env("NSR_AC_SFX_DEFAULT")).value_or(30);
+  static const u32 tail = ParseU32(Env("NSR_AC_SFX_TAIL")).value_or(2);
+  if (!AcPtr(bank_struct))
+    return fallback;
+  const u32 bank = m.rd(bank_struct + 0x14);
+  const u32 table = m.rd(0x803A6DF4);
+  if (bank >= m.rd16(0x803A6C48) || !AcPtr(table))
+    return fallback;
+  const u32 hdr = m.rd(table + 0xC * bank);
+  if (!AcPtr(hdr) || m.rd(hdr) != 0x424E4B62 || sound >= m.rd16(hdr + 6))
+    return fallback;
+  const u32 slot = hdr + 0x14 + 4 * sound;
+  const u32 off = m.rd(slot);
+  if (off == 0 || !AcPtr(slot + off))
+    return fallback;
+  const u32 p = slot + off;
+  if (m.rd16(p) != 0x5054)  // 'PT'
+    return fallback;
+  u32 best = 0, samples = 0, rate = 22050;
+  bool loop = false, any = false;
+  auto close = [&] {
+    if (samples)
+      best = std::max<u32>(best, static_cast<u32>((u64(samples) * 60 + rate - 1) / rate));
+    samples = 0;
+    rate = 22050;
+  };
+  for (u32 i = p + 4, n = 0; i < p + 0x400 && n < 256; ++n)
+  {
+    const u8 t = m.rd8(i++);
+    if (t == 0xFF)
+      break;
+    if (t == 0xFD)
+    {
+      close();
+      any = true;
+      continue;
+    }
+    if (t == 0xFC || t == 0xFE)
+      continue;
+    const u8 len = m.rd8(i++);
+    u32 v = 0;
+    for (u32 k = 0; k < len && k < 4; ++k)
+      v = (v << 8) | m.rd8(i + k);
+    i += len;
+    if (t == 0x85)
+      samples = v;
+    else if (t == 0x84 && v)
+      rate = v;
+    else if (t == 0x86)
+      loop = true;
+  }
+  close();
+  if (loop)
+    return AC_LOOP;
+  return any && best ? best + tail : fallback;
+}
+
+// Slot index of a live virtual handle, or -1.
+s32 AcSfxFind(const AcMem& m, u32 vh)
+{
+  if ((vh & 0xFF000000) != AC_VIRTUAL_SFX)
+    return -1;
+  for (u32 i = 0; i < AC_SFX_SLOTS; ++i)
+  {
+    if (m.rd(AC_SFX + 12 * i) == vh)
+      return static_cast<s32>(i);
+  }
+  return -1;
+}
+
+bool AcSfxPlaying(const AcMem& m, s32 slot, u32 f)
+{
+  if (slot < 0)
+    return false;
+  const u32 end = m.rd(AC_SFX + 12 * slot + 8);
+  return end == AC_LOOP || static_cast<s32>(f - end) < 0;
+}
+
+u32 AcSfxStart(const AcMem& m, u32 frames, u32 f)
+{
+  const u32 seq = m.rd(AC_BASE + 4);
+  m.wr(AC_BASE + 4, seq + 1);
+  const u32 vh = AC_VIRTUAL_SFX | (seq & 0x00FFFFFF);
+  // A free or finished slot, else the oldest start.
+  u32 pick = 0, oldest = 0xFFFFFFFF;
+  for (u32 i = 0; i < AC_SFX_SLOTS; ++i)
+  {
+    const u32 a = AC_SFX + 12 * i;
+    if (m.rd(a) == 0 || !AcSfxPlaying(m, static_cast<s32>(i), f))
+    {
+      pick = i;
+      break;
+    }
+    if (m.rd(a + 4) < oldest)
+    {
+      oldest = m.rd(a + 4);
+      pick = i;
+    }
+  }
+  const u32 a = AC_SFX + 12 * pick;
+  m.wr(a, vh);
+  m.wr(a + 4, f);
+  m.wr(a + 8, frames == AC_LOOP ? AC_LOOP : f + frames);
+  return vh;
+}
+
+u32 AcReal(u32 vid)
+{
+  const auto it = s_ac_real.find(vid);
+  return it == s_ac_real.end() ? 0xFFFFFFFF : it->second;
+}
+
+// --- bank uploads ----------------------------------------------------------
+bool AcBankReady(const AcMem& m, u32 record, u32 f)
+{
+  static const u32 wait = ParseU32(Env("NSR_AC_BANK_FRAMES")).value_or(6);
+  s32 free_slot = -1, oldest_slot = 0;
+  u32 oldest = 0xFFFFFFFF;
+  for (u32 i = 0; i < AC_BANK_SLOTS; ++i)
+  {
+    const u32 a = AC_BANK + 8 * i;
+    if (m.rd(a) == record)
+    {
+      if (f - m.rd(a + 4) < wait)
+        return false;
+      m.wr(a, 0);
+      m.wr(a + 4, 0);
+      return true;
+    }
+    if (m.rd(a) == 0 && free_slot < 0)
+      free_slot = static_cast<s32>(i);
+    if (m.rd(a) != 0 && m.rd(a + 4) < oldest)
+    {
+      oldest = m.rd(a + 4);
+      oldest_slot = static_cast<s32>(i);
+    }
+  }
+  const u32 a = AC_BANK + 8 * static_cast<u32>(free_slot >= 0 ? free_slot : oldest_slot);
+  m.wr(a, record);
+  m.wr(a + 4, f);
+  return wait == 0;
+}
+}  // namespace
+
+void AudioClockSessionStart(const Core::CPUThreadGuard& guard)
+{
+  if (AcModeNow() == AcMode::Off)
+    return;
+  const AcMem m{guard};
+  for (u32 a = AC_BASE; a < AC_END; a += 4)
+    m.wr(a, 0);
+  m.wr(AC_BASE, AC_MAGIC);
+  s_ac_real.clear();
+  Log("audio clock: model at {:08x}..{:08x} ({})", AC_BASE, AC_END,
+      AcModeNow() == AcMode::Shadow ? "shadow" : "on");
+}
+
+// Queries (HookType::Gate): answer from the model and skip the wrapper.
+void AudioClockQueryHook(const Core::CPUThreadGuard& guard)
+{
+  auto& ppc = guard.GetSystem().GetPPCState();
+  const u32 pc = s_hook_pc;
+  if (!AcActive(guard, ppc))
+    return;
+  const AcMem m{guard};
+  const u32 f = s_rb.tick_running;
+  const bool shadow = AcModeNow() == AcMode::Shadow;
+  if (pc == C_BANK_READY)
+  {
+    const u32 record = ppc.gpr[9];
+    const bool ready = AcBankReady(m, record, f);
+    if (shadow)
+    {
+      AcLogLine(fmt::format("V {} bank {:08x} {}", f, record, ready ? 1 : 0));
+      return;
+    }
+    ppc.gpr[3] = ready ? 1 : 0;
+    ppc.npc = C_BANK_READY + 4;
+    return;
+  }
+  if (!AcSoundLayerOn(m))
+    return;  // the wrapper returns at once without touching audio
+  const u32 r3 = ppc.gpr[3], r4 = ppc.gpr[4];
+  u32 ret = 0;
+  switch (pc)
+  {
+  case W_SPEECH_STATUS:
+  {
+    const u32 s = AcPtr(r3) ? m.rd(r3) : 0xFFFFFFFF;
+    u32 count = 0, head = 0, ms = 0;
+    if (s < AC_STREAMS)
+    {
+      AcSpeechAdvance(m, s, f);
+      const u32 b = AcStreamBase(s);
+      count = m.rd(b + 4);
+      if (count)
+      {
+        head = m.rd(b + 0x10);
+        const u32 start = m.rd(b), dur = m.rd(b + 0x14);
+        ms = AcFramesToMs(static_cast<s32>(f - start) < 0 ? dur : start + dur - f);
+      }
+    }
+    if (shadow)
+    {
+      AcLogLine(fmt::format("V {} speech {} {} {:08x} {}", f, s, count, head, ms));
+      return;
+    }
+    m.wr(r4, count);
+    m.wr(r4 + 4, head);
+    m.wr(r4 + 8, ms);
+    ret = 0;
+    break;
+  }
+  case W_EVENT_STATUS:
+  {
+    u32 out[4] = {0, 0, 0, 0};
+    ret = 0xFFFFFFF8;
+    const u32 s = r3 & 0xFF;
+    if (s < AC_STREAMS && static_cast<s32>(r3) >= 0)
+    {
+      AcSpeechAdvance(m, s, f);
+      const u32 b = AcStreamBase(s);
+      u32 at = m.rd(b);
+      for (u32 i = 0, n = m.rd(b + 4); i < n; ++i)
+      {
+        const u32 dur = m.rd(b + 0x14 + 8 * i);
+        if (m.rd(b + 0x10 + 8 * i) == r3)
+        {
+          const u32 elapsed = i == 0 && static_cast<s32>(f - at) > 0 ? f - at : 0;
+          out[0] = i == 0 ? 2 : 1;
+          out[1] = AcFramesToMs(elapsed);
+          out[2] = AcFramesToMs(dur - std::min(dur, elapsed));
+          out[3] = AcFramesToMs(dur);
+          ret = 0;
+          break;
+        }
+        at += dur;
+      }
+    }
+    if (shadow)
+    {
+      AcLogLine(fmt::format("V {} event {:08x} {} {} {}", f, r3, out[0], out[1], ret));
+      return;
+    }
+    for (u32 i = 0; i < 4; ++i)
+      m.wr(r4 + 4 * i, out[i]);
+    break;
+  }
+  case W_SFX_FINISHED:
+  {
+    ret = AcSfxPlaying(m, AcSfxFind(m, r3), f) ? 0 : 1;
+    if (shadow)
+    {
+      AcLogLine(fmt::format("V {} finished {:08x} {}", f, r3, ret));
+      return;
+    }
+    break;
+  }
+  case W_STREAM_VOLUME:
+  {
+    const u32 s = AcPtr(r3) ? m.rd(r3) : 0xFFFFFFFF;
+    ret = s < AC_STREAMS ? m.rd(AcStreamBase(s) + 8) : 0;
+    if (shadow)
+    {
+      AcLogLine(fmt::format("V {} volume {} {}", f, s, ret));
+      return;
+    }
+    break;
+  }
+  default:
+    return;
+  }
+  ppc.gpr[3] = ret;
+  ppc.npc = LR(ppc);
+}
+
+// Effects (HookType::Start): keep the model in step, translate ids.
+void AudioClockEffectHook(const Core::CPUThreadGuard& guard)
+{
+  auto& ppc = guard.GetSystem().GetPPCState();
+  const u32 pc = s_hook_pc;
+  // Return sites are inside game functions: LR there is not the wrapper's
+  // caller, so check the session conditions without the LR test.
+  const bool return_site =
+      pc == R_SFX_START || std::find(R_SPEECH_QUEUE.begin(), R_SPEECH_QUEUE.end(), pc) != R_SPEECH_QUEUE.end() ||
+      std::find(R_SFX_HANDLE.begin(), R_SFX_HANDLE.end(), pc) != R_SFX_HANDLE.end();
+  const Rollback& r = s_rb;
+  if (AcModeNow() == AcMode::Off || !r.vtime_on || !r.in_unit ||
+      PowerPC::MMU::HostRead<u32>(guard, 0x800000E4) != 0x803A3F30 ||
+      PowerPC::MMU::HostRead<u32>(guard, AC_BASE) != AC_MAGIC)
+    return;
+  if (!return_site && LR(ppc) >= 0x8025E000)
+    return;
+  const AcMem m{guard};
+  const u32 f = r.tick_running;
+  const bool shadow = AcModeNow() == AcMode::Shadow;
+  const u32 r3 = ppc.gpr[3];
+  switch (pc)
+  {
+  case W_SFX_START:
+  {
+    // fn_801F4050 calls the middleware only if the sound layer is on and the
+    // bank's ready byte (+0x1C, set by the virtualised bank service) is set.
+    const bool calls = m.rd8(SND_FLAGS + 1) && m.rd8(SND_FLAGS + 2) && AcPtr(r3) && m.rd8(r3 + 0x1C);
+    s_ac_sfx_start = {calls, f, r3, ppc.gpr[4], 0};
+    return;
+  }
+  case R_SFX_START:
+  {
+    if (!s_ac_sfx_start.valid || s_ac_sfx_start.frame != f)
+      return;
+    s_ac_sfx_start.valid = false;
+    const u32 frames = AcSfxFrames(m, s_ac_sfx_start.a, s_ac_sfx_start.b);
+    const u32 vh = AcSfxStart(m, frames, f);
+    s_ac_real[vh] = r3;
+    AcLogLine(fmt::format("E {} sfx {:08x} {:x} frames {} -> {:08x} real {:08x}", f, s_ac_sfx_start.a,
+                          s_ac_sfx_start.b, frames == AC_LOOP ? -1 : static_cast<s32>(frames), vh, r3));
+    if (!shadow)
+      ppc.gpr[3] = vh;
+    return;
+  }
+  case W_SPEECH_QUEUE:
+  {
+    const u32 s = AcPtr(r3) ? m.rd(r3) : 0xFFFFFFFF;
+    s_ac_queue = {AcSoundLayerOn(m) && s < AC_STREAMS, f, s, 0, 0};
+    return;
+  }
+  case W_SPEECH_SKIP:
+  {
+    const u32 real = AcReal(r3);
+    AcLogLine(fmt::format("E {} skip {:08x} real {:08x}", f, r3, real));
+    AcSpeechRemove(m, r3, f);
+    if (!shadow)
+      ppc.gpr[3] = real;
+    return;
+  }
+  case W_STREAM_STOP:
+  case W_STREAM_DESTROY:
+  {
+    const u32 s = AcPtr(r3) ? m.rd(r3) : 0xFFFFFFFF;
+    AcLogLine(fmt::format("E {} stream-stop {}", f, s));
+    AcStreamClear(m, s);
+    return;
+  }
+  case W_STREAM_SETVOL:
+  case W_STREAM_FADE:
+  {
+    const u32 s = AcPtr(r3) ? m.rd(r3) : 0xFFFFFFFF;
+    if (s < AC_STREAMS)
+      m.wr(AcStreamBase(s) + 8, pc == W_STREAM_SETVOL ? ppc.gpr[4] : ppc.gpr[5]);
+    return;
+  }
+  case W_SFX_FADE:
+  case W_SFX_STOP:
+  case W_SFX_PARAM:
+  case W_SFX_STOP2:
+  {
+    const s32 slot = AcSfxFind(m, r3);
+    const bool playing = AcSfxPlaying(m, slot, f);
+    s_ac_handle = {true, f, playing ? static_cast<u32>(slot) : 0xFFFFFFF8, 0, 0};
+    if ((pc == W_SFX_STOP || pc == W_SFX_STOP2) && slot >= 0 && playing)
+      m.wr(AC_SFX + 12 * slot + 8, f);  // stopped: finished from now on
+    if ((r3 & 0xFF000000) == AC_VIRTUAL_SFX && !shadow)
+      ppc.gpr[3] = AcReal(r3);
+    return;
+  }
+  default:
+    break;
+  }
+  if (std::find(R_SPEECH_QUEUE.begin(), R_SPEECH_QUEUE.end(), pc) != R_SPEECH_QUEUE.end())
+  {
+    if (!s_ac_queue.valid || s_ac_queue.frame != f)
+      return;
+    s_ac_queue.valid = false;
+    const u32 s = s_ac_queue.a;
+    const u32 seq = m.rd(AC_BASE + 8);
+    m.wr(AC_BASE + 8, seq + 1);
+    const u32 vid = ((seq + 1) & 0x00FFFFFF) << 8 | s;
+    const u32 frames = AcSpeechFrames();
+    AcSpeechQueue(m, s, vid, frames, f);
+    s_ac_real[vid] = r3;
+    AcLogLine(fmt::format("E {} queue {} frames {} -> {:08x} real {:08x}", f, s, frames, vid, r3));
+    if (!shadow)
+      ppc.gpr[3] = vid;
+    return;
+  }
+  if (std::find(R_SFX_HANDLE.begin(), R_SFX_HANDLE.end(), pc) != R_SFX_HANDLE.end())
+  {
+    if (s_ac_handle.valid && s_ac_handle.frame == f && !shadow)
+      ppc.gpr[3] = s_ac_handle.a;
+    s_ac_handle.valid = false;
+  }
+}
+
+std::vector<unsigned int> AudioClockQueryHooks()
+{
+  return {W_SPEECH_STATUS, W_EVENT_STATUS, W_SFX_FINISHED, W_STREAM_VOLUME, C_BANK_READY};
+}
+
+std::vector<unsigned int> AudioClockEffectHooks()
+{
+  std::vector<unsigned int> v{W_SFX_START,   R_SFX_START,      W_SPEECH_QUEUE,  W_SPEECH_SKIP,
+                              W_STREAM_STOP, W_STREAM_DESTROY, W_STREAM_SETVOL, W_STREAM_FADE,
+                              W_SFX_FADE,    W_SFX_STOP,       W_SFX_PARAM,     W_SFX_STOP2};
+  v.insert(v.end(), R_SPEECH_QUEUE.begin(), R_SPEECH_QUEUE.end());
+  v.insert(v.end(), R_SFX_HANDLE.begin(), R_SFX_HANDLE.end());
+  return v;
 }
 
 std::vector<unsigned int> ResimSkipList()
