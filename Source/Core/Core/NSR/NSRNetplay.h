@@ -144,6 +144,12 @@ constexpr unsigned int LOAD_START_FN = 0x801ED634;
 constexpr unsigned int LOAD_DONE_FN = 0x801EC914;
 void LoadBarrierHook(const Core::CPUThreadGuard& guard);  // HookType::Start  // functions skipped in re-simulated frames
 void PresentHook(const Core::CPUThreadGuard& guard);    // HookType::Gate
+// fn_80198B24 reads the depth buffer at a screen point (GXPeekZ) for an
+// object's visibility flag. EFB contents differ between GPUs/backends, so
+// during the session it returns NSR_RB_PEEKZ (default 0, what the Null
+// backend returns and what all determinism tests ran with).
+constexpr unsigned int PEEK_Z_FN = 0x80198B24;
+void PeekZHook(const Core::CPUThreadGuard& guard);  // HookType::Gate
 // Called after each tick's sim part 2 (no arguments).
 void RollbackTickEndHook(const Core::CPUThreadGuard& guard);
 // Rollback session with NSR_RB_INSTANT_DISC: DVD commands complete with

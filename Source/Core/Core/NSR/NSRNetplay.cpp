@@ -963,6 +963,17 @@ void RbSampleIo(const Core::CPUThreadGuard& guard)
 }
 std::atomic<s64> s_rb_last_tick_ms{0};  // host time of the last tick hook (watchdog)
 
+std::optional<u64> ParseU64(const std::string& text)
+{
+  if (text.empty())
+    return std::nullopt;
+  char* end = nullptr;
+  const unsigned long long v = std::strtoull(text.c_str(), &end, 0);
+  if (end == text.c_str() || *end != '\0')
+    return std::nullopt;
+  return v;
+}
+
 std::optional<u32> ParseU32(const std::string& text)
 {
   if (text.empty())
@@ -1373,6 +1384,12 @@ bool IsIoIdle(const u8* ram)
   auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
   if (rd(0x803ED118) != 0)
     return false;
+  // ARQ (audio-RAM DMA, shared by audio streaming and game copies): no queued
+  // or pending request, or a restore could desync the middleware from the
+  // hardware (rb-coverage-review L4).
+  for (const u32 a : {0x803ED2D8u, 0x803ED2E0u, 0x803ED2F0u, 0x803ED2F4u})
+    if (rd(a) != 0)
+      return false;
   for (u32 i = 0; i < 4; ++i)
   {
     const u32 sentinel = 0x803A55D8 + 8 * i;
@@ -1431,6 +1448,10 @@ void RbRestore(Core::System& system, u8* ram, const std::vector<u8>& slot)
   auto& jit = system.GetJitInterface();
   for (const u32 page : changed)
     jit.InvalidateICache(0x80000000 | page, PAGE, true);
+  // The emulated instruction cache too: recompilation fetches through it, so
+  // stale lines would keep the old code bytes (rb-coverage-review C5).
+  if (!changed.empty())
+    system.GetPPCState().iCache.Reset(jit);
 }
 
 // Compare RAM (re-simulated state before tick t) with the original state
@@ -1890,6 +1911,22 @@ static void RbDumpUnit(Core::System& system, const u8* ram, u32 live, u32 frame)
   }
 }
 
+// Forced-rollback depth for a live unit: NSR_RB_FORCE, or with
+// NSR_RB_FORCE_RANDOM=seed a pseudo-random depth in 0..NSR_RB_FORCE per unit
+// (0 = no rollback), like netplay's varying misprediction depths. Two runs
+// with different seeds model two peers with different rollback patterns.
+static u32 ForcedDepth(u32 live)
+{
+  static const std::optional<u32> seed = ParseU32(Env("NSR_RB_FORCE_RANDOM"));
+  if (!seed)
+    return s_rb.force;
+  u64 z = (u64(*seed) << 32 | live) + 0x9E3779B97F4A7C15ULL;
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  z ^= z >> 31;
+  return static_cast<u32>(z % (s_rb.force + 1));
+}
+
 u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
 {
   auto& system = guard.GetSystem();
@@ -1955,17 +1992,19 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
         std::memcpy(r.ring[r.live % slots].data() + lo, ram + lo, hi - lo);
       RbCheck(r.live, ram, r.ring[r.live % slots]);
     }
-    else if (r.force > 0 && r.live >= r.force + r.force_from && r.live <= r.force_to)
+    else if (r.force > 0 && r.live >= r.force + r.force_from && r.live <= r.force_to &&
+             ForcedDepth(r.live) > 0)
     {
       // Forced rollback (stage 1 test): keep the state before this unit, go
-      // back `force` units (not past the load barrier), and re-run them with
+      // back `depth` units (not past the load barrier), and re-run them with
       // the pads they had.
-      u32 target = std::max(r.live - r.force, r.barrier);
+      const u32 depth = std::min(ForcedDepth(r.live), r.live - std::min(r.live, r.vtime_from));
+      u32 target = std::max(r.live - depth, r.barrier);
       if (r.io_idle_mode)
       {
         // Only while idle now, to the newest idle snapshot at or before the
         // target still in the ring.
-        target = r.live - r.force;
+        target = r.live - depth;
         const u32 oldest = r.live >= slots - 1 ? r.live - (slots - 1) : 0;
         while (target >= oldest && target > 0 && !(r.io_idle.contains(target) && r.io_idle[target]))
           --target;
@@ -1977,7 +2016,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
       }
       if (target < r.live)
       {
-        if (target != r.live - r.force)
+        if (target != r.live - depth)
           ++r.clamped;
         RbSave(ram, r.ring[r.live % slots]);
         RbRestore(system, ram, r.ring[target % slots]);
@@ -2097,7 +2136,12 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
   if (r.vtime_from && t == r.vtime_from && !r.vtime_on)
   {
     r.vtime_on = true;
-    r.vtime_base = system.GetSystemTimers().GetFakeTimeBase();
+    // The same base on every machine (each machine's own time base differs,
+    // and game frame timers floor time*60/clock), a whole number of frames.
+    // NSR_RB_VTIME_BASE overrides it (netplay: agreed at session start).
+    constexpr u64 TB_PER_FRAME = 40500000 / 60;
+    r.vtime_base = ParseU64(Env("NSR_RB_VTIME_BASE")).value_or(TB_PER_FRAME << 37) /
+                   TB_PER_FRAME * TB_PER_FRAME;
     Log("virtual tick time from tick {} (base {:016x})", t, r.vtime_base);
   }
   r.in_unit = true;
@@ -2239,6 +2283,16 @@ u32 s_hook_pc = 0;
 // including the present's bookkeeping (framebuffer flip): skipping
 // the whole present (fn_801CE82C) left that game state out of step and broke
 // matches. Extra flips within one retrace are invisible: VI shows the last.
+void PeekZHook(const Core::CPUThreadGuard& guard)
+{
+  if (!s_rb.vtime_on)
+    return;  // outside the session: run the real peek
+  static const u32 value = ParseU32(Env("NSR_RB_PEEKZ")).value_or(0);
+  auto& ppc = guard.GetSystem().GetPPCState();
+  ppc.gpr[3] = value;
+  ppc.npc = LR(ppc);
+}
+
 void PresentHook(const Core::CPUThreadGuard& guard)
 {
   Rollback& r = s_rb;
@@ -2272,10 +2326,18 @@ void RollbackTickEndHook(const Core::CPUThreadGuard& guard)
 namespace
 {
 // Virtual time for a time read from game code inside a tick, or nothing.
-std::optional<u64> VirtualTime(const PowerPC::PowerPCState& ppc)
+std::optional<u64> VirtualTime(const Core::CPUThreadGuard& guard, const PowerPC::PowerPCState& ppc)
 {
   Rollback& r = s_rb;
   if (!r.vtime_on || !r.in_unit || LR(ppc) >= 0x80230000)  // SDK callers: real time
+    return std::nullopt;
+  // Spin-waits on ARQ (audio-shared DMA queue; fn_801C1D98..fn_801C1F54) read
+  // the time once per iteration, a timing-dependent count: real time, and
+  // they don't consume a virtual call slot (rb-coverage-review L1).
+  if (LR(ppc) >= 0x801C1D98 && LR(ppc) < 0x801C1F54)
+    return std::nullopt;
+  // Only the main thread runs the sim (rb-coverage-review L1c).
+  if (PowerPC::MMU::HostRead<u32>(guard, 0x800000E4) != 0x803A3F30)
     return std::nullopt;
   constexpr u64 TB_PER_TICK = 40500000 / 60;  // GameCube time base, one 60 Hz frame
   return r.vtime_base + u64(r.tick_running - r.vtime_from) * TB_PER_TICK + 64 * u64(r.vtime_calls++);
@@ -2286,7 +2348,7 @@ void OSGetTimeHook(const Core::CPUThreadGuard& guard)
 {
   auto& system = guard.GetSystem();
   auto& ppc = system.GetPPCState();
-  const u64 t = VirtualTime(ppc).value_or(system.GetSystemTimers().GetFakeTimeBase());
+  const u64 t = VirtualTime(guard, ppc).value_or(system.GetSystemTimers().GetFakeTimeBase());
   ppc.gpr[3] = static_cast<u32>(t >> 32);
   ppc.gpr[4] = static_cast<u32>(t);
   ppc.npc = LR(ppc);
@@ -2296,7 +2358,7 @@ void OSGetTickHook(const Core::CPUThreadGuard& guard)
 {
   auto& system = guard.GetSystem();
   auto& ppc = system.GetPPCState();
-  ppc.gpr[3] = static_cast<u32>(VirtualTime(ppc).value_or(system.GetSystemTimers().GetFakeTimeBase()));
+  ppc.gpr[3] = static_cast<u32>(VirtualTime(guard, ppc).value_or(system.GetSystemTimers().GetFakeTimeBase()));
   ppc.npc = LR(ppc);
 }
 
@@ -2389,9 +2451,14 @@ void AudioGateReturnHook(const Core::CPUThreadGuard& guard)
 
 std::vector<unsigned int> ResimSkipList()
 {
+  // Default: skip nothing; re-simulated frames draw fully. Skipping world
+  // draws left CPU-side render state (a ring allocator cursor, view/object
+  // matrices, EA draw state) permanently different from a no-rollback run,
+  // so peers with different rollback histories could never hash equal
+  // (rb-coverage-review C1). Each frame costs one retrace either way.
   const std::string spec = Env("NSR_RB_SKIP_RESIM");
   if (spec.empty())
-    return {RENDER_FN};
+    return {};
   std::vector<unsigned int> out;
   for (const std::string& a : Split(spec, ','))
     if (const auto v = ParseU32(a))
