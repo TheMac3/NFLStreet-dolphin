@@ -2283,6 +2283,15 @@ u32 s_hook_pc = 0;
 // including the present's bookkeeping (framebuffer flip): skipping
 // the whole present (fn_801CE82C) left that game state out of step and broke
 // matches. Extra flips within one retrace are invisible: VI shows the last.
+void ViCallbackHook(const Core::CPUThreadGuard& guard)
+{
+  auto& ppc = guard.GetSystem().GetPPCState();
+  const u32 lr = LR(ppc);
+  const bool from_frame_routine = lr >= RB_FRAME_CODE && lr < RB_FRAME_CODE + 0x80;
+  if (from_frame_routine != s_rb.vtime_on)
+    ppc.npc = lr;  // skip this call
+}
+
 void PeekZHook(const Core::CPUThreadGuard& guard)
 {
   if (!s_rb.vtime_on)

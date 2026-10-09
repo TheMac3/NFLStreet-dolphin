@@ -31,7 +31,7 @@ namespace HLE
 static std::map<u32, u32> s_hooked_addresses;
 
 // clang-format off
-constexpr std::array<Hook, 39> os_patches{{
+constexpr std::array<Hook, 40> os_patches{{
     // Placeholder, os_patches[0] is the "non-existent function" index
     {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
 
@@ -77,6 +77,7 @@ constexpr std::array<Hook, 39> os_patches{{
     {"NSR_TickCount",                NSRNetplay::TickCountHook,             HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: one tick per frame
     {"NSR_Present",                  NSRNetplay::PresentHook,               HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: no vsync wait in re-sim
     {"NSR_PeekZ",                    NSRNetplay::PeekZHook,                 HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: GPU-independent depth peek
+    {"NSR_ViCallback",               NSRNetplay::ViCallbackHook,            HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: retrace counters per frame
     {"NSR_LoadBarrier",              NSRNetplay::LoadBarrierHook,           HookType::Start,   HookFlag::Fixed}, // NFLStreet POC rollback: disc load barrier
     {"NSR_AudioGate",                NSRNetplay::AudioGateHook,             HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: audio side effects
     {"NSR_AudioGateReturn",          NSRNetplay::AudioGateReturnHook,       HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: record audio results
@@ -144,6 +145,7 @@ void PatchFixedFunctions(Core::System& system)
     Patch(system, NSRNetplay::TICK_COUNT_FN, "NSR_TickCount");
     Patch(system, NSRNetplay::VI_WAIT_FOR_RETRACE, "NSR_Present");
     Patch(system, NSRNetplay::PEEK_Z_FN, "NSR_PeekZ");
+    Patch(system, NSRNetplay::VI_PRE_CB, "NSR_ViCallback");
     // Functions skipped in re-simulated frames: NSR_RB_SKIP_RESIM=addr,...
     // (default: none, re-simulated frames draw fully); NSR_RB_RENDER_RESIM forces none.
     if (!std::getenv("NSR_RB_RENDER_RESIM"))

@@ -150,6 +150,14 @@ void PresentHook(const Core::CPUThreadGuard& guard);    // HookType::Gate
 // backend returns and what all determinism tests ran with).
 constexpr unsigned int PEEK_Z_FN = 0x80198B24;
 void PeekZHook(const Core::CPUThreadGuard& guard);  // HookType::Gate
+// The game's VI pre-retrace callback fn_801F7DF4 advances a retrace counter
+// (*(0x803EBE44)+0x20) and a retrace-driven clock that game code reads. The
+// rollback frame routine also calls it once per frame. During the session
+// only that call runs (counters follow frames: a frame may take several
+// retraces, differently on each peer); before it, only the interrupt's.
+constexpr unsigned int VI_PRE_CB = 0x801F7DF4;
+constexpr unsigned int RB_FRAME_CODE = 0x80416A80;  // isopatch frame routine (calls VI_PRE_CB)
+void ViCallbackHook(const Core::CPUThreadGuard& guard);  // HookType::Gate
 // Called after each tick's sim part 2 (no arguments).
 void RollbackTickEndHook(const Core::CPUThreadGuard& guard);
 // Rollback session with NSR_RB_INSTANT_DISC: DVD commands complete with
