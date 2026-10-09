@@ -855,6 +855,14 @@ struct Rollback
 {
   bool initialized = false;
   u32 force = 0;          // NSR_RB_FORCE: ticks to roll back before every live tick
+  // NSR_RB_MISPREDICT=d (with NSR_RB_REPLAY, and NSR_RB_FORCE > 0 for the ring):
+  // netplay with input delay d on one machine. Each live frame runs with the
+  // last confirmed pads (frame t-d) as its prediction; when frame c = t-d's
+  // true pads differ from what c ran with, roll back to c (or the newest
+  // I/O-idle snapshot before it) and re-run with the corrected pads.
+  u32 mispredict = 0;
+  u32 mispredict_pending = UINT32_MAX;  // earliest frame still to correct
+  u64 mispredictions = 0;
   u32 force_from = 0;     // NSR_RB_FORCE_FROM: first live tick that is rolled back
   u32 force_to = 0xFFFFFFFF;  // NSR_RB_FORCE_TO: last one (diagnostics)
   u32 perturb_at = 0;     // NSR_RB_PERTURB_AT: diagnostics, see RollbackTickHook
@@ -1015,6 +1023,7 @@ void RbInit(Core::System& system)
     Log("replaying pads for {} ticks", r.replay.size());
   }
   r.force_from = ParseU32(Env("NSR_RB_FORCE_FROM")).value_or(0);
+  r.mispredict = ParseU32(Env("NSR_RB_MISPREDICT")).value_or(0);
   r.force_to = ParseU32(Env("NSR_RB_FORCE_TO")).value_or(0xFFFFFFFF);
   r.perturb_at = ParseU32(Env("NSR_RB_PERTURB_AT")).value_or(0);
   r.vtime_from = ParseU32(Env("NSR_RB_VTIME_FROM")).value_or(0);
@@ -1927,6 +1936,14 @@ static u32 ForcedDepth(u32 live)
   return static_cast<u32>(z % (s_rb.force + 1));
 }
 
+// Misprediction mode: the pads frame t really had (the replayed recording).
+static Pads TruePads(u32 t)
+{
+  if (const auto it = s_rb.replay.find(t); it != s_rb.replay.end())
+    return it->second;
+  return s_rb.latest;
+}
+
 u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
 {
   auto& system = guard.GetSystem();
@@ -1988,9 +2005,59 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     {
       // Re-simulation reached the live tick again: the state must match what
       // it was before the rollback.
-      for (const auto& [lo, hi] : RbLiveRanges(system, ram))
-        std::memcpy(r.ring[r.live % slots].data() + lo, ram + lo, hi - lo);
-      RbCheck(r.live, ram, r.ring[r.live % slots]);
+      if (r.mispredict == 0)  // with corrected pads the state is meant to differ
+      {
+        for (const auto& [lo, hi] : RbLiveRanges(system, ram))
+          std::memcpy(r.ring[r.live % slots].data() + lo, ram + lo, hi - lo);
+        RbCheck(r.live, ram, r.ring[r.live % slots]);
+      }
+    }
+    else if (r.mispredict > 0 && r.force > 0)
+    {
+      // Misprediction mode: confirm frame c = live - d.
+      const u32 t = r.live, d = r.mispredict;
+      const u32 start = std::max(r.force_from, r.vtime_from);
+      if (t >= start + d)
+      {
+        const u32 c = t - d;
+        if (r.pads.contains(c) && r.pads[c] != TruePads(c))
+        {
+          r.mispredict_pending = std::min(r.mispredict_pending, c);
+          ++r.mispredictions;
+        }
+      }
+      if (r.mispredict_pending != UINT32_MAX)
+      {
+        u32 target = r.mispredict_pending;
+        const u32 oldest = t >= slots - 1 ? t - (slots - 1) : 0;
+        bool ok = target >= oldest && target >= start;
+        if (ok && r.io_idle_mode)
+        {
+          while (target >= oldest && target > start && !(r.io_idle.contains(target) && r.io_idle[target]))
+            --target;
+          ok = IsIoIdle(ram) && target >= oldest && r.io_idle.contains(target) && r.io_idle[target];
+        }
+        if (ok)
+        {
+          // Corrected pads: true up to the newest confirmed frame, then the
+          // new prediction (its pads) for the unconfirmed ones.
+          const u32 confirmed = t >= d ? t - d : 0;
+          for (u32 j = target; j < t; ++j)
+            r.pads[j] = TruePads(std::min(j, confirmed));
+          RbSave(ram, r.ring[t % slots]);
+          RbRestore(system, ram, r.ring[target % slots]);
+          r.cursor = target;
+          r.rolled = true;
+          ++r.rollbacks;
+          r.mispredict_pending = UINT32_MAX;
+        }
+        else
+        {
+          ++r.skipped_busy;  // retry next frame (deeper rollback then)
+          if (target < oldest)
+            Log("misprediction at {} fell out of the snapshot ring (live {})", r.mispredict_pending, t);
+        }
+      }
     }
     else if (r.force > 0 && r.live >= r.force + r.force_from && r.live <= r.force_to &&
              ForcedDepth(r.live) > 0)
@@ -2125,6 +2192,8 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     r.pads[t] = it->second;  // same inputs per tick as a recorded run
   else
     r.pads[t] = r.latest;
+  if (r.mispredict > 0 && r.force > 0 && t >= std::max(r.force_from, r.vtime_from) + r.mispredict)
+    r.pads[t] = TruePads(t - r.mispredict);  // prediction: last confirmed pads
   if (r.record)
   {
     std::fwrite(&t, 4, 1, r.record);
@@ -2163,10 +2232,10 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
   {
     Log("tick {}: rollbacks {}, re-simulated {}, mismatched checks {}/{}; audio gate: "
         "recorded {}, replayed {}, mismatched {}; load barriers {} (clamped {}, in re-sim {}); "
-        "io-idle skips {}",
+        "io-idle skips {}; mispredictions {}",
         t, r.rollbacks, r.resim_ticks, r.mismatched_checks, r.checks, r.gate_recorded,
         r.gate_replayed, r.gate_mismatched, r.barrier_events, r.clamped, r.barrier_resim,
-        r.skipped_busy);
+        r.skipped_busy, r.mispredictions);
     if (r.mismatched_checks > 0)
       RbReport(15);  // Dolphin is usually killed, not shut down: report as we go
     // Revisit NSR_RB_VMEM_BYTES if the game ever uses fake VMEM past it.
