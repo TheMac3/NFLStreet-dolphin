@@ -36,6 +36,7 @@
 #include "Core/HW/HSP/HSP.h"
 #include "Core/HW/MMIO.h"
 #include "Core/HW/Memmap.h"
+#include "Core/HW/SystemTimers.h"
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
@@ -431,7 +432,9 @@ void DSPManager::UpdateAudioDMA()
     // streaming output.
     auto& memory = m_system.GetMemory();
     void* address = memory.GetPointerForRange(m_audio_dma.current_source_address, 32);
-    AudioCommon::SendAIBuffer(m_system, static_cast<short*>(address), 8);
+    // NFLStreet rollback: re-simulated frames' audio was heard live already.
+    if (m_system.GetSystemTimers().GetNSRSpeedFactor() == 1.0f)
+      AudioCommon::SendAIBuffer(m_system, static_cast<short*>(address), 8);
 
     if (m_audio_dma.remaining_blocks_count != 0)
     {
@@ -447,7 +450,7 @@ void DSPManager::UpdateAudioDMA()
       GenerateDSPInterrupt(DSP::INT_AID, 0);
     }
   }
-  else
+  else if (m_system.GetSystemTimers().GetNSRSpeedFactor() == 1.0f)
   {
     AudioCommon::SendAIBuffer(m_system, &zero_samples[0], 8);
   }
@@ -462,6 +465,8 @@ void DSPManager::Do_ARAM_DMA()
 
   // ARAM DMA transfer rate has been measured on real hw
   int ticksToTransfer = (m_aram_dma.Cnt.count / 32) * 246;
+  if (m_nsr_speed_factor != 1.0f)
+    ticksToTransfer = static_cast<int>(ticksToTransfer / m_nsr_speed_factor);
   core_timing.ScheduleEvent(ticksToTransfer, m_event_type_complete_aram);
 
   // Real hardware DMAs in 32byte chunks, but we can get by with 8byte chunks

@@ -76,6 +76,10 @@ public:
   void EmulatorState(bool running);
   void ResetVideoBuffer();
 
+  // NFLStreet rollback: single-core GPU command processing runs `factor`
+  // times faster in emulated time (re-simulated frames; 1 = configured speed).
+  void SetNSRSpeedFactor(float factor) { m_nsr_speed_factor = factor; }
+
 private:
   void RefreshConfig();
   void ReadDataFromFifo(u32 read_ptr);
@@ -128,6 +132,7 @@ private:
   int m_config_sync_gpu_max_distance = 0;
   int m_config_sync_gpu_min_distance = 0;
   float m_config_sync_gpu_overclock = 0.0f;
+  float m_nsr_speed_factor = 1.0f;
 
   Core::System& m_system;
 };

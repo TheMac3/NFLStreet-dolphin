@@ -101,6 +101,10 @@ public:
   void UpdateAudioDMA();
   void UpdateDSPSlice(int cycles);
 
+  // NFLStreet rollback: ARAM DMA completes `factor` times sooner in emulated
+  // time (re-simulated frames run on a faster machine; 1 = real speed).
+  void SetNSRSpeedFactor(float factor) { m_nsr_speed_factor = factor; }
+
 private:
   void GenerateDSPInterrupt(u64 DSPIntType, s64 cyclesLate);
   static void GlobalGenerateDSPInterrupt(Core::System& system, u64 DSPIntType, s64 cyclesLate);
@@ -186,6 +190,7 @@ private:
 
   CoreTiming::EventType* m_event_type_generate_dsp_interrupt = nullptr;
   CoreTiming::EventType* m_event_type_complete_aram = nullptr;
+  float m_nsr_speed_factor = 1.0f;
 
   Core::System& m_system;
 };

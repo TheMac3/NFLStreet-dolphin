@@ -36,6 +36,15 @@ namespace Fifo
 {
 static constexpr int GPU_TIME_SLOT_SIZE = 1000;
 
+}  // namespace Fifo
+
+// NFLStreet rollback diagnostics (NSR_RB_COST): emulated GPU command cycles
+// executed on the CPU thread (single-core mode), summed over the run.
+u64 g_nsr_gpu_cycles = 0;
+
+namespace Fifo
+{
+
 FifoManager::FifoManager(Core::System& system) : m_system{system}
 {
 }
@@ -437,7 +446,8 @@ int FifoManager::RunGpuOnCpu(int ticks)
   auto& command_processor = m_system.GetCommandProcessor();
   auto& fifo = command_processor.GetFifo();
   bool reset_simd_state = false;
-  int available_ticks = int(ticks * m_config_sync_gpu_overclock) + m_sync_ticks.load();
+  int available_ticks =
+      int(ticks * m_config_sync_gpu_overclock * m_nsr_speed_factor) + m_sync_ticks.load();
   while (fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) &&
          fifo.CPReadWriteDistance.load(std::memory_order_relaxed) && !AtBreakpoint(m_system) &&
          available_ticks >= 0)
@@ -460,6 +470,7 @@ int FifoManager::RunGpuOnCpu(int ticks)
       m_video_buffer_read_ptr = OpcodeDecoder::RunFifo(
           DataReader(m_video_buffer_read_ptr, m_video_buffer_write_ptr), &cycles);
       available_ticks -= cycles;
+      g_nsr_gpu_cycles += cycles;
     }
 
     if (fifo.CPReadPointer.load(std::memory_order_relaxed) ==

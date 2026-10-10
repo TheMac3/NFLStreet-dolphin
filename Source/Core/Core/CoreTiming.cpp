@@ -136,10 +136,11 @@ void CoreTimingManager::Shutdown()
 
 void CoreTimingManager::RefreshConfig()
 {
-  m_config_oc_factor =
+  m_config_base_oc_factor =
       (Config::Get(Config::MAIN_OVERCLOCK_ENABLE) ? Config::Get(Config::MAIN_OVERCLOCK) : 1.0f) *
       (Config::Get(Config::MAIN_VI_OVERCLOCK_ENABLE) ? Config::Get(Config::MAIN_VI_OVERCLOCK) :
                                                        1.0f);
+  m_config_oc_factor = m_config_base_oc_factor * m_nsr_speed_factor;
   m_config_oc_inv_factor = 1.0f / m_config_oc_factor;
   m_config_sync_on_skip_idle = Config::Get(Config::MAIN_SYNC_ON_SKIP_IDLE);
   m_config_rush_frame_presentation = Config::Get(Config::MAIN_RUSH_FRAME_PRESENTATION);
@@ -585,6 +586,26 @@ void CoreTimingManager::Idle()
   PowerPC::UpdatePerformanceMonitor(ppc_state.downcount, 0, 0, ppc_state);
   m_idled_cycles += DowncountToCycles(ppc_state.downcount);
   ppc_state.downcount = 0;
+}
+
+void CoreTimingManager::SetNSRSpeedFactor(float factor)
+{
+  if (factor == m_nsr_speed_factor)
+    return;
+  m_nsr_speed_factor = factor;
+  m_config_oc_factor = m_config_base_oc_factor * factor;
+  m_config_oc_inv_factor = 1.0f / m_config_oc_factor;
+  // Re-express the rest of the current slice at the new rate. The cycles
+  // already executed (slice_length - remaining) and the cycle the next event
+  // is due at stay exactly as they were; only the instructions per remaining
+  // cycle change. GetTicks()/the JIT's inline time base read the same
+  // global_timer/slice_length/last_OC_factor_inverted, so time stays
+  // continuous. Advance() picks the new factor up for later slices anyway.
+  auto& ppc_state = m_system.GetPPCState();
+  const int remaining = DowncountToCycles(ppc_state.downcount);
+  m_last_oc_factor = m_config_oc_factor;
+  m_globals.last_OC_factor_inverted = m_config_oc_inv_factor;
+  ppc_state.downcount = CyclesToDowncount(remaining);
 }
 
 std::string CoreTimingManager::GetScheduledEventsSummary() const

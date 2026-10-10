@@ -38,6 +38,8 @@
 #include "Common/Swap.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
+#include "Core/CoreTiming.h"
+#include "Core/HW/DSP.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/SystemTimers.h"
 #include "Core/PowerPC/BreakPoints.h"
@@ -46,6 +48,7 @@
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 #include "VideoCommon/CommandProcessor.h"
+#include "VideoCommon/Fifo.h"
 
 namespace NSRNetplay
 {
@@ -1526,8 +1529,20 @@ void RbRestore(Core::System& system, u8* ram, const std::vector<u8>& slot)
     jit.InvalidateICache(0x80000000 | page, PAGE, true);
   // The emulated instruction cache too: recompilation fetches through it, so
   // stale lines would keep the old code bytes (rb-coverage-review C5).
+  // Only the cache contents are dropped: InstructionCache::Reset would also
+  // clear the whole JIT block cache (ClearSafe), and recompiling every block
+  // after every rollback cost ~200 ms of host time in the next frame. Blocks
+  // for the changed pages are already invalidated above; blocks for unchanged
+  // pages were compiled from bytes the restore did not touch, so they stay
+  // valid. NSR_RB_JIT_CLEAR=1 restores the full clear (diagnostics).
+  static const bool jit_clear = !Env("NSR_RB_JIT_CLEAR").empty();
   if (!changed.empty())
-    system.GetPPCState().iCache.Reset(jit);
+  {
+    if (jit_clear)
+      system.GetPPCState().iCache.Reset(jit);
+    else
+      system.GetPPCState().iCache.Cache::Reset();
+  }
 }
 
 // Compare RAM (re-simulated state before tick t) with the original state
@@ -2464,6 +2479,199 @@ void RollbackTickHook(const Core::CPUThreadGuard& guard)
   ppc_state.gpr[3] = RbStep(guard, buf);
 }
 
+// ---------------------------------------------------------------------------
+// Re-simulation cost diagnostics (NSR_RB_COST=1, NSR_RB_PROF=<cycles>).
+// Per unit (frame stub -> frame-end stub): emulated time base ticks (40.5 MHz),
+// CPU cycles the idle-skip fast-forwarded (all threads waiting), emulated GPU
+// command cycles, host microseconds, and host time of RbStep (snapshot work).
+// The profiler samples, every <cycles> emulated CPU cycles while a unit runs,
+// what the CPU is doing: the PC when the main thread runs, otherwise the
+// running thread and the main thread's saved call stack (why it waits).
+// NSR_RB_COST is host-side only (reads counters, writes the log). NSR_RB_PROF
+// schedules a CoreTiming event: it changes nothing the game sees directly,
+// but shorter slices move the points where interrupts are taken, so use it
+// for profiling, not for gate runs.
+}  // namespace NSRNetplay
+extern u64 g_nsr_gpu_cycles;
+namespace NSRNetplay
+{
+namespace
+{
+struct CostState
+{
+  bool active = false;
+  u64 tb = 0, idle = 0, gpu = 0;
+  s64 step_us = 0;
+  u32 frame = 0;
+  bool resim = false;
+  std::chrono::steady_clock::time_point host;
+  // profiler
+  CoreTiming::EventType* prof_event = nullptr;
+  s64 prof_interval = 0;
+  bool prof_scheduled = false;
+  std::map<std::string, u64> prof[2];  // [resim]
+  u64 prof_n[2] = {0, 0};
+};
+CostState s_cost;
+
+void ProfDump()
+{
+  for (int k = 0; k < 2; ++k)
+  {
+    std::vector<std::pair<u64, std::string>> v;
+    for (const auto& [key, n] : s_cost.prof[k])
+      v.emplace_back(n, key);
+    std::sort(v.rbegin(), v.rend());
+    Log("prof {} samples {}", k ? "resim" : "live", s_cost.prof_n[k]);
+    for (size_t i = 0; i < v.size() && i < 60; ++i)
+      Log("prof {} {} {}", k ? "resim" : "live", v[i].first, v[i].second);
+    s_cost.prof[k].clear();
+    s_cost.prof_n[k] = 0;
+  }
+}
+
+void ProfSample(Core::System& system, u64, s64)
+{
+  s_cost.prof_scheduled = false;
+  Rollback& r = s_rb;
+  if (!r.vtime_on)
+    return;
+  if (r.in_unit)
+  {
+    const u8* ram = system.GetMemory().GetRAM();
+    auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
+    const auto& ppc = system.GetPPCState();
+    const u32 cur = rd(0x800000E4);
+    std::string key;
+    if (cur == 0x803A3F30)
+      key = fmt::format("run {:08x}", ppc.pc);
+    else
+    {
+      key = fmt::format("wait cur {:08x} pc {:08x} main", cur, ppc.pc);
+      u32 sp = rd(0x803A3F30 + 4);  // main OSThread: OSContext gpr[1]
+      for (int i = 0; i < 6 && (sp >> 24) == 0x80; ++i)
+      {
+        sp = rd(sp);
+        if ((sp >> 24) != 0x80)
+          break;
+        key += fmt::format(" {:08x}", rd(sp + 4));
+      }
+    }
+    ++s_cost.prof[r.in_resim ? 1 : 0][key];
+    ++s_cost.prof_n[r.in_resim ? 1 : 0];
+  }
+  system.GetCoreTiming().ScheduleEvent(s_cost.prof_interval, s_cost.prof_event);
+  s_cost.prof_scheduled = true;
+}
+
+void CostFrameStart(const Core::CPUThreadGuard& guard,
+                    std::chrono::steady_clock::time_point step_start)
+{
+  static const bool cost = !Env("NSR_RB_COST").empty();
+  static const s64 prof = static_cast<s64>(ParseU32(Env("NSR_RB_PROF")).value_or(0));
+  static const u32 prof_every = ParseU32(Env("NSR_RB_PROF_EVERY")).value_or(1000);
+  auto& system = guard.GetSystem();
+  const Rollback& r = s_rb;
+  if (prof > 0 && r.vtime_on)
+  {
+    if (!s_cost.prof_event)
+    {
+      s_cost.prof_interval = prof;
+      s_cost.prof_event = system.GetCoreTiming().RegisterEvent("NSRProfile", ProfSample);
+    }
+    if (!s_cost.prof_scheduled)
+    {
+      system.GetCoreTiming().ScheduleEvent(prof, s_cost.prof_event);
+      s_cost.prof_scheduled = true;
+    }
+    if (!r.in_resim && r.tick_running % prof_every == 0 && s_cost.prof_n[0] + s_cost.prof_n[1])
+      ProfDump();
+  }
+  if (!cost || !r.vtime_on)
+    return;
+  s_cost.active = true;
+  s_cost.step_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - step_start)
+                       .count();
+  s_cost.frame = r.tick_running;
+  s_cost.resim = r.in_resim;
+  s_cost.tb = system.GetSystemTimers().GetFakeTimeBase();
+  s_cost.idle = system.GetCoreTiming().GetIdleTicks();
+  s_cost.gpu = g_nsr_gpu_cycles;
+  s_cost.host = std::chrono::steady_clock::now();
+}
+
+void CostFrameEnd(const Core::CPUThreadGuard& guard)
+{
+  if (!s_cost.active)
+    return;
+  s_cost.active = false;
+  auto& system = guard.GetSystem();
+  const auto host = std::chrono::steady_clock::now() - s_cost.host;
+  const u64 tb = system.GetSystemTimers().GetFakeTimeBase();
+  Log("cost frame {} resim {} tb {} idle_cyc {} gpu_cyc {} host_us {} step_us {} at {}",
+      s_cost.frame, s_cost.resim ? 1 : 0, tb - s_cost.tb,
+      system.GetCoreTiming().GetIdleTicks() - s_cost.idle, g_nsr_gpu_cycles - s_cost.gpu,
+      std::chrono::duration_cast<std::chrono::microseconds>(host).count(), s_cost.step_us, tb);
+}
+// Re-simulated frames run on a faster emulated machine: NSR_RB_RESIM_SPEED
+// (default 16; 1 = off) times faster CPU, and the devices whose work the
+// CPU's frame waits on or hands off are sped up by the same factor, so their
+// progress per re-simulated instruction stays what it was:
+//   - single-core GPU command processing (NSR_RB_RESIM_GPU_SPEED);
+//   - ARAM DMA (NSR_RB_RESIM_ARAM_SPEED);
+//   - the audio DMA cadence that drives AX frames, and the DSP slice
+//     (NSR_RB_RESIM_AUDIO_SPEED); re-simulated audio is not sent to the
+//     speakers (it was heard live).
+// VI, the time base/decrementer (OS alarms) and SI stay at real speed.
+//
+// Why: a re-simulated frame waits for nothing any more (no retrace wait, no
+// present fence; measured 0% idle), so its ~9 ms of emulated time was pure
+// CPU work of the full frame (sim + draw-list building, ~4.5M cycles at
+// 486 MHz): at k = 7 about 5 retraces of emulated time per live frame.
+//
+// Why the devices too: audio rolls back with the game, and the AX callbacks
+// that advance it run at interrupt level during re-simulation. With only the
+// CPU faster, a re-simulated frame got ~16x fewer AX frames and ARAM DMA
+// steps than before, so under sustained rollback the rolled-back audio engine
+// fell behind (whole-RAM gate: ~430 bytes of audio-engine/bank state differ
+// at frame 5000; EA audio library read garbage at frame 5491).
+//
+// Determinism: game code sees virtual, per-frame time inside units
+// (VirtualTime), never cycles. What changes is where real-time hardware
+// events (VI, alarms) land relative to re-simulated instructions; that
+// already differs between machines and between live and re-simulated runs,
+// and what the sim reads that follows it is answered per frame (audio clock,
+// music events, VI counters). Verified with the RNG and whole-RAM gates.
+void ResimSpeed(const Core::CPUThreadGuard& guard, bool resim)
+{
+  static const float factor = [] {
+    const std::string v = Env("NSR_RB_RESIM_SPEED");
+    return v.empty() ? 16.0f : std::max(1.0f, std::strtof(v.c_str(), nullptr));
+  }();
+  static const float gpu_factor = [] {
+    const std::string v = Env("NSR_RB_RESIM_GPU_SPEED");
+    return v.empty() ? factor : std::max(1.0f, std::strtof(v.c_str(), nullptr));
+  }();
+  if (factor != 1.0f)
+    guard.GetSystem().GetCoreTiming().SetNSRSpeedFactor(resim ? factor : 1.0f);
+  if (gpu_factor != 1.0f)
+    guard.GetSystem().GetFifo().SetNSRSpeedFactor(resim ? gpu_factor : 1.0f);
+  static const float aram_factor = [] {
+    const std::string v = Env("NSR_RB_RESIM_ARAM_SPEED");
+    return v.empty() ? factor : std::max(1.0f, std::strtof(v.c_str(), nullptr));
+  }();
+  if (aram_factor != 1.0f)
+    guard.GetSystem().GetDSP().SetNSRSpeedFactor(resim ? aram_factor : 1.0f);
+  static const float audio_factor = [] {
+    const std::string v = Env("NSR_RB_RESIM_AUDIO_SPEED");
+    return v.empty() ? factor : std::max(1.0f, std::strtof(v.c_str(), nullptr));
+  }();
+  if (audio_factor != 1.0f)
+    guard.GetSystem().GetSystemTimers().SetNSRSpeedFactor(resim ? audio_factor : 1.0f);
+}
+}  // namespace
+
 void RollbackFrameHook(const Core::CPUThreadGuard& guard)
 {
   auto& ppc_state = guard.GetSystem().GetPPCState();
@@ -2471,8 +2679,11 @@ void RollbackFrameHook(const Core::CPUThreadGuard& guard)
   Rollback& r = s_rb;
   r.frame_mode = true;
   r.frame_tick_done = false;
+  const auto step_start = std::chrono::steady_clock::now();
   ppc_state.gpr[3] = RbStep(guard, RB_PAD_BUF);
   AudioClockFrameLog(guard);
+  ResimSpeed(guard, r.in_unit && r.in_resim);
+  CostFrameStart(guard, step_start);
 }
 
 void RollbackFrameEndHook(const Core::CPUThreadGuard& guard)
@@ -2483,6 +2694,8 @@ void RollbackFrameEndHook(const Core::CPUThreadGuard& guard)
   if (s_rb.vtime_on && !async_present)
     PowerPC::MMU::HostWrite<u32>(guard, PowerPC::MMU::HostRead<u32>(guard, VI_POST_COUNTER) + 1,
                                  VI_POST_COUNTER);
+  CostFrameEnd(guard);
+  ResimSpeed(guard, false);
   s_rb.in_unit = false;
 }
 

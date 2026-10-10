@@ -75,7 +75,11 @@ void SystemTimersManager::DSPCallback(Core::System& system, u64 userdata, s64 cy
   // for hle, just gives all of the slice to hle
   auto& dsp = system.GetDSP();
   dsp.UpdateDSPSlice(static_cast<int>(dsp.GetDSPEmulator()->DSP_UpdateRate() - cycles_late));
-  system.GetCoreTiming().ScheduleEvent(dsp.GetDSPEmulator()->DSP_UpdateRate() - cycles_late,
+  // NFLStreet rollback: shorter DSP slices while re-simulating (see SetNSRSpeedFactor).
+  const float nsr = system.GetSystemTimers().m_nsr_speed_factor;
+  const s64 rate = nsr == 1.0f ? dsp.GetDSPEmulator()->DSP_UpdateRate() :
+                                 static_cast<s64>(dsp.GetDSPEmulator()->DSP_UpdateRate() / nsr);
+  system.GetCoreTiming().ScheduleEvent(rate - cycles_late,
                                        system.GetSystemTimers().m_event_type_dsp);
 }
 
@@ -90,8 +94,12 @@ void SystemTimersManager::AudioDMACallback(Core::System& system, u64 userdata, s
 {
   system.GetDSP().UpdateAudioDMA();  // Push audio to speakers.
   auto& system_timers = system.GetSystemTimers();
-  const int callback_period = GetAudioDMACallbackPeriod(
+  int callback_period = GetAudioDMACallbackPeriod(
       system_timers.m_cpu_core_clock, system.GetAudioInterface().GetAIDSampleRateDivisor());
+  // NFLStreet rollback: AX frames keep their per-instruction cadence while
+  // re-simulating on the faster machine (see SetNSRSpeedFactor).
+  if (system_timers.m_nsr_speed_factor != 1.0f)
+    callback_period = static_cast<int>(callback_period / system_timers.m_nsr_speed_factor);
   system.GetCoreTiming().ScheduleEvent(callback_period - cycles_late,
                                        system_timers.m_event_type_audio_dma);
 }

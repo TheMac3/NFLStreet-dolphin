@@ -134,6 +134,12 @@ public:
   // Pretend that the main CPU has executed enough cycles to reach the next event.
   void Idle();
 
+  // NFLStreet rollback: multiply the CPU speed (instructions per emulated
+  // cycle) by `factor` from the current instruction on, on top of the
+  // configured overclock; 1 restores it. Used for re-simulated frames, so they
+  // cost little emulated time (see NSRNetplay ResimSpeed). CPU thread only.
+  void SetNSRSpeedFactor(float factor);
+
   // Clear all pending events. This should ONLY be done on exit or state load.
   void ClearPendingEvents();
 
@@ -206,6 +212,8 @@ private:
   CPUThreadConfigCallback::ConfigChangedCallbackID m_registered_config_callback_id;
   float m_config_oc_factor = 1.0f;
   float m_config_oc_inv_factor = 1.0f;
+  float m_config_base_oc_factor = 1.0f;  // configured, without the NSR factor
+  float m_nsr_speed_factor = 1.0f;
   bool m_config_sync_on_skip_idle = false;
   bool m_config_rush_frame_presentation = false;
 

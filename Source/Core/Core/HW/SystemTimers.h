@@ -89,6 +89,13 @@ public:
   // - 2.0: the emulator is running at 200% speed (or 100% speed but sleeping half of the time).
   double GetEstimatedEmulationPerformance() const;
 
+  // NFLStreet rollback: the audio DMA (AI -> DSP interrupt cadence, hence AX
+  // frames) and the DSP slice run `factor` times faster in emulated time, and
+  // the DMA'd samples are not sent to the speakers (re-simulated frames; 1 =
+  // real speed, audio output on).
+  void SetNSRSpeedFactor(float factor) { m_nsr_speed_factor = factor; }
+  float GetNSRSpeedFactor() const { return m_nsr_speed_factor; }
+
 private:
   static void DSPCallback(Core::System& system, u64 userdata, s64 cycles_late);
   static void AudioDMACallback(Core::System& system, u64 userdata, s64 cycles_late);
@@ -101,6 +108,7 @@ private:
   Core::System& m_system;
 
   u32 m_cpu_core_clock = 486000000u;  // 486 mhz
+  float m_nsr_speed_factor = 1.0f;
 
   // This is completely arbitrary. If we find that we need lower latency,
   // we can just increase this number.
