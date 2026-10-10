@@ -13,6 +13,26 @@
 #include "Core/NSR/ReplayFollow.h"
 
 #include <algorithm>
+#if defined(__linux__)
+#include <ucontext.h>
+#include <dlfcn.h>
+#endif
+#include <ctime>
+#include <csignal>
+#include <cerrno>
+// Snapshot dirty-page tracking needs Linux 6.7+ (userfaultfd async
+// write-protect + PAGEMAP_SCAN); elsewhere snapshots use full copies.
+#if defined(__linux__)
+#define NSR_HAVE_UFFD 1
+#include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <linux/userfaultfd.h>
+#include <linux/fs.h>
+#include <unistd.h>
+#else
+#define NSR_HAVE_UFFD 0
+#endif
+#include <fcntl.h>
 #include <array>
 #include <atomic>
 #include <charconv>
@@ -45,6 +65,7 @@
 #include "Core/PowerPC/BreakPoints.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/MMU.h"
+#include "Core/PowerPC/PPCCache.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 #include "VideoCommon/CommandProcessor.h"
@@ -163,6 +184,32 @@ std::string Env(const char* name, const char* fallback = "")
   const char* v = std::getenv(name);
   return v ? v : fallback;
 }
+
+// Host-time phase accounting for NSR_RB_COST (cumulative nanoseconds; the cost
+// log prints per-unit deltas). GPU and DSP time are summed by Fifo.cpp and
+// SystemTimers.cpp into g_nsr_host_ns[] while g_nsr_host_timing is set.
+enum HostPhase : int
+{
+  PH_SAVE,         // RbSave: snapshot copies
+  PH_RESTORE,      // RbRestore: page compare + copy of changed pages
+  PH_LIVE,         // RbLiveRanges walk + keep/put-back copies (restore and check)
+  PH_JIT,          // JIT page invalidation + icache reset after a restore
+  PH_CHECK,        // RbCheck: re-simulated state vs the saved original
+  PH_COUNT
+};
+u64 s_phase_ns[PH_COUNT] = {};
+struct PhaseTimer
+{
+  explicit PhaseTimer(HostPhase p) : phase(p) {}
+  ~PhaseTimer()
+  {
+    s_phase_ns[phase] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+  }
+  HostPhase phase;
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+};
 
 std::vector<std::string> Split(const std::string& s, char sep)
 {
@@ -1151,6 +1198,325 @@ RollbackConfig& ConfigForRollback()
 
 bool IsIoIdle(const u8* ram);  // defined with the restore helpers
 
+// ---------------------------------------------------------------------------
+// Dirty-page tracking for snapshots (NSR_RB_DIRTY, default on where the
+// kernel supports it; NSR_RB_DIRTY=0 = full copies as before).
+//
+// A full snapshot is ~26 MB, but a frame writes only ~0.5-2 MB of it. The
+// kernel tracks which pages of emulated memory were written: every host
+// mapping of MEM1 and fake VMEM (emulated memory is one shared-memory object
+// mapped at several host addresses: the RAM pointer, the physical and the
+// BAT/logical fastmem views; each has its own page-table entries) is
+// registered with a userfaultfd in asynchronous write-protect mode
+// (UFFD_FEATURE_WP_ASYNC, Linux 6.7+; UFFD_USER_MODE_ONLY, so no privilege
+// is needed). A write to a protected page is resolved inside the kernel
+// (~1 us, once per page between samples) and marks the page written;
+// PAGEMAP_SCAN with PM_SCAN_WP_MATCHING returns the written pages of a range
+// and protects them again in one call (~50 us for all of game memory). This
+// sees every writer in the process: the JIT's fastmem stores, Dolphin's
+// HostWrite/DMA copies, kernel copies into the buffer, and our restores.
+//
+// Alternatives measured and rejected: soft-dirty bits (clear_refs) clear the
+// whole process's page tables, ~7.5 ms per sample with the snapshot ring;
+// mprotect would collide with Dolphin's own fastmem fault handler.
+//
+// Bookkeeping: Sample() stamps every page written since the previous sample
+// with a new epoch number. A snapshot slot remembers the epoch at which it
+// equalled RAM (`synced`). Pages stamped later are the only ones that can
+// differ between that slot and RAM now, so:
+//   - a save copies only those pages (and marks the slot synced now);
+//   - a restore compares/copies only those pages;
+//   - the re-simulation check compares only those pages.
+// Every save/restore/check samples first, so writes made anywhere (game,
+// hardware DMA, HLE hooks) between two operations are always seen.
+// Slots without a recorded epoch (new, or not ring slots) get full copies.
+// NSR_RB_DIRTY_VERIFY=1 checks every incremental save and restore against a
+// full comparison and logs any page the tracker missed.
+struct DirtyTracker
+{
+  static constexpr u32 PAGE = 0x1000;
+  bool on = false;
+  bool verify = false;
+  int uffd = -1;
+  int pagemap_fd = -1;
+  u32 mem1_bytes = 0;
+  u32 mem1_pages = 0;   // state-space pages [0, mem1_pages) = MEM1
+  u32 vmem_pages = 0;   // then fake VMEM (the snapshotted prefix)
+  struct View
+  {
+    uintptr_t host;   // host address of state page `first`
+    u32 first, count; // state-space page range this mapping covers
+  };
+  std::vector<View> views;
+  std::vector<u32> stamp;     // per state page: epoch of its last observed write
+  u32 epoch = 1;
+#if NSR_HAVE_UFFD
+  std::vector<page_region> regions;
+#endif
+  std::map<const u8*, u32> synced;  // slot data -> epoch it equalled RAM
+  // Segment pieces per MEM1 page: chunks[page_first[p] .. page_first[p+1]).
+  std::vector<std::pair<u32, u32>> chunks;
+  std::vector<u32> page_first;
+  u64 samples = 0, sample_ns = 0, pages_seen = 0, failures = 0, remaps = 0;
+  u32 seen_remaps = 0;
+
+  // All host mappings of the tracked shared memory, from /proc/self/maps.
+  std::vector<View> ParseViews() const
+  {
+#if NSR_HAVE_UFFD
+    std::vector<View> out;
+    // Shared-memory layout (Memmap.cpp): MEM1 at 0 (power-of-two size),
+    // then the L1 cache (256 KiB), then fake VMEM.
+    const u64 ram_pow2 = u64{1} << (64 - __builtin_clzll(u64{mem1_bytes} - 1));
+    const u64 vmem_shm = ram_pow2 + 0x40000;
+    FILE* maps = std::fopen("/proc/self/maps", "r");
+    if (!maps)
+      return out;
+    const std::string tag = fmt::format("/dolphin-emu.{}", getpid());
+    char line[512];
+    while (std::fgets(line, sizeof(line), maps))
+    {
+      unsigned long lo, hi, off;
+      char perms[8];
+      if (std::sscanf(line, "%lx-%lx %7s %lx", &lo, &hi, perms, &off) != 4 ||
+          !std::strstr(line, tag.c_str()))
+        continue;
+      auto add = [&](u64 base, u32 pages, u32 first_state) {
+        // [off, off + hi - lo) of the shm file is mapped at lo; intersect with
+        // [base, base + pages * PAGE) and record it in state-space pages.
+        const u64 a = std::max<u64>(off, base);
+        const u64 b = std::min<u64>(off + (hi - lo), base + u64{pages} * PAGE);
+        if (a >= b)
+          return;
+        out.push_back({static_cast<uintptr_t>(lo + (a - off)),
+                       static_cast<u32>(first_state + (a - base) / PAGE),
+                       static_cast<u32>((b - a + PAGE - 1) / PAGE)});
+      };
+      add(0, mem1_pages, 0);
+      if (vmem_pages)
+        add(vmem_shm, vmem_pages, mem1_pages);
+    }
+    std::fclose(maps);
+    return out;
+#else
+    return {};
+#endif
+  }
+
+  bool Register(const View& v) const
+  {
+#if NSR_HAVE_UFFD
+    uffdio_register reg{};
+    reg.range.start = v.host;
+    reg.range.len = u64{v.count} * PAGE;
+    reg.mode = UFFDIO_REGISTER_MODE_WP;
+    if (ioctl(uffd, UFFDIO_REGISTER, &reg) == 0)
+      return true;
+    Log("snapshot dirty tracking: can't register mapping {:x}+{:#x}: {}", v.host, reg.range.len,
+        std::strerror(errno));
+    return errno == EBUSY;
+#else
+    (void)v;
+    return false;
+#endif
+  }
+
+  // Dolphin remaps all logical views whenever the game writes a BAT (the new
+  // mappings lose their registration); Memory::g_nsr_logical_remaps reports
+  // that, and the views are also re-read every 600 frames as a safety net.
+  // After a change, register the mappings again, and since writes through
+  // them may have gone unseen, every page counts as written.
+  void RefreshViews(bool remapped = false)
+  {
+    auto now = ParseViews();
+    const bool same = !remapped && now.size() == views.size() &&
+                      std::equal(now.begin(), now.end(), views.begin(), [](const View& x, const View& y) {
+                        return x.host == y.host && x.first == y.first && x.count == y.count;
+                      });
+    if (same)
+      return;
+    if (!remapped)
+      Log("snapshot dirty tracking: game memory mappings changed ({} -> {})", views.size(), now.size());
+    views = std::move(now);
+    for (const View& v : views)
+      Register(v);
+    Sample();
+    std::fill(stamp.begin(), stamp.end(), epoch);
+  }
+
+  bool Init(const std::vector<std::pair<u32, u32>>& segments, u32 mem1_size, u32 vmem_bytes)
+  {
+#if NSR_HAVE_UFFD
+    mem1_bytes = mem1_size;
+    mem1_pages = (mem1_size + PAGE - 1) / PAGE;
+    vmem_pages = (vmem_bytes + PAGE - 1) / PAGE;
+    seen_remaps = Memory::g_nsr_logical_remaps;
+    views = ParseViews();
+    if (views.empty())
+      return false;
+    uffd = static_cast<int>(syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY));
+    if (uffd < 0)
+      return false;
+    uffdio_api api{};
+    api.api = UFFD_API;
+    api.features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_HUGETLBFS_SHMEM | UFFD_FEATURE_WP_UNPOPULATED;
+    pagemap_fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+    if (ioctl(uffd, UFFDIO_API, &api) != 0 || pagemap_fd < 0)
+      return false;
+    for (const View& v : views)
+    {
+      if (!Register(v))
+        return false;
+    }
+    stamp.assign(mem1_pages + vmem_pages, 0);
+    regions.resize(4096);
+    if (!Sample())
+      return false;
+    page_first.assign(mem1_pages + 1, 0);
+    for (u32 p = 0; p < mem1_pages; ++p)
+    {
+      page_first[p] = static_cast<u32>(chunks.size());
+      const u32 plo = p * PAGE, phi = plo + PAGE;
+      for (const auto& [lo, hi] : segments)
+      {
+        const u32 x = std::max(lo, plo), y = std::min(hi, phi);
+        if (x < y)
+          chunks.emplace_back(x, y);
+      }
+    }
+    page_first[mem1_pages] = static_cast<u32>(chunks.size());
+    verify = !Env("NSR_RB_DIRTY_VERIFY").empty();
+    std::fill(stamp.begin(), stamp.end(), epoch);  // nothing synced yet
+    return true;
+#else
+    (void)segments, (void)mem1_size, (void)vmem_bytes;
+    return false;
+#endif
+  }
+
+  // Release the kernel handles and forget everything (core shutdown; the
+  // next session initialises again).
+  void Reset()
+  {
+#if NSR_HAVE_UFFD
+    if (uffd >= 0)
+      close(uffd);
+    if (pagemap_fd >= 0)
+      close(pagemap_fd);
+#endif
+    *this = DirtyTracker{};
+  }
+
+  // Stamp the pages written since the previous sample and protect them again.
+  bool Sample()
+  {
+#if NSR_HAVE_UFFD
+    // Dolphin remapped its logical views (a BAT write) since we last looked:
+    // re-read the mappings first (RefreshViews samples again by itself).
+    if (seen_remaps != Memory::g_nsr_logical_remaps)
+    {
+      seen_remaps = Memory::g_nsr_logical_remaps;
+      ++remaps;
+      RefreshViews(true);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    ++epoch;
+    bool ok = true;
+    for (const View& v : views)
+    {
+      const u64 end = v.host + u64{v.count} * PAGE;
+      u64 start = v.host;
+      while (start < end)
+      {
+        pm_scan_arg arg{};
+        arg.size = sizeof(arg);
+        arg.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
+        arg.start = start;
+        arg.end = end;
+        arg.vec = reinterpret_cast<u64>(regions.data());
+        arg.vec_len = regions.size();
+        arg.category_mask = PAGE_IS_WRITTEN;
+        arg.return_mask = PAGE_IS_WRITTEN;
+        long n = ioctl(pagemap_fd, PAGEMAP_SCAN, &arg);
+        if (n < 0 && errno == EPERM)
+        {
+          // Dolphin replaced this mapping (it remaps the logical views
+          // whenever the game writes a BAT), so the new one isn't registered
+          // yet. Register it; writes made through it before now are unknown,
+          // so the whole view counts as written once.
+          ++remaps;
+          Register(v);
+          std::fill(stamp.begin() + v.first, stamp.begin() + v.first + v.count, epoch);
+          n = ioctl(pagemap_fd, PAGEMAP_SCAN, &arg);
+        }
+        if (n < 0)
+        {
+          if (failures++ < 5)
+            Log("snapshot dirty tracking: PAGEMAP_SCAN of mapping {:x} failed: {}", v.host,
+                std::strerror(errno));
+          ok = false;  // be conservative: the whole view counts as written
+          std::fill(stamp.begin() + v.first, stamp.begin() + v.first + v.count, epoch);
+          break;
+        }
+        for (long i = 0; i < n; ++i)
+        {
+          const u32 a = static_cast<u32>((regions[i].start - v.host) / PAGE);
+          const u32 b = static_cast<u32>((regions[i].end - v.host) / PAGE);
+          for (u32 q = a; q < b && q < v.count; ++q)
+            stamp[v.first + q] = epoch;
+          pages_seen += b - a;
+        }
+        if (arg.walk_end <= start)
+          break;
+        start = arg.walk_end;
+      }
+    }
+    ++samples;
+    sample_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now() - t0)
+                     .count();
+    return ok;
+#else
+    return false;
+#endif
+  }
+
+  // MEM1 pages wholly inside the GX FIFO, [first, end). The FIFO is a live
+  // range (RbRestore always puts the current FIFO back), and the CPU writes
+  // the frame's whole command stream into it, so saving or restoring those
+  // pages is wasted work.
+  // If the game ever moves its FIFO, pages skipped so far may be stale in
+  // every slot: forget all slots' sync points (next saves are full copies).
+  std::pair<u32, u32> FifoPages()
+  {
+    auto& fifo = Core::System::GetInstance().GetCommandProcessor().GetFifo();
+    const u32 fb = fifo.CPBase.load() & 0x01FFFFFF, fe = (fifo.CPEnd.load() & 0x01FFFFFF) + 32;
+    std::pair<u32, u32> pages{0, 0};
+    if (fe > fb && fe <= mem1_bytes)
+      pages = {(fb + PAGE - 1) / PAGE, fe / PAGE};
+    if (pages != fifo_pages)
+    {
+      if (fifo_pages.second != 0)
+        Log("snapshot dirty tracking: GX FIFO moved; all snapshots resync");
+      fifo_pages = pages;
+      synced.clear();
+    }
+    return pages;
+  }
+  std::pair<u32, u32> fifo_pages{0, 0};
+  u64 fifo_skipped = 0;
+
+  // Epoch at which `slot` equalled RAM, or nothing (slot needs a full copy).
+  std::optional<u32> Synced(const std::vector<u8>& slot) const
+  {
+    const auto it = synced.find(slot.data());
+    if (it == synced.end())
+      return std::nullopt;
+    return it->second;
+  }
+};
+DirtyTracker s_dirty;
+
 void RbInit(Core::System& system)
 {
   Rollback& r = s_rb;
@@ -1343,6 +1709,14 @@ void RbInit(Core::System& system)
     r.ring.assign(r.io_idle_mode ? std::max<u32>(depth + 1, ParseU32(Env("NSR_RB_RING")).value_or(24))
                                  : depth + 1,
                   std::vector<u8>(size + r.vmem_bytes));
+    if (Env("NSR_RB_DIRTY", "1") != "0")
+    {
+      s_dirty.on = s_dirty.Init(r.segments, size, r.vmem_bytes);
+      Log("snapshot dirty-page tracking: {} ({} mappings of game memory)",
+          s_dirty.on ? "on" : "unavailable, full copies", s_dirty.views.size());
+      for (const auto& v : s_dirty.views)
+        Log("  mapping {:x}: state pages {:#x}+{:#x}", v.host, v.first, v.count);
+    }
   }
   if (r.force > 0 || config.sample || r.stacks)
   {
@@ -1389,6 +1763,49 @@ void RbInit(Core::System& system)
 
 void RbSave(const u8* ram, std::vector<u8>& slot)
 {
+  PhaseTimer timer(PH_SAVE);
+  DirtyTracker& d = s_dirty;
+  const bool full_slot = s_rb.vmem_bytes == 0 || slot.size() >= s_rb.mem1_size + s_rb.vmem_bytes;
+  if (d.on && full_slot)
+  {
+    d.Sample();
+    const auto [fifo_lo, fifo_hi] = d.FifoPages();
+    const auto since = d.Synced(slot);
+    for (u32 p = 0; p < d.mem1_pages; ++p)
+    {
+      if (since && d.stamp[p] <= *since)
+        continue;
+      if (since && p >= fifo_lo && p < fifo_hi)
+      {
+        ++d.fifo_skipped;
+        continue;
+      }
+      for (u32 c = d.page_first[p]; c < d.page_first[p + 1]; ++c)
+        std::memcpy(slot.data() + d.chunks[c].first, ram + d.chunks[c].first,
+                    d.chunks[c].second - d.chunks[c].first);
+    }
+    for (u32 q = 0; q < d.vmem_pages && s_rb.vmem_bytes; ++q)
+    {
+      if (since && d.stamp[d.mem1_pages + q] <= *since)
+        continue;
+      const u32 a = q * DirtyTracker::PAGE, n = std::min(DirtyTracker::PAGE, s_rb.vmem_bytes - a);
+      std::memcpy(slot.data() + s_rb.mem1_size + a, s_rb.vmem + a, n);
+    }
+    d.synced[slot.data()] = d.epoch;
+    if (d.verify)
+    {
+      u32 missed = 0;
+      for (const auto& [lo, hi] : s_rb.segments)
+        for (u32 a = lo; a < hi; a += 4)
+          missed += (a / DirtyTracker::PAGE < fifo_lo || a / DirtyTracker::PAGE >= fifo_hi) &&
+                    std::memcmp(slot.data() + a, ram + a, std::min(4u, hi - a)) != 0;
+      if (s_rb.vmem_bytes)
+        missed += std::memcmp(slot.data() + s_rb.mem1_size, s_rb.vmem, s_rb.vmem_bytes) != 0;
+      if (missed)
+        Log("DIRTY VERIFY: save missed {} words (live {} cursor {})", missed, s_rb.live, s_rb.cursor);
+    }
+    return;
+  }
   for (const auto& [lo, hi] : s_rb.segments)
     std::memcpy(slot.data() + lo, ram + lo, hi - lo);
   // Fake VMEM (EA database heap), only into slots sized for it (the ring).
@@ -1540,34 +1957,111 @@ void RbRestore(Core::System& system, u8* ram, const std::vector<u8>& slot)
   // Copy page by page and tell the JIT about every page whose bytes changed:
   // restored memory can hold code (e.g. code the audio engine generates in the
   // heap), and compiled blocks for the old bytes must not keep running.
+  std::optional<PhaseTimer> timer(std::in_place, PH_LIVE);
   const auto live = RbLiveRanges(system, ram);
   std::vector<std::vector<u8>> keep;
   for (const auto& [lo, hi] : live)
     keep.emplace_back(ram + lo, ram + hi);
+  timer.emplace(PH_RESTORE);
   constexpr u32 PAGE = 0x1000;
   std::vector<u32> changed;
-  for (const auto& [lo, hi] : s_rb.segments)
+  DirtyTracker& d = s_dirty;
+  std::optional<u32> since;
+  bool vmem_restored = false;
+  std::pair<u32, u32> fifo{0, 0};
+  if (d.on)
   {
-    for (u32 a = lo; a < hi;)
+    d.Sample();
+    fifo = d.FifoPages();
+    since = d.Synced(slot);
+  }
+  if (since)
+  {
+    // Only pages written since the slot equalled RAM can differ from it.
+    // GX FIFO pages are skipped: the live FIFO is put back below anyway.
+    const auto [fifo_lo, fifo_hi] = fifo;
+    for (u32 p = 0; p < d.mem1_pages; ++p)
     {
-      const u32 b = std::min(hi, (a & ~(PAGE - 1)) + PAGE);
-      if (std::memcmp(ram + a, slot.data() + a, b - a) != 0)
+      if (d.stamp[p] <= *since || (p >= fifo_lo && p < fifo_hi))
+        continue;
+      bool page_changed = false;
+      for (u32 c = d.page_first[p]; c < d.page_first[p + 1]; ++c)
       {
-        std::memcpy(ram + a, slot.data() + a, b - a);
-        if (changed.empty() || changed.back() != (a & ~(PAGE - 1)))
-          changed.push_back(a & ~(PAGE - 1));
+        const auto [a, b] = d.chunks[c];
+        if (std::memcmp(ram + a, slot.data() + a, b - a) != 0)
+        {
+          std::memcpy(ram + a, slot.data() + a, b - a);
+          page_changed = true;
+        }
       }
-      a = b;
+      if (page_changed)
+        changed.push_back(p * PAGE);
+    }
+    for (u32 q = 0; q < d.vmem_pages && s_rb.vmem_bytes; ++q)
+    {
+      if (d.stamp[d.mem1_pages + q] <= *since)
+        continue;
+      const u32 a = q * PAGE, n = std::min(PAGE, s_rb.vmem_bytes - a);
+      std::memcpy(s_rb.vmem + a, slot.data() + s_rb.mem1_size + a, n);
+      vmem_restored = true;
     }
   }
+  else
+  {
+    for (const auto& [lo, hi] : s_rb.segments)
+    {
+      for (u32 a = lo; a < hi;)
+      {
+        const u32 b = std::min(hi, (a & ~(PAGE - 1)) + PAGE);
+        if (std::memcmp(ram + a, slot.data() + a, b - a) != 0)
+        {
+          std::memcpy(ram + a, slot.data() + a, b - a);
+          if (changed.empty() || changed.back() != (a & ~(PAGE - 1)))
+            changed.push_back(a & ~(PAGE - 1));
+        }
+        a = b;
+      }
+    }
+    // Fake VMEM holds data only (the database heap): no JIT invalidation needed.
+    if (s_rb.vmem_bytes && slot.size() >= s_rb.mem1_size + s_rb.vmem_bytes)
+    {
+      std::memcpy(s_rb.vmem, slot.data() + s_rb.mem1_size, s_rb.vmem_bytes);
+      vmem_restored = true;
+    }
+  }
+  if (since && d.verify)
+  {
+    u32 missed = 0;
+    for (const auto& [lo, hi] : s_rb.segments)
+      for (u32 a = lo; a < hi; a += PAGE - (a % PAGE))
+      {
+        const u32 b = std::min(hi, a + PAGE - (a % PAGE));
+        bool in_live = false;
+        for (const auto& [llo, lhi] : live)
+          in_live |= a < lhi && llo < b;
+        if (!in_live && std::memcmp(ram + a, slot.data() + a, b - a) != 0)
+          ++missed;
+      }
+    if (s_rb.vmem_bytes && std::memcmp(s_rb.vmem, slot.data() + s_rb.mem1_size, s_rb.vmem_bytes) != 0)
+      ++missed;
+    if (missed)
+      Log("DIRTY VERIFY: restore missed {} pages (live {} cursor {})", missed, s_rb.live, s_rb.cursor);
+  }
+  timer.emplace(PH_LIVE);
   for (size_t i = 0; i < live.size(); ++i)
     std::memcpy(ram + live[i].first, keep[i].data(), keep[i].size());
-  // Fake VMEM holds data only (the database heap): no JIT invalidation needed.
-  if (s_rb.vmem_bytes && slot.size() >= s_rb.mem1_size + s_rb.vmem_bytes)
-    std::memcpy(s_rb.vmem, slot.data() + s_rb.mem1_size, s_rb.vmem_bytes);
+  timer.emplace(PH_JIT);
   auto& jit = system.GetJitInterface();
-  for (const u32 page : changed)
-    jit.InvalidateICache(0x80000000 | page, PAGE, true);
+  // One call per run of consecutive changed pages (the per-call address
+  // translation and block-map lookups dominate for single pages).
+  for (size_t i = 0; i < changed.size();)
+  {
+    size_t j = i + 1;
+    while (j < changed.size() && changed[j] == changed[j - 1] + PAGE)
+      ++j;
+    jit.InvalidateICache(0x80000000 | changed[i], static_cast<u32>(j - i) * PAGE, true);
+    i = j;
+  }
   // The emulated instruction cache too: recompilation fetches through it, so
   // stale lines would keep the old code bytes (rb-coverage-review C5).
   // Only the cache contents are dropped: InstructionCache::Reset would also
@@ -1576,13 +2070,55 @@ void RbRestore(Core::System& system, u8* ram, const std::vector<u8>& slot)
   // for the changed pages are already invalidated above; blocks for unchanged
   // pages were compiled from bytes the restore did not touch, so they stay
   // valid. NSR_RB_JIT_CLEAR=1 restores the full clear (diagnostics).
+  //
+  // Only the lines of changed pages are dropped (what icbi does line by line);
+  // Cache::Reset also refilled ~2 MB of lookup tables on every rollback.
+  // Lines of untouched pages hold the same bytes as before the restore.
+  // Fake VMEM is data only, but its lines are dropped too if it was restored.
   static const bool jit_clear = !Env("NSR_RB_JIT_CLEAR").empty();
-  if (!changed.empty())
+  if (jit_clear && !changed.empty())
   {
-    if (jit_clear)
-      system.GetPPCState().iCache.Reset(jit);
-    else
-      system.GetPPCState().iCache.Cache::Reset();
+    system.GetPPCState().iCache.Reset(jit);
+  }
+  else if (!changed.empty() || vmem_restored)
+  {
+    auto& memory = system.GetMemory();
+    auto& ic = system.GetPPCState().iCache;
+    std::vector<bool> page_changed(memory.GetRamSize() / PAGE + 1, false);
+    for (const u32 page : changed)
+      page_changed[page / PAGE] = true;
+    for (u32 set = 0; set < PowerPC::CACHE_SETS; ++set)
+    {
+      for (u32 way = 0; way < PowerPC::CACHE_WAYS; ++way)
+      {
+        if (!(ic.valid[set] & (1u << way)))
+          continue;
+        const u32 a = ic.addrs[set][way];
+        std::vector<u8>* table;
+        u32 index;
+        if (a & PowerPC::CACHE_VMEM_BIT)
+        {
+          if (!vmem_restored)
+            continue;
+          table = &ic.lookup_table_vmem;
+          index = (a & memory.GetFakeVMemMask()) >> 5;
+        }
+        else if (a & PowerPC::CACHE_EXRAM_BIT)
+        {
+          continue;  // Wii only
+        }
+        else
+        {
+          if (!page_changed[(a & memory.GetRamMask()) / PAGE])
+            continue;
+          table = &ic.lookup_table;
+          index = (a & memory.GetRamMask()) >> 5;
+        }
+        ic.valid[set] &= ~(1u << way);
+        ic.modified[set] &= ~(1u << way);
+        (*table)[index] = 0xFF;
+      }
+    }
   }
 }
 
@@ -1594,10 +2130,23 @@ void RbCheck(u32 tick, const u8* ram, const std::vector<u8>& original)
   ++r.checks;
   u32 differing = 0;
   std::vector<std::pair<u32, u32>> ranges;  // coalesced, for the log
+  // Dirty tracking: pages not written since `original` equalled RAM can't differ.
+  DirtyTracker& d = s_dirty;
+  std::optional<u32> since;
+  if (d.on)
+  {
+    d.Sample();
+    since = d.Synced(original);
+  }
   for (const auto& [lo, hi] : r.segments)
   {
     for (u32 g = lo; g < hi; g += RB_GRANULE)
     {
+      if (since && d.stamp[g / DirtyTracker::PAGE] <= *since)
+      {
+        g = std::min(hi, (g / DirtyTracker::PAGE + 1) * DirtyTracker::PAGE) - RB_GRANULE;
+        continue;
+      }
       const u32 len = std::min(RB_GRANULE, hi - g);
       if (std::memcmp(ram + g, original.data() + g, len) == 0)
         continue;
@@ -1615,6 +2164,8 @@ void RbCheck(u32 tick, const u8* ram, const std::vector<u8>& original)
   {
     for (u32 g = 0; g < r.vmem_bytes; g += RB_GRANULE)
     {
+      if (since && d.stamp[d.mem1_pages + g / DirtyTracker::PAGE] <= *since)
+        continue;
       const u32 len = std::min(RB_GRANULE, r.vmem_bytes - g);
       if (std::memcmp(r.vmem + g, original.data() + r.mem1_size + g, len) == 0)
         continue;
@@ -2280,6 +2831,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
       // it was before the rollback.
       if (r.mispredict == 0)  // with corrected pads the state is meant to differ
       {
+        PhaseTimer timer(PH_CHECK);
         for (const auto& [lo, hi] : RbLiveRanges(system, ram))
           std::memcpy(r.ring[r.live % slots].data() + lo, ram + lo, hi - lo);
         RbCheck(r.live, ram, r.ring[r.live % slots]);
@@ -2328,7 +2880,9 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
           const u32 confirmed = t >= d ? t - d : 0;
           for (u32 j = target; j < t; ++j)
             r.pads[j] = TruePads(std::min(j, confirmed));
-          RbSave(ram, r.ring[t % slots]);
+          // No save of the state before frame t here: nothing reads it (the
+          // re-simulation check is off in this mode) and the live frame t
+          // saves its slot again when re-simulation reaches it.
           RbRestore(system, ram, r.ring[target % slots]);
           r.cursor = target;
           r.rolled = true;
@@ -2513,8 +3067,15 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     r.counters.erase(r.counters.begin(), r.counters.lower_bound(t - 600));
     r.gate_log.erase(r.gate_log.begin(), r.gate_log.lower_bound(t - 600));
   }
+  if (s_dirty.on && (t % 600 == 0 || t == r.vtime_from))
+    s_dirty.RefreshViews();
   if (t % 600 == 0)
   {
+    if (s_dirty.on && s_dirty.samples)
+      Log("snapshot dirty tracking: {} samples, {:.1f} us/sample, {} remapped views, {:.1f} written "
+          "pages/sample, {} GX FIFO page copies skipped",
+          s_dirty.samples, s_dirty.sample_ns / 1e3 / s_dirty.samples, s_dirty.remaps,
+          static_cast<double>(s_dirty.pages_seen) / s_dirty.samples, s_dirty.fifo_skipped);
     Log("tick {}: rollbacks {}, re-simulated {}, mismatched checks {}/{}; audio gate: "
         "recorded {}, replayed {}, mismatched {}; load barriers {} (clamped {}, in re-sim {}); "
         "io-idle skips {}; mispredictions {} (uncorrectable {})",
@@ -2587,6 +3148,9 @@ void RollbackTickHook(const Core::CPUThreadGuard& guard)
 // for profiling, not for gate runs.
 }  // namespace NSRNetplay
 extern u64 g_nsr_gpu_cycles;
+extern bool g_nsr_skip_vertices;  // VideoCommon/VertexLoaderManager.cpp
+extern bool g_nsr_host_timing;
+extern u64 g_nsr_host_ns[2];  // [0] GPU command processing, [1] DSP slices + audio DMA
 namespace NSRNetplay
 {
 namespace
@@ -2594,6 +3158,10 @@ namespace
 struct CostState
 {
   bool active = false;
+  u64 ph_step[PH_COUNT] = {};  // phase totals before RbStep
+  u64 ph_unit[PH_COUNT] = {};  // ... after RbStep (unit start)
+  u64 dev_unit[2] = {};        // GPU/DSP host totals at unit start
+  std::chrono::steady_clock::time_point epoch = std::chrono::steady_clock::now();
   u64 tb = 0, idle = 0, gpu = 0;
   s64 step_us = 0;
   u32 frame = 0;
@@ -2692,6 +3260,9 @@ void CostFrameStart(const Core::CPUThreadGuard& guard,
   s_cost.tb = system.GetSystemTimers().GetFakeTimeBase();
   s_cost.idle = system.GetCoreTiming().GetIdleTicks();
   s_cost.gpu = g_nsr_gpu_cycles;
+  g_nsr_host_timing = true;
+  std::copy(std::begin(s_phase_ns), std::end(s_phase_ns), s_cost.ph_unit);
+  std::copy(std::begin(g_nsr_host_ns), std::end(g_nsr_host_ns), s_cost.dev_unit);
   s_cost.host = std::chrono::steady_clock::now();
 }
 
@@ -2701,12 +3272,24 @@ void CostFrameEnd(const Core::CPUThreadGuard& guard)
     return;
   s_cost.active = false;
   auto& system = guard.GetSystem();
-  const auto host = std::chrono::steady_clock::now() - s_cost.host;
+  const auto now = std::chrono::steady_clock::now();
+  const auto us = [](u64 ns) { return ns / 1000; };
   const u64 tb = system.GetSystemTimers().GetFakeTimeBase();
-  Log("cost frame {} resim {} tb {} idle_cyc {} gpu_cyc {} host_us {} step_us {} at {}",
+  // Per unit: emulated time, idle-skipped and GPU cycles; host time of the
+  // unit (host_us; of which gpu/dsp emulation), of RbStep before it (step_us;
+  // of which save/restore/live/jit/check), and the host clock at its end.
+  Log("cost frame {} resim {} tb {} idle_cyc {} gpu_cyc {} host_us {} step_us {} at {} "
+      "save {} restore {} live {} jit {} check {} gpu_us {} dsp_us {} hat {}",
       s_cost.frame, s_cost.resim ? 1 : 0, tb - s_cost.tb,
       system.GetCoreTiming().GetIdleTicks() - s_cost.idle, g_nsr_gpu_cycles - s_cost.gpu,
-      std::chrono::duration_cast<std::chrono::microseconds>(host).count(), s_cost.step_us, tb);
+      std::chrono::duration_cast<std::chrono::microseconds>(now - s_cost.host).count(),
+      s_cost.step_us, tb, us(s_cost.ph_unit[PH_SAVE] - s_cost.ph_step[PH_SAVE]),
+      us(s_cost.ph_unit[PH_RESTORE] - s_cost.ph_step[PH_RESTORE]),
+      us(s_cost.ph_unit[PH_LIVE] - s_cost.ph_step[PH_LIVE]),
+      us(s_cost.ph_unit[PH_JIT] - s_cost.ph_step[PH_JIT]),
+      us(s_cost.ph_unit[PH_CHECK] - s_cost.ph_step[PH_CHECK]),
+      us(g_nsr_host_ns[0] - s_cost.dev_unit[0]), us(g_nsr_host_ns[1] - s_cost.dev_unit[1]),
+      std::chrono::duration_cast<std::chrono::microseconds>(now - s_cost.epoch).count());
 }
 // Re-simulated frames run on a faster emulated machine: NSR_RB_RESIM_SPEED
 // (default 16; 1 = off) times faster CPU, and the devices whose work the
@@ -2763,8 +3346,114 @@ void ResimSpeed(const Core::CPUThreadGuard& guard, bool resim)
   }();
   if (audio_factor != 1.0f)
     guard.GetSystem().GetSystemTimers().SetNSRSpeedFactor(resim ? audio_factor : 1.0f);
+  // Host time: re-simulated frames are never shown, so the GPU skips their
+  // primitives (vertex loading and the backend's draw path: ~3 ms of host time
+  // per frame even with the Null backend). Command parsing, register state,
+  // EFB copies and the emulated GPU timing still run. NSR_RB_RESIM_DRAW=1
+  // keeps them.
+  static const bool resim_draw = !Env("NSR_RB_RESIM_DRAW").empty();
+  g_nsr_skip_vertices = resim && !resim_draw;
 }
 }  // namespace
+
+// Host profiler (diagnostics, NSR_HOST_PROF=<microseconds of CPU time>,
+// NSR_HOST_PROF_OUT=<file>): a per-thread CPU-time timer interrupts the CPU
+// thread and records the host instruction pointer, tagged with what the
+// rollback code was doing (RbStep, a live unit, a re-simulated unit). Every
+// 600 frames the cumulative counts are written as "phase module offset count"
+// lines; module offsets of the Dolphin binary are symbolized offline (nm).
+// Addresses outside any loaded file are JIT-compiled game code.
+#if defined(__linux__) && defined(__x86_64__)
+namespace
+{
+constexpr u32 HP_MAX = 1u << 20;
+std::atomic<u32> s_hp_n{0};
+u64 s_hp_pc[HP_MAX];
+u8 s_hp_tag[HP_MAX];
+volatile sig_atomic_t s_hp_phase = 0;  // 0 other, 1 live unit, 2 re-sim unit, 3 RbStep
+std::map<std::tuple<int, std::string, u64>, u64> s_hp_counts;
+
+void HostProfHandler(int, siginfo_t*, void* uc)
+{
+  const u32 i = s_hp_n.fetch_add(1, std::memory_order_relaxed);
+  if (i < HP_MAX)
+  {
+    s_hp_pc[i] = static_cast<u64>(static_cast<ucontext_t*>(uc)->uc_mcontext.gregs[REG_RIP]);
+    s_hp_tag[i] = static_cast<u8>(s_hp_phase);
+  }
+}
+
+void HostProfStart()
+{
+  static bool started = false;
+  static const u32 us = ParseU32(Env("NSR_HOST_PROF")).value_or(0);
+  if (started || us == 0)
+    return;
+  started = true;
+  struct sigaction sa{};
+  sa.sa_sigaction = HostProfHandler;
+  sa.sa_flags = SA_SIGINFO | SA_RESTART;
+  sigemptyset(&sa.sa_mask);
+  const int signo = SIGRTMIN + 7;
+  sigaction(signo, &sa, nullptr);
+  sigevent sev{};
+  sev.sigev_notify = SIGEV_THREAD_ID;
+  sev.sigev_signo = signo;
+  sev._sigev_un._tid = static_cast<pid_t>(syscall(SYS_gettid));
+  timer_t timer;
+  if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &timer) != 0)
+    return;
+  itimerspec its{};
+  its.it_interval.tv_nsec = static_cast<long>(us) * 1000;
+  its.it_value = its.it_interval;
+  timer_settime(timer, 0, &its, nullptr);
+  Log("host profiler: every {} us of CPU-thread time", us);
+}
+
+void HostProfDump()
+{
+  static const std::string out = Env("NSR_HOST_PROF_OUT");
+  const u32 n = std::min(s_hp_n.exchange(0), HP_MAX);
+  if (n == 0 || out.empty())
+    return;
+  for (u32 i = 0; i < n; ++i)
+  {
+    Dl_info info{};
+    std::string module = "jit";
+    u64 offset = s_hp_pc[i];
+    if (dladdr(reinterpret_cast<void*>(s_hp_pc[i]), &info) && info.dli_fname)
+    {
+      module = info.dli_fname;
+      offset = s_hp_pc[i] - reinterpret_cast<u64>(info.dli_fbase);
+    }
+    else
+    {
+      offset = 0;  // JIT code: one bucket
+    }
+    ++s_hp_counts[{s_hp_tag[i], module, offset}];
+  }
+  if (FILE* f = std::fopen(out.c_str(), "w"))
+  {
+    for (const auto& [key, count] : s_hp_counts)
+      std::fprintf(f, "%d %s %llx %llu\n", std::get<0>(key), std::get<1>(key).c_str(),
+                   static_cast<unsigned long long>(std::get<2>(key)),
+                   static_cast<unsigned long long>(count));
+    std::fclose(f);
+  }
+}
+}  // namespace
+#else
+namespace
+{
+volatile sig_atomic_t s_hp_phase = 0;
+void HostProfStart()
+{
+}
+void HostProfDump()
+{
+}
+}  // namespace
+#endif
 
 void RollbackFrameHook(const Core::CPUThreadGuard& guard)
 {
@@ -2774,8 +3463,17 @@ void RollbackFrameHook(const Core::CPUThreadGuard& guard)
   r.frame_mode = true;
   r.frame_tick_done = false;
   r.in_game_seen = false;
+  std::copy(std::begin(s_phase_ns), std::end(s_phase_ns), s_cost.ph_step);
+  if (r.vtime_on)
+  {
+    HostProfStart();
+    if (!r.in_resim && r.live % 600 == 0)
+      HostProfDump();
+  }
+  s_hp_phase = 3;
   const auto step_start = std::chrono::steady_clock::now();
   ppc_state.gpr[3] = RbStep(guard, RB_PAD_BUF);
+  s_hp_phase = r.in_resim ? 2 : 1;
   AudioClockFrameLog(guard);
   ResimSpeed(guard, r.in_unit && r.in_resim);
   CostFrameStart(guard, step_start);
@@ -2790,6 +3488,7 @@ void RollbackFrameEndHook(const Core::CPUThreadGuard& guard)
     PowerPC::MMU::HostWrite<u32>(guard, PowerPC::MMU::HostRead<u32>(guard, VI_POST_COUNTER) + 1,
                                  VI_POST_COUNTER);
   CostFrameEnd(guard);
+  s_hp_phase = 0;
   ResimSpeed(guard, false);
   r.in_unit = false;
   if (!r.vtime_on)
@@ -4333,6 +5032,7 @@ void Shutdown(const Core::CPUThreadGuard& guard)
     }
     enet_host_destroy(s.host);
   }
+  s_dirty.Reset();
   if (s_rb.record)
     std::fclose(s_rb.record);
   if (s_rb.ac_log)

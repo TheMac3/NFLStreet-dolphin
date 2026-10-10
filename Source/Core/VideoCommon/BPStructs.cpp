@@ -41,6 +41,8 @@
 #include "VideoCommon/VideoEvents.h"
 #include "VideoCommon/XFStateManager.h"
 
+extern bool g_nsr_skip_vertices;  // VertexLoaderManager.cpp (NFLStreet rollback re-simulation)
+
 using namespace BPFunctions;
 
 static constexpr Common::EnumMap<float, GammaCorrection::Invalid2_2> s_gammaLUT = {1.0f, 1.7f, 2.2f,
@@ -297,6 +299,17 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
 
     const u32 copy_width = srcRect.GetWidth();
     const u32 copy_height = srcRect.GetHeight();
+
+    // NFLStreet rollback: a re-simulated frame draws nothing (its primitives
+    // are skipped) and is never shown, so its EFB/XFB copies and clears are
+    // skipped too (no texture-cache entries, no extra presented frame). With
+    // Dolphin's default copies to texture only, game RAM is not written here.
+    if (g_nsr_skip_vertices)
+    {
+      if (PE_copy.copy_to_xfb == 1)
+        g_bounding_box->Disable(pixel_shader_manager);
+      return;
+    }
 
     // Check if we are to copy from the EFB or draw to the XFB
     if (PE_copy.copy_to_xfb == 0)

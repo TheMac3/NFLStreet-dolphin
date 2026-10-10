@@ -3,6 +3,8 @@
 
 #include "VideoCommon/Fifo.h"
 
+#include <chrono>
+
 #include <atomic>
 #include <cstring>
 
@@ -41,6 +43,10 @@ static constexpr int GPU_TIME_SLOT_SIZE = 1000;
 // NFLStreet rollback diagnostics (NSR_RB_COST): emulated GPU command cycles
 // executed on the CPU thread (single-core mode), summed over the run.
 u64 g_nsr_gpu_cycles = 0;
+// NSR_RB_COST host-time accounting: [0] GPU command processing on the CPU
+// thread (here), [1] DSP slices + audio DMA (SystemTimers.cpp), nanoseconds.
+bool g_nsr_host_timing = false;
+u64 g_nsr_host_ns[2] = {0, 0};
 
 namespace Fifo
 {
@@ -442,6 +448,20 @@ void FifoManager::RunGpu()
 }
 
 int FifoManager::RunGpuOnCpu(int ticks)
+{
+  if (g_nsr_host_timing)
+  {
+    const auto start = std::chrono::steady_clock::now();
+    const int result = RunGpuOnCpuImpl(ticks);
+    g_nsr_host_ns[0] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+    return result;
+  }
+  return RunGpuOnCpuImpl(ticks);
+}
+
+int FifoManager::RunGpuOnCpuImpl(int ticks)
 {
   auto& command_processor = m_system.GetCommandProcessor();
   auto& fifo = command_processor.GetFifo();

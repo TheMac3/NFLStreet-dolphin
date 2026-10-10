@@ -85,6 +85,7 @@ private:
   void ReadDataFromFifo(u32 read_ptr);
   void ReadDataFromFifoOnCPU(u32 read_ptr);
   int RunGpuOnCpu(int ticks);
+  int RunGpuOnCpuImpl(int ticks);
   int WaitForGpuThread(int ticks);
   static void SyncGPUCallback(Core::System& system, u64 ticks, s64 cyclesLate);
 

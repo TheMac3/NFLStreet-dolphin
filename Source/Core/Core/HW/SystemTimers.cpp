@@ -45,6 +45,7 @@ IPC_HLE_PERIOD: For the Wii Remote this is the call schedule:
 #include "Core/HW/SystemTimers.h"
 
 #include <cfloat>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 
@@ -66,13 +67,39 @@ IPC_HLE_PERIOD: For the Wii Remote this is the call schedule:
 #include "VideoCommon/Fifo.h"
 #include "VideoCommon/PerformanceMetrics.h"
 
+extern bool g_nsr_host_timing;  // VideoCommon/Fifo.cpp (NFLStreet NSR_RB_COST)
+extern u64 g_nsr_host_ns[2];
+
 namespace SystemTimers
 {
+namespace
+{
+// NFLStreet NSR_RB_COST: host time of DSP slices and audio DMA, nanoseconds.
+struct NsrDspTimer
+{
+  NsrDspTimer() : on(g_nsr_host_timing)
+  {
+    if (on)
+      start = std::chrono::steady_clock::now();
+  }
+  ~NsrDspTimer()
+  {
+    if (on)
+      g_nsr_host_ns[1] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - start)
+                              .count();
+  }
+  bool on;
+  std::chrono::steady_clock::time_point start;
+};
+}  // namespace
+
 // DSP/CPU timeslicing.
 void SystemTimersManager::DSPCallback(Core::System& system, u64 userdata, s64 cycles_late)
 {
   // splits up the cycle budget in case lle is used
   // for hle, just gives all of the slice to hle
+  NsrDspTimer nsr_timer;
   auto& dsp = system.GetDSP();
   dsp.UpdateDSPSlice(static_cast<int>(dsp.GetDSPEmulator()->DSP_UpdateRate() - cycles_late));
   // NFLStreet rollback: shorter DSP slices while re-simulating (see SetNSRSpeedFactor).
@@ -92,6 +119,7 @@ static int GetAudioDMACallbackPeriod(u32 cpu_core_clock, u32 aid_sample_rate_div
 
 void SystemTimersManager::AudioDMACallback(Core::System& system, u64 userdata, s64 cycles_late)
 {
+  NsrDspTimer nsr_timer;
   system.GetDSP().UpdateAudioDMA();  // Push audio to speakers.
   auto& system_timers = system.GetSystemTimers();
   int callback_period = GetAudioDMACallbackPeriod(

@@ -233,8 +233,13 @@ bool MemoryManager::InitFastmemArena()
   return true;
 }
 
+// NFLStreet rollback: bumped whenever the logical views are remapped, so the
+// snapshot dirty-page tracker (NSRNetplay.cpp) re-reads the mappings.
+u32 g_nsr_logical_remaps = 0;
+
 void MemoryManager::UpdateLogicalMemory(const PowerPC::BatTable& dbat_table)
 {
+  ++g_nsr_logical_remaps;
   for (auto& entry : m_logical_mapped_entries)
   {
     m_arena.UnmapFromMemoryRegion(entry.mapped_pointer, entry.mapped_size);

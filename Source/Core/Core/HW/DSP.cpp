@@ -23,6 +23,8 @@
 
 #include "Core/HW/DSP.h"
 
+#include <chrono>
+
 #include <memory>
 
 #include "AudioCommon/AudioCommon.h"
@@ -40,6 +42,9 @@
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
+
+extern bool g_nsr_host_timing;  // VideoCommon/Fifo.cpp (NFLStreet NSR_RB_COST)
+extern u64 g_nsr_host_ns[2];
 
 namespace DSP
 {
@@ -231,7 +236,16 @@ void DSPManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
                  }),
                  MMIO::ComplexWrite<u16>([](Core::System& system, u32, u16 val) {
                    auto& dsp = system.GetDSP();
+                   // NFLStreet NSR_RB_COST: HLE ucodes run their command
+                   // lists (AX mixing) from this mail write.
+                   const bool timing = g_nsr_host_timing;
+                   const auto start = timing ? std::chrono::steady_clock::now() :
+                                               std::chrono::steady_clock::time_point{};
                    dsp.m_dsp_emulator->DSP_WriteMailBoxLow(true, val);
+                   if (timing)
+                     g_nsr_host_ns[1] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now() - start)
+                                             .count();
                  }));
   mmio->Register(base | DSP_MAIL_FROM_DSP_HI, MMIO::ComplexRead<u16>([](Core::System& system, u32) {
                    auto& dsp = system.GetDSP();

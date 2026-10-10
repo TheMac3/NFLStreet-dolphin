@@ -34,6 +34,9 @@
 #include "VideoCommon/VideoConfig.h"
 #include "VideoCommon/XFMemory.h"
 
+// NFLStreet rollback: set while a re-simulated frame runs (NSRNetplay.cpp).
+bool g_nsr_skip_vertices = false;
+
 namespace VertexLoaderManager
 {
 // Used by zfreeze
@@ -399,6 +402,15 @@ int RunVertices(int vtx_attr_group, OpcodeDecoder::Primitive primitive, int coun
   VertexLoaderBase* loader = RefreshLoader<IsPreprocess>(vtx_attr_group);
 
   int size = count * loader->m_vertex_size;
+
+  // NFLStreet rollback: re-simulated frames are never shown, so their
+  // primitives are skipped (the command stream, registers and the emulated
+  // GPU cycle count are unchanged; see NSRNetplay ResimSpeed).
+  if constexpr (!IsPreprocess)
+  {
+    if (g_nsr_skip_vertices)
+      return size;
+  }
 
   if constexpr (!IsPreprocess)
   {

@@ -28,6 +28,9 @@ class Mapping;
 
 namespace Memory
 {
+// NFLStreet rollback: count of logical-view remaps (UpdateLogicalMemory).
+extern u32 g_nsr_logical_remaps;
+
 constexpr u32 MEM1_BASE_ADDR = 0x80000000U;
 constexpr u32 MEM2_BASE_ADDR = 0x90000000U;
 constexpr u32 MEM1_SIZE_RETAIL = 0x01800000U;
