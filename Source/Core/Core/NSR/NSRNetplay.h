@@ -145,6 +145,10 @@ void RollbackPollHook(const Core::CPUThreadGuard& guard);
 void RollbackTickHook(const Core::CPUThreadGuard& guard);
 void RollbackFrameHook(const Core::CPUThreadGuard& guard);     // r3 = 1: run another frame
 void RollbackFrameEndHook(const Core::CPUThreadGuard& guard);
+// InGame group update.  A session that has observed this call leaves when a
+// completed live frame no longer makes it (match/results transition).
+constexpr unsigned int IN_GAME_FN = 0x8002854C;
+void InGameHook(const Core::CPUThreadGuard& guard);  // HookType::Start
 void TickCountHook(const Core::CPUThreadGuard& guard);  // HookType::Gate
 std::vector<unsigned int> ResimSkipList();
 std::vector<unsigned int> EffectGateList();  // NSR_RB_EFFECT_GATE
@@ -286,5 +290,8 @@ void SetHookPc(unsigned int pc);  // set by HLE::Execute before each hook
 
 // Tear down the network session (called on emulation shutdown).
 bool IsReplayCatchingUp();
-void Shutdown();
+// GN7E69 revision-0 rollback-patch footprint.  HLE installs the complete NSR
+// hook set only when every signature word matches.
+bool ValidateRollbackImage(Core::System& system);
+void Shutdown(const Core::CPUThreadGuard& guard);
 }  // namespace NSRNetplay

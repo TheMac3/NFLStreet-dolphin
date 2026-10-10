@@ -67,6 +67,7 @@
 #include "Core/Movie.h"
 #include "Core/NetPlayClient.h"
 #include "Core/NetPlayProto.h"
+#include "Core/NSR/NSRNetplay.h"
 #include "Core/PatchEngine.h"
 #include "Core/PowerPC/GDBStub.h"
 #include "Core/PowerPC/JitInterface.h"
@@ -590,6 +591,8 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
            NetPlay::IsNetPlayRunning() ? &(boot_session_data.GetNetplaySettings()->sram) : nullptr);
 
   Common::ScopeGuard hw_guard{[&system] {
+    CPUThreadGuard guard(system);
+    NSRNetplay::Shutdown(guard);
     INFO_LOG_FMT(CONSOLE, "{}", StopMessage(false, "Shutting down HW"));
     HW::Shutdown(system);
     INFO_LOG_FMT(CONSOLE, "{}", StopMessage(false, "HW shutdown"));
@@ -601,7 +604,6 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
     PatchEngine::Shutdown();
     HLE::Clear();
 
-    CPUThreadGuard guard(system);
     system.GetPowerPC().GetDebugInterface().Clear(guard);
   }};
 

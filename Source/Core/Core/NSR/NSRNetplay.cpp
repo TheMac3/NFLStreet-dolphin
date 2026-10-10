@@ -859,9 +859,61 @@ constexpr std::array<TickCounter, 4> TICK_COUNTERS{{
                             // (fn_801F7ABC; advanced by fn_801F7AE8)
 }};
 
+enum class AcMode
+{
+  Off,
+  On,
+  Shadow
+};
+
+// Environment-backed rollback options belong to one emulation lifetime.  Keeping them here,
+// rather than in function-local statics, lets Shutdown fully reset a process before another game
+// boot parses its own configuration.
+struct RollbackConfig
+{
+  bool nsr_enabled = false;
+  bool netplay_enabled = false;
+  std::optional<u32> seed;
+  bool instant_disc = false;
+  bool sample = false;
+  std::string stacks_path;
+  std::vector<std::string> transplant;
+  std::vector<std::string> dump_units;
+  std::vector<std::string> adopt;
+  std::optional<u32> force_random_seed;
+  bool disc_trace = false;
+  bool io_trace = false;
+  bool quiet_trace = false;
+  bool async_present = false;
+  u32 peek_z = 0;
+  bool keep_resim_vsync = false;
+  std::vector<u32> audio_gate_only;
+  std::vector<u32> effect_gates;
+  std::vector<u32> audio_trace;
+  std::vector<u32> probes;
+  std::vector<u32> skip_resim;
+  bool probe_all = false;
+  u32 session_end = 0;
+  bool auto_reenter = false;
+  AcMode ac_mode = AcMode::On;
+  std::string ac_log_path;
+  std::vector<std::pair<u32, u32>> ac_hash_ranges;
+  u32 ac_speech_frames = 75;
+  u32 ac_speech_lead = 0;
+  u32 ac_sfx_default = 30;
+  u32 ac_sfx_tail = 2;
+  u32 ac_bank_frames = 6;
+  u32 ac_polls_per_tick = 1000;
+  u32 ac_song_frames = 10800;
+  u32 ac_song_gap = 380;
+};
+
 struct Rollback
 {
   bool initialized = false;
+  bool config_loaded = false;
+  RollbackConfig config;
+  bool seed_written = false;
   u32 force = 0;          // NSR_RB_FORCE: ticks to roll back before every live tick
   // NSR_RB_MISPREDICT=d (with NSR_RB_REPLAY, and NSR_RB_FORCE > 0 for the ring):
   // netplay with input delay d on one machine. Each live frame runs with the
@@ -936,6 +988,13 @@ struct Rollback
   u32 live = 0;    // index of the next live tick
   u32 cursor = 0;  // index of the tick about to run (< live while re-simulating)
   bool rolled = false;
+  bool session_ended = false;
+  bool session_end_consumed = false;
+  bool enter_pending = false;
+  bool reenter_ready = false;
+  bool in_game_seen = false;
+  bool session_saw_in_game = false;
+  u32 session_generation = 0;
   std::map<u32, Pads> pads;              // tick -> pads it ran with
   std::map<u32, std::array<u32, 4>> counters;  // tick -> TICK_COUNTERS values before it
   std::vector<std::vector<u8>> ring;     // ring[t % (force + 1)] = state before tick t
@@ -950,6 +1009,11 @@ struct Rollback
   std::vector<u8> at_start, at_end;  // RAM at the last tick start / tick end
   bool have_end = false;
   std::vector<u32> inside, outside;
+
+  bool memwatch_armed = false;
+  u32 probe_last_value = 0, probe_last_pc = 0, probe_last_lr = 0;
+  FILE* ac_log = nullptr;
+  FILE* stacks = nullptr;
 };
 
 Rollback s_rb;
@@ -985,6 +1049,12 @@ void RbSampleIo(const Core::CPUThreadGuard& guard)
     it->second = std::max(it->second, hi);
 }
 std::atomic<s64> s_rb_last_tick_ms{0};  // host time of the last tick hook (watchdog)
+std::atomic<u32> s_rb_watch_live{0};
+std::atomic<u64> s_rb_watch_rollbacks{0};
+std::jthread s_rb_watchdog;
+
+void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame);
+void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason);
 
 std::optional<u64> ParseU64(const std::string& text)
 {
@@ -1008,17 +1078,93 @@ std::optional<u32> ParseU32(const std::string& text)
   return static_cast<u32>(v);
 }
 
+std::vector<u32> ParseAddressList(const std::string& text)
+{
+  std::vector<u32> out;
+  for (const std::string& item : Split(text, ','))
+  {
+    if (const auto value = ParseU32(item))
+      out.push_back(*value);
+  }
+  return out;
+}
+
+RollbackConfig& ConfigForRollback()
+{
+  Rollback& r = s_rb;
+  if (r.config_loaded)
+    return r.config;
+
+  RollbackConfig& c = r.config;
+  c.nsr_enabled = std::getenv("NSR_NETPLAY") != nullptr || std::getenv("NSR_SEED") != nullptr;
+  c.netplay_enabled = std::getenv("NSR_NETPLAY") != nullptr;
+  c.seed = ParseU32(Env("NSR_SEED"));
+  c.instant_disc = !Env("NSR_RB_INSTANT_DISC").empty();
+  c.sample = !Env("NSR_RB_SAMPLE").empty();
+  c.stacks_path = Env("NSR_RB_STACKS");
+  c.transplant = Split(Env("NSR_RB_TRANSPLANT"), ':');
+  c.dump_units = Split(Env("NSR_RB_DUMP_UNIT"), ',');
+  c.adopt = Split(Env("NSR_RB_ADOPT"), ':');
+  c.force_random_seed = ParseU32(Env("NSR_RB_FORCE_RANDOM"));
+  c.disc_trace = !Env("NSR_RB_DISC_TRACE").empty();
+  c.io_trace = !Env("NSR_RB_IO_TRACE").empty();
+  c.quiet_trace = !Env("NSR_RB_QUIET_TRACE").empty();
+  c.async_present = !Env("NSR_RB_ASYNC_PRESENT").empty();
+  c.peek_z = ParseU32(Env("NSR_RB_PEEKZ")).value_or(0);
+  c.keep_resim_vsync = !Env("NSR_RB_RESIM_VSYNC").empty();
+  const std::string audio_gate = Env("NSR_RB_AUDIO_GATE");
+  c.audio_gate_only =
+      audio_gate == "1" ? std::vector<u32>{0x8026AAF0} : ParseAddressList(audio_gate);
+  c.effect_gates = ParseAddressList(Env("NSR_RB_EFFECT_GATE"));
+  c.audio_trace = ParseAddressList(Env("NSR_AC_TRACE"));
+  c.probes = ParseAddressList(Env("NSR_RB_PROBES"));
+  c.skip_resim = ParseAddressList(Env("NSR_RB_SKIP_RESIM"));
+  c.probe_all = !Env("NSR_RB_PROBE_ALL").empty();
+  c.session_end = ParseU32(Env("NSR_RB_SESSION_END")).value_or(0);
+  c.auto_reenter = !Env("NSR_RB_AUTO_REENTER").empty();
+  const std::string ac_mode = Env("NSR_AC", "1");
+  c.ac_mode = ac_mode == "0" ? AcMode::Off : ac_mode == "shadow" ? AcMode::Shadow : AcMode::On;
+  c.ac_log_path = Env("NSR_AC_LOG");
+  for (const std::string& item : Split(Env("NSR_AC_HASH"), ','))
+  {
+    const auto parts = Split(item, '-');
+    if (parts.size() == 2)
+    {
+      const auto lo = ParseU32(parts[0]);
+      const auto hi = ParseU32(parts[1]);
+      if (lo && hi && *hi > *lo)
+        c.ac_hash_ranges.emplace_back(*lo, *hi);
+    }
+  }
+  c.ac_speech_frames = std::max<u32>(1, ParseU32(Env("NSR_AC_SPEECH_FRAMES")).value_or(75));
+  c.ac_speech_lead = ParseU32(Env("NSR_AC_SPEECH_LEAD")).value_or(0);
+  c.ac_sfx_default = ParseU32(Env("NSR_AC_SFX_DEFAULT")).value_or(30);
+  c.ac_sfx_tail = ParseU32(Env("NSR_AC_SFX_TAIL")).value_or(2);
+  c.ac_bank_frames = ParseU32(Env("NSR_AC_BANK_FRAMES")).value_or(6);
+  c.ac_polls_per_tick =
+      std::max<u32>(1, ParseU32(Env("NSR_AC_POLLS_PER_TICK")).value_or(1000));
+  c.ac_song_frames = std::max<u32>(1, ParseU32(Env("NSR_AC_SONG_FRAMES")).value_or(10800));
+  c.ac_song_gap = ParseU32(Env("NSR_AC_SONG_GAP")).value_or(380);
+  r.config_loaded = true;
+  return c;
+}
+
 bool IsIoIdle(const u8* ram);  // defined with the restore helpers
 
 void RbInit(Core::System& system)
 {
   Rollback& r = s_rb;
+  RollbackConfig& config = ConfigForRollback();
   r.initialized = true;
   if (const std::string path = Env("NSR_LOG"); !path.empty() && s_session.log == stderr)
   {
     if (FILE* f = std::fopen(path.c_str(), "a"))
       s_session.log = f;
   }
+  if (!config.ac_log_path.empty())
+    r.ac_log = std::fopen(config.ac_log_path.c_str(), "w");
+  if (!config.stacks_path.empty())
+    r.stacks = std::fopen(config.stacks_path.c_str(), "w");
   r.force = ParseU32(Env("NSR_RB_FORCE")).value_or(0);
   if (const std::string path = Env("NSR_RB_REPLAY_FOLLOW"); !path.empty())
   {
@@ -1189,159 +1335,54 @@ void RbInit(Core::System& system)
   }
 
   r.io_idle_mode = !Env("NSR_RB_IO_IDLE").empty();
-  if (r.force > 0 || !Env("NSR_RB_SAMPLE").empty() || !Env("NSR_RB_STACKS").empty())
+  if (r.force > 0)
   {
-    if (r.force > 0)
-    {
-      // Deep enough for the deepest rollback the session can ask for
-      // (forced depth or misprediction delay), plus quiet-point slack.
-      const u32 depth = std::max(r.force, r.mispredict);
-      r.ring.assign(r.io_idle_mode ? std::max<u32>(depth + 1, ParseU32(Env("NSR_RB_RING")).value_or(24))
-                                   : depth + 1,
-                    std::vector<u8>(size + r.vmem_bytes));
-    }
-    // Diagnostics: if ticks stop after rollbacks began (the game hung), log
-    // where the CPU is once and dump MEM1 (NSR_DUMP_PREFIX-hang.bin).
-    std::thread([&system] {
-      for (;;)
-      {
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        const s64 last = s_rb_last_tick_ms.load();
-        const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch())
-                            .count();
-        // NSR_RB_SAMPLE: profile where the CPU is during rollbacks (every 2 s).
-        static const bool sample = !Env("NSR_RB_SAMPLE").empty();
-        // NSR_RB_STACKS=path: append raw call stacks (pc, then return
-        // addresses) for an offline call-tree profile, 400 samples every 2 s.
-        static FILE* stacks = [] {
-          const std::string path = Env("NSR_RB_STACKS");
-          return path.empty() ? nullptr : std::fopen(path.c_str(), "w");
-        }();
-        if (stacks)
-        {
-          auto& p = system.GetPPCState();
-          const u8* m = system.GetMemory().GetRAM();
-          auto rd2 = [&](u32 a) { return Common::swap32(m + (a & 0x01FFFFFF)); };
-          for (int k = 0; k < 400; ++k)
+    // Deep enough for the deepest rollback the session can ask for
+    // (forced depth or misprediction delay), plus quiet-point slack.
+    const u32 depth = std::max(r.force, r.mispredict);
+    r.ring.assign(r.io_idle_mode ? std::max<u32>(depth + 1, ParseU32(Env("NSR_RB_RING")).value_or(24))
+                                 : depth + 1,
+                  std::vector<u8>(size + r.vmem_bytes));
+  }
+  if (r.force > 0 || config.sample || r.stacks)
+  {
+    // The watchdog owns no emulator object.  CPU-thread hooks publish only the
+    // counters it needs, so stopping/joining it never races PPC or RAM teardown.
+    s_rb_watchdog = std::jthread(
+        [sample = config.sample, stacks = r.stacks](std::stop_token stop) {
+          while (!stop.stop_requested())
           {
-            std::string line = fmt::format("{:08x} {:08x}", p.pc, LR(p));
-            u32 sp = p.gpr[1];
-            for (int i = 0; i < 24 && (sp >> 24) == 0x80; ++i)
+            for (int i = 0; i < 20 && !stop.stop_requested(); ++i)
+              std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (stop.stop_requested())
+              return;
+
+            const s64 last = s_rb_last_tick_ms.load();
+            const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+            const u32 live = s_rb_watch_live.load();
+            const u64 rollbacks = s_rb_watch_rollbacks.load();
+            if (stacks)
             {
-              sp = rd2(sp);
-              if ((sp >> 24) != 0x80)
-                break;
-              line += fmt::format(" {:08x}", rd2(sp + 4));
+              // PPC stacks may only be sampled on the CPU thread.  Retain a
+              // useful host-side liveness trace without touching emulated state.
+              std::fprintf(stacks, "%u rollbacks=%llu last_tick_ms=%lld\n", live,
+                           static_cast<unsigned long long>(rollbacks),
+                           static_cast<long long>(last));
+              std::fflush(stacks);
             }
-            std::fprintf(stacks, "%u %s\n", s_rb.live, line.c_str());
-            std::this_thread::sleep_for(std::chrono::milliseconds(3));
+            if (sample)
+              Log("sample live {} rollbacks {} last-tick-age {}ms", live, rollbacks,
+                  last ? now - last : 0);
+            if (rollbacks == 0 || last == 0 || now - last < 5000)
+              continue;
+            Log("HANG: no tick for {} ms after {} rollbacks (live {}); PPC/RAM sampling "
+                "is deferred to CPU-thread diagnostics",
+                now - last, rollbacks, live);
+            return;
           }
-          std::fflush(stacks);
-          continue;
-        }
-        if (sample && (s_rb.rollbacks > 0 || s_rb.force == 0))
-        {
-          auto& p = system.GetPPCState();
-          const u8* m = system.GetMemory().GetRAM();
-          auto rd2 = [&](u32 a) { return Common::swap32(m + (a & 0x01FFFFFF)); };
-          std::map<u32, int> hits;
-          for (int k = 0; k < 200; ++k)
-          {
-            // Attribute to the InGame call site on the stack (its LR inside
-            // InGame::fn_8002854C), or the PC if not inside InGame.
-            u32 sp = p.gpr[1], site = 0;
-            u32 lr0 = LR(p);
-            if (lr0 >= 0x8002854C && lr0 < 0x80028744)
-              site = lr0;
-            for (int i = 0; i < 24 && !site && (sp >> 24) == 0x80; ++i)
-            {
-              sp = rd2(sp);
-              if ((sp >> 24) != 0x80)
-                break;
-              const u32 ra = rd2(sp + 4);
-              if (ra >= 0x8002854C && ra < 0x80028744)
-                site = ra;
-            }
-            ++hits[site ? site : (p.pc | 1)];
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-          }
-          std::vector<std::pair<int, u32>> top;
-          for (const auto& [pc, n] : hits)
-            top.emplace_back(n, pc);
-          std::sort(top.rbegin(), top.rend());
-          std::string line;
-          for (size_t i = 0; i < top.size() && i < 8; ++i)
-            line += fmt::format(" {:08x}x{}", top[i].second, top[i].first);
-          Log("sample (InGame call site, odd = outside InGame) live {}:{}", s_rb.live, line);
-          continue;
-        }
-        if (s_rb.rollbacks == 0 || last == 0 || now - last < 5000)
-          continue;
-        auto& ppc = system.GetPPCState();
-        const u8* ram = system.GetMemory().GetRAM();
-        auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
-        // Sample the CPU 50 times: a busy loop shows one hot PC, an interrupt
-        // storm shows handler PCs, a blocked thread shows the idle loop.
-        std::map<std::string, int> samples;
-        for (int k = 0; k < 50; ++k)
-        {
-          std::string chain = fmt::format("pc {:08x} lr {:08x} msr {:08x}", ppc.pc, LR(ppc), ppc.msr.Hex);
-          u32 sp = ppc.gpr[1];
-          for (int i = 0; i < 12 && (sp >> 24) == 0x80; ++i)
-          {
-            sp = rd(sp);
-            if ((sp >> 24) != 0x80)
-              break;
-            chain += fmt::format(" <- {:08x}", rd(sp + 4));
-          }
-          ++samples[chain];
-          std::this_thread::sleep_for(std::chrono::milliseconds(40));
-        }
-        Log("HANG: no tick for {} ms after {} rollbacks; CPU samples:", now - last, s_rb.rollbacks);
-        {
-          // Thread dump: every active thread's state, wait queue, saved pc/lr.
-          u32 th = rd(0x800000DC);
-          for (int n = 0; n < 16 && (th >> 24) == 0x80; ++n, th = rd(th + 0x2FC))
-            Log("  thread {:08x} state {} prio {} queue {:08x} srr0 {:08x} lr {:08x} sp {:08x}", th,
-                rd(th + 0x2C8) >> 16, rd(th + 0x2D0), rd(th + 0x2DC), rd(th + 0x198), rd(th + 0x84),
-                rd(th + 4));
-          Log("  dvd executing {:08x}; pending loads {}; io idle {}; disc worker sem counts {} {}",
-              rd(0x803ED118), rd(PENDING_LOADS), IsIoIdle(ram), rd(0x80381C00), rd(0x80381C0C));
-        }
-        // In __OSUnhandledException (GN7E69 0x8023AF0C): r24 = exception,
-        // r25 = context, r26 = DSISR, r27 = DAR.
-        const u32 c = ppc.gpr[25];
-        Log("  r24 {:08x} r25 {:08x} r26 {:08x} r27 {:08x}; context srr0 {:08x} srr1 {:08x} lr {:08x}",
-            ppc.gpr[24], c, ppc.gpr[26], ppc.gpr[27], (c >> 24) == 0x80 ? rd(c + 0x198) : 0,
-            (c >> 24) == 0x80 ? rd(c + 0x19C) : 0, (c >> 24) == 0x80 ? rd(c + 0x84) : 0);
-        if ((c >> 24) == 0x80)
-        {
-          // The faulting context's registers and stack.
-          std::string regs;
-          for (int g = 0; g < 32; ++g)
-            regs += fmt::format(" r{}={:08x}", g, rd(c + 4 * g));
-          Log("  context:{} ctr={:08x}", regs, rd(c + 0x88));
-          std::string chain;
-          u32 sp = rd(c + 4);
-          for (int i = 0; i < 16 && (sp >> 24) == 0x80; ++i)
-          {
-            chain += fmt::format(" [{:08x}: lr {:08x}]", sp, rd(sp + 4));
-            sp = rd(sp);
-          }
-          Log("  context stack:{}", chain);
-        }
-        for (const auto& [chain, n] : samples)
-          Log("  {:2}x {}", n, chain);
-        const std::string prefix = Env("NSR_DUMP_PREFIX");  // never dump into the cwd
-        if (FILE* f = prefix.empty() ? nullptr : std::fopen((prefix + "-hang.bin").c_str(), "wb"))
-        {
-          std::fwrite(ram, 1, system.GetMemory().GetRamSizeReal(), f);
-          std::fclose(f);
-        }
-        return;
-      }
-    }).detach();
+        });
   }
   Log("rollback image: force={} keep-ranges={} hash-log={}", r.force, keep.size(), r.hash_log);
 }
@@ -1707,19 +1748,18 @@ void RbWriteProfile()
 // GRand re-seeds from it).
 void InstallSeedOnce(const Core::CPUThreadGuard& guard)
 {
-  static bool seed_written = false;
-  if (seed_written)
+  Rollback& r = s_rb;
+  if (r.seed_written)
     return;
-  seed_written = true;
-  if (const auto value = ParseU32(Env("NSR_SEED")))
+  r.seed_written = true;
+  if (const auto value = ConfigForRollback().seed)
     PowerPC::MMU::HostWrite<u32>(guard, *value, SEED_ADDRESS);
 }
 }  // namespace
 
 long long DiscLatency(long long ticks)
 {
-  static const bool instant = !Env("NSR_RB_INSTANT_DISC").empty();
-  return instant && s_rb.vtime_on ? 0 : ticks;
+  return ConfigForRollback().instant_disc && s_rb.vtime_on ? 0 : ticks;
 }
 
 void NoteDiscCommand()
@@ -1737,9 +1777,40 @@ void LogMemHit(u32 pc, u32 lr, bool write, size_t size, u64 value, u32 addr)
 
 bool IsEnabled()
 {
-  static const bool enabled =
-      std::getenv("NSR_NETPLAY") != nullptr || std::getenv("NSR_SEED") != nullptr;
-  return enabled;
+  return ConfigForRollback().nsr_enabled;
+}
+
+bool ValidateRollbackImage(Core::System& system)
+{
+  // tools/isopatch.py verifies the GN7E69-r0 originals before writing this
+  // footprint.  Treat the complete footprint as the patch signature: a
+  // mismatch rejects every invasive NSR hook rather than installing a
+  // partial fixed-address set into an unknown executable.
+  constexpr std::pair<u32, u32> signature[] = {
+      {0x80416900, 0x4E800020}, {0x80416904, 0x4E800020}, {0x80416908, 0x4E800020},
+      {0x8041690C, 0x4E800020}, {0x80416910, 0x4E800020}, {0x80416914, 0x4E800020},
+      {0x80416918, 0x4E800020}, {0x80026B64, 0x483EFF1D}, {0x80198924, 0x4827DFE9},
+      {0x801E271C, 0x48234245}, {0x801E2720, 0x60000000}, {0x801E2724, 0x60000000},
+      {0x801E2728, 0x60000000}, {0x801E272C, 0x60000000}, {0x801E2730, 0x60000000},
+      {0x80028654, 0x483EE3BD}, {0x8002865C, 0x60000000}, {0x80416A80, 0x9421FFE0},
+      {0x80416A84, 0x7C0802A6}, {0x80416A88, 0x90010024}, {0x80416A8C, 0x93E1001C},
+      {0x80416A90, 0x4BFFFE85}, {0x80416A94, 0x7C7F1B78}, {0x80416A98, 0x4BDE135D},
+      {0x80416A9C, 0x4BC10035}, {0x80416AA0, 0x4BFFFE79}, {0x80416AA4, 0x73E00001},
+      {0x80416AA8, 0x4082FFE8}, {0x80416AAC, 0x83E1001C}, {0x80416AB0, 0x80010024},
+      {0x80416AB4, 0x7C0803A6}, {0x80416AB8, 0x38210020}, {0x80416ABC, 0x4E800020},
+  };
+  const auto& memory = system.GetMemory();
+  for (const auto& [address, expected] : signature)
+  {
+    const u32 actual = memory.Read_U32(address);
+    if (actual != expected)
+    {
+      Log("rollback hook signature mismatch at {:08x}: expected {:08x}, got {:08x}; hooks disabled",
+          address, expected, actual);
+      return false;
+    }
+  }
+  return true;
 }
 
 void Hook(const Core::CPUThreadGuard& guard)
@@ -1751,7 +1822,7 @@ void Hook(const Core::CPUThreadGuard& guard)
   ppc_state.npc = LR(ppc_state);  // Replace hook: return to caller
 
   InstallSeedOnce(guard);
-  if (std::getenv("NSR_NETPLAY") == nullptr)
+  if (!ConfigForRollback().netplay_enabled)
     return;  // seed-only mode (offline practice)
 
   Session& s = s_session;
@@ -1940,7 +2011,7 @@ void RollbackPollHook(const Core::CPUThreadGuard& guard)
 // tick's step ("3637/3633").
 static void RbTransplant(Core::System& system, u8* ram, u32 live, u32 frame)
 {
-  static const auto spec = Split(Env("NSR_RB_TRANSPLANT"), ':');
+  const auto& spec = ConfigForRollback().transplant;
   if (spec.size() != 3)
     return;
   const std::string key =
@@ -1980,7 +2051,7 @@ static void RbTransplant(Core::System& system, u8* ram, u32 live, u32 frame)
 // for the live frame itself), to NSR_DUMP_PREFIX-unit-<live>-<frame>.bin.
 static void RbDumpUnit(Core::System& system, const u8* ram, u32 live, u32 frame)
 {
-  static const std::vector<std::string> wanted = Split(Env("NSR_RB_DUMP_UNIT"), ',');
+  const auto& wanted = ConfigForRollback().dump_units;
   const std::string key = std::to_string(live) + ":" + std::to_string(frame);
   if (std::find(wanted.begin(), wanted.end(), key) == wanted.end())
     return;
@@ -2011,7 +2082,7 @@ static void RbDumpUnit(Core::System& system, const u8* ram, u32 live, u32 frame)
 // can be compared frame by frame inside the session.
 static void RbAdopt(Core::System& system, u8* ram, u32 live)
 {
-  static const auto spec = Split(Env("NSR_RB_ADOPT"), ':');
+  const auto& spec = ConfigForRollback().adopt;
   if (spec.size() != 2 || ParseU32(spec[1]).value_or(0xFFFFFFFF) != live)
     return;
   std::vector<u8> slot(s_rb.mem1_size + s_rb.vmem_bytes);
@@ -2047,7 +2118,7 @@ static void RbAdopt(Core::System& system, u8* ram, u32 live)
 // with different seeds model two peers with different rollback patterns.
 static u32 ForcedDepth(u32 live)
 {
-  static const std::optional<u32> seed = ParseU32(Env("NSR_RB_FORCE_RANDOM"));
+  const std::optional<u32> seed = ConfigForRollback().force_random_seed;
   if (!seed)
     return s_rb.force;
   u64 z = (u64(*seed) << 32 | live) + 0x9E3779B97F4A7C15ULL;
@@ -2123,12 +2194,46 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
       return 0;
   }
   u8* ram = system.GetMemory().GetRAM();
-  const u32 slots = r.ring.empty() ? 1 : static_cast<u32>(r.ring.size());
+  const u32 t = r.live;
   ++r.ticks_since_poll;
+  r.tick_running = t;
+  if (!r.vtime_on && ((!r.session_ended && r.vtime_from && t == r.vtime_from) ||
+                      (r.enter_pending && r.config.auto_reenter)))
+  {
+    EnterRollbackSession(guard, t);
+  }
+  if (!r.vtime_on)
+  {
+    // The rollback image still routes every main-loop iteration through this
+    // stub.  Outside a match it is deliberately a thin pass-through: sample
+    // this frame's input, never snapshot/predict/restore, and leave every
+    // gate disabled so menus and loading use the game's original clocks.
+    Pads pass_pads = r.latest;
+    if (s_follow)
+      pass_pads = follow_pads;
+    else if (const auto it = r.replay.find(t); it != r.replay.end())
+      pass_pads = it->second;
+    if (r.record)
+    {
+      std::fwrite(&t, 4, 1, r.record);
+      std::fwrite(pass_pads.data(), 1, sizeof(Pads), r.record);
+      std::fflush(r.record);
+    }
+    RbWritePads(guard, buf, pass_pads);
+    r.in_unit = false;
+    r.in_resim = false;
+    r.frame_tick_done = false;
+    r.live = t + 1;
+    r.cursor = r.live;
+    r.rolled = false;
+    s_rb_watch_live = r.live;
+    return 0;
+  }
+  const u32 slots = r.ring.empty() ? 1 : static_cast<u32>(r.ring.size());
   RbSampleIo(guard);
   if (r.disc_commands != r.disc_commands_seen)
   {
-    if (static const bool trace = !Env("NSR_RB_DISC_TRACE").empty(); trace && r.vtime_on)
+    if (r.config.disc_trace && r.vtime_on)
       Log("disc commands before unit live {} cursor {} rolled {}: {}", r.live, r.cursor, r.rolled,
           r.disc_commands - r.disc_commands_seen);
     r.disc_commands_seen = r.disc_commands;
@@ -2136,10 +2241,9 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
 
   // NSR_RB_MEMWATCH: armed at the start of the NSR_RB_WATCH window (memchecks
   // make the JIT very slow, so not from boot).
-  static bool memwatch_armed = false;
-  if (!memwatch_armed && r.watch && r.live >= r.watch_from)
+  if (!r.memwatch_armed && r.watch && r.live >= r.watch_from)
   {
-    memwatch_armed = true;
+    r.memwatch_armed = true;
     if (const auto addr = ParseU32(Env("NSR_RB_MEMWATCH")))
     {
       TMemCheck mc;
@@ -2305,7 +2409,6 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
   }
 
   // Live tick.
-  const u32 t = r.live;
   RbTransplant(system, ram, t, t);
   if (r.perturb_at && t + 1 == r.perturb_at)
     RbSave(ram, r.prev);
@@ -2338,7 +2441,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
   }
   if (r.hash_log && t % 60 == 0)
     Log("tick {} hash {:016x}", t, RbHash(ram));
-  if (static const bool trace = !Env("NSR_RB_IO_TRACE").empty(); trace && t % 5 == 0)
+  if (r.config.io_trace && t % 5 == 0)
   {
     auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
     Log("io unit {}: dvd exec {:08x} q0 {:08x} worker state {} queue {:08x} srr0 {:08x} semA {} semB {} "
@@ -2353,7 +2456,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
   if (r.io_idle_mode)
   {
     r.io_idle[t] = IsIoIdle(ram);
-    if (static const bool qt = !Env("NSR_RB_QUIET_TRACE").empty(); qt)
+    if (r.config.quiet_trace)
     {
       auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
       const bool dvd = rd(0x803ED118) == 0;
@@ -2385,22 +2488,11 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
   RbWritePads(guard, buf, r.pads[t]);
   RbAdopt(system, ram, t);
   RbDumpUnit(system, ram, t, t);
-  if (r.vtime_from && t == r.vtime_from && !r.vtime_on)
+  if (t == r.vtime_from)
   {
-    r.vtime_on = true;
-    // The same base on every machine (each machine's own time base differs,
-    // and game frame timers floor time*60/clock), a whole number of frames.
-    // NSR_RB_VTIME_BASE overrides it (netplay: agreed at session start).
-    constexpr u64 TB_PER_FRAME = 40500000 / 60;
-    r.vtime_base = ParseU64(Env("NSR_RB_VTIME_BASE")).value_or(TB_PER_FRAME << 37) /
-                   TB_PER_FRAME * TB_PER_FRAME;
-    Log("virtual tick time from tick {} (base {:016x})", t, r.vtime_base);
     AudioClockSessionStart(guard);
-    // The snapshot "before frame t" was saved above, before the audio clock
-    // model (MEM1 0x80416B00..) was initialised (and before NSR_RB_ADOPT, if
-    // any): re-save it, or a rollback to exactly the session's first frame
-    // would restore an uninitialised model (no AC_MAGIC: every audio hook falls
-    // back to real answers from then on; interim review, 2026-10-10).
+    // The model lives in restored RAM, so the first snapshot must contain
+    // its initialized magic and queues.  RbAdopt intentionally precedes it.
     if (!r.ring.empty())
       RbSave(ram, r.ring[t % slots]);
   }
@@ -2413,6 +2505,8 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
   r.live = t + 1;
   r.cursor = r.live;
   r.rolled = false;
+  s_rb_watch_live = r.live;
+  s_rb_watch_rollbacks = r.rollbacks;
   if (t >= 600)
   {
     r.pads.erase(r.pads.begin(), r.pads.lower_bound(t - 600));
@@ -2679,6 +2773,7 @@ void RollbackFrameHook(const Core::CPUThreadGuard& guard)
   Rollback& r = s_rb;
   r.frame_mode = true;
   r.frame_tick_done = false;
+  r.in_game_seen = false;
   const auto step_start = std::chrono::steady_clock::now();
   ppc_state.gpr[3] = RbStep(guard, RB_PAD_BUF);
   AudioClockFrameLog(guard);
@@ -2690,13 +2785,49 @@ void RollbackFrameEndHook(const Core::CPUThreadGuard& guard)
 {
   auto& ppc_state = guard.GetSystem().GetPPCState();
   ppc_state.npc = LR(ppc_state);
-  static const bool async_present = !Env("NSR_RB_ASYNC_PRESENT").empty();
-  if (s_rb.vtime_on && !async_present)
+  Rollback& r = s_rb;
+  if (r.vtime_on && !r.config.async_present)
     PowerPC::MMU::HostWrite<u32>(guard, PowerPC::MMU::HostRead<u32>(guard, VI_POST_COUNTER) + 1,
                                  VI_POST_COUNTER);
   CostFrameEnd(guard);
   ResimSpeed(guard, false);
-  s_rb.in_unit = false;
+  r.in_unit = false;
+  if (!r.vtime_on)
+  {
+    if (r.session_ended && r.config.auto_reenter)
+    {
+      if (!r.in_game_seen)
+        r.reenter_ready = true;
+      else if (r.reenter_ready)
+        r.enter_pending = true;
+    }
+    return;
+  }
+  if (r.in_resim)
+    return;
+  if (r.config.session_end && !r.session_end_consumed &&
+      r.tick_running >= r.config.session_end)
+  {
+    r.session_end_consumed = true;
+    LeaveRollbackSession(guard, "NSR_RB_SESSION_END");
+  }
+  else if (r.session_saw_in_game && !r.in_game_seen)
+  {
+    LeaveRollbackSession(guard, "InGame group inactive");
+  }
+}
+
+// The active InGame group calls this once per main-loop iteration.  Losing
+// that call after a session has observed it is the match/results boundary;
+// seeing it again after at least one inactive frame can arm an opt-in test
+// re-entry at the following frame boundary.
+void InGameHook(const Core::CPUThreadGuard& guard)
+{
+  (void)guard;
+  Rollback& r = s_rb;
+  r.in_game_seen = true;
+  if (r.vtime_on)
+    r.session_saw_in_game = true;
 }
 
 // Frame mode, during the session: exactly one tick per frame. Replaces the
@@ -2768,9 +2899,8 @@ void PeekZHook(const Core::CPUThreadGuard& guard)
 {
   if (!s_rb.vtime_on)
     return;  // outside the session: run the real peek
-  static const u32 value = ParseU32(Env("NSR_RB_PEEKZ")).value_or(0);
   auto& ppc = guard.GetSystem().GetPPCState();
-  ppc.gpr[3] = value;
+  ppc.gpr[3] = s_rb.config.peek_z;
   ppc.npc = LR(ppc);
 }
 
@@ -2829,7 +2959,7 @@ void PresentHook(const Core::CPUThreadGuard& guard)
 {
   Rollback& r = s_rb;
   auto& ppc = guard.GetSystem().GetPPCState();
-  static const bool async_present = !Env("NSR_RB_ASYNC_PRESENT").empty();  // old behavior
+  const bool async_present = r.config.async_present;  // old behavior
   if (s_hook_pc == VI_WAIT_FOR_RETRACE && r.vtime_on && r.frame_mode && r.in_unit && !async_present &&
       LR(ppc) != PRESENT_BREAKPT_RETURN &&
       PowerPC::MMU::HostRead<u32>(guard, 0x800000E4) == 0x803A3F30)  // main thread
@@ -2857,8 +2987,8 @@ void PresentHook(const Core::CPUThreadGuard& guard)
   }
   // Diagnostics: NSR_RB_RESIM_VSYNC=1 keeps the vsync wait in re-simulated
   // frames (each then takes a live frame's emulated time).
-  static const bool keep_vsync = !Env("NSR_RB_RESIM_VSYNC").empty();
-  if (r.frame_mode && r.in_unit && r.in_resim && !(keep_vsync && s_hook_pc == VI_WAIT_FOR_RETRACE))
+  if (r.frame_mode && r.in_unit && r.in_resim &&
+      !(r.config.keep_resim_vsync && s_hook_pc == VI_WAIT_FOR_RETRACE))
     ppc.npc = LR(ppc);
 }
 
@@ -2945,17 +3075,8 @@ void AudioGateHook(const Core::CPUThreadGuard& guard)
   // from fn_801F4050); =addr,... gates exactly those entries. Gating every
   // entry crashes (some return pointers or fill out-parameters in game
   // memory that a skipped call leaves unwritten).
-  static const std::vector<unsigned int> only = [] {
-    std::vector<unsigned int> v;
-    const std::string spec = Env("NSR_RB_AUDIO_GATE");
-    if (spec == "1")
-      return std::vector<unsigned int>{0x8026AAF0};
-    for (const std::string& a : Split(spec, ','))
-      if (const auto x = ParseU32(a))
-        v.push_back(*x);
-    return v;
-  }();
-  static const std::vector<unsigned int> effects = EffectGateList();
+  const auto& only = r.config.audio_gate_only;
+  const auto& effects = r.config.effect_gates;
   if (!only.empty() && std::find(only.begin(), only.end(), entry) == only.end() &&
       std::find(effects.begin(), effects.end(), entry) == effects.end())
     return;
@@ -3022,11 +3143,7 @@ std::vector<AcPending> s_ac_pending;
 
 FILE* AcLog()
 {
-  static FILE* f = [] {
-    const std::string path = Env("NSR_AC_LOG");
-    return path.empty() ? nullptr : std::fopen(path.c_str(), "w");
-  }();
-  return f;
+  return s_rb.ac_log;
 }
 
 // The return stub is a `blr` in free patch data (zero in the image); its
@@ -3093,19 +3210,8 @@ void AudioClockFrameLog(const Core::CPUThreadGuard& guard)
     return;
   // NSR_AC_HASH=lo-hi,...: also a hash of each range (diagnostics: find the
   // first frame where some state differs between two runs).
-  static const std::vector<std::pair<u32, u32>> ranges = [] {
-    std::vector<std::pair<u32, u32>> v;
-    for (const std::string& item : Split(Env("NSR_AC_HASH"), ','))
-    {
-      const auto parts = Split(item, '-');
-      if (parts.size() == 2)
-        if (const auto lo = ParseU32(parts[0]), hi = ParseU32(parts[1]); lo && hi && *hi > *lo)
-          v.emplace_back(*lo, *hi);
-    }
-    return v;
-  }();
   std::string hashes;
-  for (const auto& [lo, hi] : ranges)
+  for (const auto& [lo, hi] : s_rb.config.ac_hash_ranges)
   {
     u32 h = 2166136261u;
     for (u32 a = lo; a < hi; ++a)
@@ -3119,11 +3225,7 @@ void AudioClockFrameLog(const Core::CPUThreadGuard& guard)
 
 std::vector<unsigned int> AudioTraceList()
 {
-  std::vector<unsigned int> out;
-  for (const std::string& a : Split(Env("NSR_AC_TRACE"), ','))
-    if (const auto v = ParseU32(a))
-      out.push_back(*v);
-  return out;
+  return ConfigForRollback().audio_trace;
 }
 
 // ---------------------------------------------------------------------------
@@ -3206,19 +3308,9 @@ constexpr u32 W_SFX_STOP2 = 0x801F4130;      // (handle)
 // After calls of the handle wrappers whose result reaches game code.
 constexpr std::array<u32, 4> R_SFX_HANDLE{0x8006CA70, 0x8006CA08, 0x8006E2E4, 0x8006E9E0};
 
-enum class AcMode
-{
-  Off,
-  On,
-  Shadow
-};
 AcMode AcModeNow()
 {
-  static const AcMode mode = [] {
-    const std::string v = Env("NSR_AC", "1");
-    return v == "0" ? AcMode::Off : v == "shadow" ? AcMode::Shadow : AcMode::On;
-  }();
-  return mode;
+  return ConfigForRollback().ac_mode;
 }
 
 struct AcMem
@@ -3321,13 +3413,12 @@ void AcSpeechAdvance(const AcMem& m, u32 s, u32 f)
 // lines measured 25..491). Revisit if commentary pacing feels off.
 u32 AcSpeechFrames()
 {
-  static const u32 frames = ParseU32(Env("NSR_AC_SPEECH_FRAMES")).value_or(75);
-  return std::max<u32>(1, frames);
+  return s_rb.config.ac_speech_frames;
 }
 
 void AcSpeechQueue(const AcMem& m, u32 s, u32 vid, u32 frames, u32 f)
 {
-  static const u32 lead = ParseU32(Env("NSR_AC_SPEECH_LEAD")).value_or(0);
+  const u32 lead = s_rb.config.ac_speech_lead;
   AcSpeechAdvance(m, s, f);
   const u32 b = AcStreamBase(s);
   const u32 count = m.rd(b + 4);
@@ -3384,8 +3475,8 @@ void AcStreamClear(const AcMem& m, u32 s)
 // patch offsets at +0x14 relative to their own slot (fn_8026A6A8).
 u32 AcSfxFrames(const AcMem& m, u32 bank_struct, u32 sound)
 {
-  static const u32 fallback = ParseU32(Env("NSR_AC_SFX_DEFAULT")).value_or(30);
-  static const u32 tail = ParseU32(Env("NSR_AC_SFX_TAIL")).value_or(2);
+  const u32 fallback = s_rb.config.ac_sfx_default;
+  const u32 tail = s_rb.config.ac_sfx_tail;
   if (!AcPtr(bank_struct))
     return fallback;
   const u32 bank = m.rd(bank_struct + 0x14);
@@ -3499,7 +3590,7 @@ u32 AcReal(u32 vid)
 // --- bank uploads ----------------------------------------------------------
 bool AcBankReady(const AcMem& m, u32 record, u32 f)
 {
-  static const u32 wait = ParseU32(Env("NSR_AC_BANK_FRAMES")).value_or(6);
+  const u32 wait = s_rb.config.ac_bank_frames;
   s32 free_slot = -1, oldest_slot = 0;
   u32 oldest = 0xFFFFFFFF;
   for (u32 i = 0; i < AC_BANK_SLOTS; ++i)
@@ -3564,7 +3655,7 @@ constexpr u32 AC_POLL_FRAME = AC_BASE + 0x4CC;  // (inside the music block's spa
 
 void AcCountPoll(const AcMem& m)
 {
-  static const u32 per_tick = std::max<u32>(1, ParseU32(Env("NSR_AC_POLLS_PER_TICK")).value_or(1000));
+  const u32 per_tick = s_rb.config.ac_polls_per_tick;
   const u32 frame = s_rb.tick_running;
   u32 polls = m.rd(AC_POLL_FRAME) == frame ? m.rd(AC_POLLS) : 0;
   ++polls;
@@ -3874,14 +3965,12 @@ bool MusicStartId(s32 id)
 
 u32 MusicSongFrames()
 {
-  static const u32 v = ParseU32(Env("NSR_AC_SONG_FRAMES")).value_or(10800);
-  return std::max<u32>(1, v);
+  return s_rb.config.ac_song_frames;
 }
 
 u32 MusicGapFrames()
 {
-  static const u32 v = ParseU32(Env("NSR_AC_SONG_GAP")).value_or(380);
-  return v;
+  return s_rb.config.ac_song_gap;
 }
 
 void MusicEnsureTramp(const Core::CPUThreadGuard& guard)
@@ -4022,20 +4111,13 @@ std::vector<unsigned int> ResimSkipList()
   // matrices, EA draw state) permanently different from a no-rollback run,
   // so peers with different rollback histories could never hash equal
   // (rb-coverage-review C1). Each frame costs one retrace either way.
-  const std::string spec = Env("NSR_RB_SKIP_RESIM");
-  if (spec.empty())
-    return {};
-  std::vector<unsigned int> out;
-  for (const std::string& a : Split(spec, ','))
-    if (const auto v = ParseU32(a))
-      out.push_back(*v);
-  return out;
+  return ConfigForRollback().skip_resim;
 }
 
 void LoadBarrierHook(const Core::CPUThreadGuard& guard)
 {
   Rollback& r = s_rb;
-  if (!r.initialized || r.io_idle_mode)
+  if (!r.initialized || !r.vtime_on || r.io_idle_mode)
     return;
   if (r.in_resim)
   {
@@ -4053,22 +4135,12 @@ void LoadBarrierHook(const Core::CPUThreadGuard& guard)
 
 std::vector<unsigned int> EffectGateList()
 {
-  std::vector<unsigned int> out;
-  for (const std::string& a : Split(Env("NSR_RB_EFFECT_GATE"), ','))
-    if (const auto v = ParseU32(a))
-      out.push_back(*v);
-  return out;
+  return ConfigForRollback().effect_gates;
 }
 
 std::vector<unsigned int> ProbeAddresses()
 {
-  std::vector<unsigned int> out;
-  for (const std::string& a : Split(Env("NSR_RB_PROBES"), ','))
-  {
-    if (const auto v = ParseU32(a))
-      out.push_back(*v);
-  }
-  return out;
+  return ConfigForRollback().probes;
 }
 
 void ProbeHook(const Core::CPUThreadGuard& guard)
@@ -4076,21 +4148,150 @@ void ProbeHook(const Core::CPUThreadGuard& guard)
   Rollback& r = s_rb;
   if (!r.watch || r.live < r.watch_from || r.live > r.watch_to)
     return;
-  static u32 last_value = 0, last_pc = 0, last_lr = 0;
   auto& ppc = guard.GetSystem().GetPPCState();
   const u32 v = PowerPC::MMU::HostRead<u32>(guard, r.watch);
-  static const bool all = !Env("NSR_RB_PROBE_ALL").empty();
-  if (all)
+  if (r.config.probe_all)
     Log("probe hit {:08x} from {:08x}: [{:08x}] = {:08x}; live {} cursor {} resim {} r3 {:08x} r4 {:08x}",
         s_hook_pc, LR(ppc) - 4, r.watch, v, r.live, r.cursor, r.in_resim, ppc.gpr[3], ppc.gpr[4]);
-  if (v != last_value)
+  if (v != r.probe_last_value)
     Log("probe: [{:08x}] {:08x} -> {:08x} after {:08x} (called from {:08x}), before {:08x} "
         "(called from {:08x}); live {} cursor {}",
-        r.watch, last_value, v, last_pc, last_lr - 4, s_hook_pc, LR(ppc) - 4, r.live, r.cursor);
-  last_value = v;
-  last_pc = s_hook_pc;
-  last_lr = LR(ppc);
+        r.watch, r.probe_last_value, v, r.probe_last_pc, r.probe_last_lr - 4, s_hook_pc,
+        LR(ppc) - 4, r.live, r.cursor);
+  r.probe_last_value = v;
+  r.probe_last_pc = s_hook_pc;
+  r.probe_last_lr = LR(ppc);
 }
+
+namespace
+{
+// Start a match-scoped rollback epoch without changing the absolute frame
+// index used by recordings.  All history and host mappings are discarded so
+// no correction can cross a prior match or menu transition.
+void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
+{
+  (void)guard;
+  Rollback& r = s_rb;
+  r.vtime_from = frame;
+  r.vtime_on = true;
+  r.in_unit = false;
+  r.in_resim = false;
+  r.frame_tick_done = false;
+  r.rolled = false;
+  r.cursor = frame;
+  r.tick_running = frame;
+  r.vtime_calls = 0;
+  r.enter_pending = false;
+  r.reenter_ready = false;
+  r.session_ended = false;
+  r.in_game_seen = false;
+  r.session_saw_in_game = false;
+  ++r.session_generation;
+  r.mispredict_pending = UINT32_MAX;
+  r.mispredictions = 0;
+  r.uncorrectable = 0;
+  r.io_idle.clear();
+  r.skipped_busy = 0;
+  r.barrier = frame;
+  r.barrier_events = 0;
+  r.barrier_resim = 0;
+  r.clamped = 0;
+  r.gate_log.clear();
+  r.gate_pending.clear();
+  r.gate_index = 0;
+  r.gate_replayed = 0;
+  r.gate_mismatched = 0;
+  r.gate_recorded = 0;
+  r.pads.clear();
+  r.counters.clear();
+  r.checks = 0;
+  r.mismatched_checks = 0;
+  r.rollbacks = 0;
+  r.resim_ticks = 0;
+  r.granule_hits.clear();
+  r.logged_mismatches = 0;
+  r.disc_commands_seen = r.disc_commands;
+  s_io_ranges.clear();
+  for (auto& slot : r.ring)
+    std::fill(slot.begin(), slot.end(), 0);
+  s_ac_pending.clear();
+  s_ac_real.clear();
+  s_ac_sfx_start = {};
+  s_ac_queue = {};
+  s_ac_handle = {};
+  s_music_lr = 0;
+  s_music_r3 = 0;
+  s_sim_wait_lr = 0;
+  s_sim_wait_pass = false;
+  s_sim_waits = 0;
+
+  // The same deterministic base is used for every epoch unless the future
+  // netplay handshake supplies an agreed override.
+  constexpr u64 TB_PER_FRAME = 40500000 / 60;
+  r.vtime_base = ParseU64(Env("NSR_RB_VTIME_BASE")).value_or(TB_PER_FRAME << 37) /
+                 TB_PER_FRAME * TB_PER_FRAME;
+  s_rb_watch_rollbacks = 0;
+  Log("rollback session {} entered at frame {} (base {:016x})", r.session_generation, frame,
+      r.vtime_base);
+}
+
+// End the rollback epoch at a completed live frame.  Clearing the guest model
+// and every host-side trampoline/mapping makes all fixed hooks pass through
+// immediately and leaves the next epoch independent of this one.
+void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason)
+{
+  Rollback& r = s_rb;
+  if (!r.vtime_on)
+    return;
+  Log("rollback session {} left after frame {}: {}", r.session_generation, r.tick_running, reason);
+  if (r.force > 0)
+    RbReport(40);
+
+  const AcMem model{guard};
+  for (u32 address = AC_BASE; address < AC_END; address += 4)
+    model.wr(address, 0);
+  s_ac_pending.clear();
+  s_ac_real.clear();
+  s_ac_sfx_start = {};
+  s_ac_queue = {};
+  s_ac_handle = {};
+  s_music_lr = 0;
+  s_music_r3 = 0;
+  s_sim_wait_lr = 0;
+  s_sim_wait_pass = false;
+  s_sim_waits = 0;
+
+  r.vtime_on = false;
+  r.in_unit = false;
+  r.in_resim = false;
+  r.frame_tick_done = false;
+  r.rolled = false;
+  r.cursor = r.live;
+  r.vtime_calls = 0;
+  r.tick_mode = false;
+  r.ticks_since_poll = 0;
+  r.idle_polls = 0;
+  r.mispredict_pending = UINT32_MAX;
+  r.io_idle.clear();
+  r.barrier = 0;
+  r.gate_log.clear();
+  r.gate_pending.clear();
+  r.gate_index = 0;
+  r.pads.clear();
+  r.counters.clear();
+  r.enter_pending = false;
+  r.reenter_ready = false;
+  r.session_ended = true;
+  r.in_game_seen = false;
+  r.session_saw_in_game = false;
+  s_io_ranges.clear();
+  for (auto& slot : r.ring)
+    std::fill(slot.begin(), slot.end(), 0);
+  r.rollbacks = 0;
+  r.resim_ticks = 0;
+  s_rb_watch_rollbacks = 0;
+}
+}  // namespace
 
 // Let the video thread omit historical catch-up frames without skipping game-side draws.
 bool IsReplayCatchingUp()
@@ -4098,16 +4299,31 @@ bool IsReplayCatchingUp()
   return s_follow_catchup.load();
 }
 
-void Shutdown()
+void Shutdown(const Core::CPUThreadGuard& guard)
 {
+  if (s_rb_watchdog.joinable())
+  {
+    s_rb_watchdog.request_stop();
+    s_rb_watchdog.join();
+  }
   if (s_follow)
     Config::SetCurrent(Config::MAIN_EMULATION_SPEED, s_follow_speed);
   s_follow.reset();
   s_follow_catchup = false;
   s_follow_failed = false;
+  s_follow_delay = 0;
+  s_follow_speed = 1.0f;
   Session& s = s_session;
-  if (s_rb.initialized && s_rb.force > 0)
+  if (s_rb.vtime_on)
+    LeaveRollbackSession(guard, "core shutdown");
+  else if (s_rb.initialized && s_rb.force > 0)
     RbReport(40);
+  if (s_rb.initialized)
+  {
+    const AcMem model{guard};
+    for (u32 address = AC_BASE; address < AC_END; address += 4)
+      model.wr(address, 0);
+  }
   if (s.host)
   {
     for (ENetPeer* peer : s.peers)
@@ -4117,10 +4333,30 @@ void Shutdown()
     }
     enet_host_destroy(s.host);
   }
+  if (s_rb.record)
+    std::fclose(s_rb.record);
+  if (s_rb.ac_log)
+    std::fclose(s_rb.ac_log);
+  if (s_rb.stacks)
+    std::fclose(s_rb.stacks);
   if (s.log && s.log != stderr)
     std::fclose(s.log);
+  s_ac_pending.clear();
+  s_ac_real.clear();
+  s_ac_sfx_start = {};
+  s_ac_queue = {};
+  s_ac_handle = {};
+  s_music_lr = 0;
+  s_music_r3 = 0;
+  s_sim_wait_lr = 0;
+  s_sim_wait_pass = false;
+  s_sim_waits = 0;
+  s_hook_pc = 0;
   s = Session{};
   s_rb = Rollback{};
   s_io_ranges.clear();
+  s_rb_last_tick_ms = 0;
+  s_rb_watch_live = 0;
+  s_rb_watch_rollbacks = 0;
 }
 }  // namespace NSRNetplay

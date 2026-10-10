@@ -31,7 +31,7 @@ namespace HLE
 static std::map<u32, u32> s_hooked_addresses;
 
 // clang-format off
-constexpr std::array<Hook, 48> os_patches{{
+constexpr std::array<Hook, 49> os_patches{{
     // Placeholder, os_patches[0] is the "non-existent function" index
     {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
 
@@ -74,6 +74,7 @@ constexpr std::array<Hook, 48> os_patches{{
     {"NSR_Probe",                    NSRNetplay::ProbeHook,                 HookType::Start,   HookFlag::Fixed}, // NFLStreet POC diagnostics
     {"NSR_RollbackFrame",            NSRNetplay::RollbackFrameHook,         HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: frame start
     {"NSR_RollbackFrameEnd",         NSRNetplay::RollbackFrameEndHook,      HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: frame end
+    {"NSR_InGame",                   NSRNetplay::InGameHook,                 HookType::Start,   HookFlag::Fixed}, // NFLStreet POC rollback: match lifecycle
     {"NSR_TickCount",                NSRNetplay::TickCountHook,             HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: one tick per frame
     {"NSR_Present",                  NSRNetplay::PresentHook,               HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: no vsync wait in re-sim
     {"NSR_PeekZ",                    NSRNetplay::PeekZHook,                 HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: GPU-independent depth peek
@@ -142,7 +143,8 @@ void PatchFixedFunctions(Core::System& system)
   // Rollback images (isopatch `rollback`) route every pad poll and sim tick
   // through these stubs, so they're always installed for NFL Street 2. In
   // other images that RAM is unused data that never runs.
-  if (SConfig::GetInstance().GetGameID() == "GN7E69")
+  if (SConfig::GetInstance().GetGameID() == "GN7E69" &&
+      SConfig::GetInstance().GetRevision() == 0 && NSRNetplay::ValidateRollbackImage(system))
   {
     Patch(system, NSRNetplay::RB_POLL_STUB, "NSR_RollbackPoll");
     Patch(system, NSRNetplay::RB_TICK_STUB, "NSR_RollbackTick");
@@ -150,6 +152,7 @@ void PatchFixedFunctions(Core::System& system)
     Patch(system, NSRNetplay::RB_TIME_STUB, "NSR_RollbackTime");
     Patch(system, NSRNetplay::RB_FRAME_STUB, "NSR_RollbackFrame");
     Patch(system, NSRNetplay::RB_FRAME_END_STUB, "NSR_RollbackFrameEnd");
+    Patch(system, NSRNetplay::IN_GAME_FN, "NSR_InGame");
     Patch(system, NSRNetplay::TICK_COUNT_FN, "NSR_TickCount");
     Patch(system, NSRNetplay::VI_WAIT_FOR_RETRACE, "NSR_Present");
     // Present paces with a GX FIFO breakpoint released by the next VI post
