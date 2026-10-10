@@ -31,7 +31,7 @@ namespace HLE
 static std::map<u32, u32> s_hooked_addresses;
 
 // clang-format off
-constexpr std::array<Hook, 44> os_patches{{
+constexpr std::array<Hook, 47> os_patches{{
     // Placeholder, os_patches[0] is the "non-existent function" index
     {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
 
@@ -85,6 +85,9 @@ constexpr std::array<Hook, 44> os_patches{{
     {"NSR_AudioCallReturn",          NSRNetplay::AudioCallReturnHook,       HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: audio clock diagnostics
     {"NSR_AudioClockQuery",          NSRNetplay::AudioClockQueryHook,       HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: frame-based audio answers
     {"NSR_AudioClockEffect",         NSRNetplay::AudioClockEffectHook,      HookType::Start,   HookFlag::Fixed}, // NFLStreet POC rollback: frame-based audio bookkeeping
+    {"NSR_MusicDispatch",            NSRNetplay::MusicDispatchHook,         HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: music events on frames
+    {"NSR_MusicPick",                NSRNetplay::MusicPickHook,             HookType::Start,   HookFlag::Fixed}, // NFLStreet POC rollback: music events on frames
+    {"NSR_MusicTramp",               NSRNetplay::MusicTrampHook,            HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: music events on frames
 }};
 // clang-format on
 
@@ -180,9 +183,18 @@ void PatchFixedFunctions(Core::System& system)
       Patch(system, a, "NSR_AudioClockQuery");
     for (const u32 a : NSRNetplay::AudioClockEffectHooks())
       Patch(system, a, "NSR_AudioClockEffect");
-    if (std::getenv("NSR_AC_CALLS"))  // audio clock diagnostics: log game->audio calls
+    for (const u32 a : NSRNetplay::MusicDispatchers())
+      Patch(system, a, "NSR_MusicDispatch");
+    Patch(system, NSRNetplay::MUSIC_PICK_SONG_FN, "NSR_MusicPick");
+    Patch(system, NSRNetplay::MUSIC_TRAMP_ADDR, "NSR_MusicTramp");
+    if (std::getenv("NSR_AC_CALLS") || std::getenv("NSR_AC_TRACE"))  // audio clock diagnostics
     {
-      for (const u32 entry : NSRNetplay::AUDIO_GATE_ENTRIES)
+      if (std::getenv("NSR_AC_CALLS"))  // log game->audio calls
+      {
+        for (const u32 entry : NSRNetplay::AUDIO_GATE_ENTRIES)
+          Patch(system, entry, "NSR_AudioCallLog");
+      }
+      for (const u32 entry : NSRNetplay::AudioTraceList())
         Patch(system, entry, "NSR_AudioCallLog");
       Patch(system, NSRNetplay::AC_RETURN_STUB, "NSR_AudioCallReturn");
       system.GetMemory().Write_U32(0x4E800020, NSRNetplay::AC_RETURN_STUB);  // blr

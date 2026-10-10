@@ -245,6 +245,8 @@ constexpr unsigned int AC_RETURN_STUB = 0x80416AFC;  // `blr` written by Dolphin
 void AudioCallLogHook(const Core::CPUThreadGuard& guard);     // HookType::Start
 void AudioCallReturnHook(const Core::CPUThreadGuard& guard);  // HookType::Replace
 void AudioClockFrameLog(const Core::CPUThreadGuard& guard);
+// NSR_AC_TRACE=addr,...: log calls of these functions too (same format as NSR_AC_CALLS).
+std::vector<unsigned int> AudioTraceList();
 // Audio clock model (during the rollback session, NSR_AC != 0): the sim's
 // view of audio progress is a deterministic function of frames and game data,
 // kept in MEM1 (restored by rollback); see NSRNetplay.cpp "Audio clock model".
@@ -258,6 +260,17 @@ void AudioClockQueryHook(const Core::CPUThreadGuard& guard);   // HookType::Gate
 void AudioClockEffectHook(const Core::CPUThreadGuard& guard);  // HookType::Start
 std::vector<unsigned int> AudioClockQueryHooks();
 std::vector<unsigned int> AudioClockEffectHooks();
+// Audio clock, music (EA Trax over PathFinder): during the session the
+// PathFinder -> game listener dispatchers run only from the frame routine,
+// on frame-decided song starts/ends (see NSRNetplay.cpp "music").
+void MusicSessionStart(const Core::CPUThreadGuard& guard, u32 frame);
+void MusicDispatchHook(const Core::CPUThreadGuard& guard);  // HookType::Gate
+void MusicPickHook(const Core::CPUThreadGuard& guard);      // HookType::Start (fn_80072424)
+void MusicInjectEvent(const Core::CPUThreadGuard& guard);   // from ViCallbackHook
+void MusicTrampHook(const Core::CPUThreadGuard& guard);     // HookType::Replace
+constexpr unsigned int MUSIC_TRAMP_ADDR = 0x80416AF8;
+constexpr unsigned int MUSIC_PICK_SONG_FN = 0x80072424;
+std::vector<unsigned int> MusicDispatchers();
 
 // Diagnostics: NSR_RB_PROBES=addr,... installs ProbeHook (HookType::Start)
 // at those function entries; inside the NSR_RB_WATCH window it logs each

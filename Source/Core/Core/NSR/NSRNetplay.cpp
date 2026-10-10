@@ -2510,7 +2510,14 @@ void ViCallbackHook(const Core::CPUThreadGuard& guard)
   const u32 lr = LR(ppc);
   const bool from_frame_routine = lr >= RB_FRAME_CODE && lr < RB_FRAME_CODE + 0x80;
   if (from_frame_routine != s_rb.vtime_on)
+  {
     ppc.npc = lr;  // skip this call
+    return;
+  }
+  // Session, frame routine: deliver due music events first (audio clock,
+  // MusicInjectEvent); the callback itself runs when none is left.
+  if (from_frame_routine)
+    MusicInjectEvent(guard);
 }
 
 void PeekZHook(const Core::CPUThreadGuard& guard)
@@ -2777,9 +2784,39 @@ void AudioClockFrameLog(const Core::CPUThreadGuard& guard)
   FILE* f = AcLog();
   if (!f || !s_rb.vtime_on)
     return;
-  std::fprintf(f, "F %u %d %08x %08x\n", s_rb.tick_running, s_rb.in_resim ? 1 : 0,
+  // NSR_AC_HASH=lo-hi,...: also a hash of each range (diagnostics: find the
+  // first frame where some state differs between two runs).
+  static const std::vector<std::pair<u32, u32>> ranges = [] {
+    std::vector<std::pair<u32, u32>> v;
+    for (const std::string& item : Split(Env("NSR_AC_HASH"), ','))
+    {
+      const auto parts = Split(item, '-');
+      if (parts.size() == 2)
+        if (const auto lo = ParseU32(parts[0]), hi = ParseU32(parts[1]); lo && hi && *hi > *lo)
+          v.emplace_back(*lo, *hi);
+    }
+    return v;
+  }();
+  std::string hashes;
+  for (const auto& [lo, hi] : ranges)
+  {
+    u32 h = 2166136261u;
+    for (u32 a = lo; a < hi; ++a)
+      h = (h ^ PowerPC::MMU::HostRead<u8>(guard, a)) * 16777619u;
+    hashes += fmt::format(" {:08x}", h);
+  }
+  std::fprintf(f, "F %u %d %08x %08x%s\n", s_rb.tick_running, s_rb.in_resim ? 1 : 0,
                PowerPC::MMU::HostRead<u32>(guard, 0x80481888),
-               PowerPC::MMU::HostRead<u32>(guard, 0x80481904));
+               PowerPC::MMU::HostRead<u32>(guard, 0x80481904), hashes.c_str());
+}
+
+std::vector<unsigned int> AudioTraceList()
+{
+  std::vector<unsigned int> out;
+  for (const std::string& a : Split(Env("NSR_AC_TRACE"), ','))
+    if (const auto v = ParseU32(a))
+      out.push_back(*v);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -3179,10 +3216,11 @@ void AudioClockSessionStart(const Core::CPUThreadGuard& guard)
   if (AcModeNow() == AcMode::Off)
     return;
   const AcMem m{guard};
-  for (u32 a = AC_BASE; a < AC_END; a += 4)
+  for (u32 a = AC_BASE; a < AC_END - 4; a += 4)  // the last word: MusicDispatchHook's pre-session note
     m.wr(a, 0);
   m.wr(AC_BASE, AC_MAGIC);
   s_ac_real.clear();
+  MusicSessionStart(guard, s_rb.tick_running);
   Log("audio clock: model at {:08x}..{:08x} ({})", AC_BASE, AC_END,
       AcModeNow() == AcMode::Shadow ? "shadow" : "on");
 }
@@ -3422,6 +3460,190 @@ void AudioClockEffectHook(const Core::CPUThreadGuard& guard)
       ppc.gpr[3] = s_ac_handle.a;
     s_ac_handle.valid = false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Audio clock, music: EA Trax song changes follow frames.
+//
+// Why: in-game music is EA PathFinder (0x801B1000..0x801B9200) driven by the
+// audio thread (handler 0x801B3AAC, registered with the middleware; its clock
+// and stream queries follow DSP playback). At segment boundaries PathFinder
+// calls the game's listener lists (dispatchers fn_8006D91C / fn_8006D98C /
+// fn_8006D9FC, registered by fn_8006DAA8 through fn_801B2F18) *on the audio
+// thread*. The EA Trax manager (fn_8007272C, state *(0x803EA704), 0x130
+// bytes) listens on the first list (fn_80071C3C): a song's end segment
+// (id 0x7C*k + 0x75) makes it pick the next playlist song and tell PathFinder
+// to play it (fn_80072424); a song's start segment (id 0x7C*k) builds the
+// now-playing banner and posts it to the UI (fn_800724F4 -> fn_8021D7B8),
+// which allocates UI objects from shared heaps. So song changes, the
+// manager's state and the banner happened on audio time: different frames
+// per peer and between a live frame and its re-simulation.
+//
+// What: during the session the dispatchers run only when this model calls
+// them, on the main thread from the frame routine (the frame routine's
+// VI_PRE_CB call is redirected through the dispatcher first, then resumes;
+// see MusicInjectEvent). PathFinder's own calls are skipped. The model, in
+// MEM1 (restored by rollback, identical on every peer):
+//   - when the game picks a song (fn_80072424, from the model's end event or
+//     any main-thread caller), the song "starts" NSR_AC_SONG_GAP frames later
+//     (default 380: end-to-start delay in a reference match) and "ends"
+//     NSR_AC_SONG_FRAMES after that (default 10800 = 3:00);
+//   - at a start the dispatcher gets (0x11000000, 0x7C): banner;
+//   - at an end it gets (0x11000000, 0x75): next song, which PathFinder then
+//     plays (audible switch);
+//   - the song playing when the session starts started at the last real start
+//     event before the session (recorded pre-session, when every peer still
+//     shares one timeline).
+// Music stays audible: PathFinder still plays every song the game picks. A
+// real song shorter than the model's length is followed by silence until the
+// model's end event; a longer one is cut by the switch. Deferred: real song
+// lengths (PathFinder segment data / stream headers; songs are 39 segments,
+// ids step 3), revisit if the fixed length sounds wrong.
+// ---------------------------------------------------------------------------
+namespace
+{
+constexpr std::array<u32, 3> MUSIC_DISPATCH{0x8006D91C, 0x8006D98C, 0x8006D9FC};
+constexpr u32 MUSIC_PICK_SONG = 0x80072424;  // EA Trax: next playlist song -> PathFinder
+constexpr u32 MUSIC_MANAGER = 0x803EA704;    // -0x7B9C(r13): EA Trax manager state
+constexpr u32 MUSIC_TRAMP = 0x80416AF8;      // injected dispatcher calls return here (blr)
+constexpr u32 AC_MUSIC = 0x80416FC0;         // +0 song end frame, +4 song start frame
+constexpr u32 AC_MUSIC_LAST_START = 0x80416FFC;  // last real start before the session (kept)
+static_assert(AC_SFX + AC_SFX_SLOTS * 12 <= AC_MUSIC);
+constexpr u32 MUSIC_EVENT = 0x11000000;  // track event flags as PathFinder sends them
+constexpr u32 MUSIC_START_ID = 0x7C, MUSIC_END_ID = 0x75;
+u32 s_music_lr = 0, s_music_r3 = 0;  // the frame routine's VI_PRE_CB call being resumed
+
+bool MusicStartId(s32 id)
+{
+  return id >= 0 && id % 0x7C == 0;
+}
+
+u32 MusicSongFrames()
+{
+  static const u32 v = ParseU32(Env("NSR_AC_SONG_FRAMES")).value_or(10800);
+  return std::max<u32>(1, v);
+}
+
+u32 MusicGapFrames()
+{
+  static const u32 v = ParseU32(Env("NSR_AC_SONG_GAP")).value_or(380);
+  return v;
+}
+
+void MusicEnsureTramp(const Core::CPUThreadGuard& guard)
+{
+  if (PowerPC::MMU::HostRead<u32>(guard, MUSIC_TRAMP) != 0x4E800020)
+    PowerPC::MMU::HostWrite<u32>(guard, 0x4E800020, MUSIC_TRAMP);
+}
+}  // namespace
+
+// Session start: the song playing now started at the last real start event.
+void MusicSessionStart(const Core::CPUThreadGuard& guard, u32 frame)
+{
+  const AcMem m{guard};
+  const u32 last = m.rd(AC_MUSIC_LAST_START);
+  u32 end = (last ? last : frame) + MusicSongFrames();
+  if (static_cast<s32>(end - frame) <= 0)
+    end = frame + 1;
+  m.wr(AC_MUSIC, end);
+  m.wr(AC_MUSIC + 4, 0);
+  AcLogLine(fmt::format("M {} session: last start {} -> end {}", frame, last, end));
+}
+
+// HookType::Gate at the three PathFinder -> game dispatchers.
+void MusicDispatchHook(const Core::CPUThreadGuard& guard)
+{
+  auto& ppc = guard.GetSystem().GetPPCState();
+  const Rollback& r = s_rb;
+  if (AcModeNow() == AcMode::Off)
+    return;
+  if (!r.vtime_on)
+  {
+    // Before the session (one shared timeline in netplay: lockstep): note
+    // when the current song started, for MusicSessionStart.
+    if (s_hook_pc == MUSIC_DISPATCH[0] && (ppc.gpr[3] & 0x01000000) &&
+        MusicStartId(static_cast<s32>(ppc.gpr[4])))
+      PowerPC::MMU::HostWrite<u32>(guard, r.tick_running, AC_MUSIC_LAST_START);
+    return;
+  }
+  if (LR(ppc) == MUSIC_TRAMP || AcModeNow() == AcMode::Shadow)
+    return;  // the model's own call (or shadow mode): run it
+  AcLogLine(fmt::format("M {} blocked {:08x} {:08x} {:08x}", r.tick_running, s_hook_pc, ppc.gpr[3],
+                        ppc.gpr[4]));
+  ppc.npc = LR(ppc);  // PathFinder's call on audio time: skipped
+}
+
+// HookType::Start at fn_80072424 (the game picks the next song).
+void MusicPickHook(const Core::CPUThreadGuard& guard)
+{
+  const Rollback& r = s_rb;
+  if (AcModeNow() != AcMode::On || !r.vtime_on || !r.in_unit ||
+      PowerPC::MMU::HostRead<u32>(guard, 0x800000E4) != 0x803A3F30)
+    return;
+  const AcMem m{guard};
+  if (m.rd(AC_BASE) != AC_MAGIC)
+    return;
+  const u32 mgr = m.rd(MUSIC_MANAGER);
+  if (!AcPtr(mgr) || m.rd8(mgr + 0x126) != 0)
+    return;  // music off: fn_80072424 returns without picking
+  const u32 f = r.tick_running;
+  m.wr(AC_MUSIC + 4, f + MusicGapFrames());
+  m.wr(AC_MUSIC, f + MusicGapFrames() + MusicSongFrames());
+  AcLogLine(fmt::format("M {} pick: start {} end {}", f, f + MusicGapFrames(),
+                        f + MusicGapFrames() + MusicSongFrames()));
+}
+
+// Called from ViCallbackHook for the frame routine's VI_PRE_CB call during the
+// session: if a music event is due, call the dispatcher with it first
+// (return to MUSIC_TRAMP, which re-enters VI_PRE_CB with the original LR).
+void MusicInjectEvent(const Core::CPUThreadGuard& guard)
+{
+  auto& ppc = guard.GetSystem().GetPPCState();
+  const Rollback& r = s_rb;
+  if (AcModeNow() != AcMode::On || !r.in_unit)
+    return;
+  const AcMem m{guard};
+  if (m.rd(AC_BASE) != AC_MAGIC)
+    return;
+  const u32 f = r.tick_running;
+  const u32 end = m.rd(AC_MUSIC), start = m.rd(AC_MUSIC + 4);
+  u32 id;
+  if (start && static_cast<s32>(f - start) >= 0)
+  {
+    id = MUSIC_START_ID;
+    m.wr(AC_MUSIC + 4, 0);
+  }
+  else if (end && static_cast<s32>(f - end) >= 0)
+  {
+    id = MUSIC_END_ID;
+    m.wr(AC_MUSIC, f + MusicSongFrames());  // if the game doesn't pick, try again later
+  }
+  else
+  {
+    return;
+  }
+  AcLogLine(fmt::format("M {} inject {:x}", f, id));
+  MusicEnsureTramp(guard);
+  s_music_lr = LR(ppc);
+  s_music_r3 = ppc.gpr[3];
+  LR(ppc) = MUSIC_TRAMP;
+  ppc.gpr[3] = MUSIC_EVENT;
+  ppc.gpr[4] = id;
+  ppc.npc = MUSIC_DISPATCH[0];
+}
+
+// HookType::Replace at MUSIC_TRAMP: back into the frame routine's VI_PRE_CB call.
+void MusicTrampHook(const Core::CPUThreadGuard& guard)
+{
+  auto& ppc = guard.GetSystem().GetPPCState();
+  LR(ppc) = s_music_lr;
+  ppc.gpr[3] = s_music_r3;
+  ppc.npc = VI_PRE_CB;
+}
+
+std::vector<unsigned int> MusicDispatchers()
+{
+  return {MUSIC_DISPATCH.begin(), MUSIC_DISPATCH.end()};
 }
 
 std::vector<unsigned int> AudioClockQueryHooks()
