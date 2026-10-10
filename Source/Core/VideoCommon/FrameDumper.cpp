@@ -9,6 +9,7 @@
 
 #include "Core/Config/GraphicsSettings.h"
 #include "Core/Config/MainSettings.h"
+#include "Core/NSR/NSRNetplay.h"
 
 #include "VideoCommon/AbstractFramebuffer.h"
 #include "VideoCommon/AbstractGfx.h"
@@ -43,6 +44,10 @@ void FrameDumper::DumpCurrentFrame(const AbstractTexture* src_texture,
                                    const MathUtil::Rectangle<int>& target_rect, u64 ticks,
                                    int frame_number)
 {
+  // Keep capture numbering continuous while historical replay runs faster than wall time.
+  if (NSRNetplay::IsReplayCatchingUp())
+    return;
+
   int source_width = src_rect.GetWidth();
   int source_height = src_rect.GetHeight();
   int target_width = target_rect.GetWidth();

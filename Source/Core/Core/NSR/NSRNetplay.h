@@ -58,6 +58,18 @@
 //                             write / read each live tick's pads, so two runs
 //                             see identical input per tick whatever their
 //                             timing (compare them with NSR_RB_DUMP_AT)
+//   NSR_RB_REPLAY_FOLLOW = path  tail a private append-only 52-byte pad stream.
+//     Requires CPUThread=False, no RECORD/REPLAY/FORCE/MISPREDICT. Host sleeps
+//     at missing input and never predicts. .ready acknowledges startup; a
+//     decimal last-unit .end drains the delay tail; .complete acknowledges
+//     consumption; .error reports corruption or EOF timeout. Terminal states
+//     remain in an interruptible host wait for renderer-driven shutdown.
+//   NSR_RB_REPLAY_DELAY = N     minimum complete units behind the head (default
+//                             0; use 0 when the relay already imposes delay).
+//   NSR_RB_REPLAY_TIMEOUT_MS = N  no-progress wait limit (default 30000).
+//     Historical backlog runs unthrottled with capture suppressed until near
+//     the delayed head; gameplay drawing remains enabled. Normal replay is 1x,
+//     and the launch speed is restored on shutdown.
 //   NSR_RB_PROFILE = path     (no rollback) classify every 64-byte granule of
 //                             MEM1 by who writes it: the sim (between tick
 //                             start and tick end) or the rest of the frame
@@ -255,5 +267,6 @@ void ProbeHook(const Core::CPUThreadGuard& guard);
 void SetHookPc(unsigned int pc);  // set by HLE::Execute before each hook
 
 // Tear down the network session (called on emulation shutdown).
+bool IsReplayCatchingUp();
 void Shutdown();
 }  // namespace NSRNetplay

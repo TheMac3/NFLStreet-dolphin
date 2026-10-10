@@ -10,9 +10,12 @@
 //   - periodic whole-MEM1 hashes, compared with every peer, to detect desyncs.
 
 #include "Core/NSR/NSRNetplay.h"
+#include "Core/NSR/ReplayFollow.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -20,18 +23,20 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
 #include <tuple>
-#include <atomic>
 #include <vector>
 
 #include <enet/enet.h>
 #include <fmt/format.h>
 
 #include "Common/CommonTypes.h"
+#include "Common/Config/Config.h"
 #include "Common/Swap.h"
+#include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/SystemTimers.h"
@@ -944,6 +949,12 @@ struct Rollback
 };
 
 Rollback s_rb;
+// Follow input is CPU-thread-owned; only the capture-suppression flag crosses threads.
+std::unique_ptr<ReplayFollow> s_follow;
+std::atomic<bool> s_follow_catchup{false};
+bool s_follow_failed = false;
+unsigned s_follow_delay = 0;
+float s_follow_speed = 1.0f;
 
 // Disc-streaming destinations (GN7E69): the game's disc worker (descriptor at
 // 0x803D55E0: destination +0x10, bytes +0x18) streams audio (EA audio driver,
@@ -1005,6 +1016,54 @@ void RbInit(Core::System& system)
       s_session.log = f;
   }
   r.force = ParseU32(Env("NSR_RB_FORCE")).value_or(0);
+  if (const std::string path = Env("NSR_RB_REPLAY_FOLLOW"); !path.empty())
+  {
+    std::string error;
+    if (!Env("NSR_RB_REPLAY").empty() || !Env("NSR_RB_RECORD").empty() ||
+        (Env("NSR_RB_FORCE") != "0" && !Env("NSR_RB_FORCE").empty()) ||
+        !Env("NSR_RB_MISPREDICT").empty() || Config::Get(Config::MAIN_CPU_THREAD))
+    {
+      error = "follow requires single-core, no replay/record/forced rollback";
+    }
+
+    // Strict decimal parsing prevents malformed safety values from using a permissive default.
+    auto option = [&error](const char* name, unsigned fallback, unsigned maximum) {
+      const std::string text = Env(name);
+      if (text.empty())
+        return fallback;
+      unsigned value = 0;
+      const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+      if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+          value > maximum)
+      {
+        error = "invalid follow option";
+      }
+      return value;
+    };
+    s_follow_delay = option("NSR_RB_REPLAY_DELAY", 0, 216000);
+    const unsigned timeout = option("NSR_RB_REPLAY_TIMEOUT_MS", 30000, 3600000);
+    if (!timeout)
+      error = "follow timeout must be positive";
+    if (error.empty())
+    {
+      s_follow = std::make_unique<ReplayFollow>(path, s_follow_delay, timeout);
+      s_follow_speed = Config::Get(Config::MAIN_EMULATION_SPEED);
+      error = s_follow->Error();
+      if (error.empty() && !s_follow->Status(".ready", "1\n"))
+        error = "cannot write follow acknowledgement";
+    }
+    if (error.empty())
+    {
+      Config::SetCurrent(Config::MAIN_EMULATION_SPEED, 1.0f);
+      Log("follow ready: {} delay {} timeout {}ms", path, s_follow_delay, timeout);
+    }
+    else
+    {
+      Log("follow init failed: {}", error);
+      s_follow_failed = true;
+      Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+    }
+  }
   if (const std::string path = Env("NSR_RB_RECORD"); !path.empty())
     r.record = std::fopen(path.c_str(), "wb");
   if (const std::string path = Env("NSR_RB_REPLAY"); !path.empty())
@@ -1992,6 +2051,51 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
   s_rb_last_tick_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                        std::chrono::steady_clock::now().time_since_epoch())
                        .count();
+  // Wait before touching live-unit state. Host sleep advances no guest clocks, refreshes the
+  // watchdog, and observes Stopping before the core joins this CPU thread.
+  Pads follow_pads{};
+  if (s_follow || s_follow_failed)
+  {
+    bool terminal = s_follow_failed;
+    while (Core::IsRunningOrStarting(system))
+    {
+      s_rb_last_tick_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+      if (!terminal)
+      {
+        std::array<unsigned char, 48> bytes{};
+        const auto result = s_follow->Poll(r.live, bytes);
+        if (result == ReplayFollow::Result::Pads)
+        {
+          const auto backlog = s_follow->Backlog(r.live);
+          // Hysteresis avoids toggling unlimited speed at the edge of the delayed head.
+          const bool catching = s_follow_catchup.load() ? backlog > s_follow_delay + 2 :
+                                                         backlog > s_follow_delay + 4;
+          if (catching != s_follow_catchup.exchange(catching))
+          {
+            Config::SetCurrent(Config::MAIN_EMULATION_SPEED, catching ? 0.0f : 1.0f);
+            Log("follow catch-up {} at unit {} backlog {}", catching, r.live, backlog);
+          }
+          std::memcpy(follow_pads.data(), bytes.data(), bytes.size());
+          break;
+        }
+        terminal = result == ReplayFollow::Result::Complete ||
+                   result == ReplayFollow::Result::Error;
+        if (result == ReplayFollow::Result::Complete)
+          Log("follow complete after {} units", r.live);
+        if (result == ReplayFollow::Result::Error)
+        {
+          Log("follow failed at unit {}: {}", r.live, s_follow->Error());
+          s_follow->Status(".error", s_follow->Error() + "\n");
+          Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (!Core::IsRunningOrStarting(system))
+      return 0;
+  }
   u8* ram = system.GetMemory().GetRAM();
   const u32 slots = r.ring.empty() ? 1 : static_cast<u32>(r.ring.size());
   ++r.ticks_since_poll;
@@ -2227,7 +2331,9 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
   }
   if (r.force > 0)
     RbSave(ram, r.ring[t % slots]);
-  if (const auto it = r.replay.find(t); it != r.replay.end())
+  if (s_follow)
+    r.pads[t] = follow_pads;
+  else if (const auto it = r.replay.find(t); it != r.replay.end())
     r.pads[t] = it->second;  // same inputs per tick as a recorded run
   else
     r.pads[t] = r.latest;
@@ -3410,8 +3516,19 @@ void ProbeHook(const Core::CPUThreadGuard& guard)
   last_lr = LR(ppc);
 }
 
+// Let the video thread omit historical catch-up frames without skipping game-side draws.
+bool IsReplayCatchingUp()
+{
+  return s_follow_catchup.load();
+}
+
 void Shutdown()
 {
+  if (s_follow)
+    Config::SetCurrent(Config::MAIN_EMULATION_SPEED, s_follow_speed);
+  s_follow.reset();
+  s_follow_catchup = false;
+  s_follow_failed = false;
   Session& s = s_session;
   if (s_rb.initialized && s_rb.force > 0)
     RbReport(40);
