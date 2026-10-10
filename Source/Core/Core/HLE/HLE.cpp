@@ -31,7 +31,7 @@ namespace HLE
 static std::map<u32, u32> s_hooked_addresses;
 
 // clang-format off
-constexpr std::array<Hook, 47> os_patches{{
+constexpr std::array<Hook, 48> os_patches{{
     // Placeholder, os_patches[0] is the "non-existent function" index
     {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
 
@@ -88,6 +88,7 @@ constexpr std::array<Hook, 47> os_patches{{
     {"NSR_MusicDispatch",            NSRNetplay::MusicDispatchHook,         HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: music events on frames
     {"NSR_MusicPick",                NSRNetplay::MusicPickHook,             HookType::Start,   HookFlag::Fixed}, // NFLStreet POC rollback: music events on frames
     {"NSR_MusicTramp",               NSRNetplay::MusicTrampHook,            HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: music events on frames
+    {"NSR_SimWaitTramp",             NSRNetplay::SimWaitTrampHook,          HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: retrace waits inside the sim
 }};
 // clang-format on
 
@@ -187,6 +188,7 @@ void PatchFixedFunctions(Core::System& system)
       Patch(system, a, "NSR_MusicDispatch");
     Patch(system, NSRNetplay::MUSIC_PICK_SONG_FN, "NSR_MusicPick");
     Patch(system, NSRNetplay::MUSIC_TRAMP_ADDR, "NSR_MusicTramp");
+    Patch(system, NSRNetplay::SIM_WAIT_TRAMP_ADDR, "NSR_SimWaitTramp");
     if (std::getenv("NSR_AC_CALLS") || std::getenv("NSR_AC_TRACE"))  // audio clock diagnostics
     {
       if (std::getenv("NSR_AC_CALLS"))  // log game->audio calls

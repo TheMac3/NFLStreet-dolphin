@@ -2381,6 +2381,13 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
                    TB_PER_FRAME * TB_PER_FRAME;
     Log("virtual tick time from tick {} (base {:016x})", t, r.vtime_base);
     AudioClockSessionStart(guard);
+    // The snapshot "before frame t" was saved above, before the audio clock
+    // model (MEM1 0x80416B00..) was initialised (and before NSR_RB_ADOPT, if
+    // any): re-save it, or a rollback to exactly the session's first frame
+    // would restore an uninitialised model (no AC_MAGIC: every audio hook falls
+    // back to real answers from then on; interim review, 2026-10-10).
+    if (!r.ring.empty())
+      RbSave(ram, r.ring[t % slots]);
   }
   r.in_unit = true;
   r.in_resim = false;
@@ -2531,6 +2538,8 @@ void ViCallbackHook(const Core::CPUThreadGuard& guard)
   auto& ppc = guard.GetSystem().GetPPCState();
   const u32 lr = LR(ppc);
   const bool from_frame_routine = lr >= RB_FRAME_CODE && lr < RB_FRAME_CODE + 0x80;
+  if (lr == 0x80416AF4 && s_rb.vtime_on)  // SIM_WAIT_TRAMP: a retrace wait inside the sim
+    return;
   if (from_frame_routine != s_rb.vtime_on)
   {
     ppc.npc = lr;  // skip this call
@@ -2552,11 +2561,74 @@ void PeekZHook(const Core::CPUThreadGuard& guard)
   ppc.npc = LR(ppc);
 }
 
+// Retrace waits inside the sim (session). The frame-driven clocks (the VI
+// pre-retrace callback's retrace-driven clock 0x8039B430, the post-retrace
+// counter, the audio clock model) advance once per frame, from the frame
+// routine. Game code that waits for one of them to pass a deadline inside a
+// frame, e.g. the EA Trax fade-out at the end of a game (fn_80072C90 waits
+// in fn_800731D0 -> VIWaitForRetrace until fn_800728F8 sees the retrace clock
+// pass the fade end), would wait forever (Demo Mode soak: every run hung at
+// frame 101554, the final whistle). So each such wait is one virtual
+// retrace: the VI pre-retrace callback runs once (from here, through
+// SIM_WAIT_TRAMP), the post-retrace counter and the audio clock advance by
+// one, then the real wait runs (live) or is skipped (re-simulation). The
+// number of waits is decided by game state, so every machine and every
+// re-simulation counts the same. The per-frame present wait
+// (PRESENT_BREAKPT_RETURN) is not a sim wait.
+namespace
+{
+constexpr u32 SIM_WAIT_TRAMP = 0x80416AF4;  // `blr` written by Dolphin (free patch data)
+u32 s_sim_wait_lr = 0;
+bool s_sim_wait_pass = false;
+u64 s_sim_waits = 0;
+
+void SimWaitBegin(const Core::CPUThreadGuard& guard)
+{
+  using PowerPC::MMU;
+  auto& ppc = guard.GetSystem().GetPPCState();
+  MMU::HostWrite<u32>(guard, MMU::HostRead<u32>(guard, VI_POST_COUNTER) + 1, VI_POST_COUNTER);
+  AudioClockSimWait(guard);
+  if (MMU::HostRead<u32>(guard, SIM_WAIT_TRAMP) != 0x4E800020)
+    MMU::HostWrite<u32>(guard, 0x4E800020, SIM_WAIT_TRAMP);
+  if (++s_sim_waits % 600 == 1)
+    Log("sim retrace wait #{} in frame {} from {:08x}", s_sim_waits, s_rb.tick_running, LR(ppc) - 4);
+  s_sim_wait_lr = LR(ppc);
+  LR(ppc) = SIM_WAIT_TRAMP;
+  ppc.npc = VI_PRE_CB;  // ViCallbackHook lets it run (LR == SIM_WAIT_TRAMP)
+}
+}  // namespace
+
+// HookType::Replace at SIM_WAIT_TRAMP: after the callback, the wait itself.
+void SimWaitTrampHook(const Core::CPUThreadGuard& guard)
+{
+  auto& ppc = guard.GetSystem().GetPPCState();
+  LR(ppc) = s_sim_wait_lr;
+  if (s_rb.in_resim)
+  {
+    ppc.npc = s_sim_wait_lr;  // re-simulation: no real wait
+    return;
+  }
+  s_sim_wait_pass = true;  // PresentHook lets this one call through
+  ppc.npc = VI_WAIT_FOR_RETRACE;
+}
+
 void PresentHook(const Core::CPUThreadGuard& guard)
 {
   Rollback& r = s_rb;
   auto& ppc = guard.GetSystem().GetPPCState();
   static const bool async_present = !Env("NSR_RB_ASYNC_PRESENT").empty();  // old behavior
+  if (s_hook_pc == VI_WAIT_FOR_RETRACE && r.vtime_on && r.frame_mode && r.in_unit && !async_present &&
+      LR(ppc) != PRESENT_BREAKPT_RETURN &&
+      PowerPC::MMU::HostRead<u32>(guard, 0x800000E4) == 0x803A3F30)  // main thread
+  {
+    if (s_sim_wait_pass && LR(ppc) == s_sim_wait_lr)
+    {
+      s_sim_wait_pass = false;
+      return;  // the real wait (live frame)
+    }
+    SimWaitBegin(guard);
+    return;
+  }
   if (s_hook_pc == VI_POST_COUNTER_FN)
   {
     if (!async_present && r.vtime_on)
@@ -2977,6 +3049,16 @@ bool AcSoundLayerOn(const AcMem& m)
   return (m.rd(SND_FLAGS) & 0x00FFFF00) == 0x00010100;
 }
 
+// The model's clock: the frame number plus the retrace waits game code made
+// inside frames during the session (AC_EXTRA_TICKS, counted by
+// SimWaitBegin), so a sim loop that waits retraces for audio progress sees
+// the model advance, the same way on every machine.
+constexpr u32 AC_EXTRA_TICKS = AC_BASE + 0xC;
+u32 AcNow(const AcMem& m)
+{
+  return s_rb.tick_running + m.rd(AC_EXTRA_TICKS);
+}
+
 u32 AcFramesToMs(u32 frames)
 {
   return static_cast<u32>(u64(frames) * 1000 / 60);
@@ -3233,6 +3315,13 @@ bool AcBankReady(const AcMem& m, u32 record, u32 f)
 }
 }  // namespace
 
+void AudioClockSimWait(const Core::CPUThreadGuard& guard)
+{
+  const AcMem m{guard};
+  if (AcModeNow() != AcMode::Off && m.rd(AC_BASE) == AC_MAGIC)
+    m.wr(AC_EXTRA_TICKS, m.rd(AC_EXTRA_TICKS) + 1);
+}
+
 void AudioClockSessionStart(const Core::CPUThreadGuard& guard)
 {
   if (AcModeNow() == AcMode::Off)
@@ -3247,6 +3336,35 @@ void AudioClockSessionStart(const Core::CPUThreadGuard& guard)
       AcModeNow() == AcMode::Shadow ? "shadow" : "on");
 }
 
+// Busy-wait guard. Game code can also poll the model in a loop without
+// waiting for a retrace, e.g. the sound loader fn_8006C1E8 spins on
+// fn_8006C120 + SndUpdate until its bank queue drains, which needs the bank
+// service's bank-ready query (fn_801F35B4) to say ready: with answers that
+// only change from frame to frame, that loop never ends (Demo Mode: frame
+// 106071, loading the next demo). So every NSR_AC_POLLS_PER_TICK model
+// queries within one frame (default 1000; a normal frame makes far fewer)
+// count as one more frame-equivalent of model time (AC_EXTRA_TICKS). The
+// count is decided by game code, so it is the same on every machine and in
+// re-simulation; normal frames are unaffected.
+constexpr u32 AC_POLLS = AC_BASE + 0x4C8;       // queries so far in AC_POLL_FRAME
+constexpr u32 AC_POLL_FRAME = AC_BASE + 0x4CC;  // (inside the music block's spare words)
+
+void AcCountPoll(const AcMem& m)
+{
+  static const u32 per_tick = std::max<u32>(1, ParseU32(Env("NSR_AC_POLLS_PER_TICK")).value_or(1000));
+  const u32 frame = s_rb.tick_running;
+  u32 polls = m.rd(AC_POLL_FRAME) == frame ? m.rd(AC_POLLS) : 0;
+  ++polls;
+  m.wr(AC_POLL_FRAME, frame);
+  m.wr(AC_POLLS, polls);
+  if (polls % per_tick == 0)
+  {
+    m.wr(AC_EXTRA_TICKS, m.rd(AC_EXTRA_TICKS) + 1);
+    if (polls == per_tick)
+      AcLogLine(fmt::format("P {} busy poll: {} model queries in one frame", frame, polls));
+  }
+}
+
 // Queries (HookType::Gate): answer from the model and skip the wrapper.
 void AudioClockQueryHook(const Core::CPUThreadGuard& guard)
 {
@@ -3255,7 +3373,8 @@ void AudioClockQueryHook(const Core::CPUThreadGuard& guard)
   if (!AcActive(guard, ppc))
     return;
   const AcMem m{guard};
-  const u32 f = s_rb.tick_running;
+  AcCountPoll(m);
+  const u32 f = AcNow(m);
   const bool shadow = AcModeNow() == AcMode::Shadow;
   if (pc == C_BANK_READY)
   {
@@ -3384,7 +3503,7 @@ void AudioClockEffectHook(const Core::CPUThreadGuard& guard)
   if (!return_site && LR(ppc) >= 0x8025E000)
     return;
   const AcMem m{guard};
-  const u32 f = r.tick_running;
+  const u32 f = AcNow(m);
   const bool shadow = AcModeNow() == AcMode::Shadow;
   const u32 r3 = ppc.gpr[3];
   switch (pc)
@@ -3528,7 +3647,7 @@ constexpr std::array<u32, 3> MUSIC_DISPATCH{0x8006D91C, 0x8006D98C, 0x8006D9FC};
 constexpr u32 MUSIC_PICK_SONG = 0x80072424;  // EA Trax: next playlist song -> PathFinder
 constexpr u32 MUSIC_MANAGER = 0x803EA704;    // -0x7B9C(r13): EA Trax manager state
 constexpr u32 MUSIC_TRAMP = 0x80416AF8;      // injected dispatcher calls return here (blr)
-constexpr u32 AC_MUSIC = 0x80416FC0;         // +0 song end frame, +4 song start frame
+constexpr u32 AC_MUSIC = 0x80416FC0;         // +0 song end frame, +4 song start frame (+8/+C: AcCountPoll)
 constexpr u32 AC_MUSIC_LAST_START = 0x80416FFC;  // last real start before the session (kept)
 static_assert(AC_SFX + AC_SFX_SLOTS * 12 <= AC_MUSIC);
 constexpr u32 MUSIC_EVENT = 0x11000000;  // track event flags as PathFinder sends them
@@ -3608,7 +3727,7 @@ void MusicPickHook(const Core::CPUThreadGuard& guard)
   const u32 mgr = m.rd(MUSIC_MANAGER);
   if (!AcPtr(mgr) || m.rd8(mgr + 0x126) != 0)
     return;  // music off: fn_80072424 returns without picking
-  const u32 f = r.tick_running;
+  const u32 f = AcNow(m);
   m.wr(AC_MUSIC + 4, f + MusicGapFrames());
   m.wr(AC_MUSIC, f + MusicGapFrames() + MusicSongFrames());
   AcLogLine(fmt::format("M {} pick: start {} end {}", f, f + MusicGapFrames(),
@@ -3627,7 +3746,7 @@ void MusicInjectEvent(const Core::CPUThreadGuard& guard)
   const AcMem m{guard};
   if (m.rd(AC_BASE) != AC_MAGIC)
     return;
-  const u32 f = r.tick_running;
+  const u32 f = AcNow(m);
   const u32 end = m.rd(AC_MUSIC), start = m.rd(AC_MUSIC + 4);
   u32 id;
   if (start && static_cast<s32>(f - start) >= 0)

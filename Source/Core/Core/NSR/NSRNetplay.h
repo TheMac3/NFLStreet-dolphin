@@ -268,6 +268,11 @@ void MusicDispatchHook(const Core::CPUThreadGuard& guard);  // HookType::Gate
 void MusicPickHook(const Core::CPUThreadGuard& guard);      // HookType::Start (fn_80072424)
 void MusicInjectEvent(const Core::CPUThreadGuard& guard);   // from ViCallbackHook
 void MusicTrampHook(const Core::CPUThreadGuard& guard);     // HookType::Replace
+// Retrace waits inside the sim during the session count as one virtual
+// retrace each (see NSRNetplay.cpp, SimWaitBegin).
+void AudioClockSimWait(const Core::CPUThreadGuard& guard);
+void SimWaitTrampHook(const Core::CPUThreadGuard& guard);  // HookType::Replace
+constexpr unsigned int SIM_WAIT_TRAMP_ADDR = 0x80416AF4;
 constexpr unsigned int MUSIC_TRAMP_ADDR = 0x80416AF8;
 constexpr unsigned int MUSIC_PICK_SONG_FN = 0x80072424;
 std::vector<unsigned int> MusicDispatchers();
