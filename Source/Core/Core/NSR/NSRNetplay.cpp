@@ -868,6 +868,7 @@ struct Rollback
   u32 mispredict = 0;
   u32 mispredict_pending = UINT32_MAX;  // earliest frame still to correct
   u64 mispredictions = 0;
+  u64 uncorrectable = 0;  // mispredictions older than the ring/session/barrier
   u32 force_from = 0;     // NSR_RB_FORCE_FROM: first live tick that is rolled back
   u32 force_to = 0xFFFFFFFF;  // NSR_RB_FORCE_TO: last one (diagnostics)
   u32 perturb_at = 0;     // NSR_RB_PERTURB_AT: diagnostics, see RollbackTickHook
@@ -1188,9 +1189,14 @@ void RbInit(Core::System& system)
   if (r.force > 0 || !Env("NSR_RB_SAMPLE").empty() || !Env("NSR_RB_STACKS").empty())
   {
     if (r.force > 0)
-      r.ring.assign(r.io_idle_mode ? std::max<u32>(r.force + 1, ParseU32(Env("NSR_RB_RING")).value_or(24))
-                                   : r.force + 1,
+    {
+      // Deep enough for the deepest rollback the session can ask for
+      // (forced depth or misprediction delay), plus quiet-point slack.
+      const u32 depth = std::max(r.force, r.mispredict);
+      r.ring.assign(r.io_idle_mode ? std::max<u32>(depth + 1, ParseU32(Env("NSR_RB_RING")).value_or(24))
+                                   : depth + 1,
                     std::vector<u8>(size + r.vmem_bytes));
+    }
     // Diagnostics: if ticks stop after rollbacks began (the game hung), log
     // where the CPU is once and dump MEM1 (NSR_DUMP_PREFIX-hang.bin).
     std::thread([&system] {
@@ -1380,7 +1386,9 @@ std::vector<std::pair<u32, u32>> RbLiveRanges(Core::System& system, const u8* ra
     {
       keep(t, 0x318);
       const u32 base = rd(t + 0x304), end = rd(t + 0x308);
-      if (valid(end) && valid(base) && end < base && base - end <= 0x100000)
+      // base is the one-past-the-top address, which may equal the end of MEM1.
+      const bool base_ok = base > 0x80003100 && base <= 0x80000000 + mem_size;
+      if (valid(end) && base_ok && end < base && base - end <= 0x100000)
         live.emplace_back(end & 0x01FFFFFF, base & 0x01FFFFFF);
     }
     keep(rd(t + 0x2DC), 8);
@@ -2083,7 +2091,10 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
         terminal = result == ReplayFollow::Result::Complete ||
                    result == ReplayFollow::Result::Error;
         if (result == ReplayFollow::Result::Complete)
+        {
           Log("follow complete after {} units", r.live);
+          Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+        }
         if (result == ReplayFollow::Result::Error)
         {
           Log("follow failed at unit {}: {}", r.live, s_follow->Error());
@@ -2173,12 +2184,23 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
       {
         u32 target = r.mispredict_pending;
         const u32 oldest = t >= slots - 1 ? t - (slots - 1) : 0;
-        bool ok = target >= oldest && target >= start;
+        // Never restore before the session, the ring or a load barrier.
+        const u32 lower = std::max({oldest, start, r.barrier});
+        bool ok = target >= lower;
         if (ok && r.io_idle_mode)
         {
-          while (target >= oldest && target > start && !(r.io_idle.contains(target) && r.io_idle[target]))
+          while (target > lower && !(r.io_idle.contains(target) && r.io_idle[target]))
             --target;
-          ok = IsIoIdle(ram) && target >= oldest && r.io_idle.contains(target) && r.io_idle[target];
+          ok = IsIoIdle(ram) && target >= lower && r.io_idle.contains(target) && r.io_idle[target];
+        }
+        if (!ok && r.mispredict_pending < lower)
+        {
+          // Uncorrectable (in netplay: needs a state resync). Report it and
+          // drop it instead of retrying forever while running on wrong pads.
+          Log("UNCORRECTABLE misprediction at {} (live {}, lower bound {})", r.mispredict_pending, t,
+              lower);
+          ++r.uncorrectable;
+          r.mispredict_pending = UINT32_MAX;
         }
         if (ok)
         {
@@ -2194,11 +2216,9 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
           ++r.rollbacks;
           r.mispredict_pending = UINT32_MAX;
         }
-        else
+        else if (r.mispredict_pending != UINT32_MAX)
         {
           ++r.skipped_busy;  // retry next frame (deeper rollback then)
-          if (target < oldest)
-            Log("misprediction at {} fell out of the snapshot ring (live {})", r.mispredict_pending, t);
         }
       }
     }
@@ -2216,9 +2236,11 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
         // target still in the ring.
         target = r.live - depth;
         const u32 oldest = r.live >= slots - 1 ? r.live - (slots - 1) : 0;
-        while (target >= oldest && target > 0 && !(r.io_idle.contains(target) && r.io_idle[target]))
+        // Never search past the ring, the session start or a load barrier.
+        const u32 lower = std::max({oldest, r.vtime_from, r.barrier});
+        while (target > lower && !(r.io_idle.contains(target) && r.io_idle[target]))
           --target;
-        if (!IsIoIdle(ram) || target < oldest || !r.io_idle.contains(target))
+        if (!IsIoIdle(ram) || target < lower || !r.io_idle.contains(target) || !r.io_idle[target])
         {
           ++r.skipped_busy;
           target = r.live;  // no rollback this unit
@@ -2379,10 +2401,10 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
   {
     Log("tick {}: rollbacks {}, re-simulated {}, mismatched checks {}/{}; audio gate: "
         "recorded {}, replayed {}, mismatched {}; load barriers {} (clamped {}, in re-sim {}); "
-        "io-idle skips {}; mispredictions {}",
+        "io-idle skips {}; mispredictions {} (uncorrectable {})",
         t, r.rollbacks, r.resim_ticks, r.mismatched_checks, r.checks, r.gate_recorded,
         r.gate_replayed, r.gate_mismatched, r.barrier_events, r.clamped, r.barrier_resim,
-        r.skipped_busy, r.mispredictions);
+        r.skipped_busy, r.mispredictions, r.uncorrectable);
     if (r.mismatched_checks > 0)
       RbReport(15);  // Dolphin is usually killed, not shut down: report as we go
     // Revisit NSR_RB_VMEM_BYTES if the game ever uses fake VMEM past it.
