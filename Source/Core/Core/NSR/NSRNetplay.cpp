@@ -3892,6 +3892,10 @@ static bool RbNetworkPreflight(u32 live)
                                std::chrono::milliseconds(PEER_TIMEOUT_MS), true);
     NSRTelemetry::Count(NSRTelemetry::Counter::NetStalls);
     NSRTelemetry::Observe(NSRTelemetry::Hist::NetStallUs, waited_us(stall_start));
+    // A stall is time the peers agreed to lose; without this the throttle
+    // would replay it as fast frames and push this peer straight back ahead.
+    Core::System::GetInstance().GetCoreTiming().NSRDeferThrottle(
+        std::chrono::steady_clock::now() - stall_start);
     if (!ok)
       return false;
   }
@@ -3908,6 +3912,12 @@ static bool RbNetworkPreflight(u32 live)
     wait_until([] { return true; }, std::chrono::microseconds(sync_wait_us), false);
     NSRTelemetry::Count(NSRTelemetry::Counter::SyncWaits);
     NSRTelemetry::Observe(NSRTelemetry::Hist::TimeSyncWaitUs, waited_us(sync_start));
+    // Keep the stretch: Dolphin's speed limiter otherwise treats it as lag
+    // (anything under MaxFallback, 100 ms by default) and runs the next frames
+    // fast to catch up, which cancelled every stretch and left the faster
+    // peer 2-3 frames ahead for the whole match (2026-10-11 two-human runs).
+    Core::System::GetInstance().GetCoreTiming().NSRDeferThrottle(
+        std::chrono::steady_clock::now() - sync_start);
   }
   if (const auto desync = s_rb_exchange->FirstDesync();
       desync && (!s_rb_logged_desync || *desync < *s_rb_logged_desync))

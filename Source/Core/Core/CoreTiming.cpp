@@ -588,6 +588,12 @@ void CoreTimingManager::Idle()
   ppc_state.downcount = 0;
 }
 
+void CoreTimingManager::NSRDeferThrottle(Clock::duration waited)
+{
+  if (waited > Clock::duration::zero())
+    m_throttle_reference_time += waited;
+}
+
 void CoreTimingManager::SetNSRSpeedFactor(float factor)
 {
   if (factor == m_nsr_speed_factor)

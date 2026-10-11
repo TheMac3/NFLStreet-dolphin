@@ -140,6 +140,13 @@ public:
   // cost little emulated time (see NSRNetplay ResimSpeed). CPU thread only.
   void SetNSRSpeedFactor(float factor);
 
+  // NFLStreet rollback netplay: the CPU thread just waited `waited` of host
+  // time on purpose (a time-sync stretch or a prediction-window stall). Move
+  // the throttle reference forward by that much so the speed limiter does not
+  // treat the wait as lag and run the next frames fast to catch it up, which
+  // would undo the stretch. Host pacing only; no emulated state. CPU thread only.
+  void NSRDeferThrottle(Clock::duration waited);
+
   // Clear all pending events. This should ONLY be done on exit or state load.
   void ClearPendingEvents();
 
