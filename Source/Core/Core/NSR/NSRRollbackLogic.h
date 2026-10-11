@@ -9,7 +9,9 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <optional>
 #include <span>
@@ -132,6 +134,105 @@ constexpr bool Before(std::uint32_t frame, std::uint32_t end)
 {
   return static_cast<std::int32_t>(frame - end) < 0;
 }
+
+// Undo log for rollback-owned bytes that live outside the MEM1/VMEM snapshots
+// (final-review M1: the game's ARAM replay ring). Instead of copying the
+// window into every ring slot, each guest write into the window first records
+// the bytes it is about to overwrite, tagged with a monotonically increasing
+// sequence number. A snapshot remembers Mark() when it is saved; restoring it
+// undoes every record newer than that mark, newest first, which leaves the
+// window exactly as it was when the snapshot was taken (the write order within
+// and across frames is irrelevant: reverse-order undo of the complete write
+// history since the mark is exact).
+//
+// Why an undo log and not a per-slot copy of the window: the game writes
+// ~2.6 KB every second frame into a ~560 KB window, so the log holds a few
+// tens of KB for a 24-slot ring while slot copies would cost 24 x 560 KB of
+// memory plus a copy (or a dirty-page scheme) per save.
+//
+// Invariants (the caller's job):
+//   - Marks are only restored backward along the executed timeline: a slot
+//     saved in a timeline that a later restore abandoned is re-saved before
+//     it can be restored again (the rollback ring re-saves every re-simulated
+//     frame), so its stale mark is never used. Sequence numbers are never
+//     reused after an undo, so a stale mark cannot alias a newer record.
+//   - TrimThrough(oldest) only with the oldest mark any still-restorable
+//     snapshot holds; records at or before it can never be undone again.
+class WindowUndoLog
+{
+public:
+  // Called before the guest overwrites mem[address, address + length). Only
+  // the part inside the window [lo, hi) is recorded; `mem` is the whole
+  // backing store (addresses index it directly). Returns bytes recorded.
+  std::size_t Record(std::span<const std::uint8_t> mem, std::uint32_t lo, std::uint32_t hi,
+                     std::uint32_t address, std::uint32_t length)
+  {
+    const std::uint64_t end = std::uint64_t{address} + length;
+    const std::uint64_t a = std::max<std::uint64_t>(address, lo);
+    const std::uint64_t b = std::min<std::uint64_t>({end, hi, mem.size()});
+    if (a >= b)
+      return 0;
+    Entry& e = m_entries.emplace_back();
+    e.seq = ++m_seq;
+    e.address = static_cast<std::uint32_t>(a);
+    e.old.assign(mem.begin() + static_cast<std::ptrdiff_t>(a),
+                 mem.begin() + static_cast<std::ptrdiff_t>(b));
+    m_bytes += e.old.size();
+    return e.old.size();
+  }
+
+  std::uint64_t Mark() const { return m_seq; }
+
+  // Undo every record newer than `mark` into `mem`, newest first. Returns the
+  // number of records undone.
+  std::size_t UndoTo(std::uint64_t mark, std::span<std::uint8_t> mem)
+  {
+    std::size_t undone = 0;
+    while (!m_entries.empty() && m_entries.back().seq > mark)
+    {
+      const Entry& e = m_entries.back();
+      if (std::uint64_t{e.address} + e.old.size() <= mem.size())
+        std::copy(e.old.begin(), e.old.end(), mem.begin() + e.address);
+      m_bytes -= e.old.size();
+      m_entries.pop_back();
+      ++undone;
+    }
+    return undone;
+  }
+
+  // Drop records no restorable snapshot can undo any more.
+  void TrimThrough(std::uint64_t oldest_mark)
+  {
+    while (!m_entries.empty() && m_entries.front().seq <= oldest_mark)
+    {
+      m_bytes -= m_entries.front().old.size();
+      m_entries.pop_front();
+    }
+  }
+
+  // Session boundary: forget everything (the sequence restarts too, because
+  // every snapshot mark of the previous session is discarded with it).
+  void Clear()
+  {
+    m_entries.clear();
+    m_bytes = 0;
+    m_seq = 0;
+  }
+
+  std::size_t Records() const { return m_entries.size(); }
+  std::size_t Bytes() const { return m_bytes; }
+
+private:
+  struct Entry
+  {
+    std::uint64_t seq = 0;
+    std::uint32_t address = 0;
+    std::vector<std::uint8_t> old;
+  };
+  std::deque<Entry> m_entries;
+  std::size_t m_bytes = 0;
+  std::uint64_t m_seq = 0;
+};
 
 struct SongTimeline
 {

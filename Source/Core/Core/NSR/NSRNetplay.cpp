@@ -51,6 +51,7 @@
 #include <optional>
 #include <random>
 #include <set>
+#include <span>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -2476,6 +2477,255 @@ void RbInit(Core::System& system)
       keep.size(), r.hash_log, r.net_enabled, r.net_delay, r.max_prediction);
 }
 
+// ---------------------------------------------------------------------------
+// ARAM replay ring (final-review M1, rb-coverage-review C3)
+//
+// The game records every gameplay object for its instant replay: every second
+// frame fn_800307C0 -> fn_8002FE34 -> fn_80199C94 serializes the object list
+// (-0x5C58(r13)) into one of 4 rotating MRAM buffers and copies the record
+// into ARAM with the synchronous ARQ writer fn_801C1D98. The records form a
+// ring of `count` x `bytes` that fn_80030B30 -> fn_80199D58 allocates from the
+// game's ARAM heap (fn_801D2BB0); Quick Play: 213 x 0xA40 at
+// 0x466460..0x4EEBA0. The instant-replay viewer (X after a play) reads records
+// back through fn_8002FECC -> fn_80199CF0 -> fn_801C1E78 into game memory.
+//
+// ARAM is outside the MEM1/VMEM snapshots, so a restore used to leave records
+// written by abandoned (mispredicted) frames in the ring wherever the
+// corrected timeline did not rewrite the same record; a replay viewed later
+// would differ between peers (and copy that difference into MEM1).
+//
+// Coverage: an undo log (RollbackLogic::WindowUndoLog) of every ARAM write
+// into the ring while a rollback ring exists. DSPManager reports each ARAM
+// transfer before it happens (SetNSRARAMObserver); writes into the ring's
+// window record the bytes they replace. Each snapshot stores the log's mark,
+// and RbRestore undoes the newer records, so after a restore the ring equals
+// the snapshot's frame exactly, including writes made during re-simulation
+// (logged like live ones and undone by a later, deeper rollback). Records
+// older than every ring slot's mark are trimmed. Session enter/leave clears
+// the log and the marks (like the ring slots and their metadata).
+//
+// Why the window comes from the game's own ring descriptor (read from MEM1 at
+// each transfer, not a fixed address range): only bytes of the ring's ARAM
+// allocation are ever logged or undone, whatever the mode or allocation
+// order, so audio banks and streamed samples (kept live; the audio model
+// handles audio) can never be rolled back. The descriptor is itself restored
+// game state, so the window always matches the timeline that writes into it.
+// A window change inside a session is logged.
+//
+// Why an undo log rather than copying the ring into every slot: ~2.6 KB is
+// written every second frame into a ~560 KB window, so the log holds tens of
+// KB and costs one small copy per write; slot copies would be 24 x 560 KB.
+//
+// ARQ and quiet points: Dolphin performs an ARQ request's ARAM DMA in full
+// when the transfer starts (completion is only a scheduled event), so a write
+// is logged in the frame whose code (or interrupt) started it; I/O-idle quiet
+// points already require the ARQ queues empty. Speed factors (16x re-sim
+// machine) only change completion timing.
+//
+// Diagnostics: NSR_RB_ARAM=0 keeps the observer but does not log or undo
+// (reproduces the uncovered behavior for tests); reads of the ring
+// (ARAM -> MRAM DMA) are counted and the first ones logged
+// (NSR_RB_ARAM_TRACE=1 logs every ring read and write); NSR_DUMP_PREFIX
+// dumps write the ring to <dump>.aram (see WriteAramRingSidecar).
+//
+// Deferred: other ARAM contents (audio) stay live by design. RbAdopt's
+// file-based state transplant does not adopt the ring (it is a single-machine
+// diagnostic). Revisit both if a mode is found that keeps other gameplay data
+// in ARAM (the read probe reports reads of the ring only).
+constexpr u32 ARAM_RING_BASE_PTR = 0x803ECBEC;    // -0x56B4(r13): ARAM address, 0 = none
+constexpr u32 ARAM_RING_COUNT = 0x803EC658;       // -0x5C48(r13): records in the ring
+constexpr u32 ARAM_RING_RECORD_BYTES = 0x803EC650;  // -0x5C50(r13): bytes per record
+
+struct AramRing
+{
+  const u8* mem1 = nullptr;  // set while a session observes ARAM
+  u8* aram = nullptr;
+  u32 aram_size = 0;
+  bool undo = false;  // logging/undo on (a rollback ring exists, NSR_RB_ARAM != 0)
+  bool trace = false;  // NSR_RB_ARAM_TRACE=1: log every ring access (diagnostics)
+  RollbackLogic::WindowUndoLog log;
+  std::map<const u8*, u64> marks;  // snapshot slot -> log mark when saved
+  std::pair<u32, u32> window{0, 0};
+  u64 writes = 0, write_bytes = 0, byte_writes = 0, reads = 0, read_bytes = 0;
+  u64 restores = 0, undone = 0;
+  u64 host_ns = 0;  // host time spent logging, undoing and trimming (cost report)
+  u32 reads_logged = 0;
+};
+
+// Adds the host time of one logging/undo step to s_aram.host_ns.
+struct AramTimer
+{
+  ~AramTimer();
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+};
+AramRing s_aram;
+AramTimer::~AramTimer()
+{
+  s_aram.host_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - start)
+                                         .count());
+}
+
+// [lo, hi) of the ring in ARAM from the game's descriptor; {0, 0} if none.
+std::pair<u32, u32> AramRingWindow(const u8* ram, u32 aram_size)
+{
+  auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
+  const u32 base = rd(ARAM_RING_BASE_PTR);
+  const u64 end = u64{base} + u64{rd(ARAM_RING_COUNT)} * rd(ARAM_RING_RECORD_BYTES);
+  if (base == 0 || end <= base || end > aram_size)
+    return {0, 0};
+  return {base, static_cast<u32>(end)};
+}
+
+void AramObserver(DSP::DSPManager& dsp, u32 address, u32 length,
+                  DSP::DSPManager::NSRARAMAccess access)
+{
+  using Access = DSP::DSPManager::NSRARAMAccess;
+  AramRing& a = s_aram;
+  if (!a.mem1)
+    return;
+  const auto window = AramRingWindow(a.mem1, dsp.GetARAMSize());
+  if (window != a.window)
+  {
+    Log("ARAM replay ring: window {:x}..{:x} (was {:x}..{:x}) at frame {}", window.first,
+        window.second, a.window.first, a.window.second, s_rb.tick_running);
+    a.window = window;
+  }
+  const auto [lo, hi] = window;
+  if (lo == hi || address >= hi || u64{address} + length <= lo)
+    return;
+  if (a.trace)
+  {
+    Log("ARAM replay ring: {} {:x}+{:#x} frame {} re-sim {}",
+        access == Access::DMARead ? "read" : "write", address, length, s_rb.tick_running,
+        s_rb.in_resim);
+  }
+  if (access == Access::DMARead)
+  {
+    ++a.reads;
+    a.read_bytes += length;
+    if (a.reads_logged < 16)
+    {
+      ++a.reads_logged;
+      Log("ARAM replay ring: read {:x}+{:#x} in frame {} (re-sim {})", address, length,
+          s_rb.tick_running, s_rb.in_resim);
+    }
+    return;
+  }
+  ++(access == Access::ByteWrite ? a.byte_writes : a.writes);
+  a.write_bytes += length;
+  if (a.undo)
+  {
+    AramTimer timer;
+    a.log.Record({a.aram, a.aram_size}, lo, hi, address, length);
+  }
+}
+
+// RbSave: remember the log position of this snapshot and trim records that no
+// rollback-ring slot can undo any more.
+void AramRingSaved(const std::vector<u8>& slot)
+{
+  AramRing& a = s_aram;
+  if (!a.undo)
+    return;
+  AramTimer timer;
+  a.marks[slot.data()] = a.log.Mark();
+  if (a.log.Records() <= 2 * s_rb.ring.size())
+    return;
+  u64 oldest = UINT64_MAX;
+  for (const auto& ring_slot : s_rb.ring)
+  {
+    if (const auto it = a.marks.find(ring_slot.data()); it != a.marks.end())
+      oldest = std::min(oldest, it->second);
+  }
+  if (oldest != UINT64_MAX)
+    a.log.TrimThrough(oldest);
+}
+
+// RbRestore: put the ring back to the snapshot's frame. Slots this session
+// never saved (RbAdopt's file state) leave ARAM alone.
+void AramRingRestore(const std::vector<u8>& slot)
+{
+  AramRing& a = s_aram;
+  if (!a.undo)
+    return;
+  const auto it = a.marks.find(slot.data());
+  if (it == a.marks.end())
+    return;
+  AramTimer timer;
+  ++a.restores;
+  a.undone += a.log.UndoTo(it->second, {a.aram, a.aram_size});
+}
+
+void AramRingReport(const char* when)
+{
+  const AramRing& a = s_aram;
+  if (!a.mem1)
+    return;
+  Log("ARAM replay ring ({}): window {:x}..{:x}, {} DMA writes + {} byte writes ({} bytes), "
+      "{} reads ({} bytes); undo {}: {} restores undid {} records, log {} records / {} bytes, "
+      "host {} us",
+      when, a.window.first, a.window.second, a.writes, a.byte_writes, a.write_bytes, a.reads,
+      a.read_bytes, a.undo ? "on" : "off", a.restores, a.undone, a.log.Records(), a.log.Bytes(),
+      a.host_ns / 1000);
+}
+
+// Session enter (enter = true) / leave: start or stop observing ARAM, with an
+// empty log either way.
+void AramRingSession(Core::System& system, bool enter)
+{
+  if (!enter)
+    AramRingReport("session leave");
+  s_aram = {};
+  auto& dsp = system.GetDSP();
+  if (!enter)
+  {
+    dsp.SetNSRARAMObserver(nullptr);
+    return;
+  }
+  s_aram.mem1 = system.GetMemory().GetRAM();
+  s_aram.aram = dsp.GetARAMPtr();
+  s_aram.aram_size = dsp.GetARAMSize();
+  s_aram.undo = !s_rb.ring.empty() && Env("NSR_RB_ARAM") != "0" && s_aram.aram != nullptr;
+  s_aram.trace = Env("NSR_RB_ARAM_TRACE") == "1";
+  s_aram.window = AramRingWindow(s_aram.mem1, s_aram.aram_size);
+  dsp.SetNSRARAMObserver(AramObserver);
+  Log("ARAM replay ring: window {:x}..{:x} at session start, undo log {}", s_aram.window.first,
+      s_aram.window.second, s_aram.undo ? "on" : "off");
+}
+
+// The ring as it is now: its ARAM address and bytes (empty if none).
+std::pair<u32, std::span<const u8>> AramRingBytes(Core::System& system)
+{
+  const auto& dsp = system.GetDSP();
+  const u8* aram = dsp.GetARAMPtr();
+  if (!aram || !system.GetMemory().GetRAM())
+    return {0, {}};
+  const auto [lo, hi] = AramRingWindow(system.GetMemory().GetRAM(), dsp.GetARAMSize());
+  return {lo, std::span<const u8>(aram + lo, hi - lo)};
+}
+
+// <dump>.aram next to a MEM1 dump: "NSRARAM1", the ring's ARAM address and
+// length (u32 little-endian each), then its bytes (tools/rbdiff.py compares
+// it with the other dump's sidecar). Written even when no ring exists
+// (length 0), so a missing ring is visible in the comparison.
+void WriteAramRingSidecar(Core::System& system, const std::string& dump)
+{
+  const auto [address, bytes] = AramRingBytes(system);
+  FILE* f = std::fopen((dump + ".aram").c_str(), "wb");
+  if (!f)
+    return;
+  const u32 length = static_cast<u32>(bytes.size());
+  const u8 header[16] = {'N', 'S', 'R', 'A', 'R', 'A', 'M', '1',
+                         static_cast<u8>(address), static_cast<u8>(address >> 8),
+                         static_cast<u8>(address >> 16), static_cast<u8>(address >> 24),
+                         static_cast<u8>(length), static_cast<u8>(length >> 8),
+                         static_cast<u8>(length >> 16), static_cast<u8>(length >> 24)};
+  std::fwrite(header, 1, sizeof(header), f);
+  std::fwrite(bytes.data(), 1, bytes.size(), f);
+  std::fclose(f);
+}
+
 // Per-machine heap blocks (sidecar, see WritePerMachineSidecar): blocks the
 // game's allocator hands to audio code. The audio middleware, the game's sound
 // layer and stream source, and PathFinder allocate from the shared game heap
@@ -2514,6 +2764,7 @@ void AllocUndoTo(u64 seq)
 void RbSave(const u8* ram, std::vector<u8>& slot)
 {
   s_slot_seq[slot.data()] = s_alloc_seq;
+  AramRingSaved(slot);  // ARAM replay ring (final-review M1)
   // Keep the undo log bounded by the oldest snapshot still remembered.
   if (s_alloc_log.size() > 65536 && !s_slot_seq.empty())
   {
@@ -2764,6 +3015,7 @@ void RbRestore(Core::System& system, u8* ram, const std::vector<u8>& slot)
   // heap), and compiled blocks for the old bytes must not keep running.
   if (const auto it = s_slot_seq.find(slot.data()); it != s_slot_seq.end())
     AllocUndoTo(it->second);
+  AramRingRestore(slot);  // ARAM replay ring (final-review M1)
   std::optional<PhaseTimer> timer(std::in_place, PH_LIVE);
   const auto live = RbLiveRanges(system, ram);
   std::vector<std::vector<u8>> keep;
@@ -3451,8 +3703,15 @@ static void RbTransplant(Core::System& system, u8* ram, u32 live, u32 frame)
 //                requests, the audio callback-list nodes, the tick
 //                accumulator, disc staging/descriptor, disc stream
 //                destinations, the GX FIFO (CP registers).
+//   io-object, audio-data, heap-counters, heap-free: see the writer below.
 // Static per-machine words (.data/.bss, the same in every mode) stay in
 // rbdiff's own list.
+// Format v2 (first line "# nsr-permachine v2"; final review M3) adds the
+// complete heap block map ("#heap"/"#block" records, see WalkHeap), so rbdiff
+// can exclude a per-machine block only where both dumps agree on its
+// boundaries and owner and report an allocation-ownership difference instead
+// of hiding it. Older sidecars lack the map; rbdiff still reads them (union
+// semantics) and says the comparison has reduced confidence.
 // ---------------------------------------------------------------------------
 namespace
 {
@@ -3610,6 +3869,131 @@ std::optional<std::pair<u32, u32>> EnclosingBlock(const u8* ram, u32 p)
   }
   return std::nullopt;
 }
+
+// --- Heap block map (sidecar v2; final review M3) ------------------------------
+// The per-machine heap ranges above say what THIS dump thinks is audio/I/O
+// memory. Comparing two dumps by the union of those claims let one dump's
+// "audio" label hide the other dump's gameplay object at the same address
+// (an allocation-ownership divergence). So the sidecar also records every
+// block of every heap with its owner, and rbdiff excludes a per-machine block
+// only when both dumps agree on it, reporting any owner/boundary difference.
+//
+// Allocator layout (GN7E69, fn_801D28A8 family), from dumps: a block starts
+// with a back link (absent in a heap's first block), then a word whose high
+// half `off` is the header length counted from that word: the flags word
+// (used byte, mask 0xFF00) is at +off-12, the heap descriptor at +off-8, the
+// next block's start at +off-4 and the payload at +off. Seen: 0x0C (plain
+// block, the classic 16-byte header), 0x10, 0x1C (aligned block with a
+// 16-byte pre-header). A heap's chain ends with a 0x14-byte sentinel block.
+// Heap descriptors: +4 points at itself, +0x10 first child heap, +0x14/+0x18
+// the heap's [start, end). Top-level heaps are listed in a static table of
+// {start, end, flags, descriptor} entries (0x80384BC0.. in GN7E69: the ARAM
+// heap, the fake-VMEM heap, then the MEM1 heaps); nested heaps live inside a
+// block of their parent and are found from the descriptor's child link and
+// from used blocks whose payload holds a descriptor.
+// Deferred: only the first child link is followed (no sibling link has been
+// seen; a second nested heap would still be found from its parent's block).
+// Revisit if a sidecar's "#heap" lines ever disagree with a full-MEM1
+// descriptor scan.
+constexpr std::pair<u32, u32> HEAP_TABLE{0x80384B00, 0x80384D00};
+
+struct HeapBlock
+{
+  u32 lo, hi, payload;
+  bool used;
+};
+
+struct HeapWalk
+{
+  u32 desc, start, end;
+  std::vector<HeapBlock> blocks;
+  bool complete;  // reached the end sentinel through valid headers
+};
+
+// MEM1 virtual address with `extent` readable bytes.
+bool InMem1(u32 a, u32 extent)
+{
+  return a >= 0x80003100 && a < 0x81800000 && extent <= 0x81800000 - a;
+}
+
+bool HeapDescriptor(const u8* ram, u32 desc)
+{
+  auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
+  if (!InMem1(desc, 0x1C) || rd(desc + 4) != desc)
+    return false;
+  const u32 start = rd(desc + 0x14), end = rd(desc + 0x18);
+  return InMem1(start, 0x20) && end > start && end <= 0x81800000;
+}
+
+HeapWalk WalkHeap(const u8* ram, u32 desc)
+{
+  auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
+  HeapWalk w{desc, rd(desc + 0x14), rd(desc + 0x18), {}, false};
+  u32 h = w.start;
+  while (h + 0x20 <= w.end && w.blocks.size() < 200000)
+  {
+    // The class word is at +4 after a back link, or at +0 in the first block.
+    u32 pos = 0, off = 0;
+    for (const u32 cand : {h + 4, h})
+    {
+      const u32 o = InMem1(cand, 4) ? rd(cand) >> 16 : 0;
+      if (o >= 0xC && o <= 0x40 && (o & 3) == 0 && InMem1(cand, o + 4) && rd(cand + o - 8) == desc)
+      {
+        pos = cand;
+        off = o;
+        break;
+      }
+    }
+    if (!pos)
+      return w;
+    const u32 next = rd(pos + off - 4);
+    if (next <= h || next > w.end)
+      return w;
+    w.blocks.push_back({h, next, pos + off, (rd(pos + off - 12) & 0xFF00) != 0});
+    h = next;
+  }
+  w.complete = h + 0x20 > w.end;
+  return w;
+}
+
+std::vector<HeapWalk> WalkAllHeaps(const u8* ram)
+{
+  auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
+  std::vector<u32> todo;
+  for (u32 e = HEAP_TABLE.first; e < HEAP_TABLE.second; e += 16)
+  {
+    const u32 desc = rd(e + 12);
+    if (HeapDescriptor(ram, desc) && rd(desc + 0x14) == rd(e) && rd(desc + 0x18) == rd(e + 4))
+      todo.push_back(desc);
+  }
+  std::set<u32> seen;
+  std::vector<HeapWalk> heaps;
+  while (!todo.empty() && heaps.size() < 64)
+  {
+    const u32 desc = todo.back();
+    todo.pop_back();
+    if (!seen.insert(desc).second)
+      continue;
+    HeapWalk w = WalkHeap(ram, desc);
+    if (const u32 child = rd(desc + 0x10); HeapDescriptor(ram, child))
+      todo.push_back(child);
+    for (const HeapBlock& b : w.blocks)
+    {
+      if (!b.used)
+        continue;
+      for (const u32 c : {b.payload, b.payload + 0x10})
+      {
+        if (c + 0x1C < b.hi && HeapDescriptor(ram, c) && rd(c + 0x14) >= b.lo &&
+            rd(c + 0x18) <= b.hi)
+          todo.push_back(c);
+      }
+    }
+    heaps.push_back(std::move(w));
+  }
+  std::sort(heaps.begin(), heaps.end(),
+            [](const HeapWalk& a, const HeapWalk& b) { return a.start < b.start; });
+  return heaps;
+}
 }  // namespace
 
 // Boot-time disc/stream I/O objects: the heap blocks enclosing what the I/O
@@ -3746,7 +4130,8 @@ static void WritePerMachineSidecar(Core::System& system, const u8* ram, const st
   FILE* f = std::fopen((dump + ".permachine").c_str(), "w");
   if (!f)
     return;
-  std::fprintf(f, "# per-machine ranges at dump time: lo hi kind (virtual, [lo, hi)); "
+  std::fprintf(f, "# nsr-permachine v2: per-machine ranges at dump time: lo hi kind (virtual, "
+                  "[lo, hi)); heap block map in '#heap'/'#block' lines; "
                   "NSRNetplay WritePerMachineSidecar\n");
   size_t blocks = 0;
   for (const PerMachineRange& range : PerMachineRanges(system, ram))
@@ -3755,8 +4140,38 @@ static void WritePerMachineSidecar(Core::System& system, const u8* ram, const st
     if (std::strcmp(range.kind, "audio-heap") == 0)
       ++blocks;
   }
+  // Heap block map (v2, see WalkHeap). Written as '#'-prefixed records so a
+  // pre-v2 rbdiff, which treats every non-comment line as per-machine memory,
+  // keeps its old behaviour instead of excluding game blocks:
+  //   #heap  desc start end blocks complete|partial
+  //   #block lo hi used|free owner
+  // lo/hi are the block's own boundaries (back link .. next block); owner is
+  // the per-machine kind above for the block whose header is listed there
+  // (payload - 0x10), "game" for any other used block, "-" when free.
+  std::map<u32, const char*> owner;  // payload - 0x10 -> kind
+  for (const auto& [lo, hi] : IoObjectBlocks(ram))
+    owner[lo] = "io-object";
+  for (const auto& [lo, hi] : AudioDataBlocks(ram))
+    owner[lo] = "audio-data";
+  for (const auto& [p, recorded] : s_audio_blocks)
+    owner[p - 0x10] = "audio-heap";
+  size_t mapped = 0;
+  for (const HeapWalk& w : WalkAllHeaps(ram))
+  {
+    if (w.blocks.empty())
+      continue;  // not a heap after all (a self-pointing word in some object)
+    std::fprintf(f, "#heap %08x %08x %08x %zu %s\n", w.desc, w.start, w.end, w.blocks.size(),
+                 w.complete ? "complete" : "partial");
+    for (const HeapBlock& b : w.blocks)
+    {
+      const auto it = b.used ? owner.find(b.payload - 0x10) : owner.end();
+      std::fprintf(f, "#block %08x %08x %s %s\n", b.lo, b.hi, b.used ? "used" : "free",
+                   !b.used ? "-" : it != owner.end() ? it->second : "game");
+    }
+    mapped += w.blocks.size();
+  }
   std::fclose(f);
-  Log("wrote {}.permachine ({} audio heap blocks)", dump, blocks);
+  Log("wrote {}.permachine ({} audio heap blocks, {} heap blocks mapped)", dump, blocks, mapped);
 }
 
 // Diagnostics: NSR_RB_DUMP_UNIT=live:frame,... writes all of MEM1 right
@@ -3776,6 +4191,7 @@ static void RbDumpUnit(Core::System& system, const u8* ram, u32 live, u32 frame)
     std::fclose(f);
     Log("wrote {}", path);
     WritePerMachineSidecar(system, ram, path);
+    WriteAramRingSidecar(system, path);  // ARAM replay ring (final-review M1)
   }
   if (s_rb.vmem_bytes)
   {
@@ -3879,9 +4295,10 @@ static u64 RbSemanticChecksum(const Core::CPUThreadGuard& guard)
 // happened to reach one of them.
 //
 // What is hashed: every restored MEM1 byte (r.segments: MEM1 minus RB_KEEP,
-// plus AUDIO_KEEP when audio is kept live) and the snapshotted fake-VMEM
-// prefix (the EA database heap), plus the old semantic words and the list of
-// excluded ranges.  What is excluded, all from existing audited lists so the
+// plus AUDIO_KEEP when audio is kept live), the snapshotted fake-VMEM prefix
+// (the EA database heap) and the game's ARAM gameplay replay ring (restored
+// by its undo log; GameplayAramRingHash), plus the old semantic words and the
+// list of excluded ranges.  What is excluded, all from existing audited lists so the
 // runtime check and the whole-RAM netplay oracle (tools/rbdiff.py) agree:
 //   - RB_KEEP (never restored) and AUDIO_KEEP (rbdiff excludes it in every
 //     mode: middleware .data follows each machine's audio time);
@@ -3907,8 +4324,7 @@ static u64 RbSemanticChecksum(const Core::CPUThreadGuard& guard)
 // Without a dirty tracker (NSR_RB_DIRTY=0, a diagnostic setting) every page
 // is rehashed on every digest.  Handoff barriers hash everything once.
 //
-// Deferred: the unsnapshotted ARAM replay ring (final review M1) is neither
-// restored nor hashed; revisit with M1's frame-keyed ARAM undo log.  Hashing
+// Deferred: hashing
 // the frame's full CPU context is unnecessary: digests are taken at the frame
 // stub, where the main thread's state is the same call path on every peer.
 // ---------------------------------------------------------------------------
@@ -3916,7 +4332,7 @@ namespace
 {
 // Version of the exclusion rules; part of the config fingerprint, so peers
 // with different rules refuse to play instead of reporting false desyncs.
-constexpr u32 STATE_DIGEST_RANGES_VERSION = 1;
+constexpr u32 STATE_DIGEST_RANGES_VERSION = 2;  // 2: + ARAM gameplay ring
 
 // tools/rbdiff.py PER_MACHINE entries below its STATIC_END (.data/.bss words
 // that follow audio/disc time in every mode; physical [lo, hi)).  Keep the
@@ -3967,6 +4383,10 @@ struct StateDigest
   // data is loaded with the match.  Revisit if PathFinder loads project data
   // mid-match (it would show as a digest mismatch inside such a block).
   std::optional<std::map<u32, u32>> audio_data;
+  // ARAM gameplay ring hash cache: valid while no ring write or undo happened
+  // (the session's ARAM observer counts both) and the window is the same.
+  std::optional<std::array<u64, 6>> aram_key;
+  u64 aram_hash = 0;
   u64 digests = 0, total_ns = 0, classify_ns = 0, rehashed = 0, direct = 0;
   u64 per_machine_ns = 0, heap_ns = 0;  // parts of classify_ns
 
@@ -3978,6 +4398,7 @@ struct StateDigest
     std::fill(slot_frame.begin(), slot_frame.end(), RollbackNet::NO_FRAME);
     dumped_through = RollbackNet::NO_FRAME;
     audio_data.reset();
+    aram_key.reset();
   }
 };
 StateDigest s_digest;
@@ -4090,6 +4511,27 @@ void DigestExclusions(Core::System& system, const u8* ram, u32 mem1_size,
   *out = RollbackLogic::MergeRanges(std::move(ranges));
 }
 }  // namespace
+
+// The rollback-owned ARAM gameplay replay ring (final-review M1; restored by
+// its undo log), as GameplayAramRingHash.  Cached between digests while the
+// session's ARAM observer saw no write or undo and the window is unchanged.
+static u64 RbAramDigest(Core::System& system, bool use_cache)
+{
+  StateDigest& sd = s_digest;
+  const auto [address, bytes] = AramRingBytes(system);
+  const AramRing& a = s_aram;
+  const std::array<u64, 6> key{address, bytes.size(), a.writes, a.byte_writes, a.restores,
+                               a.undone};
+  if (use_cache && a.mem1 && sd.aram_key == key)
+    return sd.aram_hash;
+  const u64 hash = XXH3_64bits_withSeed(bytes.data(), bytes.size(), address);
+  if (use_cache && a.mem1)
+  {
+    sd.aram_key = key;
+    sd.aram_hash = hash;
+  }
+  return hash;
+}
 
 // Digest of the state at the start of `frame`.  `slot` is the ring slot just
 // saved for that frame (incremental: the cache source), or null for a one-off
@@ -4258,6 +4700,8 @@ static u64 RbStateDigest(Core::System& system, const std::vector<u8>* slot, u64 
   XXH3_state_t state;
   XXH3_64bits_reset_withSeed(&state, STATE_DIGEST_RANGES_VERSION);
   XXH3_64bits_update(&state, &semantic, sizeof(semantic));
+  const u64 aram = RbAramDigest(system, slot != nullptr);
+  XXH3_64bits_update(&state, &aram, sizeof(aram));
   for (const RollbackLogic::Range& x : sd.excluded)
   {
     const std::array<u32, 2> pair{x.lo, x.hi};
@@ -5177,6 +5621,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
       std::fclose(f);
       Log("wrote {}", path);
       WritePerMachineSidecar(system, ram, path);
+      WriteAramRingSidecar(system, path);  // ARAM replay ring (final-review M1)
     }
   }
   if (r.hash_log && t % 60 == 0)
@@ -5294,6 +5739,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
         t, r.rollbacks, r.resim_ticks, r.mismatched_checks, r.checks, r.gate_recorded,
         r.gate_replayed, r.gate_mismatched, r.barrier_events, r.clamped, r.barrier_resim,
         r.skipped_busy, r.mispredictions, r.uncorrectable, r.net_stalls, r.sync_waits);
+    AramRingReport(fmt::format("tick {}", t).c_str());  // final-review M1
     if (r.mismatched_checks > 0)
       RbReport(15);  // Dolphin is usually killed, not shut down: report as we go
     // Revisit NSR_RB_VMEM_BYTES if the game ever uses fake VMEM past it.
@@ -7181,6 +7627,7 @@ void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
     std::fill(slot.begin(), slot.end(), 0);
   RollbackLogic::ClearSessionSlotMetadata(&s_dirty.synced, &s_slot_seq);
   s_digest.Invalidate();  // the state digest cache describes the cleared slots
+  AramRingSession(guard.GetSystem(), true);  // ARAM replay ring (final-review M1)
   s_ac_pending.clear();
   s_ac_real.clear();
   s_ac_sfx_start = {};
@@ -7275,11 +7722,24 @@ void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason)
     std::fill(slot.begin(), slot.end(), 0);
   RollbackLogic::ClearSessionSlotMetadata(&s_dirty.synced, &s_slot_seq);
   s_digest.Invalidate();  // the state digest cache describes the cleared slots
+  AramRingSession(guard.GetSystem(), false);  // ARAM replay ring (final-review M1)
   r.rollbacks = 0;
   r.resim_ticks = 0;
   s_rb_watch_rollbacks = 0;
 }
 }  // namespace
+
+AramRingView GameplayAramRing(Core::System& system)
+{
+  const auto [address, bytes] = AramRingBytes(system);
+  return {address, bytes};
+}
+
+u64 GameplayAramRingHash(Core::System& system)
+{
+  const auto [address, bytes] = AramRingBytes(system);
+  return XXH3_64bits_withSeed(bytes.data(), bytes.size(), address);
+}
 
 // Let the video thread omit historical catch-up frames without skipping game-side draws.
 bool IsReplayCatchingUp()

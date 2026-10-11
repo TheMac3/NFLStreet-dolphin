@@ -7,7 +7,9 @@
 // confirmed-state desyncs, and latency-compensated time-sync convergence.
 // A separate protocol-validation section covers hostile datagrams (forged
 // acknowledgements, conflicting restatements, far-future input) and proves
-// honest lossy/reordered/relayed traffic is never rejected.
+// honest lossy/reordered/relayed traffic is never rejected. The telemetry
+// sender's bounded shutdown flush (NSRTelemetryLogic.h) is checked with a fake
+// clock and a fake slow server at the end.
 //
 // Standalone build from the repository root (no Dolphin, ENet, or gtest):
 //   g++ -std=c++20 -Wall -Wextra -Werror -I Source/Core
@@ -16,6 +18,7 @@
 
 #include "Core/NSR/NSRRollbackNetplay.h"
 #include "Core/NSR/NSRRollbackLogic.h"
+#include "Core/NSR/NSRTelemetryLogic.h"
 
 #include <algorithm>
 #include <array>
@@ -23,6 +26,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <limits>
 #include <map>
 #include <random>
@@ -1114,6 +1118,165 @@ static void TestPureRollbackHelpers()
   assert(RL::PageNeedsCopy(7, std::nullopt));
 }
 
+// Telemetry shutdown (final review L1): every pending batch shares ONE
+// deadline. Fake clock in milliseconds; the fake server takes `latency` per
+// request and, like the sender's curl progress-callback abort, gives up with
+// no response (0) when the deadline arrives first.
+static void TestTelemetryFinalFlushIsBounded()
+{
+  namespace TL = NSRTelemetry::Logic;
+  struct FakeServer
+  {
+    explicit FakeServer(int latency_ms, std::vector<int> codes_ = {})
+        : latency(latency_ms), codes(std::move(codes_))
+    {
+    }
+    int now = 0;
+    int latency = 0;
+    std::vector<int> codes;  // per request, then 200
+    size_t requests = 0;
+    std::vector<int> spilled;
+    int Post(int deadline)
+    {
+      const int code = requests < codes.size() ? codes[requests] : 200;
+      ++requests;
+      if (now + latency > deadline)
+      {
+        now = deadline;
+        return 0;
+      }
+      now += latency;
+      return code;
+    }
+  };
+  auto run = [](FakeServer& srv, std::deque<int>& pending, int budget) {
+    const int deadline = srv.now + budget;
+    return TL::FinalFlush(
+        pending, deadline, [&] { return srv.now; }, [&](int) { return srv.Post(deadline); },
+        [&](int b) { srv.spilled.push_back(b); });
+  };
+  auto queue = [](int n) {
+    std::deque<int> q;
+    for (int i = 0; i < n; ++i)
+      q.push_back(i);
+    return q;
+  };
+
+  // The review's scenario: 64 batches, a server that answers each in 1.9 s.
+  // Old behavior: 64 x 1.9 s. Now: one delivered, the second aborted at 2 s.
+  {
+    FakeServer srv(1900);
+    auto pending = queue(64);
+    const auto r = run(srv, pending, 2000);
+    assert(r.sent == 1 && r.deadline_hit && r.stop_code == 0);
+    assert(srv.now == 2000 && srv.requests == 2);
+    assert(pending.size() == 63 && pending.front() == 1);  // left for the caller to spill
+  }
+  // A fast server drains everything within the budget.
+  {
+    FakeServer srv(10);
+    auto pending = queue(64);
+    const auto r = run(srv, pending, 2000);
+    assert(r.sent == 64 && !r.deadline_hit && pending.empty() && srv.now == 640);
+  }
+  // Budget used up exactly by two answers: no third request is started.
+  {
+    FakeServer srv(1000);
+    auto pending = queue(5);
+    const auto r = run(srv, pending, 2000);
+    assert(r.sent == 2 && r.deadline_hit && srv.requests == 2 && pending.size() == 3);
+  }
+  // 400/413: kept locally (reject) and skipped; 503 and 401 stop at once.
+  {
+    FakeServer srv(10, {400, 200, 413, 503});
+    auto pending = queue(6);
+    const auto r = run(srv, pending, 2000);
+    assert(r.sent == 1 && r.rejected == 2 && r.stop_code == 503 && !r.deadline_hit);
+    assert((srv.spilled == std::vector<int>{0, 2}) && pending.size() == 3 && pending.front() == 3);
+    FakeServer auth(10, {401});
+    auto pending2 = queue(3);
+    const auto r2 = run(auth, pending2, 2000);
+    assert(r2.sent == 0 && r2.stop_code == 401 && pending2.size() == 3 && auth.requests == 1);
+  }
+  // Zero budget: nothing is sent, nothing is lost.
+  {
+    FakeServer srv(10);
+    auto pending = queue(3);
+    const auto r = run(srv, pending, 0);
+    assert(r.sent == 0 && r.deadline_hit && srv.requests == 0 && pending.size() == 3);
+  }
+}
+
+// ARAM replay-ring undo log (final-review M1): snapshots taken at frame
+// boundaries, writes inside and across the window edge, a rollback, a
+// re-simulation that writes different bytes, a second (deeper) rollback that
+// must undo re-simulated writes too, trimming, and the session clear.
+static void TestWindowUndoLog()
+{
+  std::vector<std::uint8_t> mem(64, 0);
+  RL::WindowUndoLog log;
+  constexpr std::uint32_t lo = 16, hi = 48;
+  auto write = [&](std::uint32_t address, std::uint32_t length, std::uint8_t value) {
+    log.Record(mem, lo, hi, address, length);
+    std::fill(mem.begin() + address, mem.begin() + address + length, value);
+  };
+  auto window = [&] { return std::vector<std::uint8_t>(mem.begin() + lo, mem.begin() + hi); };
+
+  // Frame 0..3 snapshots (mark + expected window at each frame start).
+  std::vector<std::uint64_t> marks;
+  std::vector<std::vector<std::uint8_t>> states;
+  auto save = [&] {
+    marks.push_back(log.Mark());
+    states.push_back(window());
+  };
+  save();                // frame 0
+  write(20, 8, 1);       // inside
+  write(8, 16, 2);       // straddles lo: only [16, 24) is recorded
+  save();                // frame 1
+  write(44, 12, 3);      // straddles hi: only [44, 48) is recorded
+  write(0, 8, 4);        // entirely outside: not recorded
+  assert(log.Records() == 3);
+  assert(log.Bytes() == 8 + 8 + 4);
+  save();                // frame 2
+  write(16, 32, 5);      // whole window
+  save();                // frame 3
+  write(30, 2, 6);
+
+  // Roll back to frame 1 and re-simulate frames 1..2 with different writes.
+  assert(log.UndoTo(marks[1], mem) == 3);
+  assert(window() == states[1]);
+  assert(mem[0] == 4);  // outside bytes are not the log's business
+  marks.resize(2);
+  states.resize(2);
+  write(40, 4, 7);  // re-simulated frame 1
+  save();           // frame 2 (re-saved)
+  write(16, 4, 8);  // re-simulated frame 2
+  save();           // frame 3 (re-saved)
+
+  // A deeper rollback undoes re-simulated and original writes in order.
+  assert(log.UndoTo(marks[2], mem) == 1);
+  assert(window() == states[2]);
+  assert(log.UndoTo(marks[0], mem) == 3);
+  assert(window() == states[0]);
+  assert(std::all_of(mem.begin() + lo, mem.begin() + hi, [](std::uint8_t b) { return b == 0; }));
+
+  // Trimming keeps exactly what restorable marks still need.
+  marks.assign(1, log.Mark());
+  write(24, 4, 9);
+  marks.push_back(log.Mark());
+  write(28, 4, 10);
+  log.TrimThrough(marks[0]);
+  assert(log.Records() == 2);
+  log.TrimThrough(marks[1]);
+  assert(log.Records() == 1 && log.Bytes() == 4);
+  assert(log.UndoTo(marks[1], mem) == 1);
+  assert(mem[28] == 0 && mem[24] == 9);
+
+  log.Clear();
+  assert(log.Records() == 0 && log.Bytes() == 0 && log.Mark() == 0);
+  assert(log.Record(mem, lo, hi, 60, 16) == 0);  // past the backing store
+}
+
 int main()
 {
   TestHandoffAgreement();
@@ -1141,6 +1304,8 @@ int main()
   TestExchangeConfigMismatch();
   TestDigestComparedOnlyWhenFinal();
   TestPureRollbackHelpers();
+  TestWindowUndoLog();
+  TestTelemetryFinalFlushIsBounded();
   std::puts("NSR rollback exchange tests passed");
   return 0;
 }

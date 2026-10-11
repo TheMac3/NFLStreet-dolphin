@@ -64,7 +64,11 @@
 //   NSR_RB_FORCE_FROM = t     only from live tick t + k on (skip boot/menus)
 //   NSR_RB_KEEP  = lo-hi,...  extra physical ranges a restore leaves alone
 //   NSR_RB_DUMP_AT = t,...    write MEM1 before live tick t
-//                             (NSR_DUMP_PREFIX-tick-t.bin)
+//                             (NSR_DUMP_PREFIX-tick-t.bin; sidecars .permachine
+//                             and .aram, the ARAM replay ring)
+//   NSR_RB_ARAM = 0           leave the game's ARAM replay ring out of rollback
+//                             (reproduces final-review M1 for tests; ring reads
+//                             and writes are still counted in the log)
 //   NSR_RB_HASH_LOG = 1       log a MEM1 hash every 60 live ticks
 //   NSR_RB_VTIME_FROM = t     virtual (tick-based) time for game code in
 //                             ticks from live tick t on (see OSGetTimeHook)
@@ -101,6 +105,7 @@
 
 #include <array>
 #include <cstddef>
+#include <span>
 #include <vector>
 
 #include "Common/CommonTypes.h"
@@ -308,6 +313,20 @@ std::vector<unsigned int> AllocHookAddresses();
 std::vector<unsigned int> ProbeAddresses();
 void ProbeHook(const Core::CPUThreadGuard& guard);
 void SetHookPc(unsigned int pc);  // set by HLE::Execute before each hook
+
+// Rollback-owned ARAM (final-review M1): the game's gameplay replay ring as
+// it is now (its ARAM address and bytes; empty when the game has no ring
+// allocated). Rollback restores it (an ARAM undo log, see NSRNetplay.cpp
+// "ARAM replay ring"), so a canonical state digest should cover these bytes;
+// NSR_DUMP_PREFIX dumps also write them to <dump>.aram. Call on the CPU thread.
+struct AramRingView
+{
+  u32 aram_address = 0;
+  std::span<const u8> bytes;
+};
+AramRingView GameplayAramRing(Core::System& system);
+// XXH3-64 of the ring's bytes seeded with its ARAM address (0 bytes hash too).
+u64 GameplayAramRingHash(Core::System& system);
 
 // Tear down the network session (called on emulation shutdown).
 bool IsReplayCatchingUp();

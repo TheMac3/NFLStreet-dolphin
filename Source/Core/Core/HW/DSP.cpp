@@ -23,6 +23,7 @@
 
 #include "Core/HW/DSP.h"
 
+#include <algorithm>
 #include <chrono>
 
 #include <memory>
@@ -470,6 +471,20 @@ void DSPManager::UpdateAudioDMA()
   }
 }
 
+// NFLStreet rollback: report [address, address + length) of ARAM to the
+// observer in pieces that do not wrap past the end of ARAM.
+void DSPManager::NSRObserveARAM(u32 address, u32 length, NSRARAMAccess access)
+{
+  while (length != 0)
+  {
+    const u32 a = address & m_aram.mask;
+    const u32 n = std::min(length, m_aram.mask + 1 - a);
+    m_nsr_aram_observer(*this, a, n, access);
+    address += n;
+    length -= n;
+  }
+}
+
 void DSPManager::Do_ARAM_DMA()
 {
   auto& core_timing = m_system.GetCoreTiming();
@@ -497,6 +512,11 @@ void DSPManager::Do_ARAM_DMA()
 
     if (m_aram_dma.ARAddr < m_aram.size)
     {
+      if (m_nsr_aram_observer)  // NFLStreet rollback (see NSRObserveARAM)
+      {
+        NSRObserveARAM(m_aram_dma.ARAddr, (static_cast<u32>(m_aram_dma.Cnt.count) + 7) & ~7u,
+                       NSRARAMAccess::DMARead);
+      }
       while (m_aram_dma.Cnt.count)
       {
         // These are logically separated in code to show that a memory map has been set up
@@ -546,6 +566,17 @@ void DSPManager::Do_ARAM_DMA()
 
     if (m_aram_dma.ARAddr < m_aram.size)
     {
+      if (m_nsr_aram_observer)  // NFLStreet rollback: before the bytes change
+      {
+        const u32 length = (static_cast<u32>(m_aram_dma.Cnt.count) + 7) & ~7u;
+        NSRObserveARAM(m_aram_dma.ARAddr, length, NSRARAMAccess::DMAWrite);
+        // Mode 4 also writes the part below 0x400000 to its mirror above it.
+        if ((m_aram_info.Hex & 0xf) == 4 && m_aram_dma.ARAddr < 0x400000)
+        {
+          NSRObserveARAM(m_aram_dma.ARAddr + 0x400000,
+                         std::min(length, 0x400000 - m_aram_dma.ARAddr), NSRARAMAccess::DMAWrite);
+        }
+      }
       while (m_aram_dma.Cnt.count)
       {
         if ((m_aram_info.Hex & 0xf) == 3)
@@ -613,6 +644,8 @@ u8 DSPManager::ReadARAM(u32 address) const
 
 void DSPManager::WriteARAM(u8 value, u32 address)
 {
+  if (m_nsr_aram_observer)  // NFLStreet rollback (see NSRObserveARAM)
+    NSRObserveARAM(address, 1, NSRARAMAccess::ByteWrite);
   // TODO: verify this on Wii
   m_aram.ptr[address & m_aram.mask] = value;
 }
