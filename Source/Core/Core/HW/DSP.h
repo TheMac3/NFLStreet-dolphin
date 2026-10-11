@@ -105,6 +105,24 @@ public:
   // time (re-simulated frames run on a faster machine; 1 = real speed).
   void SetNSRSpeedFactor(float factor) { m_nsr_speed_factor = factor; }
 
+  // NFLStreet rollback (final-review M1): an observer told, on the CPU thread,
+  // about every ARAM range a transfer is about to touch: MRAM->ARAM DMA and
+  // single-byte DSP writes before they write, ARAM->MRAM DMA before it reads.
+  // Addresses are already wrapped to the ARAM mask (a wrapping transfer and
+  // the expansion-mode mirror are reported as separate pieces). The rollback
+  // session installs it to keep an undo log of the game's ARAM replay ring;
+  // nullptr (the default, outside a session) costs one branch per transfer.
+  enum class NSRARAMAccess
+  {
+    DMAWrite,
+    DMARead,
+    ByteWrite,
+  };
+  using NSRARAMObserver = void (*)(DSPManager& dsp, u32 address, u32 length,
+                                   NSRARAMAccess access);
+  void SetNSRARAMObserver(NSRARAMObserver observer) { m_nsr_aram_observer = observer; }
+  u32 GetARAMSize() const { return m_aram.size; }
+
 private:
   void GenerateDSPInterrupt(u64 DSPIntType, s64 cyclesLate);
   static void GlobalGenerateDSPInterrupt(Core::System& system, u64 DSPIntType, s64 cyclesLate);
@@ -112,6 +130,7 @@ private:
   static void GlobalCompleteARAM(Core::System& system, u64 userdata, s64 cyclesLate);
   void UpdateInterrupts();
   void Do_ARAM_DMA();
+  void NSRObserveARAM(u32 address, u32 length, NSRARAMAccess access);
 
   // UARAMCount
   union UARAMCount
@@ -191,6 +210,7 @@ private:
   CoreTiming::EventType* m_event_type_generate_dsp_interrupt = nullptr;
   CoreTiming::EventType* m_event_type_complete_aram = nullptr;
   float m_nsr_speed_factor = 1.0f;
+  NSRARAMObserver m_nsr_aram_observer = nullptr;
 
   Core::System& m_system;
 };
