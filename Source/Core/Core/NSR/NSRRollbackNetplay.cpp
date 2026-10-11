@@ -8,14 +8,21 @@
 #include "Core/NSR/NSRRollbackNetplay.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 namespace NSRNetplay::RollbackNet
 {
 namespace
 {
-constexpr std::size_t HEADER_SIZE = 56;
+constexpr std::size_t HEADER_SIZE = 88;
 constexpr std::size_t HANDOFF_SIZE = 24;
+constexpr double FRAME_US = 16683.0;
+constexpr std::uint32_t MAX_TIMING_RTT_US = 2'000'000;
+constexpr std::size_t MIN_TIMING_SAMPLES = 6;
+constexpr std::uint32_t TIME_SYNC_INTERVAL = 30;
+constexpr double TIME_SYNC_DEADBAND_FRAMES = 0.60;
+constexpr std::uint32_t MAX_TIME_SYNC_WAIT_US = 10'000;
 
 // Append one integer in protocol byte order without depending on packed C++
 // layouts, which keeps the same datagram on x86-64 and ARM hosts.
@@ -127,6 +134,10 @@ std::vector<std::uint8_t> Encode(const Packet& packet)
   Put(out, packet.session);
   Put(out, packet.sender_frame);
   Put(out, packet.send_us);
+  for (const std::uint32_t echo : packet.echo_us)
+    Put(out, echo);
+  for (const std::uint32_t age : packet.echo_age_us)
+    Put(out, age);
   for (const std::uint32_t ack : packet.ack)
     Put(out, ack);
   Put(out, packet.checksum_frame);
@@ -155,6 +166,16 @@ std::optional<Packet> Decode(std::span<const std::uint8_t> bytes)
       !Get(bytes, at, &packet.sender_frame) || !Get(bytes, at, &packet.send_us))
   {
     return std::nullopt;
+  }
+  for (std::uint32_t& echo : packet.echo_us)
+  {
+    if (!Get(bytes, at, &echo))
+      return std::nullopt;
+  }
+  for (std::uint32_t& age : packet.echo_age_us)
+  {
+    if (!Get(bytes, at, &age))
+      return std::nullopt;
   }
   for (std::uint32_t& ack : packet.ack)
   {
@@ -204,6 +225,7 @@ Pad Exchange::Canonical(Pad pad)
 
 void Exchange::SubmitLocal(std::uint32_t live_frame, Pad pad)
 {
+  m_local_frame = live_frame;
   m_confirmed[m_me].try_emplace(live_frame + m_delay, Canonical(pad));
   AdvanceContiguous(m_me);
 }
@@ -234,6 +256,14 @@ Packet Exchange::BuildPacket(std::uint32_t live_frame, std::uint32_t send_us) co
   packet.session = m_session;
   packet.sender_frame = live_frame;
   packet.send_us = send_us;
+  for (std::uint8_t player = 0; player < m_players; ++player)
+  {
+    const PeerTiming& timing = m_timing[player];
+    if (player == m_me || !timing.have_remote_timestamp)
+      continue;
+    packet.echo_us[player] = timing.remote_send_us;
+    packet.echo_age_us[player] = send_us - timing.remote_received_us;
+  }
   packet.flags = m_first_desync ? 0x02 : 0;
   packet.ack = m_contiguous;
   if (m_finalized != NO_FRAME)
@@ -271,18 +301,15 @@ Packet Exchange::BuildPacket(std::uint32_t live_frame, std::uint32_t send_us) co
   return packet;
 }
 
-bool Exchange::Accept(const Packet& packet)
+bool Exchange::Accept(const Packet& packet, std::uint32_t receive_us)
 {
   if (packet.session != m_session || packet.players != m_players || packet.sender >= m_players ||
       packet.sender == m_me || packet.pads.size() > MAX_HISTORY)
   {
     return false;
   }
-  if (m_remote_frame[packet.sender] == NO_FRAME ||
-      packet.sender_frame > m_remote_frame[packet.sender])
-  {
-    m_remote_frame[packet.sender] = packet.sender_frame;
-  }
+  if (receive_us != 0)
+    ObserveTiming(packet, receive_us);
   const std::uint32_t ack = packet.ack[m_me];
   if (ack != NO_FRAME &&
       (m_peer_ack[packet.sender] == NO_FRAME || ack > m_peer_ack[packet.sender]))
@@ -312,6 +339,44 @@ bool Exchange::Accept(const Packet& packet)
     CompareChecksum(packet.sender, packet.checksum_frame);
   }
   return true;
+}
+
+// Derive RTT from a reflected local timestamp, then compare progress at the
+// receive boundary.  The remote report is projected forward by one-way
+// latency; unlike raw frame subtraction, equal-speed peers therefore do not
+// both look ahead merely because every report is old when it arrives.
+void Exchange::ObserveTiming(const Packet& packet, std::uint32_t receive_us)
+{
+  PeerTiming& timing = m_timing[packet.sender];
+  const std::uint32_t echoed = packet.echo_us[m_me];
+  if (echoed != 0)
+  {
+    const std::uint32_t elapsed = receive_us - echoed;
+    const std::uint32_t held = packet.echo_age_us[m_me];
+    if (elapsed >= held && elapsed - held <= MAX_TIMING_RTT_US)
+    {
+      const std::uint32_t sample = elapsed - held;
+      timing.rtt_us = timing.have_rtt ? (timing.rtt_us * 7 + sample) / 8 : sample;
+      timing.have_rtt = true;
+    }
+  }
+
+  const bool newer_frame = timing.sampled_frame == NO_FRAME ||
+                           packet.sender_frame > timing.sampled_frame;
+  if (timing.have_rtt && m_local_frame != NO_FRAME && newer_frame)
+  {
+    const double projected_remote =
+        static_cast<double>(packet.sender_frame) + timing.rtt_us / (2.0 * FRAME_US);
+    timing.advantage[timing.advantage_next] =
+        static_cast<double>(m_local_frame) - projected_remote;
+    timing.advantage_next = (timing.advantage_next + 1) % timing.advantage.size();
+    timing.advantage_count = std::min(timing.advantage_count + 1, timing.advantage.size());
+    timing.sampled_frame = packet.sender_frame;
+  }
+
+  timing.have_remote_timestamp = true;
+  timing.remote_send_us = packet.send_us;
+  timing.remote_received_us = receive_us;
 }
 
 void Exchange::AdvanceContiguous(std::uint8_t player)
@@ -467,18 +532,57 @@ std::optional<std::uint32_t> Exchange::FirstDesync() const
   return m_first_desync;
 }
 
-int Exchange::FrameAdvantage(std::uint32_t local_frame) const
+double Exchange::FrameAdvantage() const
 {
-  std::optional<std::uint32_t> slowest;
+  std::optional<double> slowest;
   for (std::uint8_t player = 0; player < m_players; ++player)
   {
-    if (player == m_me || m_remote_frame[player] == NO_FRAME)
+    if (player == m_me)
       continue;
-    slowest = slowest ? std::min(*slowest, m_remote_frame[player]) : m_remote_frame[player];
+    const PeerTiming& timing = m_timing[player];
+    if (timing.advantage_count < MIN_TIMING_SAMPLES)
+      return 0.0;
+
+    std::vector<double> samples(timing.advantage.begin(),
+                                timing.advantage.begin() + timing.advantage_count);
+    std::sort(samples.begin(), samples.end());
+    const std::size_t trim = samples.size() / 3;
+    const auto begin = samples.begin() + static_cast<std::ptrdiff_t>(trim);
+    const auto end = samples.end() - static_cast<std::ptrdiff_t>(trim);
+    double sum = 0.0;
+    for (auto it = begin; it != end; ++it)
+      sum += *it;
+    const double peer_advantage = sum / static_cast<double>(end - begin);
+    slowest = slowest ? std::min(*slowest, peer_advantage) : peer_advantage;
   }
-  if (!slowest)
+  return slowest.value_or(0.0);
+}
+
+std::uint32_t Exchange::TimeSyncWaitUs(std::uint32_t local_frame)
+{
+  if (local_frame < m_start || (local_frame - m_start) % TIME_SYNC_INTERVAL != 0 ||
+      m_last_sync_frame == local_frame)
+  {
     return 0;
-  const std::int64_t difference = std::int64_t{local_frame} - *slowest;
-  return static_cast<int>(std::clamp<std::int64_t>(difference, -100000, 100000));
+  }
+  m_last_sync_frame = local_frame;
+
+  const double advantage = FrameAdvantage();
+  if (advantage <= TIME_SYNC_DEADBAND_FRAMES)
+    return 0;
+
+  // Remove only part of the measured lead.  A capped sub-frame stretch is
+  // less visible than a full repeated frame and the next 30-sample window
+  // verifies the direction before another correction is allowed.
+  const double requested = (advantage - 0.25) * FRAME_US;
+  return std::min(MAX_TIME_SYNC_WAIT_US,
+                  static_cast<std::uint32_t>(std::max(1.0, std::round(requested))));
+}
+
+std::optional<std::uint32_t> Exchange::SmoothedRttUs(std::uint8_t player) const
+{
+  if (player >= m_players || player == m_me || !m_timing[player].have_rtt)
+    return std::nullopt;
+  return m_timing[player].rtt_us;
 }
 }  // namespace NSRNetplay::RollbackNet
