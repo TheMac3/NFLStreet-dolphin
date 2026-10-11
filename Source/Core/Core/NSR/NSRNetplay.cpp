@@ -542,7 +542,30 @@ void CheckHash(u32 player, u32 frame)
 
 u32 TelemetryLiveFrame();  // NSR telemetry: next live frame (defined with the glue)
 
-void HandlePacket(const ENetPacket* packet)
+// Bind the sender carried in an unsequenced datagram to the ENet connection
+// that delivered it.  A star leaf receives both the host's own packets and
+// the other leaves' relayed packets from player 0; everywhere else the two
+// identities must be identical.
+bool PacketSenderMatchesPeer(u32 sender, u32 source)
+{
+  const Session& s = s_session;
+  if (source >= s.players)
+    return false;
+  if (s.star && s.me != 0)
+    return source == 0;
+  return source == sender;
+}
+
+void StopForRollbackTransportFailure()
+{
+  // Milestone-1 lockstep historically falls back offline.  Rollback cannot:
+  // returning from a failed preflight would let the guest advance without a
+  // prepared frame, so a configured rollback session always fails closed.
+  if (!Env("NSR_RB_NET").empty())
+    Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+}
+
+void HandlePacket(const ENetPacket* packet, u32 source)
 {
   Session& s = s_session;
   u32 magic = 0;
@@ -553,10 +576,12 @@ void HandlePacket(const ENetPacket* packet)
     const auto decoded = RollbackNet::DecodeHandoff(
         std::span<const u8>(static_cast<const u8*>(packet->data), packet->dataLength));
     if (!decoded || decoded->players != s.players || decoded->sender == s.me ||
-        decoded->sender >= s.players)
+        decoded->sender >= s.players || !PacketSenderMatchesPeer(decoded->sender, source))
     {
       return;
     }
+    if (!s_rb_handoff || !s_rb_handoff->Accept(*decoded))
+      return;
     // The star host relays the original proposal unchanged.  Agreement is
     // still all-to-all: every receiver validates the sender and full tuple.
     if (s.star && s.me == 0)
@@ -571,8 +596,6 @@ void HandlePacket(const ENetPacket* packet)
         }
       }
     }
-    if (s_rb_handoff)
-      s_rb_handoff->Accept(*decoded);
     return;
   }
   if (magic == RollbackNet::MAGIC)
@@ -580,7 +603,7 @@ void HandlePacket(const ENetPacket* packet)
     const auto decoded = RollbackNet::Decode(
         std::span<const u8>(static_cast<const u8*>(packet->data), packet->dataLength));
     if (!decoded || !s_rb_exchange || decoded->players != s.players || decoded->sender == s.me ||
-        decoded->sender >= s.players)
+        decoded->sender >= s.players || !PacketSenderMatchesPeer(decoded->sender, source))
     {
       NSRTelemetry::Count(NSRTelemetry::Counter::PacketsRejected);  // NSR telemetry
       return;
@@ -593,6 +616,26 @@ void HandlePacket(const ENetPacket* packet)
         s_rb_bad_session_logged = true;
         Log("rollback session mismatch from player {}: expected {:08x}, got {:08x}",
             decoded->sender, s_rb_exchange->Session(), decoded->session);
+      }
+      return;
+    }
+    // Accept validates the whole datagram first (impossible ack, conflicting
+    // restatement, out-of-window input/checksum) and applies nothing when it
+    // fails.  Do this before acting on flags or relaying the packet so one
+    // peer cannot make the hub amplify an invalid datagram.
+    if (!s_rb_exchange->Accept(*decoded, HostNowUs()))
+    {
+      NSRTelemetry::Count(NSRTelemetry::Counter::PacketsRejected, 1, decoded->sender);
+      const auto& v = s_rb_exchange->FirstViolation();
+      if (v && !s_rb_violation_logged)
+      {
+        s_rb_violation_logged = true;
+        Log("rejected rollback packet from player {}: protocol violation kind {} at frame {}",
+            v->player, static_cast<int>(v->kind), v->frame);
+        NSRTelemetry::Event(NSRTelemetry::EventKind::Note, TelemetryLiveFrame(),  // NSR telemetry
+                            {NSRTelemetry::Int("protocol_violation", static_cast<int>(v->kind)),
+                             NSRTelemetry::Int("player", v->player),
+                             NSRTelemetry::Int("frame", static_cast<s64>(v->frame))});
       }
       return;
     }
@@ -612,7 +655,7 @@ void HandlePacket(const ENetPacket* packet)
       NSRTelemetry::Observe(NSRTelemetry::Hist::RemoteInputLateFrames,
                             live > newest ? live - newest : 0, decoded->sender);
     }
-    // The host relays the original authenticated session datagram unchanged;
+    // The host relays the original validated session datagram unchanged;
     // every receiver performs the same strict parser and session check.
     if (s.star && s.me == 0)
     {
@@ -626,33 +669,16 @@ void HandlePacket(const ENetPacket* packet)
         }
       }
     }
-    // Accept validates the whole datagram first (impossible ack, conflicting
-    // restatement, out-of-window input/checksum) and applies nothing when it
-    // fails.  Surface the first violation once: from an honest peer it means
-    // a bug or corruption, so it is the place to start a desync investigation.
-    if (!s_rb_exchange->Accept(*decoded, HostNowUs()))
-    {
-      NSRTelemetry::Count(NSRTelemetry::Counter::PacketsRejected, 1, decoded->sender);
-      const auto& v = s_rb_exchange->FirstViolation();
-      if (v && !s_rb_violation_logged)
-      {
-        s_rb_violation_logged = true;
-        Log("rejected rollback packet from player {}: protocol violation kind {} at frame {}",
-            v->player, static_cast<int>(v->kind), v->frame);
-        NSRTelemetry::Event(NSRTelemetry::EventKind::Note, TelemetryLiveFrame(),  // NSR telemetry
-                            {NSRTelemetry::Int("protocol_violation", static_cast<int>(v->kind)),
-                             NSRTelemetry::Int("player", v->player),
-                             NSRTelemetry::Int("frame", static_cast<s64>(v->frame))});
-      }
-    }
     return;
   }
   if (packet->dataLength < offsetof(Packet, pads))
     return;
-  Packet p;
+  Packet p{};
   std::memcpy(&p, packet->data, std::min(sizeof(Packet), packet->dataLength));
   if (p.magic != PACKET_MAGIC || p.count > REDUNDANCY || p.sender >= s.players ||
-      p.sender == s.me)
+      p.sender == s.me || !PacketSenderMatchesPeer(p.sender, source) ||
+      packet->dataLength != offsetof(Packet, pads) + p.count * sizeof(Pad) ||
+      (p.count != 0 && p.latest_frame < p.count - 1))
   {
     return;
   }
@@ -700,7 +726,19 @@ void Service(int timeout_ms)
         index = event.data;
         event.peer->data = reinterpret_cast<void*>(static_cast<uintptr_t>(index + 1));
       }
-      if (index < s.players && index != s.me)
+      if (index >= s.players || index == s.me)
+      {
+        Log("rejected connection with invalid player index {}", index);
+        enet_peer_disconnect_now(event.peer, 0);
+      }
+      else if (s.peers[index] && s.peers[index] != event.peer && Linked(index))
+      {
+        Log("duplicate connection claiming player {}", index);
+        enet_peer_disconnect_now(event.peer, 0);
+        s.failed = true;
+        StopForRollbackTransportFailure();
+      }
+      else
       {
         s.peers[index] = event.peer;
         Log("connected to player {}", index);
@@ -708,9 +746,12 @@ void Service(int timeout_ms)
       break;
     }
     case ENET_EVENT_TYPE_RECEIVE:
-      HandlePacket(event.packet);
+    {
+      const u32 source = event.peer->data ? PeerIndex(event.peer) : MAX_PLAYERS;
+      HandlePacket(event.packet, source);
       enet_packet_destroy(event.packet);
       break;
+    }
     case ENET_EVENT_TYPE_DISCONNECT:
       // A client's connect attempt timed out (NAT not open yet): retry,
       // alternating the address, a few times before giving up.
@@ -725,6 +766,7 @@ void Service(int timeout_ms)
       if (event.peer->data)
         Log("player {} disconnected", PeerIndex(event.peer));
       s.failed = true;
+      StopForRollbackTransportFailure();
       break;
     default:
       break;
@@ -883,9 +925,9 @@ bool WaitForConnection()
     }
     if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(CONNECT_TIMEOUT_MS))
     {
-      Log("not all {} players connected within {} ms; giving up (playing offline)", s.players,
-          CONNECT_TIMEOUT_MS);
+      Log("not all {} players connected within {} ms; giving up", s.players, CONNECT_TIMEOUT_MS);
       s.failed = true;
+      StopForRollbackTransportFailure();
     }
   }
   if (!s.failed)
@@ -2509,17 +2551,23 @@ std::vector<std::pair<u32, u32>> RbLiveRanges(Core::System& system, const u8* ra
   // bounded; ranges are clamped to MEM1.
   const u32 mem_size = system.GetMemory().GetRamSizeReal();
   auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
-  auto valid = [&](u32 a) { return a >= 0x80003100 && a < 0x80000000 + mem_size - 4; };
+  auto valid_range = [&](u32 a, u32 size) {
+    if (a < 0x80003100)
+      return false;
+    const u32 offset = a - 0x80000000;
+    return offset <= mem_size && size <= mem_size - offset;
+  };
+  auto valid = [&](u32 a) { return valid_range(a, 4); };
   std::vector<std::pair<u32, u32>> live;
   auto keep = [&](u32 a, u32 size) {
-    if (valid(a))
-      live.emplace_back(a & 0x01FFFFFF, std::min<u32>((a & 0x01FFFFFF) + size, mem_size));
+    if (valid_range(a, size))
+      live.emplace_back(a & 0x01FFFFFF, (a & 0x01FFFFFF) + size);
   };
   // Threads (active queue at 0x800000DC, link +0x2FC): OSThread, stack, the
   // OSThreadQueue it sleeps on (+0x2DC), the mutex it waits for (+0x2F0) and
   // the mutexes it owns (list at +0x2F4, next +0x10). OSMutex = 0x18 bytes.
   u32 t = rd(0x800000DC);
-  for (int n = 0; n < 32 && valid(t); ++n, t = rd(t + 0x2FC))
+  for (int n = 0; n < 32 && valid_range(t, 0x318); ++n, t = rd(t + 0x2FC))
   {
     // (all: every per-machine object, for the dump sidecar)
     if (t == DISC_WORKER_THREAD && s_rb.io_idle_mode && !all)
@@ -2538,22 +2586,25 @@ std::vector<std::pair<u32, u32>> RbLiveRanges(Core::System& system, const u8* ra
     keep(rd(t + 0x2DC), 8);
     keep(rd(t + 0x2F0), 0x18);
     u32 m = rd(t + 0x2F4);
-    for (int k = 0; k < 64 && valid(m); ++k, m = rd(m + 0x10))
+    for (int k = 0; k < 64 && valid_range(m, 0x18); ++k, m = rd(m + 0x10))
       keep(m, 0x18);
   }
   // Alarms (queue head 0x803ED078, next +0x14, 0x28 bytes).
   u32 al = rd(0x803ED078);
-  for (int n = 0; n < 256 && valid(al); ++n, al = rd(al + 0x14))
+  for (int n = 0; n < 256 && valid_range(al, 0x28); ++n, al = rd(al + 0x14))
     keep(al, 0x28);
   // DVD: four priority queues (circular, sentinels at 0x803A55D8 + 8 * i,
   // next at +0) and the executing block (0x803ED118). DVDCommandBlock is
   // 0x30 bytes; 0x3C for the DVDFileInfo wrapper (callback 0x8023F464).
-  auto dvd = [&](u32 cb) { keep(cb, rd(cb + 0x28) == 0x8023F464 ? 0x3C : 0x30); };
+  auto dvd = [&](u32 cb) {
+    if (valid_range(cb, 0x30))
+      keep(cb, rd(cb + 0x28) == 0x8023F464 ? 0x3C : 0x30);
+  };
   for (u32 i = 0; i < 4; ++i)
   {
     const u32 sentinel = 0x803A55D8 + 8 * i;
     u32 cb = rd(sentinel);
-    for (int n = 0; n < 64 && valid(cb) && cb != sentinel; ++n, cb = rd(cb))
+    for (int n = 0; n < 64 && valid_range(cb, 0x30) && cb != sentinel; ++n, cb = rd(cb))
       dvd(cb);
   }
   if (const u32 cb = rd(0x803ED118); valid(cb))
@@ -2563,7 +2614,7 @@ std::vector<std::pair<u32, u32>> RbLiveRanges(Core::System& system, const u8* ra
   for (const u32 head : {0x803ED2D8u, 0x803ED2E0u})
   {
     u32 q = rd(head);
-    for (int n = 0; n < 256 && valid(q); ++n, q = rd(q))
+    for (int n = 0; n < 256 && valid_range(q, 0x20); ++n, q = rd(q))
       keep(q, 0x20);
   }
   keep(rd(0x803ED2F0), 0x20);
@@ -2575,11 +2626,11 @@ std::vector<std::pair<u32, u32>> RbLiveRanges(Core::System& system, const u8* ra
   if (!s_rb.audio_rollback || all)
   {
     u32 node = rd(0x803A6BCC);
-    for (int n = 0; n < 256 && valid(node); ++n, node = rd(node))
+    for (int n = 0; n < 256 && valid_range(node, 0x10); ++n, node = rd(node))
       keep(node, 0x10);
   }
   // The game's real-time tick accumulator (see TICK_CLOCK_PTR).
-  if (const u32 outer = rd(TICK_CLOCK_PTR); valid(outer))
+  if (const u32 outer = rd(TICK_CLOCK_PTR); valid_range(outer, 0x10))
     keep(rd(outer + 0xC), 0x10);
   // GX FIFO, from the command processor's registers.
   if (!s_rb.io_idle_mode || all)
@@ -3140,8 +3191,9 @@ static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 fra
     const int limit_ms = s.exchanged_once ? PEER_TIMEOUT_MS : CONNECT_TIMEOUT_MS;
     if (s.failed || now - start > std::chrono::milliseconds(limit_ms))
     {
-      Log("a player went silent at frame {}; continuing offline", frame);
+      Log("a player went silent at frame {}", frame);
       s.failed = true;
+      StopForRollbackTransportFailure();
       return false;
     }
   }
