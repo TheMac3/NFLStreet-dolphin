@@ -7,7 +7,9 @@
 // confirmed-state desyncs, and latency-compensated time-sync convergence.
 // A separate protocol-validation section covers hostile datagrams (forged
 // acknowledgements, conflicting restatements, far-future input) and proves
-// honest lossy/reordered/relayed traffic is never rejected.
+// honest lossy/reordered/relayed traffic is never rejected. The telemetry
+// sender's bounded shutdown flush (NSRTelemetryLogic.h) is checked with a fake
+// clock and a fake slow server at the end.
 //
 // Standalone build from the repository root (no Dolphin, ENet, or gtest):
 //   g++ -std=c++20 -Wall -Wextra -Werror -I Source/Core
@@ -16,6 +18,7 @@
 
 #include "Core/NSR/NSRRollbackNetplay.h"
 #include "Core/NSR/NSRRollbackLogic.h"
+#include "Core/NSR/NSRTelemetryLogic.h"
 
 #include <algorithm>
 #include <array>
@@ -23,6 +26,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <limits>
 #include <map>
 #include <random>
@@ -958,6 +962,95 @@ static void TestPureRollbackHelpers()
   assert(RL::PageNeedsCopy(7, std::nullopt));
 }
 
+// Telemetry shutdown (final review L1): every pending batch shares ONE
+// deadline. Fake clock in milliseconds; the fake server takes `latency` per
+// request and, like the sender's curl progress-callback abort, gives up with
+// no response (0) when the deadline arrives first.
+static void TestTelemetryFinalFlushIsBounded()
+{
+  namespace TL = NSRTelemetry::Logic;
+  struct FakeServer
+  {
+    explicit FakeServer(int latency_ms, std::vector<int> codes_ = {})
+        : latency(latency_ms), codes(std::move(codes_))
+    {
+    }
+    int now = 0;
+    int latency = 0;
+    std::vector<int> codes;  // per request, then 200
+    size_t requests = 0;
+    std::vector<int> spilled;
+    int Post(int deadline)
+    {
+      const int code = requests < codes.size() ? codes[requests] : 200;
+      ++requests;
+      if (now + latency > deadline)
+      {
+        now = deadline;
+        return 0;
+      }
+      now += latency;
+      return code;
+    }
+  };
+  auto run = [](FakeServer& srv, std::deque<int>& pending, int budget) {
+    const int deadline = srv.now + budget;
+    return TL::FinalFlush(
+        pending, deadline, [&] { return srv.now; }, [&](int) { return srv.Post(deadline); },
+        [&](int b) { srv.spilled.push_back(b); });
+  };
+  auto queue = [](int n) {
+    std::deque<int> q;
+    for (int i = 0; i < n; ++i)
+      q.push_back(i);
+    return q;
+  };
+
+  // The review's scenario: 64 batches, a server that answers each in 1.9 s.
+  // Old behavior: 64 x 1.9 s. Now: one delivered, the second aborted at 2 s.
+  {
+    FakeServer srv(1900);
+    auto pending = queue(64);
+    const auto r = run(srv, pending, 2000);
+    assert(r.sent == 1 && r.deadline_hit && r.stop_code == 0);
+    assert(srv.now == 2000 && srv.requests == 2);
+    assert(pending.size() == 63 && pending.front() == 1);  // left for the caller to spill
+  }
+  // A fast server drains everything within the budget.
+  {
+    FakeServer srv(10);
+    auto pending = queue(64);
+    const auto r = run(srv, pending, 2000);
+    assert(r.sent == 64 && !r.deadline_hit && pending.empty() && srv.now == 640);
+  }
+  // Budget used up exactly by two answers: no third request is started.
+  {
+    FakeServer srv(1000);
+    auto pending = queue(5);
+    const auto r = run(srv, pending, 2000);
+    assert(r.sent == 2 && r.deadline_hit && srv.requests == 2 && pending.size() == 3);
+  }
+  // 400/413: kept locally (reject) and skipped; 503 and 401 stop at once.
+  {
+    FakeServer srv(10, {400, 200, 413, 503});
+    auto pending = queue(6);
+    const auto r = run(srv, pending, 2000);
+    assert(r.sent == 1 && r.rejected == 2 && r.stop_code == 503 && !r.deadline_hit);
+    assert((srv.spilled == std::vector<int>{0, 2}) && pending.size() == 3 && pending.front() == 3);
+    FakeServer auth(10, {401});
+    auto pending2 = queue(3);
+    const auto r2 = run(auth, pending2, 2000);
+    assert(r2.sent == 0 && r2.stop_code == 401 && pending2.size() == 3 && auth.requests == 1);
+  }
+  // Zero budget: nothing is sent, nothing is lost.
+  {
+    FakeServer srv(10);
+    auto pending = queue(3);
+    const auto r = run(srv, pending, 0);
+    assert(r.sent == 0 && r.deadline_hit && srv.requests == 0 && pending.size() == 3);
+  }
+}
+
 int main()
 {
   TestHandoffAgreement();
@@ -982,6 +1075,7 @@ int main()
   TestChecksumAgreementAndStickyDesync();
   TestRepeatedHandoffTransitions();
   TestPureRollbackHelpers();
+  TestTelemetryFinalFlushIsBounded();
   std::puts("NSR rollback exchange tests passed");
   return 0;
 }

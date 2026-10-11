@@ -136,6 +136,7 @@ add_library(core
   HLE/HLE_OS.cpp
   NSR/NSRTelemetry.cpp
   NSR/NSRTelemetry.h
+  NSR/NSRTelemetryLogic.h
   NSR/NSRNetplay.cpp
   NSR/NSRNetplay.h
   NSR/NSRRollbackNetplay.cpp

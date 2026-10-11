@@ -50,6 +50,7 @@
 #include "Common/IOFile.h"
 #include "Common/Version.h"
 #include "Core/ConfigManager.h"
+#include "Core/NSR/NSRTelemetryLogic.h"
 
 namespace NSRTelemetry
 {
@@ -64,6 +65,8 @@ constexpr std::size_t QUEUE_MAX = 256;                // records waiting for the
 constexpr std::size_t PENDING_BATCHES_MAX = 64;       // unsent batches kept for retry
 constexpr std::size_t BATCH_BYTES_MAX = 192 * 1024;   // uncompressed JSON per POST
 constexpr std::uint64_t LOCAL_FILE_MAX = 64ull << 20; // stop writing the fallback past this
+// Shutdown: total time for the final send of every pending batch (see Run).
+constexpr std::chrono::milliseconds FINAL_SEND_BUDGET{2000};
 
 // Dolphin config keys ([NSR] in Dolphin.ini, or -C Dolphin.NSR.TelemetryURL=...).
 const Config::Info<std::string> CFG_URL{{Config::System::Main, "NSR", "TelemetryURL"}, ""};
@@ -171,6 +174,16 @@ bool s_stop = false;
 std::atomic<std::uint64_t> s_dropped{0};
 std::atomic<std::uint64_t> s_record_seq{0};
 std::thread s_sender;
+// Shutdown deadline (steady-clock ticks since epoch; 0 = not shutting down),
+// set by Shutdown before it wakes the sender. Every HTTP request, including
+// one already in flight when the emulator closes, aborts at this deadline,
+// so the whole teardown shares one FINAL_SEND_BUDGET (final review L1).
+std::atomic<Clock::rep> s_stop_deadline{0};
+bool BeforeStopDeadline()
+{
+  const Clock::rep d = s_stop_deadline.load(std::memory_order_relaxed);
+  return d == 0 || Clock::now().time_since_epoch().count() < d;
+}
 Clock::time_point s_epoch = Clock::now();
 
 // --- CPU-thread state ----------------------------------------------------------
@@ -493,7 +506,8 @@ public:
   {
     const Settings& s = s_settings;
     if (!s.url.empty())
-      m_http = std::make_unique<Common::HttpRequest>(std::chrono::milliseconds{5000});
+      m_http = std::make_unique<Common::HttpRequest>(
+          std::chrono::milliseconds{5000}, [](s64, s64, s64, s64) { return BeforeStopDeadline(); });
     auto next_send = Clock::now();
     for (;;)
     {
@@ -522,14 +536,27 @@ public:
       if (stopping)
         break;
       if (!m_pending.empty() && Clock::now() >= m_retry_at)
-        Flush(false);
+        Flush();
       next_send = Clock::now() + std::chrono::seconds(2);
     }
     // Shutdown: one bounded final attempt, then spill whatever is left.
+    // The bound is ONE total budget, from Shutdown(), for the request that
+    // may still be in flight plus every pending batch (final review L1: a
+    // per-request 2 s timeout let a slow server that still answers keep
+    // teardown busy for up to PENDING_BATCHES_MAX x 2 s). Requests are
+    // aborted through curl's progress callback once the budget is spent;
+    // curl calls it at least about once a second while waiting, so teardown
+    // waits at most ~FINAL_SEND_BUDGET + 1 s here.
     if (!m_pending.empty() && !m_auth_failed && !s.url.empty())
     {
-      m_http = std::make_unique<Common::HttpRequest>(std::chrono::milliseconds{2000});
-      Flush(true);
+      const Clock::rep set = s_stop_deadline.load(std::memory_order_relaxed);
+      const auto deadline =
+          set ? Clock::time_point(Clock::duration(set)) : Clock::now() + FINAL_SEND_BUDGET;
+      m_http = std::make_unique<Common::HttpRequest>(
+          FINAL_SEND_BUDGET, [deadline](s64, s64, s64, s64) { return Clock::now() < deadline; });
+      Logic::FinalFlush(
+          m_pending, deadline, [] { return Clock::now(); },
+          [this](const Batch& b) { return Post(b); }, [this](Batch& b) { Spill(b); });
     }
     for (Batch& b : m_pending)
       Spill(b);
@@ -582,7 +609,8 @@ private:
     }
   }
 
-  void Flush(bool final_attempt)
+  // Normal operation (the shutdown flush is Logic::FinalFlush in Run).
+  void Flush()
   {
     while (!m_pending.empty() && !m_auth_failed)
     {
@@ -620,8 +648,6 @@ private:
       m_failing = true;
       for (Batch& pb : m_pending)
         Spill(pb);
-      if (final_attempt)
-        return;
       // Exponential backoff with jitter, 1 s .. 60 s (429 and 5xx included).
       std::uniform_int_distribution<int> jitter(0, static_cast<int>(m_backoff.count() / 4));
       m_retry_at = Clock::now() + m_backoff + std::chrono::milliseconds(jitter(m_rng));
@@ -1037,15 +1063,17 @@ void Shutdown()
         s_queue.push_back(Record{std::move(s_cpu.closed), {}, true});
       s_cpu.closed.reset();
     }
+    s_stop_deadline = (Clock::now() + FINAL_SEND_BUDGET).time_since_epoch().count();
     {
       std::lock_guard lk(s_queue_mutex);
       s_stop = true;
     }
     s_queue_cv.notify_all();
-    // The sender's final attempt is bounded (2 s HTTP timeout per pending batch,
-    // usually one); then it spills to the local file and exits.
+    // The sender's final attempt is bounded (one FINAL_SEND_BUDGET for all
+    // pending batches together); then it spills to the local file and exits.
     if (s_sender.joinable())
       s_sender.join();
+    s_stop_deadline = 0;  // the next session (Rearm) sends normally again
   }
   std::lock_guard lk(s_init_mutex);
   s_cpu = CpuState{};

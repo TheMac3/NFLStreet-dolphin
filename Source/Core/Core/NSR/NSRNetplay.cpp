@@ -3401,8 +3401,15 @@ static void RbTransplant(Core::System& system, u8* ram, u32 live, u32 frame)
 //                requests, the audio callback-list nodes, the tick
 //                accumulator, disc staging/descriptor, disc stream
 //                destinations, the GX FIFO (CP registers).
+//   io-object, audio-data, heap-counters, heap-free: see the writer below.
 // Static per-machine words (.data/.bss, the same in every mode) stay in
 // rbdiff's own list.
+// Format v2 (first line "# nsr-permachine v2"; final review M3) adds the
+// complete heap block map ("#heap"/"#block" records, see WalkHeap), so rbdiff
+// can exclude a per-machine block only where both dumps agree on its
+// boundaries and owner and report an allocation-ownership difference instead
+// of hiding it. Older sidecars lack the map; rbdiff still reads them (union
+// semantics) and says the comparison has reduced confidence.
 // ---------------------------------------------------------------------------
 namespace
 {
@@ -3555,6 +3562,131 @@ std::optional<std::pair<u32, u32>> EnclosingBlock(const u8* ram, u32 p)
   }
   return std::nullopt;
 }
+
+// --- Heap block map (sidecar v2; final review M3) ------------------------------
+// The per-machine heap ranges above say what THIS dump thinks is audio/I/O
+// memory. Comparing two dumps by the union of those claims let one dump's
+// "audio" label hide the other dump's gameplay object at the same address
+// (an allocation-ownership divergence). So the sidecar also records every
+// block of every heap with its owner, and rbdiff excludes a per-machine block
+// only when both dumps agree on it, reporting any owner/boundary difference.
+//
+// Allocator layout (GN7E69, fn_801D28A8 family), from dumps: a block starts
+// with a back link (absent in a heap's first block), then a word whose high
+// half `off` is the header length counted from that word: the flags word
+// (used byte, mask 0xFF00) is at +off-12, the heap descriptor at +off-8, the
+// next block's start at +off-4 and the payload at +off. Seen: 0x0C (plain
+// block, the classic 16-byte header), 0x10, 0x1C (aligned block with a
+// 16-byte pre-header). A heap's chain ends with a 0x14-byte sentinel block.
+// Heap descriptors: +4 points at itself, +0x10 first child heap, +0x14/+0x18
+// the heap's [start, end). Top-level heaps are listed in a static table of
+// {start, end, flags, descriptor} entries (0x80384BC0.. in GN7E69: the ARAM
+// heap, the fake-VMEM heap, then the MEM1 heaps); nested heaps live inside a
+// block of their parent and are found from the descriptor's child link and
+// from used blocks whose payload holds a descriptor.
+// Deferred: only the first child link is followed (no sibling link has been
+// seen; a second nested heap would still be found from its parent's block).
+// Revisit if a sidecar's "#heap" lines ever disagree with a full-MEM1
+// descriptor scan.
+constexpr std::pair<u32, u32> HEAP_TABLE{0x80384B00, 0x80384D00};
+
+struct HeapBlock
+{
+  u32 lo, hi, payload;
+  bool used;
+};
+
+struct HeapWalk
+{
+  u32 desc, start, end;
+  std::vector<HeapBlock> blocks;
+  bool complete;  // reached the end sentinel through valid headers
+};
+
+// MEM1 virtual address with `extent` readable bytes.
+bool InMem1(u32 a, u32 extent)
+{
+  return a >= 0x80003100 && a < 0x81800000 && extent <= 0x81800000 - a;
+}
+
+bool HeapDescriptor(const u8* ram, u32 desc)
+{
+  auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
+  if (!InMem1(desc, 0x1C) || rd(desc + 4) != desc)
+    return false;
+  const u32 start = rd(desc + 0x14), end = rd(desc + 0x18);
+  return InMem1(start, 0x20) && end > start && end <= 0x81800000;
+}
+
+HeapWalk WalkHeap(const u8* ram, u32 desc)
+{
+  auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
+  HeapWalk w{desc, rd(desc + 0x14), rd(desc + 0x18), {}, false};
+  u32 h = w.start;
+  while (h + 0x20 <= w.end && w.blocks.size() < 200000)
+  {
+    // The class word is at +4 after a back link, or at +0 in the first block.
+    u32 pos = 0, off = 0;
+    for (const u32 cand : {h + 4, h})
+    {
+      const u32 o = InMem1(cand, 4) ? rd(cand) >> 16 : 0;
+      if (o >= 0xC && o <= 0x40 && (o & 3) == 0 && InMem1(cand, o + 4) && rd(cand + o - 8) == desc)
+      {
+        pos = cand;
+        off = o;
+        break;
+      }
+    }
+    if (!pos)
+      return w;
+    const u32 next = rd(pos + off - 4);
+    if (next <= h || next > w.end)
+      return w;
+    w.blocks.push_back({h, next, pos + off, (rd(pos + off - 12) & 0xFF00) != 0});
+    h = next;
+  }
+  w.complete = h + 0x20 > w.end;
+  return w;
+}
+
+std::vector<HeapWalk> WalkAllHeaps(const u8* ram)
+{
+  auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
+  std::vector<u32> todo;
+  for (u32 e = HEAP_TABLE.first; e < HEAP_TABLE.second; e += 16)
+  {
+    const u32 desc = rd(e + 12);
+    if (HeapDescriptor(ram, desc) && rd(desc + 0x14) == rd(e) && rd(desc + 0x18) == rd(e + 4))
+      todo.push_back(desc);
+  }
+  std::set<u32> seen;
+  std::vector<HeapWalk> heaps;
+  while (!todo.empty() && heaps.size() < 64)
+  {
+    const u32 desc = todo.back();
+    todo.pop_back();
+    if (!seen.insert(desc).second)
+      continue;
+    HeapWalk w = WalkHeap(ram, desc);
+    if (const u32 child = rd(desc + 0x10); HeapDescriptor(ram, child))
+      todo.push_back(child);
+    for (const HeapBlock& b : w.blocks)
+    {
+      if (!b.used)
+        continue;
+      for (const u32 c : {b.payload, b.payload + 0x10})
+      {
+        if (c + 0x1C < b.hi && HeapDescriptor(ram, c) && rd(c + 0x14) >= b.lo &&
+            rd(c + 0x18) <= b.hi)
+          todo.push_back(c);
+      }
+    }
+    heaps.push_back(std::move(w));
+  }
+  std::sort(heaps.begin(), heaps.end(),
+            [](const HeapWalk& a, const HeapWalk& b) { return a.start < b.start; });
+  return heaps;
+}
 }  // namespace
 
 static void WritePerMachineSidecar(Core::System& system, const u8* ram, const std::string& dump)
@@ -3562,7 +3694,8 @@ static void WritePerMachineSidecar(Core::System& system, const u8* ram, const st
   FILE* f = std::fopen((dump + ".permachine").c_str(), "w");
   if (!f)
     return;
-  std::fprintf(f, "# per-machine ranges at dump time: lo hi kind (virtual, [lo, hi)); "
+  std::fprintf(f, "# nsr-permachine v2: per-machine ranges at dump time: lo hi kind (virtual, "
+                  "[lo, hi)); heap block map in '#heap'/'#block' lines; "
                   "NSRNetplay WritePerMachineSidecar\n");
   size_t blocks = 0;
   for (const auto& [p, recorded] : s_audio_blocks)
@@ -3651,8 +3784,38 @@ static void WritePerMachineSidecar(Core::System& system, const u8* ram, const st
       h = next;
     }
   }
+  // Heap block map (v2, see WalkHeap). Written as '#'-prefixed records so a
+  // pre-v2 rbdiff, which treats every non-comment line as per-machine memory,
+  // keeps its old behaviour instead of excluding game blocks:
+  //   #heap  desc start end blocks complete|partial
+  //   #block lo hi used|free owner
+  // lo/hi are the block's own boundaries (back link .. next block); owner is
+  // the per-machine kind above for the block whose header is listed there
+  // (payload - 0x10), "game" for any other used block, "-" when free.
+  std::map<u32, const char*> owner;  // payload - 0x10 -> kind
+  for (const auto& [lo, hi] : io)
+    owner[lo] = "io-object";
+  for (const auto& [lo, hi] : data)
+    owner[lo] = "audio-data";
+  for (const auto& [p, recorded] : s_audio_blocks)
+    owner[p - 0x10] = "audio-heap";
+  size_t mapped = 0;
+  for (const HeapWalk& w : WalkAllHeaps(ram))
+  {
+    if (w.blocks.empty())
+      continue;  // not a heap after all (a self-pointing word in some object)
+    std::fprintf(f, "#heap %08x %08x %08x %zu %s\n", w.desc, w.start, w.end, w.blocks.size(),
+                 w.complete ? "complete" : "partial");
+    for (const HeapBlock& b : w.blocks)
+    {
+      const auto it = b.used ? owner.find(b.payload - 0x10) : owner.end();
+      std::fprintf(f, "#block %08x %08x %s %s\n", b.lo, b.hi, b.used ? "used" : "free",
+                   !b.used ? "-" : it != owner.end() ? it->second : "game");
+    }
+    mapped += w.blocks.size();
+  }
   std::fclose(f);
-  Log("wrote {}.permachine ({} audio heap blocks)", dump, blocks);
+  Log("wrote {}.permachine ({} audio heap blocks, {} heap blocks mapped)", dump, blocks, mapped);
 }
 
 // Diagnostics: NSR_RB_DUMP_UNIT=live:frame,... writes all of MEM1 right
