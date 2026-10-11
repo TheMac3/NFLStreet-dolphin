@@ -2477,7 +2477,8 @@ void RbInit(Core::System& system)
 //
 // Diagnostics: NSR_RB_ARAM=0 keeps the observer but does not log or undo
 // (reproduces the uncovered behavior for tests); reads of the ring
-// (ARAM -> MRAM DMA) are counted and the first ones logged; NSR_DUMP_PREFIX
+// (ARAM -> MRAM DMA) are counted and the first ones logged
+// (NSR_RB_ARAM_TRACE=1 logs every ring read and write); NSR_DUMP_PREFIX
 // dumps write the ring to <dump>.aram (see WriteAramRingSidecar).
 //
 // Deferred: other ARAM contents (audio) stay live by design. RbAdopt's
@@ -2494,6 +2495,7 @@ struct AramRing
   u8* aram = nullptr;
   u32 aram_size = 0;
   bool undo = false;  // logging/undo on (a rollback ring exists, NSR_RB_ARAM != 0)
+  bool trace = false;  // NSR_RB_ARAM_TRACE=1: log every ring access (diagnostics)
   RollbackLogic::WindowUndoLog log;
   std::map<const u8*, u64> marks;  // snapshot slot -> log mark when saved
   std::pair<u32, u32> window{0, 0};
@@ -2545,6 +2547,12 @@ void AramObserver(DSP::DSPManager& dsp, u32 address, u32 length,
   const auto [lo, hi] = window;
   if (lo == hi || address >= hi || u64{address} + length <= lo)
     return;
+  if (a.trace)
+  {
+    Log("ARAM replay ring: {} {:x}+{:#x} frame {} re-sim {}",
+        access == Access::DMARead ? "read" : "write", address, length, s_rb.tick_running,
+        s_rb.in_resim);
+  }
   if (access == Access::DMARead)
   {
     ++a.reads;
@@ -2632,6 +2640,7 @@ void AramRingSession(Core::System& system, bool enter)
   s_aram.aram = dsp.GetARAMPtr();
   s_aram.aram_size = dsp.GetARAMSize();
   s_aram.undo = !s_rb.ring.empty() && Env("NSR_RB_ARAM") != "0" && s_aram.aram != nullptr;
+  s_aram.trace = Env("NSR_RB_ARAM_TRACE") == "1";
   s_aram.window = AramRingWindow(s_aram.mem1, s_aram.aram_size);
   dsp.SetNSRARAMObserver(AramObserver);
   Log("ARAM replay ring: window {:x}..{:x} at session start, undo log {}", s_aram.window.first,
