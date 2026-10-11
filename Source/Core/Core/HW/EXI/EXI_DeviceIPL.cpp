@@ -418,6 +418,19 @@ u32 CEXIIPL::GetEmulatedTime(Core::System& system, u32 epoch)
     // let's keep time moving forward, regardless of what it starts at
     ltime += system.GetCoreTiming().GetTicks() / system.GetSystemTimers().GetTicksPerSecond();
   }
+  else if (Config::Get(Config::MAIN_CUSTOM_RTC_ENABLE))
+  {
+    // NFLStreet: a pinned RTC advances with *emulated* time, like the movie
+    // and netplay paths above. Upstream adds host seconds elapsed since
+    // SystemTimers init, so a host-second boundary falling between that init
+    // and the BS2 boot's read (PresetTimeBaseTicks -> 0x800030D8) gives one
+    // instance an OS clock exactly 1 s (40,500,000 TB ticks) ahead of
+    // another. Lockstep (milestone 1) then reports DESYNC from frame 60 on
+    // every check, intermittently and more often on a loaded host; every
+    // NSR launcher session pins the RTC, so real matches are exposed too.
+    ltime = Config::Get(Config::MAIN_CUSTOM_RTC_VALUE);
+    ltime += system.GetCoreTiming().GetTicks() / system.GetSystemTimers().GetTicksPerSecond();
+  }
   else
   {
     ASSERT(!Core::WantsDeterminism());
