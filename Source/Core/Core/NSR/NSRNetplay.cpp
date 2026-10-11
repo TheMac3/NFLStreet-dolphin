@@ -10,6 +10,7 @@
 //   - periodic whole-MEM1 hashes, compared with every peer, to detect desyncs.
 
 #include "Core/NSR/NSRNetplay.h"
+#include "Core/NSR/NSRRollbackNetplay.h"
 #include "Core/NSR/ReplayFollow.h"
 
 #include <algorithm>
@@ -170,6 +171,12 @@ struct Session
 };
 
 Session s_session;
+// The socket-free exchange is created at the agreed rollback epoch.  ENet
+// remains a thin datagram adapter and the CPU thread is its sole owner.
+std::unique_ptr<RollbackNet::Exchange> s_rb_exchange;
+std::optional<u32> s_rb_logged_desync;
+bool s_rb_bad_session_logged = false;
+bool s_rb_peer_desync_logged = false;
 
 template <typename... Args>
 void Log(fmt::format_string<Args...> format, Args&&... args)
@@ -394,7 +401,7 @@ bool Setup()
 {
   Session& s = s_session;
   s.initialized = true;
-  if (const std::string path = Env("NSR_LOG"); !path.empty())
+  if (const std::string path = Env("NSR_LOG"); !path.empty() && s.log == stderr)
   {
     if (FILE* f = std::fopen(path.c_str(), "w"))
       s.log = f;
@@ -508,6 +515,48 @@ void CheckHash(u32 player, u32 frame)
 void HandlePacket(const ENetPacket* packet)
 {
   Session& s = s_session;
+  u32 magic = 0;
+  if (packet->dataLength >= sizeof(magic))
+    std::memcpy(&magic, packet->data, sizeof(magic));
+  if (magic == RollbackNet::MAGIC)
+  {
+    const auto decoded = RollbackNet::Decode(
+        std::span<const u8>(static_cast<const u8*>(packet->data), packet->dataLength));
+    if (!decoded || !s_rb_exchange || decoded->players != s.players || decoded->sender == s.me ||
+        decoded->sender >= s.players)
+      return;
+    if (decoded->session != s_rb_exchange->Session())
+    {
+      if (!s_rb_bad_session_logged)
+      {
+        s_rb_bad_session_logged = true;
+        Log("rollback session mismatch from player {}: expected {:08x}, got {:08x}",
+            decoded->sender, s_rb_exchange->Session(), decoded->session);
+      }
+      return;
+    }
+    if ((decoded->flags & 0x02) != 0 && !s_rb_peer_desync_logged)
+    {
+      s_rb_peer_desync_logged = true;
+      Log("player {} reports a confirmed semantic checksum mismatch", decoded->sender);
+    }
+    // The host relays the original authenticated session datagram unchanged;
+    // every receiver performs the same strict parser and session check.
+    if (s.star && s.me == 0)
+    {
+      for (u32 i = 1; i < s.players; ++i)
+      {
+        if (i != decoded->sender && Linked(i))
+        {
+          enet_peer_send(s.peers[i], 0,
+                         enet_packet_create(packet->data, packet->dataLength,
+                                            ENET_PACKET_FLAG_UNSEQUENCED));
+        }
+      }
+    }
+    s_rb_exchange->Accept(*decoded);
+    return;
+  }
   if (packet->dataLength < offsetof(Packet, pads))
     return;
   Packet p;
@@ -685,6 +734,28 @@ void SendLatest(u32 latest_frame)
     if (i == s.me || !Linked(i))
       continue;
     enet_peer_send(s.peers[i], 0, enet_packet_create(&p, size, ENET_PACKET_FLAG_UNSEQUENCED));
+  }
+  enet_host_flush(s.host);
+}
+
+// Send one NSRB datagram containing the unacknowledged local prefix plus all
+// receive acknowledgements.  Repeating this every frame (and while stalled)
+// makes packet loss recovery independent of ENet reliability queues.
+void SendRollbackLatest(u32 live_frame)
+{
+  Session& s = s_session;
+  if (!s_rb_exchange || !s.host)
+    return;
+  const u32 send_us = static_cast<u32>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+  const std::vector<u8> bytes = RollbackNet::Encode(s_rb_exchange->BuildPacket(live_frame, send_us));
+  for (u32 i = 0; i < s.players; ++i)
+  {
+    if (i != s.me && Linked(i))
+      enet_peer_send(s.peers[i], 0,
+                     enet_packet_create(bytes.data(), bytes.size(), ENET_PACKET_FLAG_UNSEQUENCED));
   }
   enet_host_flush(s.host);
 }
@@ -971,6 +1042,12 @@ struct Rollback
   u32 mispredict_pending = UINT32_MAX;  // earliest frame still to correct
   u64 mispredictions = 0;
   u64 uncorrectable = 0;  // mispredictions older than the ring/session/barrier
+  bool net_enabled = false;  // NSR_RB_NET: real peer input source
+  u32 net_delay = 1;         // local samples apply this many frames later
+  u32 max_prediction = 7;    // host-stall beyond this remote-confirmed window
+  bool time_sync = true;     // the frame-ahead peer yields up to one frame
+  u64 net_stalls = 0;
+  u64 sync_waits = 0;
   u32 force_from = 0;     // NSR_RB_FORCE_FROM: first live tick that is rolled back
   u32 force_to = 0xFFFFFFFF;  // NSR_RB_FORCE_TO: last one (diagnostics)
   u32 perturb_at = 0;     // NSR_RB_PERTURB_AT: diagnostics, see RollbackTickHook
@@ -1537,7 +1614,8 @@ void RbInit(Core::System& system)
     std::string error;
     if (!Env("NSR_RB_REPLAY").empty() || !Env("NSR_RB_RECORD").empty() ||
         (Env("NSR_RB_FORCE") != "0" && !Env("NSR_RB_FORCE").empty()) ||
-        !Env("NSR_RB_MISPREDICT").empty() || Config::Get(Config::MAIN_CPU_THREAD))
+        !Env("NSR_RB_MISPREDICT").empty() || !Env("NSR_RB_NET").empty() ||
+        Config::Get(Config::MAIN_CPU_THREAD))
     {
       error = "follow requires single-core, no replay/record/forced rollback";
     }
@@ -1599,6 +1677,17 @@ void RbInit(Core::System& system)
   }
   r.force_from = ParseU32(Env("NSR_RB_FORCE_FROM")).value_or(0);
   r.mispredict = ParseU32(Env("NSR_RB_MISPREDICT")).value_or(0);
+  r.net_enabled = !Env("NSR_RB_NET").empty();
+  r.net_delay = std::min<u32>(ParseU32(Env("NSR_RB_DELAY")).value_or(1), 8);
+  r.max_prediction = std::min<u32>(ParseU32(Env("NSR_RB_MAX_PRED")).value_or(7), 60);
+  r.time_sync = Env("NSR_RB_TIME_SYNC", "1") != "0";
+  if (r.net_enabled)
+  {
+    // Network confirmation is the input source in this mode.  The synthetic
+    // force/misprediction sources remain available unchanged when it is off.
+    r.force = 0;
+    r.mispredict = 0;
+  }
   r.force_to = ParseU32(Env("NSR_RB_FORCE_TO")).value_or(0xFFFFFFFF);
   r.perturb_at = ParseU32(Env("NSR_RB_PERTURB_AT")).value_or(0);
   r.vtime_from = ParseU32(Env("NSR_RB_VTIME_FROM")).value_or(0);
@@ -1622,7 +1711,7 @@ void RbInit(Core::System& system)
 
   // Segments = MEM1 minus the keep ranges (defaults + NSR_RB_KEEP).
   std::vector<std::pair<u32, u32>> keep(RB_KEEP.begin(), RB_KEEP.end());
-  r.audio_rollback = !Env("NSR_RB_AUDIO_ROLLBACK").empty();
+  r.audio_rollback = r.net_enabled || !Env("NSR_RB_AUDIO_ROLLBACK").empty();
   if (!r.audio_rollback)
     keep.insert(keep.end(), AUDIO_KEEP.begin(), AUDIO_KEEP.end());
   for (const std::string& item : Split(Env("NSR_RB_KEEP"), ','))
@@ -1700,12 +1789,13 @@ void RbInit(Core::System& system)
     r.outside.assign(size / r.pgran, 0);
   }
 
-  r.io_idle_mode = !Env("NSR_RB_IO_IDLE").empty();
-  if (r.force > 0)
+  r.io_idle_mode = r.net_enabled || !Env("NSR_RB_IO_IDLE").empty();
+  if (r.force > 0 || r.net_enabled)
   {
     // Deep enough for the deepest rollback the session can ask for
     // (forced depth or misprediction delay), plus quiet-point slack.
-    const u32 depth = std::max(r.force, r.mispredict);
+    const u32 net_depth = r.net_enabled ? r.max_prediction + r.net_delay : 0;
+    const u32 depth = std::max({r.force, r.mispredict, net_depth});
     r.ring.assign(r.io_idle_mode ? std::max<u32>(depth + 1, ParseU32(Env("NSR_RB_RING")).value_or(24))
                                  : depth + 1,
                   std::vector<u8>(size + r.vmem_bytes));
@@ -1716,6 +1806,26 @@ void RbInit(Core::System& system)
           s_dirty.on ? "on" : "unavailable, full copies", s_dirty.views.size());
       for (const auto& v : s_dirty.views)
         Log("  mapping {:x}: state pages {:#x}+{:#x}", v.host, v.first, v.count);
+    }
+  }
+  if (r.net_enabled)
+  {
+    if (r.vtime_from == 0)
+    {
+      Log("rollback netplay requires the agreed NSR_RB_VTIME_FROM frame");
+      s_session.failed = true;
+      Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+    }
+    else
+    {
+      if (!s_session.initialized)
+        s_session.enabled = Setup();
+      if (!s_session.enabled)
+      {
+        Log("rollback netplay transport setup failed");
+        s_session.failed = true;
+        Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+      }
     }
   }
   if (r.force > 0 || config.sample || r.stacks)
@@ -1758,7 +1868,8 @@ void RbInit(Core::System& system)
           }
         });
   }
-  Log("rollback image: force={} keep-ranges={} hash-log={}", r.force, keep.size(), r.hash_log);
+  Log("rollback image: force={} keep-ranges={} hash-log={} net={} delay={} max-pred={}", r.force,
+      keep.size(), r.hash_log, r.net_enabled, r.net_delay, r.max_prediction);
 }
 
 void RbSave(const u8* ram, std::vector<u8>& slot)
@@ -2687,6 +2798,112 @@ static Pads TruePads(u32 t)
   return s_rb.latest;
 }
 
+// Hash only semantic words known to follow the deterministic game frame.
+// Audio, SDK queues, card state, raw SI buffers and other per-machine ranges
+// are intentionally absent.  The list is small by design: a false positive
+// would make every valid rollback history look desynced.
+static u64 RbSemanticChecksum(const Core::CPUThreadGuard& guard)
+{
+  using PowerPC::MMU;
+  u64 hash = 1469598103934665603ULL;
+  auto add = [&](u32 value) { hash = (hash ^ value) * 1099511628211ULL; };
+  auto valid = [](u32 address) { return address >= 0x80003100 && address < 0x81800000; };
+
+  // EA RNG streams 0/1 are the strongest current sim oracle.
+  add(MMU::HostRead<u32>(guard, 0x80481888));
+  add(MMU::HostRead<u32>(guard, 0x80481904));
+  const u32 clock = MMU::HostRead<u32>(guard, TICK_CLOCK_PTR);
+  for (u32 offset : {0u, 4u, 8u})
+    add(valid(clock + offset) ? MMU::HostRead<u32>(guard, clock + offset) : 0);
+  const u32 flow = MMU::HostRead<u32>(guard, 0x803EABA8);
+  for (u32 offset : {0u, 0x20u, 0xBCu})
+    add(valid(flow + offset) ? MMU::HostRead<u32>(guard, flow + offset) : 0);
+  const u32 play = MMU::HostRead<u32>(guard, 0x803EAB88);
+  add(valid(play + 0xE0) ? MMU::HostRead<u32>(guard, play + 0xE0) : 0);
+  return hash;
+}
+
+// Convert the transport-neutral input arrays without coupling that component
+// to Dolphin's CommonTypes aliases.
+static RollbackNet::Pad ToNetPad(const Pad& pad)
+{
+  RollbackNet::Pad out{};
+  std::copy(pad.begin(), pad.end(), out.begin());
+  return out;
+}
+
+static Pads FromNetPads(const RollbackNet::Pads& pads)
+{
+  Pads out{};
+  for (u32 player = 0; player < MAX_PLAYERS; ++player)
+    std::copy(pads[player].begin(), pads[player].end(), out[player].begin());
+  return out;
+}
+
+// Drain and resend while prediction is at its configured bound.  This is a
+// host wait: no guest frame, clock, audio query, or disc completion advances,
+// so all peers still simulate the same numbered frame once input arrives.
+static bool RbNetworkPreflight(u32 live)
+{
+  Rollback& r = s_rb;
+  Session& s = s_session;
+  if (!r.net_enabled || !s_rb_exchange)
+    return true;
+  Service(0);
+  s_rb_exchange->SubmitLocal(live, ToNetPad(r.latest[0]));
+  s_rb_exchange->UpdateFinalized();
+  SendRollbackLatest(live);
+
+  auto wait_until = [&](auto predicate, std::chrono::milliseconds limit, bool starvation) {
+    const auto start = std::chrono::steady_clock::now();
+    auto last_send = start;
+    while (predicate() && !s.failed)
+    {
+      Service(1);
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last_send >= std::chrono::milliseconds(8))
+      {
+        SendRollbackLatest(live);
+        last_send = now;
+      }
+      if (now - start >= limit)
+        break;
+    }
+    if (predicate() && starvation)
+    {
+      Log("rollback input timeout at frame {} (confirmed through {})", live,
+          s_rb_exchange->ConfirmedThrough());
+      s.failed = true;
+      Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+      return false;
+    }
+    return true;
+  };
+
+  if (s_rb_exchange->ShouldStall(live))
+  {
+    ++r.net_stalls;
+    if (!wait_until([&] { return s_rb_exchange->ShouldStall(live); },
+                    std::chrono::milliseconds(PEER_TIMEOUT_MS), true))
+      return false;
+  }
+  // Basic Slippi-style frame advantage: the peer more than one frame ahead
+  // yields at most one 60 Hz interval, while still servicing the transport.
+  if (r.time_sync && s_rb_exchange->FrameAdvantage(live) > 1)
+  {
+    ++r.sync_waits;
+    wait_until([&] { return s_rb_exchange->FrameAdvantage(live) > 1; },
+               std::chrono::milliseconds(17), false);
+  }
+  if (const auto desync = s_rb_exchange->FirstDesync();
+      desync && (!s_rb_logged_desync || *desync < *s_rb_logged_desync))
+  {
+    s_rb_logged_desync = desync;
+    Log("DESYNC: first confirmed semantic checksum mismatch at frame {}", *desync);
+  }
+  return !s.failed;
+}
+
 u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
 {
   auto& system = guard.GetSystem();
@@ -2782,6 +2999,8 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
   }
   const u32 slots = r.ring.empty() ? 1 : static_cast<u32>(r.ring.size());
   RbSampleIo(guard);
+  if (r.net_enabled && r.cursor == r.live && !r.rolled && !RbNetworkPreflight(r.live))
+    return 0;
   if (r.disc_commands != r.disc_commands_seen)
   {
     if (r.config.disc_trace && r.vtime_on)
@@ -2829,12 +3048,49 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     {
       // Re-simulation reached the live tick again: the state must match what
       // it was before the rollback.
-      if (r.mispredict == 0)  // with corrected pads the state is meant to differ
+      if (r.mispredict == 0 && !r.net_enabled)  // corrected net pads intentionally differ
       {
         PhaseTimer timer(PH_CHECK);
         for (const auto& [lo, hi] : RbLiveRanges(system, ram))
           std::memcpy(r.ring[r.live % slots].data() + lo, ram + lo, hi - lo);
         RbCheck(r.live, ram, r.ring[r.live % slots]);
+      }
+    }
+    else if (r.net_enabled && s_rb_exchange && s_rb_exchange->PendingRollback())
+    {
+      const u32 pending = *s_rb_exchange->PendingRollback();
+      u32 target = pending;
+      const u32 oldest = r.live >= slots - 1 ? r.live - (slots - 1) : 0;
+      const u32 lower = std::max({oldest, r.vtime_from, r.barrier});
+      bool reachable = pending >= lower;
+      while (reachable && target > lower &&
+             !(r.io_idle.contains(target) && r.io_idle[target]))
+      {
+        --target;
+      }
+      const bool quiet = reachable && IsIoIdle(ram) && r.io_idle.contains(target) &&
+                         r.io_idle[target];
+      if (!reachable || (!quiet && r.live - pending >= slots - 2))
+      {
+        Log("UNCORRECTABLE network input at {} (live {}, lower {}, quiet {})", pending, r.live,
+            lower, quiet);
+        ++r.uncorrectable;
+        s_session.failed = true;
+        Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+      }
+      else if (quiet)
+      {
+        RbSave(ram, r.ring[r.live % slots]);
+        RbRestore(system, ram, r.ring[target % slots]);
+        r.cursor = target;
+        r.rolled = true;
+        ++r.rollbacks;
+        ++r.mispredictions;
+        s_rb_exchange->BeginRollback();
+      }
+      else
+      {
+        ++r.skipped_busy;
       }
     }
     else if (r.mispredict > 0 && r.force > 0)
@@ -2949,6 +3205,12 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     RbSave(ram, r.ring[r.cursor % slots]);
     if (r.io_idle_mode)
       r.io_idle[r.cursor] = IsIoIdle(ram);
+    if (r.net_enabled && s_rb_exchange)
+    {
+      r.pads[r.cursor] = FromNetPads(s_rb_exchange->Assemble(r.cursor));
+      s_rb_exchange->SetStateChecksum(r.cursor, RbSemanticChecksum(guard));
+      s_rb_exchange->UpdateFinalized();
+    }
     RbWritePads(guard, buf, r.pads.at(r.cursor));
     RbDumpUnit(system, ram, r.live, r.cursor);
     RbTransplant(system, ram, r.live, r.cursor);
@@ -3023,10 +3285,12 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     if (t >= 600)
       r.io_idle.erase(r.io_idle.begin(), r.io_idle.lower_bound(t - 600));
   }
-  if (r.force > 0)
+  if (r.force > 0 || r.net_enabled)
     RbSave(ram, r.ring[t % slots]);
   if (s_follow)
     r.pads[t] = follow_pads;
+  else if (r.net_enabled && s_rb_exchange)
+    r.pads[t] = FromNetPads(s_rb_exchange->Assemble(t));
   else if (const auto it = r.replay.find(t); it != r.replay.end())
     r.pads[t] = it->second;  // same inputs per tick as a recorded run
   else
@@ -3040,6 +3304,11 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     std::fflush(r.record);
   }
   RbWritePads(guard, buf, r.pads[t]);
+  if (r.net_enabled && s_rb_exchange)
+  {
+    s_rb_exchange->SetStateChecksum(t, RbSemanticChecksum(guard));
+    s_rb_exchange->UpdateFinalized();
+  }
   RbAdopt(system, ram, t);
   RbDumpUnit(system, ram, t, t);
   if (t == r.vtime_from)
@@ -3066,6 +3335,8 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     r.pads.erase(r.pads.begin(), r.pads.lower_bound(t - 600));
     r.counters.erase(r.counters.begin(), r.counters.lower_bound(t - 600));
     r.gate_log.erase(r.gate_log.begin(), r.gate_log.lower_bound(t - 600));
+    if (s_rb_exchange)
+      s_rb_exchange->TrimBefore(t - 600);
   }
   if (s_dirty.on && (t % 600 == 0 || t == r.vtime_from))
     s_dirty.RefreshViews();
@@ -3078,10 +3349,10 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
           static_cast<double>(s_dirty.pages_seen) / s_dirty.samples, s_dirty.fifo_skipped);
     Log("tick {}: rollbacks {}, re-simulated {}, mismatched checks {}/{}; audio gate: "
         "recorded {}, replayed {}, mismatched {}; load barriers {} (clamped {}, in re-sim {}); "
-        "io-idle skips {}; mispredictions {} (uncorrectable {})",
+        "io-idle skips {}; mispredictions {} (uncorrectable {}); net stalls {} sync waits {}",
         t, r.rollbacks, r.resim_ticks, r.mismatched_checks, r.checks, r.gate_recorded,
         r.gate_replayed, r.gate_mismatched, r.barrier_events, r.clamped, r.barrier_resim,
-        r.skipped_busy, r.mispredictions, r.uncorrectable);
+        r.skipped_busy, r.mispredictions, r.uncorrectable, r.net_stalls, r.sync_waits);
     if (r.mismatched_checks > 0)
       RbReport(15);  // Dolphin is usually killed, not shut down: report as we go
     // Revisit NSR_RB_VMEM_BYTES if the game ever uses fake VMEM past it.
@@ -4871,6 +5142,25 @@ void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
 {
   (void)guard;
   Rollback& r = s_rb;
+  if (r.net_enabled)
+  {
+    if (!s_session.enabled || s_session.failed ||
+        (!AllConnected() && !WaitForConnection()))
+    {
+      Log("rollback session cannot start: transport is not connected");
+      Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+      return;
+    }
+    const u32 session = ConfigForRollback().seed.value_or(0x4E535200) ^ frame;
+    s_rb_exchange = std::make_unique<RollbackNet::Exchange>(
+        frame, static_cast<u8>(s_session.players), static_cast<u8>(s_session.me), r.net_delay,
+        r.max_prediction, session);
+    s_rb_logged_desync.reset();
+    s_rb_bad_session_logged = false;
+    s_rb_peer_desync_logged = false;
+    Log("rollback network epoch {:08x}: player {} of {}, delay {}, max prediction {}", session,
+        s_session.me, s_session.players, r.net_delay, r.max_prediction);
+  }
   r.vtime_from = frame;
   r.vtime_on = true;
   r.in_unit = false;
@@ -4889,6 +5179,8 @@ void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
   r.mispredict_pending = UINT32_MAX;
   r.mispredictions = 0;
   r.uncorrectable = 0;
+  r.net_stalls = 0;
+  r.sync_waits = 0;
   r.io_idle.clear();
   r.skipped_busy = 0;
   r.barrier = frame;
@@ -4961,6 +5253,10 @@ void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason)
   s_sim_waits = 0;
 
   r.vtime_on = false;
+  s_rb_exchange.reset();
+  s_rb_logged_desync.reset();
+  s_rb_bad_session_logged = false;
+  s_rb_peer_desync_logged = false;
   r.in_unit = false;
   r.in_resim = false;
   r.frame_tick_done = false;
@@ -5054,6 +5350,10 @@ void Shutdown(const Core::CPUThreadGuard& guard)
   s_hook_pc = 0;
   s = Session{};
   s_rb = Rollback{};
+  s_rb_exchange.reset();
+  s_rb_logged_desync.reset();
+  s_rb_bad_session_logged = false;
+  s_rb_peer_desync_logged = false;
   s_io_ranges.clear();
   s_rb_last_tick_ms = 0;
   s_rb_watch_live = 0;

@@ -36,13 +36,26 @@
 //                 written to SEED_ADDRESS on the first hook call, so every
 //                 match differs while all machines stay identical
 //
-// Rollback (milestone 2, stage 1; NFLStreet docs/poc-milestone2.md): images
+// Rollback (milestone 2; NFLStreet docs/poc-milestone2.md): images
 // built with isopatch's `rollback` patch send every pad poll through
 // RB_POLL_STUB (PADRead + Reborn's remap go to a scratch buffer; Dolphin
 // copies the result to the game's pad buffer except while re-simulating) and
 // every sim tick through RB_TICK_STUB (a loop that re-runs past ticks while
-// Dolphin asks for them). Stage 1 is a local
-// correctness test, no network yet:
+// Dolphin asks for them). Stage 1's single-machine correctness modes remain
+// available. Stage 2 selects a real per-player input source over the same
+// ENet star/mesh transport used by lockstep:
+//   NSR_RB_NET = 1       exchange frame-keyed inputs during the rollback epoch
+//   NSR_RB_VTIME_FROM=t  agreed first rollback frame (required in network mode)
+//   NSR_RB_DELAY = n     local input delay, default 1
+//   NSR_RB_MAX_PRED = n  maximum remote prediction window, default 7
+//   NSR_RB_TIME_SYNC=0   disable the default frame-advantage host wait
+// Network mode implies I/O-idle restores and audio rollback. It ignores the
+// synthetic FORCE/MISPREDICT source while leaving those modes unchanged when
+// NSR_RB_NET is off. Confirmed frames exchange semantic checksums over EA RNG
+// streams, game clocks, and play-flow words; per-machine hardware/audio/card
+// ranges are deliberately excluded.
+//
+// Single-machine diagnostic modes:
 //   NSR_RB_FORCE = k   roll back k ticks before every live tick, re-simulate
 //                      with the recorded pads, and check that the re-simulated
 //                      state matches the original byte for byte (outside
@@ -80,8 +93,8 @@
 //   NSR_RB_RANGES = path      restore/compare only these ranges ("lo hi ..."
 //                             per line, e.g. a filtered profile), minus keeps
 //
-// Deferred (revisit at milestone 2, rollback): replace env vars with Dolphin
-// config + a launcher UI, add time sync / frame skipping, matchmaking.
+// Deferred: replace env vars with Dolphin config + launcher UI, add fine-grain
+// clock sync and state recovery, and integrate matchmaking configuration.
 
 #pragma once
 
