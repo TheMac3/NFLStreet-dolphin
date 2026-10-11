@@ -675,10 +675,19 @@ void HandlePacket(const ENetPacket* packet, u32 source)
     return;
   Packet p{};
   std::memcpy(&p, packet->data, std::min(sizeof(Packet), packet->dataLength));
+  // Service can receive a peer's first redundant send while we are still in
+  // the connection wait.  Drop it until our own stream has a frame anchor;
+  // it will be resent.  Thereafter both sides are in lockstep, so this slack
+  // comfortably covers scheduling skew without retaining attacker-selected
+  // far-future map keys forever.
+  const u64 future_limit = s.local_pads.empty() ? 0 :
+                               static_cast<u64>(s.local_pads.rbegin()->first) + REDUNDANCY + 128;
   if (p.magic != PACKET_MAGIC || p.count > REDUNDANCY || p.sender >= s.players ||
       p.sender == s.me || !PacketSenderMatchesPeer(p.sender, source) ||
       packet->dataLength != offsetof(Packet, pads) + p.count * sizeof(Pad) ||
-      (p.count != 0 && p.latest_frame < p.count - 1))
+      (p.count != 0 && p.latest_frame < p.count - 1) || s.local_pads.empty() ||
+      p.latest_frame > future_limit ||
+      (p.checksum_frame != 0 && p.checksum_frame > future_limit))
   {
     return;
   }
@@ -3238,6 +3247,9 @@ static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 fra
     for (auto& m : s.remote_pads)
       std::erase_if(m, old);
     std::erase_if(s.applied, old);
+    std::erase_if(s.local_hashes, old);
+    for (auto& m : s.remote_hashes)
+      std::erase_if(m, old);
   }
   if (frame % 600 == 0)
     Log("frame {} ok (desyncs so far: {})", frame, s.desyncs);
