@@ -3270,7 +3270,7 @@ static void RbTransplant(Core::System& system, u8* ram, u32 live, u32 frame)
         if (std::sscanf(line, "%lx %lx", &lo, &hi) != 2)
           continue;
         lo &= 0x01FFFFFF;
-        hi = std::min<unsigned long>(hi & 0x01FFFFFF, dump.size());
+        hi = std::min<unsigned long>(hi & 0x01FFFFFF, static_cast<unsigned long>(dump.size()));
         if (hi > lo)
         {
           std::memcpy(ram + lo, dump.data() + lo, hi - lo);
@@ -3810,7 +3810,8 @@ static bool RbNetworkPreflight(u32 live)
       T::SetGauge(T::Gauge::NetRttMs, peer->roundTripTime, static_cast<int>(i));
       T::SetGauge(T::Gauge::NetRttVarMs, peer->roundTripTimeVariance, static_cast<int>(i));
       T::SetGauge(T::Gauge::NetLossPct,
-                  100.0 * peer->packetLoss / ENET_PEER_PACKET_LOSS_SCALE, static_cast<int>(i));
+                  100.0 * peer->packetLoss / static_cast<double>(ENET_PEER_PACKET_LOSS_SCALE),
+                  static_cast<int>(i));
     }
     T::SetGauge(T::Gauge::FrameAdvantage, s_rb_exchange->FrameAdvantage(live));
     T::SetGauge(T::Gauge::InputDelay, r.net_delay);
@@ -4096,11 +4097,11 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     else if (r.mispredict > 0 && r.force > 0)
     {
       // Misprediction mode: confirm frame c = live - d.
-      const u32 t = r.live, d = r.mispredict;
+      const u32 now = r.live, d = r.mispredict;
       const u32 start = std::max(r.force_from, r.vtime_from);
-      if (t >= start + d)
+      if (now >= start + d)
       {
-        const u32 c = t - d;
+        const u32 c = now - d;
         if (r.pads.contains(c) && r.pads[c] != TruePads(c))
         {
           r.mispredict_pending = std::min(r.mispredict_pending, c);
@@ -4110,7 +4111,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
       if (r.mispredict_pending != UINT32_MAX)
       {
         u32 target = r.mispredict_pending;
-        const u32 oldest = t >= slots - 1 ? t - (slots - 1) : 0;
+        const u32 oldest = now >= slots - 1 ? now - (slots - 1) : 0;
         // Never restore before the session, the ring or a load barrier.
         const u32 lower = std::max({oldest, start, r.barrier});
         bool ok = target >= lower;
@@ -4124,7 +4125,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
         {
           // Uncorrectable (in netplay: needs a state resync). Report it and
           // drop it instead of retrying forever while running on wrong pads.
-          Log("UNCORRECTABLE misprediction at {} (live {}, lower bound {})", r.mispredict_pending, t,
+          Log("UNCORRECTABLE misprediction at {} (live {}, lower bound {})", r.mispredict_pending, now,
               lower);
           ++r.uncorrectable;
           r.mispredict_pending = UINT32_MAX;
@@ -4133,11 +4134,11 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
         {
           // Corrected pads: true up to the newest confirmed frame, then the
           // new prediction (its pads) for the unconfirmed ones.
-          const u32 confirmed = t >= d ? t - d : 0;
-          for (u32 j = target; j < t; ++j)
+          const u32 confirmed = now >= d ? now - d : 0;
+          for (u32 j = target; j < now; ++j)
             r.pads[j] = TruePads(std::min(j, confirmed));
-          // No save of the state before frame t here: nothing reads it (the
-          // re-simulation check is off in this mode) and the live frame t
+          // No save of the state before frame `now` here: nothing reads it (the
+          // re-simulation check is off in this mode) and the live frame `now`
           // saves its slot again when re-simulation reaches it.
           RbRestore(system, ram, r.ring[target % slots]);
           r.cursor = target;
