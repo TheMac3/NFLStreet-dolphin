@@ -1,9 +1,9 @@
 // Copyright 2026 NFLStreet POC contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// Socket-free implementation of the rollback exchange contract declared in
-// NSRRollbackNetplay.h.  Wire parsing is deliberately strict because ENet
-// datagrams are untrusted input even when the lobby supplied the peer.
+// Socket-free implementation of rollback input exchange and match-handoff
+// agreement.  Wire parsing is deliberately strict because ENet datagrams are
+// untrusted input even when the lobby supplied the peer.
 
 #include "Core/NSR/NSRRollbackNetplay.h"
 
@@ -15,6 +15,7 @@ namespace NSRNetplay::RollbackNet
 namespace
 {
 constexpr std::size_t HEADER_SIZE = 56;
+constexpr std::size_t HANDOFF_SIZE = 24;
 
 // Append one integer in protocol byte order without depending on packed C++
 // layouts, which keeps the same datagram on x86-64 and ARM hosts.
@@ -37,6 +38,81 @@ bool Get(std::span<const std::uint8_t> bytes, std::size_t& at, T* value)
   return true;
 }
 }  // namespace
+
+std::vector<std::uint8_t> EncodeHandoff(const HandoffPacket& packet)
+{
+  std::vector<std::uint8_t> out;
+  out.reserve(HANDOFF_SIZE);
+  Put(out, HANDOFF_MAGIC);
+  Put(out, HANDOFF_VERSION);
+  Put(out, packet.sender);
+  Put(out, packet.players);
+  Put(out, static_cast<std::uint8_t>(packet.kind));
+  Put(out, packet.transition);
+  Put(out, packet.frame);
+  Put(out, packet.semantic_hash);
+  return out;
+}
+
+std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes)
+{
+  if (bytes.size() != HANDOFF_SIZE)
+    return std::nullopt;
+  std::size_t at = 0;
+  std::uint32_t magic = 0;
+  std::uint8_t version = 0;
+  std::uint8_t kind = 0;
+  HandoffPacket packet;
+  if (!Get(bytes, at, &magic) || !Get(bytes, at, &version) ||
+      !Get(bytes, at, &packet.sender) || !Get(bytes, at, &packet.players) ||
+      !Get(bytes, at, &kind) || !Get(bytes, at, &packet.transition) ||
+      !Get(bytes, at, &packet.frame) ||
+      !Get(bytes, at, &packet.semantic_hash) || magic != HANDOFF_MAGIC ||
+      version != HANDOFF_VERSION || packet.players < 2 || packet.players > MAX_PLAYERS ||
+      packet.sender >= packet.players ||
+      (kind != static_cast<std::uint8_t>(HandoffKind::EnterRollback) &&
+       kind != static_cast<std::uint8_t>(HandoffKind::LeaveRollback)))
+  {
+    return std::nullopt;
+  }
+  packet.kind = static_cast<HandoffKind>(kind);
+  return packet;
+}
+
+HandoffAgreement::HandoffAgreement(std::uint8_t players, std::uint8_t me, HandoffKind kind,
+                                   std::uint32_t transition, std::uint32_t frame,
+                                   std::uint64_t semantic_hash)
+    : m_players(std::clamp<std::uint8_t>(players, 2, MAX_PLAYERS)),
+      m_me(std::min<std::uint8_t>(me, m_players - 1)),
+      m_local{m_me, m_players, kind, transition, frame, semantic_hash}
+{
+  m_seen[m_me] = true;
+}
+
+bool HandoffAgreement::Accept(const HandoffPacket& packet)
+{
+  if (packet.players != m_players || packet.sender >= m_players || packet.sender == m_me)
+    return false;
+  // Packets from an earlier/later match can survive unsequenced delivery.
+  // They are not evidence of disagreement about this transition.
+  if (packet.transition != m_local.transition)
+    return false;
+  if (packet.kind != m_local.kind || packet.frame != m_local.frame ||
+      packet.semantic_hash != m_local.semantic_hash)
+  {
+    if (!m_mismatch)
+      m_mismatch = packet;
+    return false;
+  }
+  m_seen[packet.sender] = true;
+  return true;
+}
+
+bool HandoffAgreement::Complete() const
+{
+  return !m_mismatch &&
+         std::all_of(m_seen.begin(), m_seen.begin() + m_players, [](bool seen) { return seen; });
+}
 
 std::vector<std::uint8_t> Encode(const Packet& packet)
 {

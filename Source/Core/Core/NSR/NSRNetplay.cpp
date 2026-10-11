@@ -175,6 +175,7 @@ Session s_session;
 // The socket-free exchange is created at the agreed rollback epoch.  ENet
 // remains a thin datagram adapter and the CPU thread is its sole owner.
 std::unique_ptr<RollbackNet::Exchange> s_rb_exchange;
+std::optional<RollbackNet::HandoffAgreement> s_rb_handoff;
 std::optional<u32> s_rb_logged_desync;
 bool s_rb_bad_session_logged = false;
 bool s_rb_peer_desync_logged = false;
@@ -519,6 +520,33 @@ void HandlePacket(const ENetPacket* packet)
   u32 magic = 0;
   if (packet->dataLength >= sizeof(magic))
     std::memcpy(&magic, packet->data, sizeof(magic));
+  if (magic == RollbackNet::HANDOFF_MAGIC)
+  {
+    const auto decoded = RollbackNet::DecodeHandoff(
+        std::span<const u8>(static_cast<const u8*>(packet->data), packet->dataLength));
+    if (!decoded || decoded->players != s.players || decoded->sender == s.me ||
+        decoded->sender >= s.players)
+    {
+      return;
+    }
+    // The star host relays the original proposal unchanged.  Agreement is
+    // still all-to-all: every receiver validates the sender and full tuple.
+    if (s.star && s.me == 0)
+    {
+      for (u32 i = 1; i < s.players; ++i)
+      {
+        if (i != decoded->sender && Linked(i))
+        {
+          enet_peer_send(s.peers[i], 0,
+                         enet_packet_create(packet->data, packet->dataLength,
+                                            ENET_PACKET_FLAG_UNSEQUENCED));
+        }
+      }
+    }
+    if (s_rb_handoff)
+      s_rb_handoff->Accept(*decoded);
+    return;
+  }
   if (magic == RollbackNet::MAGIC)
   {
     const auto decoded = RollbackNet::Decode(
@@ -761,6 +789,24 @@ void SendRollbackLatest(u32 live_frame)
   enet_host_flush(s.host);
 }
 
+// Broadcast the current transition proposal.  Like input history, it is
+// deliberately unsequenced and periodically resent by the CPU-thread
+// barrier; duplicate/reordered delivery is handled by HandoffAgreement.
+void SendHandoff()
+{
+  Session& s = s_session;
+  if (!s_rb_handoff || !s.host)
+    return;
+  const std::vector<u8> bytes = RollbackNet::EncodeHandoff(s_rb_handoff->Local());
+  for (u32 i = 0; i < s.players; ++i)
+  {
+    if (i != s.me && Linked(i))
+      enet_peer_send(s.peers[i], 0,
+                     enet_packet_create(bytes.data(), bytes.size(), ENET_PACKET_FLAG_UNSEQUENCED));
+  }
+  enet_host_flush(s.host);
+}
+
 bool WaitForConnection()
 {
   Session& s = s_session;
@@ -835,6 +881,27 @@ void WritePads(const Core::CPUThreadGuard& guard, u32 buf, const std::array<Pad,
     for (u32 i = 0; i < PAD_SIZE; ++i)
       PowerPC::MMU::HostWrite<u8>(guard, pads[port][i], buf + port * PAD_SIZE + i);
   }
+}
+
+// A rollback epoch can span many VI retraces and peers need not consume the
+// same host/hardware timeline while correcting predictions.  Start a fresh
+// lockstep sequence after every match instead of asking the 32-pad resend
+// window to bridge that intentional gap.
+void ResetLockstepStream()
+{
+  Session& s = s_session;
+  s.local_pads.clear();
+  for (auto& pads : s.remote_pads)
+    pads.clear();
+  s.applied.clear();
+  s.local_hashes.clear();
+  for (auto& hashes : s.remote_hashes)
+    hashes.clear();
+  s.snapshots.clear();
+  s.last_sent_hash_frame = 0;
+  s.started = false;
+  s.first_frame = 0;
+  s.next_target = 0;
 }
 
 // --- Rollback (milestone 2, stage 1) ----------------------------------------
@@ -1044,6 +1111,13 @@ struct Rollback
   u64 mispredictions = 0;
   u64 uncorrectable = 0;  // mispredictions older than the ring/session/barrier
   bool net_enabled = false;  // NSR_RB_NET: real peer input source
+  // With NSR_RB_NET and no fixed NSR_RB_VTIME_FROM, the rollback image
+  // locksteps menus and negotiates every InGame epoch automatically.
+  bool auto_handoff = false;
+  // Initial menus use cycle-identical poll lockstep.  Once rollback has run,
+  // peers may have different VI-retrace histories, so subsequent menus use
+  // the absolute-frame exchange with prediction disabled instead.
+  bool menu_frame_lockstep = false;
   u32 net_delay = 1;         // local samples apply this many frames later
   u32 max_prediction = 7;    // host-stall beyond this remote-confirmed window
   bool time_sync = true;     // the frame-ahead peer yields up to one frame
@@ -1679,6 +1753,7 @@ void RbInit(Core::System& system)
   r.force_from = ParseU32(Env("NSR_RB_FORCE_FROM")).value_or(0);
   r.mispredict = ParseU32(Env("NSR_RB_MISPREDICT")).value_or(0);
   r.net_enabled = !Env("NSR_RB_NET").empty();
+  r.auto_handoff = r.net_enabled && Env("NSR_RB_VTIME_FROM").empty();
   r.net_delay = std::min<u32>(ParseU32(Env("NSR_RB_DELAY")).value_or(1), 8);
   r.max_prediction = std::min<u32>(ParseU32(Env("NSR_RB_MAX_PRED")).value_or(7), 60);
   r.time_sync = Env("NSR_RB_TIME_SYNC", "1") != "0";
@@ -1811,7 +1886,7 @@ void RbInit(Core::System& system)
   }
   if (r.net_enabled)
   {
-    if (r.vtime_from == 0)
+    if (!r.auto_handoff && r.vtime_from == 0)
     {
       Log("rollback netplay requires the agreed NSR_RB_VTIME_FROM frame");
       s_session.failed = true;
@@ -1826,6 +1901,10 @@ void RbInit(Core::System& system)
         Log("rollback netplay transport setup failed");
         s_session.failed = true;
         Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+      }
+      else if (r.auto_handoff)
+      {
+        Log("automatic lockstep-menu handoff enabled");
       }
     }
   }
@@ -2520,32 +2599,30 @@ bool ValidateRollbackImage(Core::System& system)
   return true;
 }
 
-void Hook(const Core::CPUThreadGuard& guard)
+// Run milestone-1 raw-pad lockstep for one poll.  Keeping this independent
+// from either game-side stub lets the rollback image use the same proven
+// ordering in menus: PADRead -> agreement -> Reborn remap/PADClamp.
+static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 frame)
 {
   auto& system = guard.GetSystem();
-  auto& ppc_state = system.GetPPCState();
-  const u32 buf = ppc_state.gpr[3];
-  const u32 frame = ppc_state.gpr[4];
-  ppc_state.npc = LR(ppc_state);  // Replace hook: return to caller
-
   InstallSeedOnce(guard);
   if (!ConfigForRollback().netplay_enabled)
-    return;  // seed-only mode (offline practice)
+    return false;  // seed-only mode (offline practice)
 
   Session& s = s_session;
   if (!s.initialized)
     s.enabled = Setup();
   if (!s.enabled || s.failed)
-    return;
+    return false;
   if (!AllConnected() && !WaitForConnection())
-    return;
+    return false;
 
   // The pad poll can run more than once for the same retrace (the game also
   // polls once directly at init). Re-apply what was agreed for that frame.
   if (auto it = s.applied.find(frame); it != s.applied.end())
   {
     WritePads(guard, buf, it->second);
-    return;
+    return true;
   }
 
   // 1. Our controller is always local port 0 (raw, straight from PADRead;
@@ -2603,7 +2680,7 @@ void Hook(const Core::CPUThreadGuard& guard)
     {
       Log("a player went silent at frame {}; continuing offline", frame);
       s.failed = true;
-      return;
+      return false;
     }
   }
 
@@ -2620,7 +2697,7 @@ void Hook(const Core::CPUThreadGuard& guard)
 
   // 4. Periodic desync check: hash MEM1 after the agreed pads are in the
   //    buffer (same emulated instant on every machine).
-  if (frame % CHECKSUM_INTERVAL == 0 && frame > 0)
+  if (frame % CHECKSUM_INTERVAL == 0 && frame > 0 && s_rb.session_generation == 0)
   {
     s.local_hashes[frame] = HashMem1(system);
     s.last_sent_hash_frame = frame;
@@ -2650,6 +2727,16 @@ void Hook(const Core::CPUThreadGuard& guard)
   }
   if (frame % 600 == 0)
     Log("frame {} ok (desyncs so far: {})", frame, s.desyncs);
+  return true;
+}
+
+void Hook(const Core::CPUThreadGuard& guard)
+{
+  auto& ppc_state = guard.GetSystem().GetPPCState();
+  const u32 buf = ppc_state.gpr[3];
+  const u32 frame = ppc_state.gpr[4];
+  ppc_state.npc = LR(ppc_state);  // Replace hook: return to caller
+  LockstepExchange(guard, buf, frame);
 }
 
 void RollbackPollHook(const Core::CPUThreadGuard& guard)
@@ -2668,6 +2755,14 @@ void RollbackPollHook(const Core::CPUThreadGuard& guard)
   RbSampleIo(guard);
   if (phase == 0)
   {
+    // Automatic stage-4 sessions use the milestone-1 exchange outside the
+    // match.  It runs before Reborn's remap so different local controllers
+    // cannot change guest instruction timing or menu state.
+    if (r.auto_handoff && !r.vtime_on && !r.menu_frame_lockstep)
+    {
+      LockstepExchange(guard, scratch, retrace);
+      return;
+    }
     // Raw pads, before Reborn's remap: the test script replaces port 0.
     if (auto scripted = ScriptPad(guard, retrace))
     {
@@ -2703,7 +2798,7 @@ void RollbackPollHook(const Core::CPUThreadGuard& guard)
     r.tick_mode = false;
   }
   r.ticks_since_poll = 0;
-  if (!r.tick_mode && r.cursor == r.live)
+  if (!r.tick_mode && r.cursor == r.live && !r.menu_frame_lockstep)
     RbWritePads(guard, RB_PAD_BUF, r.latest);
 }
 
@@ -3138,6 +3233,107 @@ static u64 RbSemanticChecksum(const Core::CPUThreadGuard& guard)
   return hash;
 }
 
+// Stop the emulation after a transition protocol failure.  Continuing would
+// turn a detected boundary disagreement into an opaque menu or match desync.
+static bool FailHandoff(const std::string& message)
+{
+  Log("DESYNC: HANDOFF ABORT: {}", message);
+  s_session.failed = true;
+  s_rb_handoff.reset();
+  Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+  return false;
+}
+
+// Before rollback can be disabled, every input used by the last live frame
+// must be confirmed.  A differing late input would require re-simulating the
+// resource-teardown frame, which the lifecycle tests proved unsafe; fail
+// loudly instead of carrying speculative state into lockstep menus.
+static bool ConfirmRollbackTail(u32 completed_frame)
+{
+  if (!s_rb_exchange)
+    return FailHandoff("rollback exchange missing at leave");
+  const auto start = std::chrono::steady_clock::now();
+  auto last_send = start;
+  while ((s_rb_exchange->ConfirmedThrough() == RollbackNet::NO_FRAME ||
+          s_rb_exchange->ConfirmedThrough() < completed_frame) &&
+         !s_session.failed)
+  {
+    Service(1);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_send >= std::chrono::milliseconds(8))
+    {
+      SendRollbackLatest(s_rb.live);
+      last_send = now;
+    }
+    if (now - start >= std::chrono::milliseconds(PEER_TIMEOUT_MS))
+      return FailHandoff(fmt::format("timeout confirming leave frame {}", completed_frame));
+  }
+  if (s_session.failed)
+    return FailHandoff(fmt::format("transport failed confirming leave frame {}", completed_frame));
+  if (const auto pending = s_rb_exchange->PendingRollback())
+  {
+    return FailHandoff(fmt::format("leave frame {} revealed a misprediction at {}",
+                                   completed_frame, *pending));
+  }
+  return true;
+}
+
+// Exchange and compare the stage-2 semantic checksum at an agreed absolute
+// frame.  This is a host-side barrier: no guest time advances while waiting,
+// and each proposal is resent until every player has acknowledged the same
+// kind/frame/hash tuple.
+static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::HandoffKind kind,
+                           u32 frame)
+{
+  Session& s = s_session;
+  if (!s.enabled || s.failed || (!AllConnected() && !WaitForConnection()))
+    return FailHandoff(fmt::format("transport is not connected at frame {}", frame));
+
+  const u64 semantic = RbSemanticChecksum(guard);
+  // Entry 0, leave 1, re-entry 2, ... is derived solely from the completed
+  // session generation.  It prevents a late unsequenced packet from an old
+  // match from poisoning a later barrier.
+  const u32 transition = kind == RollbackNet::HandoffKind::EnterRollback ?
+                             s_rb.session_generation * 2 :
+                             s_rb.session_generation * 2 - 1;
+  s_rb_handoff.emplace(static_cast<u8>(s.players), static_cast<u8>(s.me), kind, transition, frame,
+                       semantic);
+  SendHandoff();
+  const auto start = std::chrono::steady_clock::now();
+  auto last_send = start;
+  while (!s_rb_handoff->Complete() && !s_rb_handoff->Mismatched() && !s.failed)
+  {
+    Service(1);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_send >= std::chrono::milliseconds(8))
+    {
+      SendHandoff();
+      last_send = now;
+    }
+    if (now - start >= std::chrono::milliseconds(PEER_TIMEOUT_MS))
+      return FailHandoff(fmt::format(
+          "timeout at {} frame {} semantic {:016x}",
+          kind == RollbackNet::HandoffKind::EnterRollback ? "entry" : "leave", frame,
+          semantic));
+  }
+  if (s_rb_handoff->Mismatched())
+  {
+    const RollbackNet::HandoffPacket& other = *s_rb_handoff->Mismatch();
+    return FailHandoff(fmt::format(
+        "state/frame mismatch from player {}: local kind {} frame {} semantic {:016x}, "
+        "remote kind {} frame {} semantic {:016x}",
+        other.sender, static_cast<u32>(kind), frame, semantic, static_cast<u32>(other.kind),
+        other.frame, other.semantic_hash));
+  }
+  if (s.failed)
+    return FailHandoff(fmt::format("transport failed at handoff frame {}", frame));
+  Log("handoff {} transition {} agreed at frame {} semantic {:016x}",
+      kind == RollbackNet::HandoffKind::EnterRollback ? "entry" : "leave", transition, frame,
+      semantic);
+  s_rb_handoff.reset();
+  return true;
+}
+
 // Convert the transport-neutral input arrays without coupling that component
 // to Dolphin's CommonTypes aliases.
 static RollbackNet::Pad ToNetPad(const Pad& pad)
@@ -3280,10 +3476,16 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
   const u32 t = r.live;
   ++r.ticks_since_poll;
   r.tick_running = t;
-  if (!r.vtime_on && ((!r.session_ended && r.vtime_from && t == r.vtime_from) ||
-                      (r.enter_pending && r.config.auto_reenter)))
+  const bool fixed_entry = !r.session_ended && r.vtime_from && t == r.vtime_from;
+  const bool test_reentry = r.enter_pending && r.config.auto_reenter;
+  const bool automatic_entry = r.enter_pending && r.auto_handoff;
+  if (!r.vtime_on && (fixed_entry || test_reentry || automatic_entry))
   {
-    EnterRollbackSession(guard, t);
+    if (!automatic_entry ||
+        HandoffBarrier(guard, RollbackNet::HandoffKind::EnterRollback, t))
+    {
+      EnterRollbackSession(guard, t);
+    }
   }
   if (!r.vtime_on)
   {
@@ -3296,6 +3498,16 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
       pass_pads = follow_pads;
     else if (const auto it = r.replay.find(t); it != r.replay.end())
       pass_pads = it->second;
+    else if (r.menu_frame_lockstep)
+    {
+      // Post-match menus cannot return to retrace-keyed lockstep because
+      // rollback histories intentionally differ.  MAX_PRED=0 turns the same
+      // absolute-frame exchange into delay-based lockstep: this host wait
+      // completes only after every player's input for t is confirmed.
+      if (!RbNetworkPreflight(t))
+        return 0;
+      pass_pads = FromNetPads(s_rb_exchange->Assemble(t));
+    }
     if (r.record)
     {
       std::fwrite(&t, 4, 1, r.record);
@@ -4080,6 +4292,15 @@ void RollbackFrameEndHook(const Core::CPUThreadGuard& guard)
   r.in_unit = false;
   if (!r.vtime_on)
   {
+    if (r.auto_handoff)
+    {
+      // InGame is observed during this completed lockstep frame.  Enter on
+      // the next frame boundary, whose absolute number is therefore derived
+      // from the confirmed lockstep timeline on every peer.
+      if (r.in_game_seen)
+        r.enter_pending = true;
+      return;
+    }
     if (r.session_ended && r.config.auto_reenter)
     {
       if (!r.in_game_seen)
@@ -4099,7 +4320,15 @@ void RollbackFrameEndHook(const Core::CPUThreadGuard& guard)
   }
   else if (r.session_saw_in_game && !r.in_game_seen)
   {
-    LeaveRollbackSession(guard, "InGame group inactive");
+    // The next absolute frame is the lockstep fallback boundary.  Confirm
+    // the just-completed transition input first, then prove equal semantic
+    // state before disabling rollback and resetting the poll stream.
+    if (!r.auto_handoff ||
+        (ConfirmRollbackTail(r.tick_running) &&
+         HandoffBarrier(guard, RollbackNet::HandoffKind::LeaveRollback, r.live)))
+    {
+      LeaveRollbackSession(guard, "InGame group inactive");
+    }
   }
 }
 
@@ -5479,6 +5708,7 @@ void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
   }
   r.vtime_from = frame;
   r.vtime_on = true;
+  r.menu_frame_lockstep = false;
   r.in_unit = false;
   r.in_resim = false;
   r.frame_tick_done = false;
@@ -5570,6 +5800,7 @@ void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason)
 
   r.vtime_on = false;
   s_rb_exchange.reset();
+  s_rb_handoff.reset();
   s_rb_logged_desync.reset();
   s_rb_bad_session_logged = false;
   s_rb_peer_desync_logged = false;
@@ -5595,6 +5826,17 @@ void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason)
   r.session_ended = true;
   r.in_game_seen = false;
   r.session_saw_in_game = false;
+  if (r.auto_handoff)
+  {
+    ResetLockstepStream();
+    const u32 session = ConfigForRollback().seed.value_or(0x4E535200) ^ r.live ^ 0x4D454E55;
+    s_rb_exchange = std::make_unique<RollbackNet::Exchange>(
+        r.live, static_cast<u8>(s_session.players), static_cast<u8>(s_session.me),
+        s_session.delay, 0, session);
+    r.menu_frame_lockstep = true;
+    Log("post-match frame lockstep epoch {:08x} starts at frame {} with delay {}", session,
+        r.live, s_session.delay);
+  }
   s_io_ranges.clear();
   for (auto& slot : r.ring)
     std::fill(slot.begin(), slot.end(), 0);
@@ -5667,6 +5909,7 @@ void Shutdown(const Core::CPUThreadGuard& guard)
   s = Session{};
   s_rb = Rollback{};
   s_rb_exchange.reset();
+  s_rb_handoff.reset();
   s_rb_logged_desync.reset();
   s_rb_bad_session_logged = false;
   s_rb_peer_desync_logged = false;

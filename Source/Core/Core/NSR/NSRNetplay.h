@@ -44,8 +44,9 @@
 // Dolphin asks for them). Stage 1's single-machine correctness modes remain
 // available. Stage 2 selects a real per-player input source over the same
 // ENet star/mesh transport used by lockstep:
-//   NSR_RB_NET = 1       exchange frame-keyed inputs during the rollback epoch
-//   NSR_RB_VTIME_FROM=t  agreed first rollback frame (required in network mode)
+//   NSR_RB_NET = 1       lockstep menus and exchange frame-keyed match inputs
+//   NSR_RB_VTIME_FROM=t  fixed first rollback frame for tests; when omitted,
+//                        InGame drives checked menu -> match -> menu handoffs
 //   NSR_RB_DELAY = n     local input delay, default 1
 //   NSR_RB_MAX_PRED = n  maximum remote prediction window, default 7
 //   NSR_RB_TIME_SYNC=0   disable the default frame-advantage host wait

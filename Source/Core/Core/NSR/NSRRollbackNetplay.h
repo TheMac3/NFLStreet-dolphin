@@ -1,11 +1,12 @@
 // Copyright 2026 NFLStreet POC contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// Frame-keyed rollback input exchange state, independent of Dolphin and ENet.
-// The emulator adapter supplies local samples and decoded datagrams; this
-// component owns prediction, acknowledgement, retransmit history, and the
-// first confirmed-state checksum mismatch.  Keeping the state machine free of
-// sockets lets two peers be exercised deterministically in one process.
+// Frame-keyed rollback input exchange and match-handoff agreement state,
+// independent of Dolphin and ENet.  The emulator adapter supplies local
+// samples and decoded datagrams; this component owns prediction,
+// acknowledgement, retransmit history, confirmed-state checksums, and
+// transition proposals.  Keeping both state machines free of sockets lets
+// peers be exercised deterministically in one process.
 
 #pragma once
 
@@ -20,7 +21,9 @@
 namespace NSRNetplay::RollbackNet
 {
 constexpr std::uint32_t MAGIC = 0x4E535242;  // 'NSRB'
+constexpr std::uint32_t HANDOFF_MAGIC = 0x4E535248;  // 'NSRH'
 constexpr std::uint8_t VERSION = 3;
+constexpr std::uint8_t HANDOFF_VERSION = 1;
 constexpr std::size_t MAX_PLAYERS = 4;
 constexpr std::size_t PAD_SIZE = 12;
 constexpr std::size_t MAX_HISTORY = 64;
@@ -45,6 +48,53 @@ struct Packet
   std::uint64_t checksum = 0;
   std::uint32_t first_frame = 0;
   std::vector<Pad> pads;
+};
+
+// Match transitions use a separate fixed-size message because the entry
+// barrier exists before an NSRB rollback epoch does.  The absolute frame is
+// assigned by the confirmed lockstep timeline; the semantic hash proves that
+// every peer reached the same deterministic game state at that boundary.
+enum class HandoffKind : std::uint8_t
+{
+  EnterRollback = 1,
+  LeaveRollback = 2,
+};
+
+struct HandoffPacket
+{
+  std::uint8_t sender = 0;
+  std::uint8_t players = 0;
+  HandoffKind kind = HandoffKind::EnterRollback;
+  std::uint32_t transition = 0;
+  std::uint32_t frame = 0;
+  std::uint64_t semantic_hash = 0;
+};
+
+std::vector<std::uint8_t> EncodeHandoff(const HandoffPacket& packet);
+std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes);
+
+// HandoffAgreement is deliberately transport-free.  Each peer proposes the
+// same kind/frame/hash tuple and accepts duplicate, reordered announcements;
+// the first conflicting tuple is sticky so the adapter can abort loudly.
+class HandoffAgreement
+{
+public:
+  HandoffAgreement(std::uint8_t players, std::uint8_t me, HandoffKind kind,
+                   std::uint32_t transition, std::uint32_t frame,
+                   std::uint64_t semantic_hash);
+
+  bool Accept(const HandoffPacket& packet);
+  bool Complete() const;
+  bool Mismatched() const { return m_mismatch.has_value(); }
+  const HandoffPacket& Local() const { return m_local; }
+  const std::optional<HandoffPacket>& Mismatch() const { return m_mismatch; }
+
+private:
+  std::uint8_t m_players;
+  std::uint8_t m_me;
+  HandoffPacket m_local;
+  std::array<bool, MAX_PLAYERS> m_seen{};
+  std::optional<HandoffPacket> m_mismatch;
 };
 
 std::vector<std::uint8_t> Encode(const Packet& packet);

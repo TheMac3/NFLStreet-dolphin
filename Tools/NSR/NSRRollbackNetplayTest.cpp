@@ -1,9 +1,10 @@
 // Copyright 2026 NFLStreet POC contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// In-process two-peer test for the socket-free rollback exchange core.  It
-// covers wire validation, delayed delivery and correction, prediction-window
-// stalling, acknowledgement-driven history, and confirmed-state desyncs.
+// In-process test for the socket-free rollback exchange and handoff cores. It
+// covers transition agreement, wire validation, delayed delivery and
+// correction, prediction-window stalling, acknowledgement-driven history,
+// and confirmed-state desyncs.
 
 #include "Core/NSR/NSRRollbackNetplay.h"
 
@@ -22,6 +23,40 @@ static void Deliver(const RN::Exchange& from, RN::Exchange* to, std::uint32_t fr
   const auto packet = RN::Decode(bytes);
   assert(packet);
   assert(to->Accept(*packet));
+}
+
+// Match entry/leave proposals are independently encoded and require the same
+// transition kind, absolute lockstep frame, and deterministic-state hash from
+// every peer.  Duplicates are harmless and the first conflict stays visible.
+static void TestHandoffAgreement()
+{
+  RN::HandoffAgreement agreement(3, 0, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd);
+  RN::HandoffPacket peer1{1, 3, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd};
+  RN::HandoffPacket peer2{2, 3, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd};
+  const auto bytes = RN::EncodeHandoff(peer1);
+  const auto decoded = RN::DecodeHandoff(bytes);
+  assert(decoded);
+  assert(agreement.Accept(*decoded));
+  assert(agreement.Accept(*decoded));
+  assert(!agreement.Complete());
+  assert(agreement.Accept(peer2));
+  assert(agreement.Complete());
+
+  RN::HandoffAgreement mismatch(2, 0, RN::HandoffKind::LeaveRollback, 3, 2000, 0x1234);
+  RN::HandoffPacket stale{1, 2, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd};
+  assert(!mismatch.Accept(stale));
+  assert(!mismatch.Mismatched());
+  RN::HandoffPacket wrong{1, 2, RN::HandoffKind::LeaveRollback, 3, 2001, 0x1234};
+  assert(!mismatch.Accept(wrong));
+  assert(mismatch.Mismatched());
+  assert(mismatch.Mismatch()->frame == 2001);
+
+  std::vector<std::uint8_t> malformed = bytes;
+  malformed[4] = 99;  // protocol version
+  assert(!RN::DecodeHandoff(malformed));
+  malformed = bytes;
+  malformed.pop_back();
+  assert(!RN::DecodeHandoff(malformed));
 }
 
 // A changed remote input arrives after its frame ran predicted, selecting the
@@ -162,6 +197,7 @@ static void TestWireValidation()
 
 int main()
 {
+  TestHandoffAgreement();
   TestPredictionAndCorrection();
   TestPredictionWindowAndAcks();
   TestLongLossRecovery();
