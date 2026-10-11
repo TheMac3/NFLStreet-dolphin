@@ -51,6 +51,7 @@
 #include <optional>
 #include <random>
 #include <set>
+#include <span>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -2429,6 +2430,255 @@ void RbInit(Core::System& system)
       keep.size(), r.hash_log, r.net_enabled, r.net_delay, r.max_prediction);
 }
 
+// ---------------------------------------------------------------------------
+// ARAM replay ring (final-review M1, rb-coverage-review C3)
+//
+// The game records every gameplay object for its instant replay: every second
+// frame fn_800307C0 -> fn_8002FE34 -> fn_80199C94 serializes the object list
+// (-0x5C58(r13)) into one of 4 rotating MRAM buffers and copies the record
+// into ARAM with the synchronous ARQ writer fn_801C1D98. The records form a
+// ring of `count` x `bytes` that fn_80030B30 -> fn_80199D58 allocates from the
+// game's ARAM heap (fn_801D2BB0); Quick Play: 213 x 0xA40 at
+// 0x466460..0x4EEBA0. The instant-replay viewer (X after a play) reads records
+// back through fn_8002FECC -> fn_80199CF0 -> fn_801C1E78 into game memory.
+//
+// ARAM is outside the MEM1/VMEM snapshots, so a restore used to leave records
+// written by abandoned (mispredicted) frames in the ring wherever the
+// corrected timeline did not rewrite the same record; a replay viewed later
+// would differ between peers (and copy that difference into MEM1).
+//
+// Coverage: an undo log (RollbackLogic::WindowUndoLog) of every ARAM write
+// into the ring while a rollback ring exists. DSPManager reports each ARAM
+// transfer before it happens (SetNSRARAMObserver); writes into the ring's
+// window record the bytes they replace. Each snapshot stores the log's mark,
+// and RbRestore undoes the newer records, so after a restore the ring equals
+// the snapshot's frame exactly, including writes made during re-simulation
+// (logged like live ones and undone by a later, deeper rollback). Records
+// older than every ring slot's mark are trimmed. Session enter/leave clears
+// the log and the marks (like the ring slots and their metadata).
+//
+// Why the window comes from the game's own ring descriptor (read from MEM1 at
+// each transfer, not a fixed address range): only bytes of the ring's ARAM
+// allocation are ever logged or undone, whatever the mode or allocation
+// order, so audio banks and streamed samples (kept live; the audio model
+// handles audio) can never be rolled back. The descriptor is itself restored
+// game state, so the window always matches the timeline that writes into it.
+// A window change inside a session is logged.
+//
+// Why an undo log rather than copying the ring into every slot: ~2.6 KB is
+// written every second frame into a ~560 KB window, so the log holds tens of
+// KB and costs one small copy per write; slot copies would be 24 x 560 KB.
+//
+// ARQ and quiet points: Dolphin performs an ARQ request's ARAM DMA in full
+// when the transfer starts (completion is only a scheduled event), so a write
+// is logged in the frame whose code (or interrupt) started it; I/O-idle quiet
+// points already require the ARQ queues empty. Speed factors (16x re-sim
+// machine) only change completion timing.
+//
+// Diagnostics: NSR_RB_ARAM=0 keeps the observer but does not log or undo
+// (reproduces the uncovered behavior for tests); reads of the ring
+// (ARAM -> MRAM DMA) are counted and the first ones logged
+// (NSR_RB_ARAM_TRACE=1 logs every ring read and write); NSR_DUMP_PREFIX
+// dumps write the ring to <dump>.aram (see WriteAramRingSidecar).
+//
+// Deferred: other ARAM contents (audio) stay live by design. RbAdopt's
+// file-based state transplant does not adopt the ring (it is a single-machine
+// diagnostic). Revisit both if a mode is found that keeps other gameplay data
+// in ARAM (the read probe reports reads of the ring only).
+constexpr u32 ARAM_RING_BASE_PTR = 0x803ECBEC;    // -0x56B4(r13): ARAM address, 0 = none
+constexpr u32 ARAM_RING_COUNT = 0x803EC658;       // -0x5C48(r13): records in the ring
+constexpr u32 ARAM_RING_RECORD_BYTES = 0x803EC650;  // -0x5C50(r13): bytes per record
+
+struct AramRing
+{
+  const u8* mem1 = nullptr;  // set while a session observes ARAM
+  u8* aram = nullptr;
+  u32 aram_size = 0;
+  bool undo = false;  // logging/undo on (a rollback ring exists, NSR_RB_ARAM != 0)
+  bool trace = false;  // NSR_RB_ARAM_TRACE=1: log every ring access (diagnostics)
+  RollbackLogic::WindowUndoLog log;
+  std::map<const u8*, u64> marks;  // snapshot slot -> log mark when saved
+  std::pair<u32, u32> window{0, 0};
+  u64 writes = 0, write_bytes = 0, byte_writes = 0, reads = 0, read_bytes = 0;
+  u64 restores = 0, undone = 0;
+  u64 host_ns = 0;  // host time spent logging, undoing and trimming (cost report)
+  u32 reads_logged = 0;
+};
+
+// Adds the host time of one logging/undo step to s_aram.host_ns.
+struct AramTimer
+{
+  ~AramTimer();
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+};
+AramRing s_aram;
+AramTimer::~AramTimer()
+{
+  s_aram.host_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - start)
+                                         .count());
+}
+
+// [lo, hi) of the ring in ARAM from the game's descriptor; {0, 0} if none.
+std::pair<u32, u32> AramRingWindow(const u8* ram, u32 aram_size)
+{
+  auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
+  const u32 base = rd(ARAM_RING_BASE_PTR);
+  const u64 end = u64{base} + u64{rd(ARAM_RING_COUNT)} * rd(ARAM_RING_RECORD_BYTES);
+  if (base == 0 || end <= base || end > aram_size)
+    return {0, 0};
+  return {base, static_cast<u32>(end)};
+}
+
+void AramObserver(DSP::DSPManager& dsp, u32 address, u32 length,
+                  DSP::DSPManager::NSRARAMAccess access)
+{
+  using Access = DSP::DSPManager::NSRARAMAccess;
+  AramRing& a = s_aram;
+  if (!a.mem1)
+    return;
+  const auto window = AramRingWindow(a.mem1, dsp.GetARAMSize());
+  if (window != a.window)
+  {
+    Log("ARAM replay ring: window {:x}..{:x} (was {:x}..{:x}) at frame {}", window.first,
+        window.second, a.window.first, a.window.second, s_rb.tick_running);
+    a.window = window;
+  }
+  const auto [lo, hi] = window;
+  if (lo == hi || address >= hi || u64{address} + length <= lo)
+    return;
+  if (a.trace)
+  {
+    Log("ARAM replay ring: {} {:x}+{:#x} frame {} re-sim {}",
+        access == Access::DMARead ? "read" : "write", address, length, s_rb.tick_running,
+        s_rb.in_resim);
+  }
+  if (access == Access::DMARead)
+  {
+    ++a.reads;
+    a.read_bytes += length;
+    if (a.reads_logged < 16)
+    {
+      ++a.reads_logged;
+      Log("ARAM replay ring: read {:x}+{:#x} in frame {} (re-sim {})", address, length,
+          s_rb.tick_running, s_rb.in_resim);
+    }
+    return;
+  }
+  ++(access == Access::ByteWrite ? a.byte_writes : a.writes);
+  a.write_bytes += length;
+  if (a.undo)
+  {
+    AramTimer timer;
+    a.log.Record({a.aram, a.aram_size}, lo, hi, address, length);
+  }
+}
+
+// RbSave: remember the log position of this snapshot and trim records that no
+// rollback-ring slot can undo any more.
+void AramRingSaved(const std::vector<u8>& slot)
+{
+  AramRing& a = s_aram;
+  if (!a.undo)
+    return;
+  AramTimer timer;
+  a.marks[slot.data()] = a.log.Mark();
+  if (a.log.Records() <= 2 * s_rb.ring.size())
+    return;
+  u64 oldest = UINT64_MAX;
+  for (const auto& ring_slot : s_rb.ring)
+  {
+    if (const auto it = a.marks.find(ring_slot.data()); it != a.marks.end())
+      oldest = std::min(oldest, it->second);
+  }
+  if (oldest != UINT64_MAX)
+    a.log.TrimThrough(oldest);
+}
+
+// RbRestore: put the ring back to the snapshot's frame. Slots this session
+// never saved (RbAdopt's file state) leave ARAM alone.
+void AramRingRestore(const std::vector<u8>& slot)
+{
+  AramRing& a = s_aram;
+  if (!a.undo)
+    return;
+  const auto it = a.marks.find(slot.data());
+  if (it == a.marks.end())
+    return;
+  AramTimer timer;
+  ++a.restores;
+  a.undone += a.log.UndoTo(it->second, {a.aram, a.aram_size});
+}
+
+void AramRingReport(const char* when)
+{
+  const AramRing& a = s_aram;
+  if (!a.mem1)
+    return;
+  Log("ARAM replay ring ({}): window {:x}..{:x}, {} DMA writes + {} byte writes ({} bytes), "
+      "{} reads ({} bytes); undo {}: {} restores undid {} records, log {} records / {} bytes, "
+      "host {} us",
+      when, a.window.first, a.window.second, a.writes, a.byte_writes, a.write_bytes, a.reads,
+      a.read_bytes, a.undo ? "on" : "off", a.restores, a.undone, a.log.Records(), a.log.Bytes(),
+      a.host_ns / 1000);
+}
+
+// Session enter (enter = true) / leave: start or stop observing ARAM, with an
+// empty log either way.
+void AramRingSession(Core::System& system, bool enter)
+{
+  if (!enter)
+    AramRingReport("session leave");
+  s_aram = {};
+  auto& dsp = system.GetDSP();
+  if (!enter)
+  {
+    dsp.SetNSRARAMObserver(nullptr);
+    return;
+  }
+  s_aram.mem1 = system.GetMemory().GetRAM();
+  s_aram.aram = dsp.GetARAMPtr();
+  s_aram.aram_size = dsp.GetARAMSize();
+  s_aram.undo = !s_rb.ring.empty() && Env("NSR_RB_ARAM") != "0" && s_aram.aram != nullptr;
+  s_aram.trace = Env("NSR_RB_ARAM_TRACE") == "1";
+  s_aram.window = AramRingWindow(s_aram.mem1, s_aram.aram_size);
+  dsp.SetNSRARAMObserver(AramObserver);
+  Log("ARAM replay ring: window {:x}..{:x} at session start, undo log {}", s_aram.window.first,
+      s_aram.window.second, s_aram.undo ? "on" : "off");
+}
+
+// The ring as it is now: its ARAM address and bytes (empty if none).
+std::pair<u32, std::span<const u8>> AramRingBytes(Core::System& system)
+{
+  const auto& dsp = system.GetDSP();
+  const u8* aram = dsp.GetARAMPtr();
+  if (!aram || !system.GetMemory().GetRAM())
+    return {0, {}};
+  const auto [lo, hi] = AramRingWindow(system.GetMemory().GetRAM(), dsp.GetARAMSize());
+  return {lo, std::span<const u8>(aram + lo, hi - lo)};
+}
+
+// <dump>.aram next to a MEM1 dump: "NSRARAM1", the ring's ARAM address and
+// length (u32 little-endian each), then its bytes (tools/rbdiff.py compares
+// it with the other dump's sidecar). Written even when no ring exists
+// (length 0), so a missing ring is visible in the comparison.
+void WriteAramRingSidecar(Core::System& system, const std::string& dump)
+{
+  const auto [address, bytes] = AramRingBytes(system);
+  FILE* f = std::fopen((dump + ".aram").c_str(), "wb");
+  if (!f)
+    return;
+  const u32 length = static_cast<u32>(bytes.size());
+  const u8 header[16] = {'N', 'S', 'R', 'A', 'R', 'A', 'M', '1',
+                         static_cast<u8>(address), static_cast<u8>(address >> 8),
+                         static_cast<u8>(address >> 16), static_cast<u8>(address >> 24),
+                         static_cast<u8>(length), static_cast<u8>(length >> 8),
+                         static_cast<u8>(length >> 16), static_cast<u8>(length >> 24)};
+  std::fwrite(header, 1, sizeof(header), f);
+  std::fwrite(bytes.data(), 1, bytes.size(), f);
+  std::fclose(f);
+}
+
 // Per-machine heap blocks (sidecar, see WritePerMachineSidecar): blocks the
 // game's allocator hands to audio code. The audio middleware, the game's sound
 // layer and stream source, and PathFinder allocate from the shared game heap
@@ -2464,6 +2714,7 @@ void AllocUndoTo(u64 seq)
 void RbSave(const u8* ram, std::vector<u8>& slot)
 {
   s_slot_seq[slot.data()] = s_alloc_seq;
+  AramRingSaved(slot);  // ARAM replay ring (final-review M1)
   // Keep the undo log bounded by the oldest snapshot still remembered.
   if (s_alloc_log.size() > 65536 && !s_slot_seq.empty())
   {
@@ -2714,6 +2965,7 @@ void RbRestore(Core::System& system, u8* ram, const std::vector<u8>& slot)
   // heap), and compiled blocks for the old bytes must not keep running.
   if (const auto it = s_slot_seq.find(slot.data()); it != s_slot_seq.end())
     AllocUndoTo(it->second);
+  AramRingRestore(slot);  // ARAM replay ring (final-review M1)
   std::optional<PhaseTimer> timer(std::in_place, PH_LIVE);
   const auto live = RbLiveRanges(system, ram);
   std::vector<std::vector<u8>> keep;
@@ -3835,6 +4087,7 @@ static void RbDumpUnit(Core::System& system, const u8* ram, u32 live, u32 frame)
     std::fclose(f);
     Log("wrote {}", path);
     WritePerMachineSidecar(system, ram, path);
+    WriteAramRingSidecar(system, path);  // ARAM replay ring (final-review M1)
   }
   if (s_rb.vmem_bytes)
   {
@@ -4527,6 +4780,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
       std::fclose(f);
       Log("wrote {}", path);
       WritePerMachineSidecar(system, ram, path);
+      WriteAramRingSidecar(system, path);  // ARAM replay ring (final-review M1)
     }
   }
   if (r.hash_log && t % 60 == 0)
@@ -4630,6 +4884,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
         t, r.rollbacks, r.resim_ticks, r.mismatched_checks, r.checks, r.gate_recorded,
         r.gate_replayed, r.gate_mismatched, r.barrier_events, r.clamped, r.barrier_resim,
         r.skipped_busy, r.mispredictions, r.uncorrectable, r.net_stalls, r.sync_waits);
+    AramRingReport(fmt::format("tick {}", t).c_str());  // final-review M1
     if (r.mismatched_checks > 0)
       RbReport(15);  // Dolphin is usually killed, not shut down: report as we go
     // Revisit NSR_RB_VMEM_BYTES if the game ever uses fake VMEM past it.
@@ -6505,6 +6760,7 @@ void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
   for (auto& slot : r.ring)
     std::fill(slot.begin(), slot.end(), 0);
   RollbackLogic::ClearSessionSlotMetadata(&s_dirty.synced, &s_slot_seq);
+  AramRingSession(guard.GetSystem(), true);  // ARAM replay ring (final-review M1)
   s_ac_pending.clear();
   s_ac_real.clear();
   s_ac_sfx_start = {};
@@ -6598,11 +6854,24 @@ void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason)
   for (auto& slot : r.ring)
     std::fill(slot.begin(), slot.end(), 0);
   RollbackLogic::ClearSessionSlotMetadata(&s_dirty.synced, &s_slot_seq);
+  AramRingSession(guard.GetSystem(), false);  // ARAM replay ring (final-review M1)
   r.rollbacks = 0;
   r.resim_ticks = 0;
   s_rb_watch_rollbacks = 0;
 }
 }  // namespace
+
+AramRingView GameplayAramRing(Core::System& system)
+{
+  const auto [address, bytes] = AramRingBytes(system);
+  return {address, bytes};
+}
+
+u64 GameplayAramRingHash(Core::System& system)
+{
+  const auto [address, bytes] = AramRingBytes(system);
+  return XXH3_64bits_withSeed(bytes.data(), bytes.size(), address);
+}
 
 // Let the video thread omit historical catch-up frames without skipping game-side draws.
 bool IsReplayCatchingUp()

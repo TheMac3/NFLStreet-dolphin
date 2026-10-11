@@ -1051,6 +1051,76 @@ static void TestTelemetryFinalFlushIsBounded()
   }
 }
 
+// ARAM replay-ring undo log (final-review M1): snapshots taken at frame
+// boundaries, writes inside and across the window edge, a rollback, a
+// re-simulation that writes different bytes, a second (deeper) rollback that
+// must undo re-simulated writes too, trimming, and the session clear.
+static void TestWindowUndoLog()
+{
+  std::vector<std::uint8_t> mem(64, 0);
+  RL::WindowUndoLog log;
+  constexpr std::uint32_t lo = 16, hi = 48;
+  auto write = [&](std::uint32_t address, std::uint32_t length, std::uint8_t value) {
+    log.Record(mem, lo, hi, address, length);
+    std::fill(mem.begin() + address, mem.begin() + address + length, value);
+  };
+  auto window = [&] { return std::vector<std::uint8_t>(mem.begin() + lo, mem.begin() + hi); };
+
+  // Frame 0..3 snapshots (mark + expected window at each frame start).
+  std::vector<std::uint64_t> marks;
+  std::vector<std::vector<std::uint8_t>> states;
+  auto save = [&] {
+    marks.push_back(log.Mark());
+    states.push_back(window());
+  };
+  save();                // frame 0
+  write(20, 8, 1);       // inside
+  write(8, 16, 2);       // straddles lo: only [16, 24) is recorded
+  save();                // frame 1
+  write(44, 12, 3);      // straddles hi: only [44, 48) is recorded
+  write(0, 8, 4);        // entirely outside: not recorded
+  assert(log.Records() == 3);
+  assert(log.Bytes() == 8 + 8 + 4);
+  save();                // frame 2
+  write(16, 32, 5);      // whole window
+  save();                // frame 3
+  write(30, 2, 6);
+
+  // Roll back to frame 1 and re-simulate frames 1..2 with different writes.
+  assert(log.UndoTo(marks[1], mem) == 3);
+  assert(window() == states[1]);
+  assert(mem[0] == 4);  // outside bytes are not the log's business
+  marks.resize(2);
+  states.resize(2);
+  write(40, 4, 7);  // re-simulated frame 1
+  save();           // frame 2 (re-saved)
+  write(16, 4, 8);  // re-simulated frame 2
+  save();           // frame 3 (re-saved)
+
+  // A deeper rollback undoes re-simulated and original writes in order.
+  assert(log.UndoTo(marks[2], mem) == 1);
+  assert(window() == states[2]);
+  assert(log.UndoTo(marks[0], mem) == 3);
+  assert(window() == states[0]);
+  assert(std::all_of(mem.begin() + lo, mem.begin() + hi, [](std::uint8_t b) { return b == 0; }));
+
+  // Trimming keeps exactly what restorable marks still need.
+  marks.assign(1, log.Mark());
+  write(24, 4, 9);
+  marks.push_back(log.Mark());
+  write(28, 4, 10);
+  log.TrimThrough(marks[0]);
+  assert(log.Records() == 2);
+  log.TrimThrough(marks[1]);
+  assert(log.Records() == 1 && log.Bytes() == 4);
+  assert(log.UndoTo(marks[1], mem) == 1);
+  assert(mem[28] == 0 && mem[24] == 9);
+
+  log.Clear();
+  assert(log.Records() == 0 && log.Bytes() == 0 && log.Mark() == 0);
+  assert(log.Record(mem, lo, hi, 60, 16) == 0);  // past the backing store
+}
+
 int main()
 {
   TestHandoffAgreement();
@@ -1075,6 +1145,7 @@ int main()
   TestChecksumAgreementAndStickyDesync();
   TestRepeatedHandoffTransitions();
   TestPureRollbackHelpers();
+  TestWindowUndoLog();
   TestTelemetryFinalFlushIsBounded();
   std::puts("NSR rollback exchange tests passed");
   return 0;
