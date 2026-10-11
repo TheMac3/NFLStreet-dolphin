@@ -5,12 +5,17 @@ A small window that replaces command lines and .bat files. It lives in the
 NFLStreet-dolphin folder (next to Dolphin.exe) and does three things:
 
   1. Game: find NFL Street Reborn's NSR.iso (or browse to it), build the
-     netplay image (nsr_patcher.prepare_image), and show its fingerprint.
+     rollback netplay image (nsr_patcher.prepare_image), and show its
+     fingerprint. An image from an older (lockstep) download is detected and
+     must be rebuilt.
   2. Play: Host (Create room: shows a code like NSR-4K7QX, lists who joined,
      Start) or Join (type the code, wait for Start), via the rendezvous server
      (room codes + hole punching, so usually no router setup). "Host by IP
      address" / typing an IP is the advanced fallback. Then it starts the
-     netplay Dolphin with every setting filled in.
+     netplay Dolphin with every setting filled in: rollback netplay (stage 4:
+     menus in confirmed lockstep, matches in rollback, see ROLLBACK_ENV), one
+     input delay chosen by the host for everyone, and passive lag/rollback
+     telemetry unless the player unticks it (then NSR_TELEMETRY=0).
   3. Practice offline, and "Set up controllers" (opens Dolphin's own window).
 
 Reborn is never modified: its files are only read, this Dolphin runs in
@@ -41,7 +46,27 @@ import nsr_patcher as patcher  # noqa: E402
 
 APP_TITLE = "NSR Netplay"
 CONFIG_NAME = "nsr-launcher.json"
-DEFAULT_DELAY = 2
+# Rollback input delay in frames, the same for every player (the host's
+# choice is sent to all). 1 is the tested release value (release plan 2.3:
+# "playtest fixed setting" until automatic delay exists); 0..MAX_DELAY offered.
+DEFAULT_DELAY = 1
+MAX_DELAY = 4
+
+# Stage-4 rollback profile (release plan 3.2), exactly what the rollback
+# netplay gates ran with (tools/detrun.py "rollback" profile) minus the fixed
+# NSR_RB_VTIME_FROM epoch: without it the fork agrees match entry/exit on the
+# confirmed lockstep menu timeline by itself. NSR_RB_DELAY is added per match.
+# NSR_RB_IO_IDLE/AUDIO_ROLLBACK are implied by NSR_RB_NET in the current fork
+# and set anyway so the telemetry config record states them; INSTANT_DISC
+# (zero-latency DVD inside rollback sessions) matches every tested run.
+ROLLBACK_ENV = {
+    "NSR_RB_NET": "1",
+    "NSR_RB_MAX_PRED": "7",
+    "NSR_RB_TIME_SYNC": "1",
+    "NSR_RB_INSTANT_DISC": "1",
+    "NSR_RB_IO_IDLE": "1",
+    "NSR_RB_AUDIO_ROLLBACK": "1",
+}
 
 
 # --- pure helpers (tested without a GUI) --------------------------------------
@@ -53,8 +78,49 @@ def app_dir() -> str:
     return os.getcwd()
 
 
+TELEMETRY_FILE = "nsr-telemetry.txt"  # shipped next to the launcher: url=..., key=... (POC)
+
+
+def telemetry_config(folder: str) -> dict[str, str]:
+    """Fallback ingest settings for rooms whose server grants no token (direct IP,
+    older room servers): NSR_TELEMETRY_URL/NSR_TELEMETRY_KEY, else nsr-telemetry.txt
+    ("url=https://..." and "key=<POC shared key>" lines). Empty: no fallback."""
+    cfg = {"url": os.environ.get("NSR_TELEMETRY_URL", ""), "key": os.environ.get("NSR_TELEMETRY_KEY", "")}
+    try:
+        with open(os.path.join(folder, TELEMETRY_FILE)) as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                if k in cfg and not cfg[k]:
+                    cfg[k] = v.strip()
+    except OSError:
+        pass
+    return cfg
+
+
+def telemetry_env(folder: str, start: lobby.StartInfo, name: str, fingerprint: str,
+                  enabled: bool = True) -> dict[str, str]:
+    """Environment for the fork's passive telemetry (NSRTelemetry.h, docs/telemetry.md).
+    The room server's per-session token wins; the shared POC key is the fallback."""
+    if not enabled:
+        return {"NSR_TELEMETRY": "0"}
+    env = {"NSR_PLAYER_NAME": name[:24], "NSR_FINGERPRINT": fingerprint or "",
+           "NSR_ROOM_CODE": start.room_code,
+           # Same id on every machine in the match: the room id, else the agreed seed.
+           "NSR_TELEMETRY_SESSION": start.room or f"seed-{start.seed:08x}"}
+    fallback = telemetry_config(folder)
+    if start.telemetry_url and start.telemetry_token:
+        env.update({"NSR_TELEMETRY_URL": start.telemetry_url,
+                    "NSR_TELEMETRY_TOKEN": start.telemetry_token})
+    elif fallback["url"] and fallback["key"]:
+        env.update({"NSR_TELEMETRY_URL": fallback["url"], "NSR_TELEMETRY_TOKEN": fallback["key"]})
+    else:
+        env["NSR_TELEMETRY_LOCAL"] = "1"  # nothing to send to: keep a local file to share
+    return env
+
+
 def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: str | None,
-                    open_ui: bool = False) -> tuple[list[str], dict[str, str]]:
+                    open_ui: bool = False, name: str = "Player", fingerprint: str = "",
+                    telemetry: bool = True) -> tuple[list[str], dict[str, str]]:
     """Command line and environment for the netplay Dolphin.
 
     start=None: practice offline. open_ui=True: just open Dolphin's window
@@ -71,6 +137,10 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     if reborn_install:
         args += ["-C", f"Dolphin.General.LoadPath={os.path.join(reborn_install, 'content')}",
                  "-C", "GFX.Settings.HiresTextures=True"]
+    # Some Quick Play paths make Reborn's own code read through a null pointer
+    # (harmless under Dolphin, which returns 0); keep those warnings out of
+    # popup dialogs during a match. They still go to Dolphin's log.
+    args += ["-C", "Dolphin.Interface.UsePanicHandlers=False"]
     args += ["-C", "Dolphin.Core.CPUThread=False",
              "-C", "Dolphin.Core.EnableCustomRTC=True",
              "-C", "Dolphin.Core.CustomRTCValue=0x30000000"]
@@ -89,6 +159,13 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
             "NSR_DELAY": str(start.delay),
             "NSR_LOG": os.path.join(folder, f"nsr-p{start.player}.log"),
         })
+        if start.mode == "rollback":
+            # Stage 4 keeps menus in lockstep and agrees match boundaries on
+            # the frame-keyed channel, so an operator-supplied epoch is both
+            # unnecessary and unsafe here.
+            env.update(ROLLBACK_ENV)
+            env["NSR_RB_DELAY"] = str(start.delay)
+            args += ["-C", "Dolphin.Core.FastDiscSpeed=True"]
         if start.rendezvous:
             # Room code: hole punching through the rendezvous server.
             env.update({"NSR_RENDEZVOUS": start.rendezvous, "NSR_ROOM": start.room,
@@ -96,6 +173,7 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
             env.pop("NSR_PORT", None)
         elif start.player > 0:
             env["NSR_PEERS"] = f"{start.host_address}:{lobby.PORT}"
+        env.update(telemetry_env(folder, start, name, fingerprint, telemetry))
     if not os.environ.get("NSR_DOLPHIN"):
         args.append("-b")  # Dolphin closes when the game stops (Qt build)
     args += ["-e", os.path.join(folder, patcher.OUTPUT_NAME)]
@@ -203,14 +281,14 @@ def run_gui(selftest: bool = False) -> int:
     outer = ttk.Frame(root, padding=16)
     outer.pack(fill="both", expand=True)
     ttk.Label(outer, text="NFL Street Netplay", style="Title.TLabel").pack(anchor="w")
-    ttk.Label(outer, text="Play NFL Street Reborn online with friends (2–4 players). "
+    ttk.Label(outer, text="Play NFL Street Reborn online with friends (2–4 players, rollback netcode). "
                           "Reborn itself is never changed.", style="Sub.TLabel").pack(anchor="w", pady=(0, 10))
 
     # 1. Game
     game = ttk.Frame(outer, style="Panel.TFrame", padding=12)
     game.pack(fill="x")
     ttk.Label(game, text="1. Game", style="Big.TLabel").grid(row=0, column=0, sticky="w")
-    game_status = ttk.Label(game, text="Checking…", style="Panel.TLabel", wraplength=500)
+    game_status = ttk.Label(game, text="Checking your game copy…", style="Panel.TLabel", wraplength=500)
     game_status.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 6))
     progress = ttk.Progressbar(game, length=300, mode="determinate")
     btn_find = ttk.Button(game, text="Find Reborn automatically")
@@ -229,6 +307,15 @@ def run_gui(selftest: bool = False) -> int:
         .grid(row=2, column=0, columnspan=2, sticky="w")
     ttk.Button(you, text="Set up controllers", command=lambda: launch(None, open_ui=True)) \
         .grid(row=1, column=2, padx=8)
+    # On by default (Mason's call for the friends playtest), but labelled with
+    # exactly what goes out; unticked = NSR_TELEMETRY=0, nothing is sent or kept.
+    telemetry_var = tk.BooleanVar(value=cfg.get("telemetry", True))
+    ttk.Checkbutton(you, text="Send lag/rollback stats to Mason's server to help fix netplay",
+                    variable=telemetry_var).grid(row=3, column=0, columnspan=3, sticky="w")
+    ttk.Label(you, text="Connection and rollback counters, your name and the room code. "
+                        "Never your button presses, files, or game data. Untick to send nothing.",
+              style="Muted.TLabel", wraplength=520, justify="left") \
+        .grid(row=4, column=0, columnspan=3, sticky="w")
 
     tabs = ttk.Notebook(outer)
     tabs.pack(fill="both", expand=True)
@@ -264,11 +351,14 @@ def run_gui(selftest: bool = False) -> int:
     btn_start.grid(row=3, column=1, sticky="w", padx=6)
     btn_close.grid(row=3, column=2, sticky="w")
     btn_open_ip.grid(row=3, column=3, sticky="e", padx=(12, 0))
-    delay_var = tk.IntVar(value=int(cfg.get("delay", DEFAULT_DELAY)))
-    ttk.Label(host_tab, text="Input delay (frames, raise if laggy):", style="Muted.TLabel") \
-        .grid(row=4, column=0, sticky="w", pady=(10, 0))
-    ttk.Spinbox(host_tab, from_=0, to=8, textvariable=delay_var, width=4) \
-        .grid(row=4, column=1, sticky="w", pady=(10, 0))
+    # "rb_delay", not the lockstep-era "delay" (2 by default), so an old
+    # config doesn't carry a lockstep value into rollback.
+    delay_var = tk.IntVar(value=min(int(cfg.get("rb_delay", DEFAULT_DELAY)), MAX_DELAY))
+    ttk.Label(host_tab, text="Input delay for everyone (frames; 1 suits most games, "
+                             "try 2 if it stutters):", style="Muted.TLabel") \
+        .grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+    ttk.Spinbox(host_tab, from_=0, to=MAX_DELAY, textvariable=delay_var, width=4) \
+        .grid(row=4, column=2, sticky="w", pady=(10, 0))
 
     # Join tab
     ttk.Label(join_tab, text="Room code (or host IP)", style="Panel.TLabel").grid(row=0, column=0, sticky="w")
@@ -304,8 +394,15 @@ def run_gui(selftest: bool = False) -> int:
     # --- game image -------------------------------------------------------
     def show_ready(fp, note=""):
         state["fingerprint"] = fp
-        game_status.configure(text=f"✓ Ready. Game fingerprint {fp}{note}\n"
+        game_status.configure(text=f"✓ Ready for rollback netplay. Game fingerprint {fp}{note}\n"
                                    "Everyone you play with must have the same fingerprint.")
+        progress.grid_forget()
+
+    def show_stale(st):
+        state["fingerprint"] = None
+        game_status.configure(text=f"Your game copy ({st.fingerprint}) is {st.note} and can't play "
+                                   "this version's rollback netplay. Click “Find Reborn "
+                                   "automatically” to rebuild it (about a minute).")
         progress.grid_forget()
 
     def prepare(iso):
@@ -364,16 +461,30 @@ def run_gui(selftest: bool = False) -> int:
 
     def check_existing():
         def work():
-            fp = patcher.image_fingerprint(folder)
-            ui(lambda: show_ready(fp) if fp else game_status.configure(
-                text="Not set up yet. Click “Find Reborn automatically”."))
+            st = patcher.image_status(folder)
+            if st is None:
+                ui(lambda: game_status.configure(
+                    text="Not set up yet. Click “Find Reborn automatically”."))
+            elif st.playable:
+                note = {"release": "",
+                        "custom": "\n(Unrecognized Reborn version: compare fingerprints with friends.)",
+                        }.get(st.kind, "\n(Custom game copy, e.g. a ratings pack: everyone needs "
+                                       "the identical copy.)")
+                ui(lambda: show_ready(st.fingerprint, note))
+            else:
+                ui(lambda: show_stale(st))
         threading.Thread(target=work, daemon=True).start()
 
     # --- launching -----------------------------------------------------------
     def launch(start, open_ui=False):
         if not open_ui and need_game():
             return
-        args, env = dolphin_command(folder, start, cfg.get("reborn_install"), open_ui=open_ui)
+        cfg["telemetry"] = bool(telemetry_var.get())
+        reborn = cfg.get("reborn_install") or patcher.saved_reborn_install(folder)
+        args, env = dolphin_command(folder, start, reborn, open_ui=open_ui,
+                                    name=name_var.get().strip() or "Player",
+                                    fingerprint=state["fingerprint"] or "",
+                                    telemetry=cfg["telemetry"])
         try:
             subprocess.Popen(args, env=env, cwd=folder)
         except OSError as e:
@@ -456,11 +567,11 @@ def run_gui(selftest: bool = False) -> int:
 
         def work():
             try:
-                me = h.start(delay=delay_var.get())
+                me = h.start(delay=max(0, min(int(delay_var.get()), MAX_DELAY)))
             except (ValueError, ConnectionError) as e:
                 ui(lambda e=e: (messagebox.showinfo(APP_TITLE, str(e)), btn_start.state(["!disabled"])))
                 return
-            cfg["delay"] = delay_var.get()
+            cfg["rb_delay"] = delay_var.get()
             save_config(folder, cfg)
             state["host"] = None
             ui(lambda: (hosting_ui(False),

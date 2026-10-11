@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""nsr_patcher.py: one-click builder of the NFLStreet netplay game image.
+"""nsr_patcher.py: one-click builder of the NFLStreet rollback netplay game image.
 
 For friends testing the POC. Double-click NSR-Patcher.exe (built from this file
 with PyInstaller) inside the NFLStreet netplay Dolphin folder, and it:
@@ -7,11 +7,22 @@ with PyInstaller) inside the NFLStreet netplay Dolphin folder, and it:
   1. finds the NFL Street Reborn game image (<Reborn install>/content/games/
      NSR.iso) in the usual install locations, or asks with a file picker,
   2. checks it's the Reborn version these patches were written for,
-  3. writes nsr-net.iso next to itself: Reborn's image with the netplay
-     patches (tools/isopatch.py: freeze seed input netplay),
-  4. shows the result's fingerprint. Lockstep netplay needs byte-identical
-     images on every machine, so friends compare fingerprints (and it says
-     whether the image matches the reference build).
+  3. writes nsr-net.iso next to itself: Reborn's image with the rollback
+     netplay patches (recipe ROLLBACK_RECIPE = tools/isopatch.py
+     `freeze seed rollback`; menus run in confirmed lockstep and matches in
+     rollback, see docs/release-plan.md section 3). It builds into a
+     temporary file and only replaces nsr-net.iso once the new copy is
+     complete, so a failed build never destroys a working image,
+  4. writes nsr-image.json (recipe, source/output digests, fingerprint; no
+     paths) and shows the result's fingerprint. Netplay needs byte-identical
+     images on every machine, so the lobby compares fingerprints (and this
+     says whether the image matches the reference build).
+
+The milestone-1 lockstep image (`freeze seed input netplay`) is no longer
+built here: it can't play rollback, and the rollback image can't play
+milestone-1 lockstep, so the netplay mode is a property of the image. An old
+lockstep nsr-net.iso is recognized (LEGACY_OUTPUTS) and reported as needing a
+rebuild.
 
 Nothing is downloaded or uploaded; Reborn's own file is only read. The
 patched image is each player's own copy, made from their own install.
@@ -23,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import sys
 import time
@@ -31,6 +43,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import isopatch  # noqa: E402
 
 OUTPUT_NAME = "nsr-net.iso"
+MANIFEST_NAME = "nsr-image.json"  # sidecar describing nsr-net.iso (no paths)
+# Versioned name of the patch recipe friends build. Bump the suffix whenever
+# isopatch's rollback bytes change (then update KNOWN_INPUTS' outputs).
+ROLLBACK_RECIPE = "gn7e69-r0-rollback-v1"
+NETPLAY_MODE = "rollback"  # what this image plays (nsr_lobby.RELEASE_MODE)
 # Where the Reborn install was found, for nsr-netplay.bat to point Dolphin's
 # texture loading at Reborn's own HD texture pack (read-only; nothing in the
 # Reborn install is ever modified or copied).
@@ -41,9 +58,17 @@ REBORN_PATH_NAME = "nsr-reborn.txt"
 # patches still apply (isopatch's byte checks will refuse otherwise).
 KNOWN_INPUTS = {
     # Reborn 3.0.0 launcher, game-patch chain label "2026.09.12".
-    # Output = netplay patch set as of the seed-word patch (2026-10-07).
+    # Output = ROLLBACK_RECIPE (isopatch freeze seed rollback as of 67e0285,
+    # 2026-10-09): byte-identical to local/work/rb3.iso, the image every
+    # rollback/stage-4 test ran on. Fingerprint B57A-8270-68C2.
     "9a6fdedbdff2b2f4ebcc346ccf0bacc97e0489a15be80c648249d0b36c6270ce":
-        ("Reborn 2026.09.12", "f3fe3498d43d4e346419352b3b376810dbc675d82eb5cc1d1ee517e9193601d8"),
+        ("Reborn 2026.09.12", "b57a827068c2e4172dda3f863db9fb446982cefddcf45708b0df6c2ebb7c6a83"),
+}
+# Images earlier launchers built, so an old nsr-net.iso is reported as stale
+# instead of "unrecognized". Milestone-1 lockstep (freeze seed input netplay)
+# from Reborn 2026.09.12, fingerprint F3FE-3498-D43D.
+LEGACY_OUTPUTS = {
+    "f3fe3498d43d4e346419352b3b376810dbc675d82eb5cc1d1ee517e9193601d8": "lockstep (milestone 1)",
 }
 
 
@@ -151,26 +176,114 @@ def reborn_install_of(iso: str) -> str | None:
     return install if os.path.isdir(os.path.join(install, "content", "textures")) else None
 
 
+def saved_reborn_install(out_dir: str) -> str | None:
+    """The Reborn install recorded next to nsr-net.iso by the last build
+    (REBORN_PATH_NAME), if it still exists. Lets the launcher use Reborn's HD
+    textures when the image was built by NSR-Patcher.exe rather than by the
+    launcher itself."""
+    try:
+        with open(os.path.join(out_dir, REBORN_PATH_NAME)) as f:
+            path = f.read().strip()
+    except OSError:
+        return None
+    return path if path and os.path.isdir(os.path.join(path, "content", "textures")) else None
+
+
+def write_manifest(out_dir: str, digest_in: str, label: str | None, digest_out: str) -> None:
+    """nsr-image.json: what nsr-net.iso is. Digests and labels only; no paths
+    or Reborn content (release plan 3.1)."""
+    manifest = {"recipe": ROLLBACK_RECIPE, "mode": NETPLAY_MODE,
+                "patches": list(isopatch.NETPLAY_SET),
+                "source_label": label, "source_sha256": digest_in,
+                "output_sha256": digest_out, "fingerprint": fingerprint(digest_out),
+                "ratings_pack_sha256": None,
+                "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    tmp = os.path.join(out_dir, MANIFEST_NAME + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(manifest, f, indent=1)
+    os.replace(tmp, os.path.join(out_dir, MANIFEST_NAME))
+
+
+def read_manifest(out_dir: str) -> dict:
+    try:
+        with open(os.path.join(out_dir, MANIFEST_NAME)) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def prepare_image(iso: str, out_dir: str, progress=None) -> Prepared:
     """Check Reborn's image, build nsr-net.iso in out_dir, fingerprint it.
     progress(stage, done, total) with stage in {"check", "build", "verify"}.
-    Raises isopatch.PatchError if the patches don't fit this Reborn version
-    (nothing is left behind). Reborn's files are only read."""
+    Raises isopatch.PatchError if the patches don't fit this Reborn version.
+    The build goes to a temporary file that replaces nsr-net.iso only when
+    complete, so a failure leaves any previous image untouched and no partial
+    file behind. Reborn's files are only read."""
     step = (lambda st: (lambda d, t: progress(st, d, t))) if progress else (lambda st: None)
     digest_in = sha256(iso, progress=step("check")) if progress else sha256(iso, "checking Reborn image")
     known = KNOWN_INPUTS.get(digest_in)
     out = os.path.join(out_dir, OUTPUT_NAME)
-    isopatch.build(iso, out, set(isopatch.NETPLAY_SET),
-                   progress=step("build") if progress else (lambda d, t: _bar("copying + patching", d, t)))
-    if not progress:
-        print()
-    digest_out = sha256(out, progress=step("verify")) if progress else sha256(out, "fingerprinting result")
+    tmp = out + ".partial"
+    if os.path.abspath(iso) in (os.path.abspath(out), os.path.abspath(tmp)):
+        raise isopatch.PatchError("the Reborn image and the output are the same file")
+    try:
+        isopatch.build(iso, tmp, set(isopatch.NETPLAY_SET),
+                       progress=step("build") if progress else (lambda d, t: _bar("copying + patching", d, t)))
+        if not progress:
+            print()
+        digest_out = sha256(tmp, progress=step("verify")) if progress else sha256(tmp, "fingerprinting result")
+        os.replace(tmp, out)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    write_manifest(out_dir, digest_in, known[0] if known else None, digest_out)
     install = reborn_install_of(iso)
     if install:
         with open(os.path.join(out_dir, REBORN_PATH_NAME), "w") as f:
             f.write(install)
     return Prepared(out, fingerprint(digest_out), known[0] if known else None,
                     (digest_out == known[1]) if known else None, install)
+
+
+class ImageStatus:
+    """What an existing nsr-net.iso is: kind "release" (a known rollback
+    output), "custom" (current recipe from an unrecognized Reborn, per its
+    manifest), "legacy" (an older launcher's lockstep image: rebuild), or
+    "unknown" (e.g. a ratings-pack build, docs/roster-editing.md). Only
+    "legacy" is refused: the lobby's fingerprint check keeps any other
+    mismatch out of a room, and refusing "unknown" would block ratings packs."""
+
+    def __init__(self, fingerprint: str, kind: str, note: str = ""):
+        self.fingerprint = fingerprint
+        self.kind = kind
+        self.note = note
+
+    @property
+    def playable(self) -> bool:
+        return self.kind != "legacy"
+
+
+def image_status(out_dir: str, progress=None) -> ImageStatus | None:
+    """Classify an existing nsr-net.iso in out_dir (None if missing). Hashes the
+    whole image (a few seconds) so a stale or damaged copy is never reported
+    as ready."""
+    path = os.path.join(out_dir, OUTPUT_NAME)
+    if not os.path.isfile(path):
+        return None
+    digest = sha256(path, progress=progress or (lambda d, t: None))
+    fp = fingerprint(digest)
+    if digest in {out for _, out in KNOWN_INPUTS.values()}:
+        return ImageStatus(fp, "release")
+    if digest in LEGACY_OUTPUTS:
+        return ImageStatus(fp, "legacy", f"an older {LEGACY_OUTPUTS[digest]} build")
+    manifest = read_manifest(out_dir)
+    if manifest.get("recipe") == ROLLBACK_RECIPE and manifest.get("output_sha256") == digest:
+        return ImageStatus(fp, "custom", "unrecognized Reborn version")
+    return ImageStatus(fp, "unknown", "not built by this version")
 
 
 def image_fingerprint(out_dir: str, progress=None) -> str | None:
@@ -182,7 +295,7 @@ def image_fingerprint(out_dir: str, progress=None) -> str | None:
 
 
 def run(iso: str | None, out_dir: str) -> int:
-    print("NFLStreet netplay image builder\n")
+    print("NFLStreet rollback netplay image builder\n")
     if not iso:
         print("Looking for NFL Street Reborn...")
         iso = find_reborn_iso() or ask_for_iso()
@@ -199,7 +312,8 @@ def run(iso: str | None, out_dir: str) -> int:
         return 1
     print(f"  {r.reborn_label or 'unknown Reborn version (patches applied cleanly)'}; "
           f"done in {time.time() - started:.0f}s")
-    print(f"\nYour netplay image fingerprint:  {r.fingerprint}")
+    print(f"\nRecipe: {ROLLBACK_RECIPE}")
+    print(f"Your netplay image fingerprint:  {r.fingerprint}")
     if r.matches_reference:
         print("Matches the reference build. Everyone with this fingerprint can play together.")
     elif r.matches_reference is False:
