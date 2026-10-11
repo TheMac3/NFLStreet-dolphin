@@ -73,6 +73,7 @@
 #include "Common/Swap.h"
 #include "Common/Thread.h"
 #include "Core/Config/MainSettings.h"
+#include "Core/ConfigManager.h"
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
 #include "Core/HW/DSP.h"
@@ -90,6 +91,11 @@
 
 namespace NSRNetplay
 {
+// Defined with the state digest; refuses a differently configured peer (M2).
+static void FailConfigMismatch(u32 player, const RollbackNet::ConfigFingerprint* local,
+                               const RollbackNet::ConfigFingerprint* remote, u64 local_digest,
+                               u64 remote_digest);
+
 namespace
 {
 constexpr u32 PAD_SIZE = 12;          // PADStatus
@@ -194,6 +200,7 @@ std::optional<RollbackNet::HandoffAgreement> s_rb_handoff;
 std::optional<u32> s_rb_logged_desync;
 bool s_rb_bad_session_logged = false;
 bool s_rb_peer_desync_logged = false;
+size_t s_rb_desyncs_dumped = 0;  // Exchange::Desyncs() entries already dumped
 // One log line per epoch for the first rejected (protocol-violating) packet.
 bool s_rb_violation_logged = false;
 
@@ -572,6 +579,23 @@ void HandlePacket(const ENetPacket* packet, u32 source)
   u32 magic = 0;
   if (packet->dataLength >= sizeof(magic))
     std::memcpy(&magic, packet->data, sizeof(magic));
+  // A peer running another protocol version cannot be parsed at all; say so
+  // once (M2) instead of leaving only a timeout.  Byte 4 is the version in
+  // both rollback formats.
+  if ((magic == RollbackNet::HANDOFF_MAGIC || magic == RollbackNet::MAGIC) &&
+      packet->dataLength > 4)
+  {
+    const u8 version = static_cast<const u8*>(packet->data)[4];
+    const u8 expected =
+        magic == RollbackNet::MAGIC ? RollbackNet::VERSION : RollbackNet::HANDOFF_VERSION;
+    static bool version_logged = false;
+    if (version != expected && !version_logged)
+    {
+      version_logged = true;
+      Log("bad config: peer {} sends rollback protocol {} version {}, this build speaks {}",
+          source, magic == RollbackNet::MAGIC ? "NSRB" : "NSRH", version, expected);
+    }
+  }
   if (magic == RollbackNet::HANDOFF_MAGIC)
   {
     const auto decoded = RollbackNet::DecodeHandoff(
@@ -627,6 +651,14 @@ void HandlePacket(const ENetPacket* packet, u32 source)
     if (!s_rb_exchange->Accept(*decoded, HostNowUs()))
     {
       NSRTelemetry::Count(NSRTelemetry::Counter::PacketsRejected, 1, decoded->sender);
+      if (const auto& mismatch = s_rb_exchange->ConfigMismatch(); mismatch && !s.failed)
+      {
+        // Same epoch, different simulation config (fixed-epoch sessions have
+        // no handoff barrier; otherwise the barrier already refused it).
+        FailConfigMismatch(mismatch->player, nullptr, nullptr, s_rb_exchange->Config(),
+                           mismatch->remote);
+        return;
+      }
       const auto& v = s_rb_exchange->FirstViolation();
       if (v && !s_rb_violation_logged)
       {
@@ -1205,6 +1237,13 @@ struct RollbackConfig
   u32 ac_polls_per_tick = 1000;
   u32 ac_song_frames = 10800;
   u32 ac_song_gap = 380;
+  // NSR_RB_DIGEST=semantic: exchange only the nine semantic words, as before
+  // the canonical state digest (diagnostics: shows what the old check misses).
+  bool digest_semantic_only = false;
+  // NSR_RB_TEST_CORRUPT=frame:addr (diagnostics, one peer only): flip one byte
+  // of game state at the start of `frame` (live and re-simulated alike, so a
+  // rollback cannot undo it) to prove the desync check detects divergence.
+  std::optional<std::pair<u32, u32>> test_corrupt;
 };
 
 struct Rollback
@@ -1463,6 +1502,14 @@ RollbackConfig& ConfigForRollback()
       std::max<u32>(1, ParseU32(Env("NSR_AC_POLLS_PER_TICK")).value_or(1000));
   c.ac_song_frames = std::max<u32>(1, ParseU32(Env("NSR_AC_SONG_FRAMES")).value_or(10800));
   c.ac_song_gap = ParseU32(Env("NSR_AC_SONG_GAP")).value_or(380);
+  c.digest_semantic_only = Env("NSR_RB_DIGEST") == "semantic";
+  if (const auto parts = Split(Env("NSR_RB_TEST_CORRUPT"), ':'); parts.size() == 2)
+  {
+    const auto frame = ParseU32(parts[0]);
+    const auto address = ParseU32(parts[1]);
+    if (frame && address)
+      c.test_corrupt = std::pair<u32, u32>{*frame, *address};
+  }
   r.config_loaded = true;
   return c;
 }
@@ -2444,6 +2491,9 @@ struct AllocEvent
   u32 lo, hi;
 };
 std::map<u32, u32> s_audio_blocks;  // payload start -> end (virtual)
+// Every heap descriptor an audio-owned allocation ever came from (sticky for
+// the process, unlike s_audio_blocks; see DigestExclusions).
+std::set<u32> s_audio_heaps;
 std::vector<AllocEvent> s_alloc_log;
 u64 s_alloc_seq = 0;
 std::map<const u8*, u64> s_slot_seq;  // snapshot slot -> s_alloc_seq when saved
@@ -3507,6 +3557,11 @@ void AllocHook(const Core::CPUThreadGuard& guard)
   // from the end of the free area): then the extent is read at dump time.
   const u32 end = BlockEnd(system.GetMemory().GetRAM(), p);
   s_audio_blocks[p] = end;
+  if (const u32 heap = PowerPC::MMU::HostRead<u32>(guard, p - 8);
+      heap >= 0x80003100 && heap < 0x817FFFF0 && PowerPC::MMU::HostRead<u32>(guard, heap + 4) == heap)
+  {
+    s_audio_heaps.insert(heap);
+  }
   s_alloc_log.push_back({++s_alloc_seq, true, p, end});
 }
 
@@ -3557,26 +3612,10 @@ std::optional<std::pair<u32, u32>> EnclosingBlock(const u8* ram, u32 p)
 }
 }  // namespace
 
-static void WritePerMachineSidecar(Core::System& system, const u8* ram, const std::string& dump)
+// Boot-time disc/stream I/O objects: the heap blocks enclosing what the I/O
+// root words point at now (block header -> next header, virtual).
+static std::map<u32, u32> IoObjectBlocks(const u8* ram)
 {
-  FILE* f = std::fopen((dump + ".permachine").c_str(), "w");
-  if (!f)
-    return;
-  std::fprintf(f, "# per-machine ranges at dump time: lo hi kind (virtual, [lo, hi)); "
-                  "NSRNetplay WritePerMachineSidecar\n");
-  size_t blocks = 0;
-  for (const auto& [p, recorded] : s_audio_blocks)
-  {
-    // The header's links can change as neighbours are allocated/freed; the
-    // block's own extent is fixed while it is allocated.
-    const u32 end = BlockEnd(ram, p) ? BlockEnd(ram, p) : recorded;
-    if (!end)
-      continue;
-    std::fprintf(f, "%08x %08x audio-heap\n", p - 0x10, end);
-    ++blocks;
-  }
-  for (const auto& [lo, hi] : RbLiveRanges(system, ram, true))
-    std::fprintf(f, "%08x %08x os-live\n", 0x80000000 | lo, 0x80000000 | hi);
   auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
   std::vector<u32> roots(IO_ROOT_WORDS.begin(), IO_ROOT_WORDS.end());
   for (u32 a = IO_ROOT_TABLE.first; a < IO_ROOT_TABLE.second; a += 4)
@@ -3587,12 +3626,16 @@ static void WritePerMachineSidecar(Core::System& system, const u8* ram, const st
     if (const auto b = EnclosingBlock(ram, rd(root)))
       io[b->first] = b->second;
   }
-  for (const auto& [lo, hi] : io)
-    std::fprintf(f, "%08x %08x io-object\n", lo, hi);
-  // Audio data blocks the allocator watch cannot attribute (loaded by the
-  // game's file loader, e.g. PathFinder project data 'PFDx', whose variables
-  // the audio thread updates): heap blocks that an audio-heap block points
-  // into and whose payload starts with a known audio data magic.
+  return io;
+}
+
+// Audio data blocks the allocator watch cannot attribute (loaded by the
+// game's file loader, e.g. PathFinder project data 'PFDx', whose variables
+// the audio thread updates): heap blocks that an audio-heap block points into
+// and whose payload starts with a known audio data magic.  [header, next).
+static std::map<u32, u32> AudioDataBlocks(const u8* ram)
+{
+  auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
   constexpr std::array<u32, 1> AUDIO_DATA_MAGICS{0x50464478};  // 'PFDx'
   std::map<u32, u32> data;
   for (const auto& [p, recorded] : s_audio_blocks)
@@ -3613,8 +3656,50 @@ static void WritePerMachineSidecar(Core::System& system, const u8* ram, const st
         data[q - 0x10] = next;
     }
   }
-  for (const auto& [lo, hi] : data)
-    std::fprintf(f, "%08x %08x audio-data\n", lo, hi);
+  return data;
+}
+
+// One per-machine range of the classification below: virtual [lo, hi) and
+// its sidecar kind (a string literal).
+struct PerMachineRange
+{
+  u32 lo, hi;
+  const char* kind;
+};
+
+// The dynamic per-machine classification of the state in `ram` (dumps'
+// .permachine sidecars and the canonical state digest share it, so the
+// netplay oracle and the runtime desync check exclude the same bytes).  In
+// sidecar order: audio heap blocks, live OS objects (every thread, alarm, DVD
+// and ARQ request, audio callback node, tick accumulator, disc staging/stream
+// destinations, GX FIFO), boot-time disc/stream I/O objects, PathFinder audio
+// data blocks, then each audio-touched heap's counters and free blocks.
+// `io_blocks` / `audio_data` replace the I/O objects / audio data blocks found
+// from the current state, and `with_heaps` = false leaves out the heap
+// counters/free blocks (the state digest passes its fixed sets and applies a
+// superset heap rule; see DigestExclusions).
+static std::vector<PerMachineRange> PerMachineRanges(Core::System& system, const u8* ram,
+                                                     const std::map<u32, u32>* io_blocks = nullptr,
+                                                     const std::map<u32, u32>* audio_data = nullptr,
+                                                     bool with_heaps = true)
+{
+  std::vector<PerMachineRange> out;
+  for (const auto& [p, recorded] : s_audio_blocks)
+  {
+    // The header's links can change as neighbours are allocated/freed; the
+    // block's own extent is fixed while it is allocated.
+    const u32 end = BlockEnd(ram, p) ? BlockEnd(ram, p) : recorded;
+    if (!end)
+      continue;
+    out.push_back({p - 0x10, end, "audio-heap"});
+  }
+  for (const auto& [lo, hi] : RbLiveRanges(system, ram, true))
+    out.push_back({0x80000000 | lo, 0x80000000 | hi, "os-live"});
+  auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
+  for (const auto& [lo, hi] : io_blocks ? *io_blocks : IoObjectBlocks(ram))
+    out.push_back({lo, hi, "io-object"});
+  for (const auto& [lo, hi] : audio_data ? *audio_data : AudioDataBlocks(ram))
+    out.push_back({lo, hi, "audio-data"});
   // Heaps that hold audio blocks also hold game blocks (e.g. the small heap
   // 0x804C4810 the audio allocator object fn_801E10F0 uses is shared with UI
   // text), and audio code allocates and frees there on audio time. Its effect
@@ -3624,6 +3709,8 @@ static void WritePerMachineSidecar(Core::System& system, const u8* ram, const st
   // are found by walking the heap's block chain from its start (+0x14) to its
   // end (+0x18) through each header's next link; a header whose "used" byte
   // is clear is free.
+  if (!with_heaps)
+    return out;
   std::set<u32> heaps;
   for (const auto& [p, recorded] : s_audio_blocks)
   {
@@ -3633,7 +3720,7 @@ static void WritePerMachineSidecar(Core::System& system, const u8* ram, const st
   }
   for (const u32 heap : heaps)
   {
-    std::fprintf(f, "%08x %08x heap-counters\n", heap + 0x24, heap + 0x30);
+    out.push_back({heap + 0x24, heap + 0x30, "heap-counters"});
     const u32 start = rd(heap + 0x14), end = rd(heap + 0x18);
     u32 h = start;
     for (int n = 0; n < 200000 && h >= start && h + 0x20 <= end && h < 0x817FFFF0; ++n)
@@ -3645,11 +3732,28 @@ static void WritePerMachineSidecar(Core::System& system, const u8* ram, const st
         hdr = h + 0x10;
       const u32 next = rd(hdr + 0xC);
       if (rd(hdr + 8) == heap && (rd(hdr + 4) & 0xFF00) == 0 && next > hdr + 0x10 && next <= end)
-        std::fprintf(f, "%08x %08x heap-free\n", hdr + 0x10, next);
+        out.push_back({hdr + 0x10, next, "heap-free"});
       if (next <= h || next > end)
         break;
       h = next;
     }
+  }
+  return out;
+}
+
+static void WritePerMachineSidecar(Core::System& system, const u8* ram, const std::string& dump)
+{
+  FILE* f = std::fopen((dump + ".permachine").c_str(), "w");
+  if (!f)
+    return;
+  std::fprintf(f, "# per-machine ranges at dump time: lo hi kind (virtual, [lo, hi)); "
+                  "NSRNetplay WritePerMachineSidecar\n");
+  size_t blocks = 0;
+  for (const PerMachineRange& range : PerMachineRanges(system, ram))
+  {
+    std::fprintf(f, "%08x %08x %s\n", range.lo, range.hi, range.kind);
+    if (std::strcmp(range.kind, "audio-heap") == 0)
+      ++blocks;
   }
   std::fclose(f);
   Log("wrote {}.permachine ({} audio heap blocks)", dump, blocks);
@@ -3764,6 +3868,673 @@ static u64 RbSemanticChecksum(const Core::CPUThreadGuard& guard)
   return hash;
 }
 
+// ---------------------------------------------------------------------------
+// Canonical state digest (final review H4).
+//
+// Peers compare a digest of the deterministic game state at the start of
+// each finalized frame (the frame whose inputs every peer has confirmed;
+// Exchange::UpdateFinalized), and at stage-4 enter/leave barriers.  The old
+// value covered nine semantic words (two RNG streams, the tick clock, flow
+// and play state), so a divergence anywhere else stayed silent until it
+// happened to reach one of them.
+//
+// What is hashed: every restored MEM1 byte (r.segments: MEM1 minus RB_KEEP,
+// plus AUDIO_KEEP when audio is kept live) and the snapshotted fake-VMEM
+// prefix (the EA database heap), plus the old semantic words and the list of
+// excluded ranges.  What is excluded, all from existing audited lists so the
+// runtime check and the whole-RAM netplay oracle (tools/rbdiff.py) agree:
+//   - RB_KEEP (never restored) and AUDIO_KEEP (rbdiff excludes it in every
+//     mode: middleware .data follows each machine's audio time);
+//   - rbdiff's static per-machine words (STATIC_PER_MACHINE below);
+//   - the dynamic per-machine classification of the current state, exactly
+//     what the dump sidecars list (PerMachineRanges: audio heap blocks, live
+//     OS objects incl. the GX FIFO and disc staging, I/O objects, audio data
+//     blocks, audio-touched heaps' counters and free blocks);
+//   - the game's PADStatus buffer (RB_PAD_BUF): input, not state.  The frame
+//     stub writes the frame's (possibly predicted) pads there before the
+//     digest is taken; they are covered by the input exchange itself.
+// The dynamic part is derived from the state being hashed, so peers in the
+// same state exclude the same bytes; the merged list is hashed too, so a
+// difference in heap ownership (final review M3) is a mismatch as well.
+// Bytes are hashed as stored (guest big-endian), page hashes combined in
+// host order: every supported host is little-endian.
+//
+// Cost: per-page XXH3-64 values are cached between digests and only pages
+// the dirty tracker stamped since the cached state are rehashed, from the
+// ring slot that was just saved (it equals RAM at that epoch).  Pages that
+// overlap a dynamic exclusion are hashed directly each time (only their
+// included pieces).  The digest itself hashes the ~6,700 page values.
+// Without a dirty tracker (NSR_RB_DIRTY=0, a diagnostic setting) every page
+// is rehashed on every digest.  Handoff barriers hash everything once.
+//
+// Deferred: the unsnapshotted ARAM replay ring (final review M1) is neither
+// restored nor hashed; revisit with M1's frame-keyed ARAM undo log.  Hashing
+// the frame's full CPU context is unnecessary: digests are taken at the frame
+// stub, where the main thread's state is the same call path on every peer.
+// ---------------------------------------------------------------------------
+namespace
+{
+// Version of the exclusion rules; part of the config fingerprint, so peers
+// with different rules refuse to play instead of reporting false desyncs.
+constexpr u32 STATE_DIGEST_RANGES_VERSION = 1;
+
+// tools/rbdiff.py PER_MACHINE entries below its STATIC_END (.data/.bss words
+// that follow audio/disc time in every mode; physical [lo, hi)).  Keep the
+// two lists in sync (and bump STATE_DIGEST_RANGES_VERSION) when either moves.
+constexpr std::array<std::pair<u32, u32>, 11> STATIC_PER_MACHINE{{
+    {0x0037F8C0, 0x00381C20},  // disc worker thread/stack
+    {0x0039B42C, 0x0039B430},  // disc worker owner word
+    {0x003D51A0, 0x003D51A4},  // disc worker owner word
+    {0x002C8840, 0x002C89E0},  // audio streaming I/O
+    {0x003EBC3C, 0x003EBC40},  // audio streaming I/O
+    {0x003ECFA0, 0x003ECFA4},  // audio streaming I/O
+    {0x002F481C, 0x002F4834},  // PathFinder music globals (audio thread)
+    {0x0039B3F0, 0x0039B3F4},  // thread owner word (audio/disc)
+    {0x003D55D0, 0x003D55DC},  // thread owner/link words (audio/disc)
+    {0x003D55E0, 0x003DD600},  // disc/stream staging
+    {0x003EBB24, 0x003EBB78},  // PathFinder music globals (audio thread)
+}};
+
+struct StateDigest
+{
+  // Cache: per state page, XXH3-64 of its restored bytes, valid where
+  // valid[p] (the page has not changed since `epoch`).
+  std::vector<u64> page;
+  std::vector<u8> valid;
+  // The same for partly excluded MEM1 pages: their included-pieces hash, valid
+  // while the page is unchanged and its exclusions have the same signature.
+  std::vector<u64> part;
+  std::vector<u64> part_sig;
+  std::vector<u8> part_valid;
+  std::optional<u32> epoch;
+  std::pair<u32, u32> fifo{0, 0};  // tracker's GX FIFO pages when cached
+  // Scratch, reused between digests.
+  std::vector<u8> kind;  // per MEM1 page: 0 cached, 1 partly excluded, 2 excluded
+  std::vector<u64> sig;  // per MEM1 page: signature of its exclusion pieces
+  std::vector<RollbackLogic::Range> excluded;  // merged, physical
+  std::vector<u64> values;                     // per state page, combined in order
+  // Diagnostics, per ring slot: the frame it describes and its page values.
+  std::vector<u32> slot_frame;
+  std::vector<std::vector<u64>> slot_values;
+  std::vector<u64> slot_semantic;
+  std::vector<std::vector<RollbackLogic::Range>> slot_excluded;
+  u32 dumped_through = RollbackNet::NO_FRAME;  // NSR_RB_DIGEST_DUMP_EVERY progress
+  // The boot-time I/O objects, fixed at the first rollback entry (see
+  // DigestExclusions); empty until then.
+  std::optional<std::map<u32, u32>> io_blocks;
+  // The audio data blocks, fixed per epoch from its agreed first state:
+  // scanning every audio block for pointers cost ~0.2 ms per digest, and the
+  // data is loaded with the match.  Revisit if PathFinder loads project data
+  // mid-match (it would show as a digest mismatch inside such a block).
+  std::optional<std::map<u32, u32>> audio_data;
+  u64 digests = 0, total_ns = 0, classify_ns = 0, rehashed = 0, direct = 0;
+  u64 per_machine_ns = 0, heap_ns = 0;  // parts of classify_ns
+
+  void Invalidate()
+  {
+    epoch.reset();
+    std::fill(valid.begin(), valid.end(), u8{0});
+    std::fill(part_valid.begin(), part_valid.end(), u8{0});
+    std::fill(slot_frame.begin(), slot_frame.end(), RollbackNet::NO_FRAME);
+    dumped_through = RollbackNet::NO_FRAME;
+    audio_data.reset();
+  }
+};
+StateDigest s_digest;
+
+// Per-machine words the state digest found beyond the lists above: each one
+// differed between two peers' finalized states in the two-human netplay gate
+// while all game state was equal (local/work/statehash, NSR_RB_DESYNC_DUMPS),
+// and both are written on audio time.  Also add them to rbdiff.py when it is
+// next touched; they were invisible to it only because its dumps are sampled
+// at frames where both machines happened to agree.
+constexpr std::array<std::pair<u32, u32>, 3> DIGEST_PER_MACHINE{{
+    // Audio-middleware .data 0x802FFE00..0x80300800 (stream/voice config and
+    // the handle generation byte 0x80300038, which differed: c4 vs c2, fb vs
+    // fd).  The Codex audio ownership audit (local/work/codex/audio-hardening-
+    // patches, 0002) found it referenced only by middleware code and proposed
+    // it for AUDIO_KEEP; that patch is unmerged, so the digest excludes it.
+    {0x002FFE00, 0x00300800},
+    // Two thread words just before PADStatus: main (0x803A3F30) on one peer,
+    // the audio thread (0x803AA828) on the other at the same frame start,
+    // always together with an audio allocation in the small heap.
+    {0x003E92C0, 0x003E92CC},
+    // +0x10 of the game's sound manager (object at 0x8030A518, *(r13-0x7C00),
+    // set up by fn_8006E710 next to the sound-start rate limiter): a ms-like
+    // value, 0x13E8 vs 0x13E0 at one frame start in ~57,000 compared frames,
+    // equal again by the next whole-RAM dump.  Revisit (find its writer with
+    // a memory watch) if more of this object shows up in a .pages diff.
+    {0x0030A528, 0x0030A52C},
+}};
+
+// The excluded ranges for the state in `ram` (current RAM: the classification
+// walks OS lists whose heads live in RB_KEEP, which slots don't hold).
+//
+// One deliberate difference from the sidecar: the I/O objects.  The sidecar
+// finds them from root words that the stream source rewrites on audio time
+// (the request table is itself a static per-machine range), so at a given
+// frame two peers can point at different blocks (first netplay gate: a
+// 0x210-byte block excluded on one peer only, a false desync 24 frames into
+// the match).  rbdiff hides that by uniting both dumps' sidecars; a digest
+// cannot.  The objects are boot-time allocations that never move, so the
+// digest uses the set found in the first agreed state (the first entry
+// barrier, or the first epoch start without one) for the whole process.
+// Transient references to audio buffers are covered by audio-heap anyway.
+// Revisit if a non-audio block reached only through the request table shows
+// per-machine bytes (a false desync whose .pages diff points there).
+void DigestExclusions(Core::System& system, const u8* ram, u32 mem1_size,
+                      std::vector<RollbackLogic::Range>* out)
+{
+  if (!s_digest.io_blocks)
+    s_digest.io_blocks = IoObjectBlocks(ram);
+  if (!s_digest.audio_data)
+    s_digest.audio_data = AudioDataBlocks(ram);
+  std::vector<RollbackLogic::Range> ranges;
+  auto add = [&](u32 lo, u64 len) {
+    if (lo < mem1_size && len > 0)
+      ranges.push_back({lo, static_cast<u32>(std::min<u64>(u64{lo} + len, mem1_size))});
+  };
+  const auto t0 = std::chrono::steady_clock::now();
+  for (const PerMachineRange& range : PerMachineRanges(system, ram, &*s_digest.io_blocks, &*s_digest.audio_data, false))
+  {
+    if (range.hi > range.lo)
+      add(range.lo & 0x01FFFFFF, range.hi - range.lo);
+  }
+  for (const auto& [lo, hi] : AUDIO_KEEP)
+    add(lo, hi - lo);
+  for (const auto& [lo, hi] : STATIC_PER_MACHINE)
+    add(lo, hi - lo);
+  for (const auto& [lo, hi] : DIGEST_PER_MACHINE)
+    add(lo, hi - lo);
+  add(RB_PAD_BUF & 0x01FFFFFF, MAX_PLAYERS * PAD_SIZE);
+  // Allocator metadata of every heap audio code has allocated from.  The
+  // audio thread allocates and frees there on audio time (e.g. a 0x20-byte
+  // block in the small heap 0x804C4810 that one peer holds at a frame start
+  // and the other does not), which moves block headers, back links, free
+  // block headers and the descriptor's bookkeeping.  Excluding every block
+  // header and aligned pre-header, every free block whole, and the
+  // descriptor's counters/bins (+0x24..+0x70: block/byte counts and an
+  // operation count, observed differing) makes both layouts exclude the same
+  // merged ranges: a transient audio block is excluded as audio-heap on one
+  // peer and as free space on the other.  Game blocks' payloads stay hashed.
+  // The heap set is sticky for the process (audio allocates in these heaps
+  // from the first menus on), so it does not depend on whether a transient
+  // block exists right now.
+  const auto t1 = std::chrono::steady_clock::now();
+  auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
+  for (const u32 heap : s_audio_heaps)
+  {
+    add((heap & 0x01FFFFFF) + 0x24, 0x70 - 0x24);
+    const u32 first = rd(heap + 0x14), last = rd(heap + 0x18);
+    u32 h = first;
+    for (int n = 0; n < 200000 && h >= first && h + 0x20 <= last && h < 0x817FFFF0; ++n)
+    {
+      u32 hdr = h;
+      if (rd(h + 8) != heap && rd(h + 0xC) == 0 && (rd(h + 4) & 0xFFFF0000) == 0x001C0000)
+        hdr = h + 0x10;  // aligned block: 16-byte pre-header first
+      const u32 next = rd(hdr + 0xC);
+      if (rd(hdr + 8) != heap || next <= hdr || next > last)
+        break;
+      const bool free_block = (rd(hdr + 4) & 0xFF00) == 0;
+      const u32 lo = h & 0x01FFFFFF, hi = ((free_block ? next : hdr + 0x10) & 0x01FFFFFF);
+      if (!ranges.empty() && ranges.back().hi == lo)
+        ranges.back().hi = std::min(hi, mem1_size);  // adjacent: extend (fewer ranges)
+      else
+        add(lo, hi - lo);
+      h = next;
+    }
+  }
+  const auto t2 = std::chrono::steady_clock::now();
+  s_digest.per_machine_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+  s_digest.heap_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+  *out = RollbackLogic::MergeRanges(std::move(ranges));
+}
+}  // namespace
+
+// Digest of the state at the start of `frame`.  `slot` is the ring slot just
+// saved for that frame (incremental: the cache source), or null for a one-off
+// full digest of RAM (handoff barriers).  Call it after the frame's pads are
+// written and nothing else has run.
+static u64 RbStateDigest(Core::System& system, const std::vector<u8>* slot, u64 semantic,
+                         u32 frame)
+{
+  Rollback& r = s_rb;
+  DirtyTracker& d = s_dirty;
+  if (r.config.digest_semantic_only || !d.paged)
+    return semantic;
+  constexpr u32 PAGE = DirtyTracker::PAGE;
+  const auto start = std::chrono::steady_clock::now();
+  StateDigest& sd = s_digest;
+  const u8* ram = system.GetMemory().GetRAM();
+  const u32 mem1_pages = d.mem1_pages;
+  const bool vmem_in_slot = slot && slot->size() >= r.mem1_size + r.vmem_bytes;
+  const u32 vmem_pages = r.vmem_bytes && (vmem_in_slot || !slot) ? d.vmem_pages : 0;
+  const u32 pages = mem1_pages + vmem_pages;
+
+  DigestExclusions(system, ram, r.mem1_size, &sd.excluded);
+  const auto classified = std::chrono::steady_clock::now();
+  sd.kind.assign(mem1_pages, 0);
+  sd.sig.assign(mem1_pages, 0);
+  for (const RollbackLogic::Range& x : sd.excluded)
+  {
+    for (u32 p = x.lo / PAGE; p <= (x.hi - 1) / PAGE && p < mem1_pages; ++p)
+    {
+      const u32 plo = p * PAGE, phi = std::min(plo + PAGE, r.mem1_size);
+      if (x.lo <= plo && x.hi >= phi)
+      {
+        sd.kind[p] = 2;
+        continue;
+      }
+      if (sd.kind[p] == 0)
+        sd.kind[p] = 1;
+      const u64 piece = (u64{std::max(x.lo, plo)} << 32) | std::min(x.hi, phi);
+      sd.sig[p] = (sd.sig[p] ^ piece) * 0x100000001B3ULL + 0x9E3779B97F4A7C15ULL;
+    }
+  }
+
+  // Cache bookkeeping (incremental digests only).  A moved GX FIFO resyncs
+  // every slot (DirtyTracker::FifoPages), so pages it skipped may be stale.
+  std::optional<u32> since;
+  if (slot)
+  {
+    if (sd.page.size() != pages)
+    {
+      sd.page.assign(pages, 0);
+      sd.valid.assign(pages, 0);
+      sd.part.assign(mem1_pages, 0);
+      sd.part_sig.assign(mem1_pages, 0);
+      sd.part_valid.assign(mem1_pages, 0);
+      sd.epoch.reset();
+    }
+    if (d.fifo_pages != sd.fifo)
+    {
+      sd.fifo = d.fifo_pages;
+      sd.Invalidate();
+    }
+    since = d.on ? sd.epoch : std::nullopt;
+  }
+  sd.values.assign(pages, 0);
+  const u8* cache_src = slot ? slot->data() : ram;
+  const u8* vmem_src = slot ? slot->data() + r.mem1_size : r.vmem;
+  const std::vector<RollbackLogic::Range>& excluded = sd.excluded;
+  std::atomic<u64> rehashed{0}, direct{0};
+  s_workers.Run(pages, PAGE_CHUNK, [&](u32 lo, u32 hi) {
+    std::array<u8, PAGE> buf;
+    u64 n_rehashed = 0, n_direct = 0;
+    // Hash page p's restored bytes (its segment pieces) from `base`.
+    auto hash_page = [&](const u8* base, u32 p) -> u64 {
+      if (p >= mem1_pages)
+      {
+        const u32 a = (p - mem1_pages) * PAGE;
+        return XXH3_64bits(vmem_src + a, std::min(PAGE, r.vmem_bytes - a));
+      }
+      const u32 c0 = d.page_first[p], c1 = d.page_first[p + 1];
+      if (c1 == c0 + 1)
+        return XXH3_64bits(base + d.chunks[c0].first, d.chunks[c0].second - d.chunks[c0].first);
+      size_t n = 0;
+      for (u32 c = c0; c < c1; ++c)
+      {
+        const auto [a, b] = d.chunks[c];
+        std::memcpy(buf.data() + n, base + a, b - a);
+        n += b - a;
+      }
+      return XXH3_64bits(buf.data(), n);
+    };
+    for (u32 p = lo; p < hi; ++p)
+    {
+      if (slot && (!since || d.stamp[p] > *since))
+      {
+        sd.valid[p] = 0;
+        if (p < mem1_pages)
+          sd.part_valid[p] = 0;
+      }
+      const u8 k = p < mem1_pages ? sd.kind[p] : u8{0};
+      if (k == 2)
+        continue;  // value stays 0
+      if (k == 1 && slot && sd.part_valid[p] && sd.part_sig[p] == sd.sig[p])
+      {
+        sd.values[p] = sd.part[p];
+        continue;
+      }
+      if (k == 1)
+      {
+        // Only the included pieces, read from RAM (the exclusions are RAM's;
+        // RAM equals the slot here except for the excluded pad buffer).
+        size_t n = 0;
+        auto it = std::upper_bound(excluded.begin(), excluded.end(), p * PAGE,
+                                   [](u32 v, const RollbackLogic::Range& x) { return v < x.hi; });
+        for (u32 c = d.page_first[p]; c < d.page_first[p + 1]; ++c)
+        {
+          u32 a = d.chunks[c].first;
+          const u32 b = d.chunks[c].second;
+          while (a < b)
+          {
+            while (it != excluded.end() && it->hi <= a)
+              ++it;
+            if (it != excluded.end() && it->lo <= a)
+            {
+              a = it->hi;
+              continue;
+            }
+            const u32 e = it != excluded.end() && it->lo < b ? it->lo : b;
+            std::memcpy(buf.data() + n, ram + a, e - a);
+            n += e - a;
+            a = e;
+          }
+        }
+        sd.values[p] = XXH3_64bits(buf.data(), n);
+        if (slot)
+        {
+          sd.part[p] = sd.values[p];
+          sd.part_sig[p] = sd.sig[p];
+          sd.part_valid[p] = 1;
+        }
+        ++n_direct;
+        continue;
+      }
+      if (!slot)
+      {
+        sd.values[p] = hash_page(ram, p);
+        continue;
+      }
+      if (!sd.valid[p])
+      {
+        sd.page[p] = hash_page(cache_src, p);
+        sd.valid[p] = 1;
+        ++n_rehashed;
+      }
+      sd.values[p] = sd.page[p];
+    }
+    rehashed.fetch_add(n_rehashed, std::memory_order_relaxed);
+    direct.fetch_add(n_direct, std::memory_order_relaxed);
+  });
+  if (slot)
+  {
+    // The cache now describes the state at the slot's sync epoch; without a
+    // tracker there is none, and the next digest rehashes everything.
+    sd.epoch = d.on ? d.Synced(*slot) : std::nullopt;
+  }
+
+  XXH3_state_t state;
+  XXH3_64bits_reset_withSeed(&state, STATE_DIGEST_RANGES_VERSION);
+  XXH3_64bits_update(&state, &semantic, sizeof(semantic));
+  for (const RollbackLogic::Range& x : sd.excluded)
+  {
+    const std::array<u32, 2> pair{x.lo, x.hi};
+    XXH3_64bits_update(&state, pair.data(), sizeof(pair));
+  }
+  XXH3_64bits_update(&state, sd.values.data(), sd.values.size() * sizeof(u64));
+  const u64 digest = XXH3_64bits_digest(&state);
+
+  if (slot && !r.ring.empty())
+  {
+    const size_t slots = r.ring.size();
+    if (sd.slot_frame.size() != slots)
+    {
+      sd.slot_frame.assign(slots, RollbackNet::NO_FRAME);
+      sd.slot_values.assign(slots, {});
+      sd.slot_semantic.assign(slots, 0);
+      sd.slot_excluded.assign(slots, {});
+    }
+    sd.slot_frame[frame % slots] = frame;
+    sd.slot_values[frame % slots] = sd.values;
+    sd.slot_semantic[frame % slots] = semantic;
+    sd.slot_excluded[frame % slots] = sd.excluded;
+  }
+  const auto end = std::chrono::steady_clock::now();
+  ++sd.digests;
+  sd.total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+  sd.classify_ns +=
+      std::chrono::duration_cast<std::chrono::nanoseconds>(classified - start).count();
+  sd.rehashed += rehashed.load();
+  sd.direct += direct.load();
+  return digest;
+}
+
+// NSR_RB_TEST_CORRUPT=frame:addr (diagnostics; set it on one peer only):
+// at the start of `frame`, before its snapshot, set the byte at `addr` to the
+// complement of what the first (live) run found there.  Idempotent, so a
+// re-simulation of the frame (or a restore of its own snapshot) reproduces
+// the same divergence instead of undoing or doubling it.
+static void RbTestCorrupt(u8* ram, u32 frame)
+{
+  static std::optional<u8> corrupted;  // the byte written (one test per process)
+  const auto& spec = s_rb.config.test_corrupt;
+  if (!spec || spec->first != frame)
+    return;
+  const u32 offset = spec->second & 0x01FFFFFF;
+  if (offset >= s_rb.mem1_size)
+    return;
+  if (!corrupted)
+  {
+    corrupted = static_cast<u8>(~ram[offset]);
+    Log("TEST CORRUPT: byte {:08x} {:02x} -> {:02x} at the start of frame {} (semantic words "
+        "untouched)",
+        spec->second, ram[offset], *corrupted, frame);
+  }
+  ram[offset] = *corrupted;
+}
+
+// Diagnostics on a confirmed digest mismatch: with NSR_DUMP_PREFIX set, write
+// the local state at that frame start (the ring slot, if it still holds the
+// frame; RB_KEEP bytes in it are stale), its fake VMEM, a sidecar of the
+// current RAM and the per-page digest values ("page value" lines, for
+// diffing against the other peer's file to find the diverged pages).
+static void RbDumpDesync(Core::System& system, u32 frame)
+{
+  const std::string prefix = Env("NSR_DUMP_PREFIX");
+  const Rollback& r = s_rb;
+  const StateDigest& sd = s_digest;
+  if (prefix.empty() || r.ring.empty() || sd.slot_frame.size() != r.ring.size())
+    return;
+  const size_t index = frame % r.ring.size();
+  if (sd.slot_frame[index] != frame)
+  {
+    Log("desync dump: frame {} is no longer in the snapshot ring", frame);
+    return;
+  }
+  const std::string path = fmt::format("{}-desync-{}.bin", prefix, frame);
+  const std::vector<u8>& slot = r.ring[index];
+  if (FILE* f = std::fopen(path.c_str(), "wb"))
+  {
+    std::fwrite(slot.data(), 1, std::min<size_t>(slot.size(), r.mem1_size), f);
+    std::fclose(f);
+  }
+  if (r.vmem_bytes && slot.size() >= r.mem1_size + r.vmem_bytes)
+  {
+    if (FILE* f = std::fopen((path + ".vmem").c_str(), "wb"))
+    {
+      std::fwrite(slot.data() + r.mem1_size, 1, r.vmem_bytes, f);
+      std::fclose(f);
+    }
+  }
+  WritePerMachineSidecar(system, system.GetMemory().GetRAM(), path);
+  if (FILE* f = std::fopen((path + ".excl").c_str(), "w"))
+  {
+    // The digest's own exclusions at that frame (physical [lo, hi)).
+    for (const RollbackLogic::Range& x : sd.slot_excluded[index])
+      std::fprintf(f, "%08x %08x\n", x.lo, x.hi);
+    std::fclose(f);
+  }
+  if (FILE* f = std::fopen((path + ".pages").c_str(), "w"))
+  {
+    std::fprintf(f, "# state digest page values at the start of frame %u (semantic %016llx); "
+                    "page index (MEM1 then fake VMEM) value\n",
+                 frame, static_cast<unsigned long long>(sd.slot_semantic[index]));
+    const std::vector<u64>& values = sd.slot_values[index];
+    for (size_t p = 0; p < values.size(); ++p)
+      std::fprintf(f, "%zx %016llx\n", p, static_cast<unsigned long long>(values[p]));
+    std::fclose(f);
+  }
+  Log("wrote {} (+ .vmem, .permachine, .excl, .pages) for the desync at frame {}", path, frame);
+}
+
+// Diagnostics: NSR_RB_DIGEST_DUMP_EVERY=n (with NSR_DUMP_PREFIX) writes the
+// digested state of every finalized frame start that is a multiple of n:
+// <prefix>-dfin-<frame>.bin (the ring slot's MEM1; RB_KEEP bytes in it are
+// stale) and .excl (the digest's excluded physical ranges).  Unlike
+// NSR_RB_DUMP_AT dumps of live (possibly mispredicted) frames, these are
+// exactly what peers compared, so two peers' files show which bytes a
+// mismatch is made of.
+static void RbDumpFinalized(u32 finalized)
+{
+  static const u32 every = ParseU32(Env("NSR_RB_DIGEST_DUMP_EVERY")).value_or(0);
+  const std::string prefix = Env("NSR_DUMP_PREFIX");
+  StateDigest& sd = s_digest;
+  const Rollback& r = s_rb;
+  if (!every || prefix.empty() || finalized == RollbackNet::NO_FRAME || r.ring.empty() ||
+      sd.slot_frame.size() != r.ring.size())
+    return;
+  u32 frame = sd.dumped_through == RollbackNet::NO_FRAME || sd.dumped_through > finalized ?
+                  finalized :
+                  sd.dumped_through + 1;
+  for (; frame <= finalized; ++frame)
+  {
+    const size_t index = frame % r.ring.size();
+    if (frame % every != 0 || sd.slot_frame[index] != frame)
+      continue;
+    const std::string path = fmt::format("{}-dfin-{}.bin", prefix, frame);
+    if (FILE* f = std::fopen(path.c_str(), "wb"))
+    {
+      std::fwrite(r.ring[index].data(), 1, r.mem1_size, f);
+      std::fclose(f);
+    }
+    if (FILE* f = std::fopen((path + ".excl").c_str(), "w"))
+    {
+      for (const RollbackLogic::Range& x : sd.slot_excluded[index])
+        std::fprintf(f, "%08x %08x\n", x.lo, x.hi);
+      std::fclose(f);
+    }
+  }
+  sd.dumped_through = finalized;
+}
+
+// ---------------------------------------------------------------------------
+// Config fingerprint (final review M2): everything that changes how a peer
+// simulates a rollback epoch or what its digest means.  See ConfigField.
+// Emulated-timing options (CPU overclock, dual core, disc speed with instant
+// disc on) are deliberately absent: the design tolerates timing differences
+// between machines (a 0.6x CPU peer passes the whole-RAM gate), and so is the
+// CPU core (JIT64 vs JITARM64 peers are a goal).
+// ---------------------------------------------------------------------------
+static RollbackNet::ConfigFingerprint LocalConfigFingerprint(Core::System& system)
+{
+  using RollbackNet::ConfigField;
+  const Rollback& r = s_rb;
+  const RollbackConfig& c = ConfigForRollback();
+  RollbackNet::ConfigFingerprint fp;
+  auto hash_text = [](const std::string& text) { return XXH3_64bits(text.data(), text.size()); };
+  auto env_list = [&](std::initializer_list<const char*> names) {
+    std::string text;
+    for (const char* name : names)
+      text += fmt::format("{}={};", name, Env(name));
+    return hash_text(text);
+  };
+  auto list = [](const std::vector<u32>& values) {
+    std::string text;
+    for (const u32 value : values)
+      text += fmt::format("{:08x},", value);
+    return text;
+  };
+  fp[ConfigField::Protocol] = (u64{RollbackNet::VERSION} << 8) | RollbackNet::HANDOFF_VERSION;
+  fp[ConfigField::StateDigest] =
+      (u64{STATE_DIGEST_RANGES_VERSION} << 8) | (c.digest_semantic_only ? 1u : 0u);
+  constexpr u64 TB_PER_FRAME = 40500000 / 60;  // as EnterRollbackSession
+  fp[ConfigField::VtimeBase] =
+      ParseU64(Env("NSR_RB_VTIME_BASE")).value_or(TB_PER_FRAME << 37) / TB_PER_FRAME * TB_PER_FRAME;
+  fp[ConfigField::VmemBytes] = r.vmem_bytes;
+  fp[ConfigField::ResimSpeed] =
+      env_list({"NSR_RB_RESIM_SPEED", "NSR_RB_RESIM_GPU_SPEED", "NSR_RB_RESIM_ARAM_SPEED",
+                "NSR_RB_RESIM_AUDIO_SPEED", "NSR_RB_RESIM_DRAW"});
+  fp[ConfigField::InstantDisc] = c.instant_disc ? 1 : 0;
+  fp[ConfigField::IoIdle] = r.io_idle_mode ? 1 : 0;
+  fp[ConfigField::AudioRollback] = r.audio_rollback ? 1 : 0;
+  {
+    // The executable text as loaded (GN7E69: 0x80003100 up to the end of the
+    // audio middleware's text), so a different Reborn build or code patch is
+    // named rather than surfacing as a state mismatch.
+    const u8* ram = system.GetMemory().GetRAM();
+    constexpr u32 TEXT_LO = 0x00003100, TEXT_HI = 0x00285A90;
+    const std::string id = fmt::format("{}-r{}-{:016x}", SConfig::GetInstance().GetGameID(),
+                                       SConfig::GetInstance().GetRevision(),
+                                       XXH3_64bits(ram + TEXT_LO, TEXT_HI - TEXT_LO));
+    fp[ConfigField::GameImage] = hash_text(id);
+  }
+  fp[ConfigField::LauncherImage] = hash_text(Env("NSR_FINGERPRINT"));
+  fp[ConfigField::Seed] = c.seed ? u64{*c.seed} : ~u64{0};
+  {
+    std::string text;
+    for (const auto& [lo, hi] : r.segments)
+      text += fmt::format("{:x}-{:x};", lo, hi);
+    fp[ConfigField::RestoreRanges] = hash_text(text);
+  }
+  {
+    std::string text = fmt::format(
+        "{} {} {} {} {} {} {} {} {};", static_cast<int>(c.ac_mode), c.ac_speech_frames,
+        c.ac_speech_lead, c.ac_sfx_default, c.ac_sfx_tail, c.ac_bank_frames, c.ac_polls_per_tick,
+        c.ac_song_frames, c.ac_song_gap);
+    for (const auto& [lo, hi] : c.ac_hash_ranges)
+      text += fmt::format("{:x}-{:x};", lo, hi);
+    fp[ConfigField::AudioClock] = hash_text(text);
+  }
+  fp[ConfigField::ResimGates] = hash_text(fmt::format(
+      "gate {} effect {} skip {} vsync {} async {} peekz {}", list(c.audio_gate_only),
+      list(c.effect_gates), list(c.skip_resim), c.keep_resim_vsync, c.async_present, c.peek_z));
+  fp[ConfigField::SessionRules] = hash_text(
+      fmt::format("auto {} from {} end {} reenter {}", r.auto_handoff,
+                  r.auto_handoff ? 0 : r.vtime_from, c.session_end, c.auto_reenter));
+  fp[ConfigField::DolphinCore] = hash_text(fmt::format(
+      "cheats {} mmu {} ram {} {} fprf {} nans {} rtc {} {}",
+      Config::Get(Config::MAIN_ENABLE_CHEATS), Config::Get(Config::MAIN_MMU),
+      Config::Get(Config::MAIN_RAM_OVERRIDE_ENABLE), Config::Get(Config::MAIN_MEM1_SIZE),
+      Config::Get(Config::MAIN_FPRF), Config::Get(Config::MAIN_ACCURATE_NANS),
+      Config::Get(Config::MAIN_CUSTOM_RTC_ENABLE), Config::Get(Config::MAIN_CUSTOM_RTC_VALUE)));
+  return fp;
+}
+
+static std::string DescribeConfig(const RollbackNet::ConfigFingerprint& fp)
+{
+  std::string text;
+  for (size_t i = 0; i < RollbackNet::CONFIG_FIELDS; ++i)
+  {
+    const auto field = static_cast<RollbackNet::ConfigField>(i);
+    text += fmt::format("{}{}={:x}", i ? " " : "", RollbackNet::ConfigFieldName(field), fp[field]);
+  }
+  return text;
+}
+
+// Refuse a differently configured peer: name every differing field, raise a
+// telemetry event and stop cleanly (detrun counts "bad config" as fatal).
+static void FailConfigMismatch(u32 player, const RollbackNet::ConfigFingerprint* local,
+                               const RollbackNet::ConfigFingerprint* remote, u64 local_digest,
+                               u64 remote_digest)
+{
+  std::string fields;
+  if (local && remote)
+  {
+    for (const auto field : RollbackNet::ConfigDifferences(*local, *remote))
+    {
+      fields += fmt::format("{}{} (local {:x}, remote {:x})", fields.empty() ? "" : ", ",
+                            RollbackNet::ConfigFieldName(field), (*local)[field],
+                            (*remote)[field]);
+    }
+  }
+  else
+  {
+    fields = fmt::format("config digest (local {:016x}, remote {:016x}); compare the "
+                         "'config fingerprint' log lines",
+                         local_digest, remote_digest);
+  }
+  Log("bad config fingerprint from player {}: refusing rollback; differing: {}", player, fields);
+  NSRTelemetry::Event(NSRTelemetry::EventKind::Note, TelemetryLiveFrame(),  // NSR telemetry
+                      {NSRTelemetry::Int("config_mismatch_player", static_cast<s64>(player)),
+                       NSRTelemetry::Hex("local_config", local_digest),
+                       NSRTelemetry::Hex("remote_config", remote_digest)},
+                      "config mismatch: " + fields);
+  s_session.failed = true;
+  Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+}
+
 // Stop the emulation after a transition protocol failure.  Continuing would
 // turn a detected boundary disagreement into an opaque menu or match desync.
 static bool FailHandoff(const std::string& message)
@@ -3809,10 +4580,12 @@ static bool ConfirmRollbackTail(u32 completed_frame)
   return true;
 }
 
-// Exchange and compare the stage-2 semantic checksum at an agreed absolute
+// Exchange and compare the canonical state digest (RbStateDigest, a full
+// one-off hash of RAM here) and the config fingerprint at an agreed absolute
 // frame.  This is a host-side barrier: no guest time advances while waiting,
 // and each proposal is resent until every player has acknowledged the same
-// kind/frame/hash tuple.
+// kind/frame/hash/config tuple.  A differing config is refused by name before
+// any rollback epoch starts (final review M2).
 static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::HandoffKind kind,
                            u32 frame)
 {
@@ -3820,7 +4593,8 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
   if (!s.enabled || s.failed || (!AllConnected() && !WaitForConnection()))
     return FailHandoff(fmt::format("transport is not connected at frame {}", frame));
 
-  const u64 semantic = RbSemanticChecksum(guard);
+  const RollbackNet::ConfigFingerprint config = LocalConfigFingerprint(guard.GetSystem());
+  const u64 semantic = RbStateDigest(guard.GetSystem(), nullptr, RbSemanticChecksum(guard), frame);
   // Entry 0, leave 1, re-entry 2, ... is derived solely from the completed
   // session generation.  It prevents a late unsequenced packet from an old
   // match from poisoning a later barrier.
@@ -3828,7 +4602,7 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
                              s_rb.session_generation * 2 :
                              s_rb.session_generation * 2 - 1;
   s_rb_handoff.emplace(static_cast<u8>(s.players), static_cast<u8>(s.me), kind, transition, frame,
-                       semantic);
+                       semantic, config);
   SendHandoff();
   const auto start = std::chrono::steady_clock::now();
   auto last_send = start;
@@ -3843,22 +4617,31 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
     }
     if (now - start >= std::chrono::milliseconds(PEER_TIMEOUT_MS))
       return FailHandoff(fmt::format(
-          "timeout at {} frame {} semantic {:016x}",
+          "timeout at {} frame {} state digest {:016x}",
           kind == RollbackNet::HandoffKind::EnterRollback ? "entry" : "leave", frame,
           semantic));
+  }
+  if (const auto& other = s_rb_handoff->ConfigMismatch())
+  {
+    const RollbackNet::ConfigFingerprint remote = other->config;
+    const u32 player = other->sender;
+    s_rb_handoff.reset();
+    FailConfigMismatch(player, &config, &remote, RollbackNet::ConfigDigest(config),
+                       RollbackNet::ConfigDigest(remote));
+    return false;  // FailConfigMismatch stopped the session
   }
   if (s_rb_handoff->Mismatched())
   {
     const RollbackNet::HandoffPacket& other = *s_rb_handoff->Mismatch();
     return FailHandoff(fmt::format(
-        "state/frame mismatch from player {}: local kind {} frame {} semantic {:016x}, "
-        "remote kind {} frame {} semantic {:016x}",
+        "state/frame mismatch from player {}: local kind {} frame {} state digest {:016x}, "
+        "remote kind {} frame {} state digest {:016x}",
         other.sender, static_cast<u32>(kind), frame, semantic, static_cast<u32>(other.kind),
         other.frame, other.semantic_hash));
   }
   if (s.failed)
     return FailHandoff(fmt::format("transport failed at handoff frame {}", frame));
-  Log("handoff {} transition {} agreed at frame {} semantic {:016x}",
+  Log("handoff {} transition {} agreed at frame {} state digest {:016x}",
       kind == RollbackNet::HandoffKind::EnterRollback ? "entry" : "leave", transition, frame,
       semantic);
   s_rb_handoff.reset();
@@ -3988,14 +4771,36 @@ static bool RbNetworkPreflight(u32 live)
     Core::System::GetInstance().GetCoreTiming().NSRDeferThrottle(
         std::chrono::steady_clock::now() - sync_start);
   }
+  RbDumpFinalized(s_rb_exchange->Finalized());
   if (const auto desync = s_rb_exchange->FirstDesync();
       desync && (!s_rb_logged_desync || *desync < *s_rb_logged_desync))
   {
     s_rb_logged_desync = desync;
-    Log("DESYNC: first confirmed semantic checksum mismatch at frame {}", *desync);
-    // NSR telemetry: the exchange keeps only the frame (no checksum accessor yet).
-    NSRTelemetry::Count(NSRTelemetry::Counter::Desyncs);
-    NSRTelemetry::Event(NSRTelemetry::EventKind::Desync, *desync, {}, "semantic checksum");
+    const RollbackNet::DesyncInfo info =
+        s_rb_exchange->FirstDesyncInfo().value_or(RollbackNet::DesyncInfo{0, *desync, 0, 0});
+    const StateDigest& sd = s_digest;
+    const size_t index = r.ring.empty() ? 0 : *desync % r.ring.size();
+    const bool have_semantic = index < sd.slot_frame.size() && sd.slot_frame[index] == *desync;
+    Log("DESYNC: first confirmed state digest mismatch at frame {} with player {}: local "
+        "{:016x} remote {:016x} (local semantic words {})",
+        *desync, info.player, info.local, info.remote,
+        have_semantic ? fmt::format("{:016x}", sd.slot_semantic[index]) : "n/a");
+    NSRTelemetry::Desync(*desync, info.local, info.remote, info.player);  // NSR telemetry
+  }
+  {
+    // Dump the first mismatching frame, or the first NSR_RB_DESYNC_DUMPS of
+    // them (diagnostics: later ones show whether a divergence persists or
+    // was a transient per-machine difference).
+    static const size_t dumps = ParseU32(Env("NSR_RB_DESYNC_DUMPS")).value_or(1);
+    const auto& all = s_rb_exchange->Desyncs();
+    for (; s_rb_desyncs_dumped < all.size() && s_rb_desyncs_dumped < dumps; ++s_rb_desyncs_dumped)
+    {
+      if (s_rb_desyncs_dumped > 0)
+        Log("digest mismatch at frame {} with player {}: local {:016x} remote {:016x}",
+            all[s_rb_desyncs_dumped].frame, all[s_rb_desyncs_dumped].player,
+            all[s_rb_desyncs_dumped].local, all[s_rb_desyncs_dumped].remote);
+      RbDumpDesync(Core::System::GetInstance(), all[s_rb_desyncs_dumped].frame);
+    }
   }
   return !s.failed;
 }
@@ -4198,6 +5003,9 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
         ++r.rollbacks;
         ++r.mispredictions;
         s_rb_exchange->BeginRollback();
+        // Digests of later frame starts describe the abandoned timeline;
+        // re-simulation records them again (H4).
+        s_rb_exchange->DiscardChecksumsAfter(target);
       }
       else
       {
@@ -4312,16 +5120,21 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     // Re-simulated unit. Its snapshot is re-saved, so its I/O-idle flag must
     // be re-evaluated too: re-simulation runs faster (no drawing), so disc
     // I/O can complete at different unit boundaries than live.
+    RbTestCorrupt(ram, r.cursor);
     RbSave(ram, r.ring[r.cursor % slots]);
     if (r.io_idle_mode)
       r.io_idle[r.cursor] = IsIoIdle(ram);
     if (r.net_enabled && s_rb_exchange)
-    {
       r.pads[r.cursor] = FromNetPads(s_rb_exchange->Assemble(r.cursor));
-      s_rb_exchange->SetStateChecksum(r.cursor, RbSemanticChecksum(guard));
+    RbWritePads(guard, buf, r.pads.at(r.cursor));
+    if (r.net_enabled && s_rb_exchange)
+    {
+      // Same point as the live unit's digest: snapshot saved, pads written.
+      s_rb_exchange->SetStateChecksum(
+          r.cursor, RbStateDigest(system, &r.ring[r.cursor % slots], RbSemanticChecksum(guard),
+                                  r.cursor));
       s_rb_exchange->UpdateFinalized();
     }
-    RbWritePads(guard, buf, r.pads.at(r.cursor));
     RbDumpUnit(system, ram, r.live, r.cursor);
     RbTransplant(system, ram, r.live, r.cursor);
     r.in_unit = true;
@@ -4396,6 +5209,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     if (t >= 600)
       r.io_idle.erase(r.io_idle.begin(), r.io_idle.lower_bound(t - 600));
   }
+  RbTestCorrupt(ram, t);
   if (r.force > 0 || r.net_enabled)
     RbSave(ram, r.ring[t % slots]);
   if (s_follow)
@@ -4415,11 +5229,6 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     std::fflush(r.record);
   }
   RbWritePads(guard, buf, r.pads[t]);
-  if (r.net_enabled && s_rb_exchange)
-  {
-    s_rb_exchange->SetStateChecksum(t, RbSemanticChecksum(guard));
-    s_rb_exchange->UpdateFinalized();
-  }
   RbAdopt(system, ram, t);
   RbDumpUnit(system, ram, t, t);
   if (t == r.vtime_from)
@@ -4429,6 +5238,15 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     // its initialized magic and queues.  RbAdopt intentionally precedes it.
     if (!r.ring.empty())
       RbSave(ram, r.ring[t % slots]);
+  }
+  if (r.net_enabled && s_rb_exchange)
+  {
+    // The digest describes exactly what a re-simulation of t starts from:
+    // the final snapshot of t (after the session-start model) with t's pads
+    // written (the pad buffer itself is excluded).
+    s_rb_exchange->SetStateChecksum(
+        t, RbStateDigest(system, &r.ring[t % slots], RbSemanticChecksum(guard), t));
+    s_rb_exchange->UpdateFinalized();
   }
   r.in_unit = true;
   r.in_resim = false;
@@ -4461,6 +5279,15 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     if (s_dirty.mode == DirtyTracker::Mode::Hash)
       Log("snapshot hash audit: {} pages compared, {} differed", s_dirty.audit_checked,
           s_dirty.audit_mismatches);
+    if (s_digest.digests)
+      Log("state digest: {} digests, {:.1f} us/digest (classify {:.1f} us: per-machine {:.1f}, "
+          "heaps {:.1f}), {:.1f} pages "
+          "rehashed/digest, {:.1f} partly excluded pages/digest, {} excluded ranges",
+          s_digest.digests, s_digest.total_ns / 1e3 / s_digest.digests,
+          s_digest.classify_ns / 1e3 / s_digest.digests,
+          s_digest.per_machine_ns / 1e3 / s_digest.digests, s_digest.heap_ns / 1e3 / s_digest.digests,
+          static_cast<double>(s_digest.rehashed) / s_digest.digests,
+          static_cast<double>(s_digest.direct) / s_digest.digests, s_digest.excluded.size());
     Log("tick {}: rollbacks {}, re-simulated {}, mismatched checks {}/{}; audio gate: "
         "recorded {}, replayed {}, mismatched {}; load barriers {} (clamped {}, in re-sim {}); "
         "io-idle skips {}; mispredictions {} (uncorrectable {}); net stalls {} sync waits {}",
@@ -4546,6 +5373,8 @@ struct CostState
   u64 ph_step[PH_COUNT] = {};  // phase totals before RbStep
   u64 ph_unit[PH_COUNT] = {};  // ... after RbStep (unit start)
   u64 dev_unit[2] = {};        // GPU/DSP host totals at unit start
+  u64 digest_step = 0;         // state digest host ns before RbStep
+  u64 digest_us = 0;           // ... spent in this unit's RbStep
   std::chrono::steady_clock::time_point epoch = std::chrono::steady_clock::now();
   u64 tb = 0, idle = 0, gpu = 0;
   s64 step_us = 0;
@@ -4648,6 +5477,7 @@ void CostFrameStart(const Core::CPUThreadGuard& guard,
   g_nsr_host_timing = true;
   std::copy(std::begin(s_phase_ns), std::end(s_phase_ns), s_cost.ph_unit);
   std::copy(std::begin(g_nsr_host_ns), std::end(g_nsr_host_ns), s_cost.dev_unit);
+  s_cost.digest_us = (s_digest.total_ns - s_cost.digest_step) / 1000;
   s_cost.host = std::chrono::steady_clock::now();
 }
 
@@ -4664,7 +5494,7 @@ void CostFrameEnd(const Core::CPUThreadGuard& guard)
   // unit (host_us; of which gpu/dsp emulation), of RbStep before it (step_us;
   // of which save/restore/live/jit/check), and the host clock at its end.
   Log("cost frame {} resim {} tb {} idle_cyc {} gpu_cyc {} host_us {} step_us {} at {} "
-      "save {} restore {} live {} jit {} check {} gpu_us {} dsp_us {} hat {}",
+      "save {} restore {} live {} jit {} check {} gpu_us {} dsp_us {} hat {} digest {}",
       s_cost.frame, s_cost.resim ? 1 : 0, tb - s_cost.tb,
       system.GetCoreTiming().GetIdleTicks() - s_cost.idle, g_nsr_gpu_cycles - s_cost.gpu,
       std::chrono::duration_cast<std::chrono::microseconds>(now - s_cost.host).count(),
@@ -4674,7 +5504,8 @@ void CostFrameEnd(const Core::CPUThreadGuard& guard)
       us(s_cost.ph_unit[PH_JIT] - s_cost.ph_step[PH_JIT]),
       us(s_cost.ph_unit[PH_CHECK] - s_cost.ph_step[PH_CHECK]),
       us(g_nsr_host_ns[0] - s_cost.dev_unit[0]), us(g_nsr_host_ns[1] - s_cost.dev_unit[1]),
-      std::chrono::duration_cast<std::chrono::microseconds>(now - s_cost.epoch).count());
+      std::chrono::duration_cast<std::chrono::microseconds>(now - s_cost.epoch).count(),
+      s_cost.digest_us);
 }
 // Re-simulated frames run on a faster emulated machine: NSR_RB_RESIM_SPEED
 // (default 16; 1 = off) times faster CPU, and the devices whose work the
@@ -4849,6 +5680,7 @@ void RollbackFrameHook(const Core::CPUThreadGuard& guard)
   r.frame_tick_done = false;
   r.in_game_seen = false;
   std::copy(std::begin(s_phase_ns), std::end(s_phase_ns), s_cost.ph_step);
+  s_cost.digest_step = s_digest.total_ns;
   if (r.vtime_on)
   {
     HostProfStart();
@@ -6286,13 +7118,19 @@ void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
       return;
     }
     const u32 session = ConfigForRollback().seed.value_or(0x4E535200) ^ frame;
+    // Every datagram carries the config digest: a fixed-epoch session (no
+    // handoff barrier) still refuses a differently configured peer (M2).
+    const RollbackNet::ConfigFingerprint config = LocalConfigFingerprint(guard.GetSystem());
+    Log("config fingerprint {:016x}: {}", RollbackNet::ConfigDigest(config),
+        DescribeConfig(config));
     s_rb_exchange = std::make_unique<RollbackNet::Exchange>(
         frame, static_cast<u8>(s_session.players), static_cast<u8>(s_session.me), r.net_delay,
-        r.max_prediction, session);
+        r.max_prediction, session, RollbackNet::ConfigDigest(config));
     s_rb_logged_desync.reset();
     s_rb_bad_session_logged = false;
     s_rb_violation_logged = false;
     s_rb_peer_desync_logged = false;
+    s_rb_desyncs_dumped = 0;
     Log("rollback network epoch {:08x}: player {} of {}, delay {}, max prediction {}", session,
         s_session.me, s_session.players, r.net_delay, r.max_prediction);
   }
@@ -6342,6 +7180,7 @@ void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
   for (auto& slot : r.ring)
     std::fill(slot.begin(), slot.end(), 0);
   RollbackLogic::ClearSessionSlotMetadata(&s_dirty.synced, &s_slot_seq);
+  s_digest.Invalidate();  // the state digest cache describes the cleared slots
   s_ac_pending.clear();
   s_ac_real.clear();
   s_ac_sfx_start = {};
@@ -6435,6 +7274,7 @@ void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason)
   for (auto& slot : r.ring)
     std::fill(slot.begin(), slot.end(), 0);
   RollbackLogic::ClearSessionSlotMetadata(&s_dirty.synced, &s_slot_seq);
+  s_digest.Invalidate();  // the state digest cache describes the cleared slots
   r.rollbacks = 0;
   r.resim_ticks = 0;
   s_rb_watch_rollbacks = 0;
@@ -6483,6 +7323,7 @@ void Shutdown(const Core::CPUThreadGuard& guard)
     enet_host_destroy(s.host);
   }
   s_dirty.Reset();
+  s_digest = StateDigest{};
   s_workers.Stop();
   if (s_rb.record)
     std::fclose(s_rb.record);
