@@ -60,8 +60,41 @@ Patches (GN7E69 rev 0, Reborn 3.0 main.dol `6dccf385…`):
           the agreed pads. The script table is read by the HLE side. The stub is `blr`; NFLStreet-dolphin replaces
           it with NSRNetplay::Hook when NSR_NETPLAY is set (lockstep pad
           exchange). Under stock Dolphin the image plays normally.
+  trace   Diagnostics for milestone 2: log entries to selected functions into
+          a 128-entry ring at 0x804132C0 (count at +0; entries at +0x10, each
+          (retrace << 8 | function id, time-base low)). Each function's first
+          instruction (all are `stwu r1, -X(r1)`) becomes a branch to a
+          trampoline after the ring that logs, runs the displaced
+          instruction, and jumps back. Needs freeze (retrace counter).
+          IDs: see TRACE_FUNCS.
+  rollback POC milestone 2 (needs freeze; replaces input/netplay at the poll
+          and profile/stress at the sim calls; needs NFLStreet-dolphin, see
+          docs/poc-milestone2.md). Uses free data at 0x80416900..0x80416A80
+          (zero in every dump, unreferenced). Four HLE stubs (0x80416900 poll,
+          0x80416904 tick, 0x80416908 tick end, 0x8041690C time; plain
+          `blr` here).
+          Poll: the tail of fn_801E26FC (0x801E271C..0x801E2730) becomes one
+          call to a routine that does what the tail did (clear, PADRead,
+          Reborn's remap + PADClamp) on a scratch buffer (0x80416920) and
+          calls the poll stub twice (r3 = scratch, r4 = retrace counter,
+          r5 = 0 before the remap, 1 after). Dolphin copies the processed
+          pads into the game's pad buffer, except during re-simulation.
+          Tick: InGame's tick loop body (`sim1(n * k); sim2(n)` at
+          0x80028654/0x8002865C) becomes a routine that loops: call the tick
+          stub (r3 = pad buffer; Dolphin may restore an earlier state and
+          write that tick's pads), run sim part 1 and part 2, call the
+          tick-end stub (0x80416908), repeat while bit 1 of the stub's r3 is
+          set.
+          Frame: the only call of InGame::fn_8002854C (0x800326D0) goes to
+          a frame routine (0x80416A80) that loops frame stub (0x80416914),
+          InGame, frame-end stub (0x80416918) while Dolphin asks, so a
+          rollback re-runs whole frames (Slippi's model); Dolphin skips the
+          present on re-simulated frames and fixes one tick per frame.
+          Time: the direct `mftb r3` in game code at 0x80198924 calls the
+          time stub (0x8041690C) instead, so Dolphin can return tick-based
+          time during ticks (re-simulation must see the same time).
 
-Usage: tools/isopatch.py SRC.iso DST.iso freeze [seed | seedlog] [input [netplay]] [profile | stress]
+Usage: tools/isopatch.py SRC.iso DST.iso freeze [seed | seedlog] [input [netplay] | rollback] [profile | stress] [trace]
 """
 from __future__ import annotations
 
@@ -91,6 +124,61 @@ SEEDLOG_MAX = 14
 PROFILE_CODE = 0x80411500
 PROFILE_ACC = 0x804117C0
 STRESS_K = 0x804117F0
+TRACE_RING = 0x804132C0       # zero in every dump; Reborn doesn't use it
+TRACE_ENTRIES = 128
+TRACE_CODE = TRACE_RING + 0x10 + TRACE_ENTRIES * 8   # 0x804136D0, room to 0x80413E00
+TRACE_FUNCS = [  # (id, address, label)
+    (1, 0x801E26FC, "pad poll (VI interrupt)"),
+    (2, 0x801E1E50, "input consumer (descriptor update)"),
+    (3, 0x8002854C, "InGame frame"),
+    (4, 0x800AD888, "sim step part 1"),
+    (5, 0x8017CEDC, "sim step part 2"),
+    (6, 0x80028140, "InGame input handler"),
+    (7, 0x801C601C, "input flush A"),
+    (8, 0x801C60BC, "input flush B"),
+    (9, 0x801C6280, "input handler register"),
+]
+RB_POLL_STUB = 0x80416900    # must match NSRNetplay::RB_POLL_STUB
+RB_TICK_STUB = 0x80416904    # must match NSRNetplay::RB_TICK_STUB
+RB_TICK_END_STUB = 0x80416908  # must match NSRNetplay::RB_TICK_END_STUB
+RB_TIME_STUB = 0x8041690C    # must match NSRNetplay::RB_TIME_STUB
+RB_GATE_RETURN = 0x80416910  # HLE only (NSRNetplay::RB_GATE_RETURN)
+RB_FRAME_STUB = 0x80416914      # must match NSRNetplay::RB_FRAME_STUB
+RB_FRAME_END_STUB = 0x80416918  # must match NSRNetplay::RB_FRAME_END_STUB
+RB_FRAME_CODE = 0x80416A80      # frame routine (after the tick routine)
+# NFLStreet-dolphin's audio clock keeps its model state (speech queues, virtual
+# sound handles, bank-upload waits) in this free data (zero in the image,
+# restored by rollback with the game). Patch code must stay below it.
+AUDIO_CLOCK_STATE = 0x80416B00  # must match NSRNetplay AC_BASE (..0x80417000)
+# The rollback unit is one main-loop iteration, fn_80026AD0 -> fn_801CBFA8:
+# it first dispatches queued messages (the whole draw traversal, UI and
+# camera updates run from there), then updates the active groups (InGame
+# Group -> InGame::fn_8002854C, the sim). Wrapping only InGame left the draw
+# pass's own state (camera smoothing, view matrices) k frames behind after
+# every rollback, which drifted until gameplay diverged.
+MAIN_ITER = 0x80026AD0          # one main-loop iteration (no args, void)
+MAIN_ITER_SITE = 0x80026B64     # its only call, in the main loop fn_80026AF8
+# The game's VI pre-retrace callback (retrace counter at *(0x803EBE44)+0x20
+# and a retrace-driven real-time clock). During the rollback session Dolphin
+# lets only the frame routine's call run (once per frame, live or
+# re-simulated), not the interrupt's, so both counters follow frames, not
+# retraces (a frame can take more than one retrace; peers differ).
+VI_PRE_CB = 0x801F7DF4
+# Game code that reads the time base directly (`mftb r3` in fn_801985FC,
+# which saves LR, so a `bl` there is safe). Re-simulation needs the same value
+# a tick saw the first time, so it goes through Dolphin.
+MFTB_SITES = [0x80198924]
+MFTB_R3 = 0x7C6C42E6
+RB_SCRATCH = 0x80416920      # PADStatus[4] that PADRead fills in a rollback image
+RB_POLL_CODE = 0x80416960
+RB_TICK_CODE = 0x80416A10
+RB_END = 0x80416A80          # must match NSRNetplay RB_KEEP
+POLL_TAIL = 0x801E271C       # addi r3,r30,buf; bl clear; addi; bl PADRead; addi; bl remap
+POLL_CLEAR = 0x801D34D0
+PAD_READ = 0x8024734C
+SIM1, SIM2 = 0x800AD888, 0x8017CEDC
+SIM1_SITE, SIM2_SITE = 0x80028654, 0x8002865C
+TICK_SCALE_SDA = -0x7FDC     # lfs f1, -0x7fdc(r13): the k in sim1(n * k)
 PROFILE_SITES = [  # (call site, original callee) -> accumulator PROFILE_ACC + 16*i
     (0x800326D0, 0x8002854C),  # InGame::fn_8002854C (whole in-game frame)
     (0x80028654, 0x800AD888),  # sim step part 1
@@ -152,6 +240,11 @@ def bc(src: int, dst: int, bo: int, bi: int) -> int:
     return (16 << 26) | (bo << 21) | (bi << 16) | (off & 0xFFFC)
 
 
+def andi_(ra, rs, imm): return (28 << 26) | (rs << 21) | (ra << 16) | (imm & 0xFFFF)
+def lfs(fd, d, ra): return (48 << 26) | (fd << 21) | (ra << 16) | (d & 0xFFFF)
+def fmuls(fd, fa, fc): return (59 << 26) | (fd << 21) | (fa << 16) | (fc << 6) | (25 << 1)
+def fmr(fd, fb): return (63 << 26) | (fd << 21) | (fb << 11) | (72 << 1)
+def nop(): return 0x60000000
 def rlwinm(ra, rs, sh, mb, me): return (21 << 26) | (rs << 21) | (ra << 16) | (sh << 11) | (mb << 6) | (me << 1)
 
 
@@ -362,8 +455,113 @@ def netplay_routine() -> list[int]:
     return code
 
 
+def _load(reg: int, value: int) -> list[int]:
+    return [lis(reg, value >> 16), ori(reg, reg, value & 0xFFFF)]
+
+
+def rollback_poll_routine() -> list[int]:
+    """Pad poll for rollback images: the original PADRead + remap, on scratch.
+
+    Called from the poll with r4 = 0x30, r5 = 0, r6 = 1 already set up for
+    the clear call (fn_801D34D0), exactly as the original tail had them.
+    The poll stub runs twice: phase 0 on the raw pads (Dolphin may replace
+    them: test scripts, later the netplay port layout), phase 1 on the
+    processed pads (Dolphin records them and copies them to the game's pad
+    buffer, except while it is re-simulating ticks). Reborn's remap still
+    runs here, in the interrupt, as in the unpatched game.
+    """
+    a = RB_POLL_CODE
+    stub_call = [*_load(3, RB_SCRATCH), *_load(4, FREEZE_COUNTER), lwz(4, 0, 4)]
+    code = [stwu(1, -0x10, 1), mflr(0), stw(0, 0x14, 1),
+            *_load(3, RB_SCRATCH), None,                 # bl clear(scratch, 0x30, 0, 1)
+            *_load(3, RB_SCRATCH), None,                 # bl PADRead(scratch)
+            *stub_call, addi(5, 0, 0), None,             # bl RB_POLL_STUB (phase 0)
+            *_load(3, RB_SCRATCH), None,                 # bl REBORN_REMAP(scratch)
+            *stub_call, addi(5, 0, 1), None]             # bl RB_POLL_STUB (phase 1)
+    # Register hygiene, as in the netplay routine: the poll runs in an
+    # interrupt, whose saved context lands in RAM.
+    code += [addi(r, 0, 0) for r in range(3, 13)] + [cmpwi(3, 0)]
+    code += [lwz(0, 0x14, 1), mtlr(0), addi(1, 1, 0x10), blr()]
+    targets = iter([POLL_CLEAR, PAD_READ, RB_POLL_STUB, REBORN_REMAP, RB_POLL_STUB])
+    for i, w in enumerate(code):
+        if w is None:
+            code[i] = b(a + 4 * i, next(targets), link=True)
+    assert a + 4 * len(code) <= RB_TICK_CODE
+    return code
+
+
+def rollback_tick_routine() -> list[int]:
+    """Replaces `bl sim1` in InGame's tick loop (f31 = n, f1 = n * k)."""
+    a = RB_TICK_CODE
+    code = [stwu(1, -0x20, 1), mflr(0), stw(0, 0x24, 1), stw(31, 0x1C, 1)]
+    loop = len(code)
+    code += [*_load(3, PAD_BUF), None,                                # bl RB_TICK_STUB
+             mr(31, 3),
+             lfs(1, TICK_SCALE_SDA, 13), fmuls(1, 31, 1), None,       # bl SIM1
+             fmr(1, 31), None,                                        # bl SIM2
+             None,                                                    # bl RB_TICK_END_STUB
+             andi_(0, 31, 1), None]                                   # bne loop
+    code += [lwz(31, 0x1C, 1), lwz(0, 0x24, 1), mtlr(0), addi(1, 1, 0x20), blr()]
+    holes = [i for i, w in enumerate(code) if w is None]
+    stub, sim1, sim2, end, bne_ = holes
+    code[stub] = b(a + 4 * stub, RB_TICK_STUB, link=True)
+    code[sim1] = b(a + 4 * sim1, SIM1, link=True)
+    code[sim2] = b(a + 4 * sim2, SIM2, link=True)
+    code[end] = b(a + 4 * end, RB_TICK_END_STUB, link=True)
+    code[bne_] = bc(a + 4 * bne_, a + 4 * loop, 4, 2)
+    assert a + 4 * len(code) <= RB_END
+    return code
+
+
+def rollback_frame_routine() -> list[int]:
+    """Replaces `bl fn_80026AD0` (frame mode): run main-loop iterations while Dolphin asks.
+
+    Loop: frame stub (r3 bit 1 = run another frame after this one), the VI
+    pre-retrace callback (Dolphin runs it here only during the session), one
+    main-loop iteration, frame-end stub.
+    """
+    a = RB_FRAME_CODE
+    code = [stwu(1, -0x20, 1), mflr(0), stw(0, 0x24, 1), stw(31, 0x1C, 1)]
+    loop = len(code)
+    code += [None,                                   # bl RB_FRAME_STUB
+             mr(31, 3), None,                        # bl VI_PRE_CB (gated by Dolphin)
+             None,                                   # bl MAIN_ITER
+             None,                                   # bl RB_FRAME_END_STUB
+             andi_(0, 31, 1), None,                  # bne loop
+             lwz(31, 0x1C, 1), lwz(0, 0x24, 1), mtlr(0), addi(1, 1, 0x20), blr()]
+    holes = [i for i, w in enumerate(code) if w is None]
+    stub, vicb, main, end, bne_ = holes
+    code[stub] = b(a + 4 * stub, RB_FRAME_STUB, link=True)
+    code[vicb] = b(a + 4 * vicb, VI_PRE_CB, link=True)
+    code[main] = b(a + 4 * main, MAIN_ITER, link=True)
+    code[end] = b(a + 4 * end, RB_FRAME_END_STUB, link=True)
+    code[bne_] = bc(a + 4 * bne_, a + 4 * loop, 4, 2)
+    assert a + 4 * len(code) <= AUDIO_CLOCK_STATE
+    return code
+
+
 class PatchError(Exception):
     """The image isn't the one these patches were written for (or bad options)."""
+
+
+def trace_trampoline(addr: int, func: int, fid: int, displaced: int) -> list[int]:
+    ring_hi, ring_lo = TRACE_RING >> 16, TRACE_RING & 0xFFFF
+    ctr_hi, ctr_lo = FREEZE_COUNTER >> 16, FREEZE_COUNTER & 0xFFFF
+    mask_mb = 32 - 3 - (TRACE_ENTRIES.bit_length() - 1)  # (count % N) * 8
+    code = [
+        stwu(1, -0x20, 1), stw(10, 8, 1), stw(11, 0xC, 1), stw(12, 0x10, 1),
+        lis(11, ring_hi), ori(11, 11, ring_lo),
+        lwz(12, 0, 11), addi(10, 12, 1), stw(10, 0, 11),
+        rlwinm(12, 12, 3, mask_mb, 28), add(12, 12, 11),
+        lis(10, ctr_hi), ori(10, 10, ctr_lo), lwz(10, 0, 10),
+        slwi(10, 10, 8), ori(10, 10, fid), stw(10, 0x10, 12),
+        mftb(10), stw(10, 0x14, 12),
+        lwz(10, 8, 1), lwz(11, 0xC, 1), lwz(12, 0x10, 1), addi(1, 1, 0x20),
+        displaced,
+        None,
+    ]
+    code[-1] = b(addr + 4 * (len(code) - 1), func + 4)
+    return code
 
 
 # --- ISO / DOL mapping -------------------------------------------------------
@@ -392,17 +590,27 @@ def write_words(iso, va: int, words: list[int], expect: list[int] | None = None)
     iso.write(struct.pack(f">{len(words)}I", *words))
 
 
-PATCHES = {"freeze", "seed", "seedlog", "input", "profile", "stress", "netplay"}
-NETPLAY_SET = ("freeze", "seed", "input", "netplay")  # what friends' netplay images use
+PATCHES = {"freeze", "seed", "seedlog", "input", "profile", "stress", "netplay", "trace",
+           "rollback"}
+# Milestone-1 delay-based lockstep image (superseded for friends; kept so the
+# lockstep path and its tests stay reproducible).
+LOCKSTEP_SET = ("freeze", "seed", "input", "netplay")
+# Stage-4 rollback image: lockstep menus, rollback matches. The fork needs
+# NSR_RB_NET=1 with it; the milestone-1 lockstep hook is absent, so this image
+# can't play lockstep netplay (the mode is a property of the image).
+ROLLBACK_SET = ("freeze", "seed", "rollback")
+NETPLAY_SET = ROLLBACK_SET  # what friends' netplay images use (nsr_patcher)
 
 
 def check_patch_set(patches: set[str]) -> None:
     if not patches or not patches <= PATCHES:
         raise PatchError(f"unknown patches: {sorted(patches - PATCHES)}")
-    for a, b_ in (("seed", "seedlog"), ("profile", "stress")):
+    for a, b_ in (("seed", "seedlog"), ("profile", "stress"), ("rollback", "input"),
+                  ("rollback", "profile"), ("rollback", "stress")):
         if {a, b_} <= patches:
             raise PatchError(f"{a} and {b_} can't be combined")
-    for need, by in (("freeze", "seedlog"), ("freeze", "input"), ("input", "netplay")):
+    for need, by in (("freeze", "seedlog"), ("freeze", "input"), ("input", "netplay"),
+                     ("freeze", "trace"), ("freeze", "rollback")):
         if by in patches and need not in patches:
             raise PatchError(f"{by} needs {need}")
 
@@ -439,6 +647,39 @@ def apply_patches(iso, patches: set[str]) -> None:
         write_words(iso, INPUT_CODE, routine, expect=[0] * len(routine))
         write_words(iso, POLL_CALL, [b(POLL_CALL, INPUT_CODE, link=True)],
                     expect=[b(POLL_CALL, REBORN_REMAP, link=True)])
+    if "trace" in patches:
+        addr = TRACE_CODE
+        write_words(iso, TRACE_RING, [0] * 4, expect=[0] * 4)
+        for fid, func, _ in TRACE_FUNCS:
+            iso.seek(dol_va_to_iso(iso, func))
+            first = struct.unpack(">I", iso.read(4))[0]
+            if first >> 16 != 0x9421:
+                raise PatchError(f"trace: {func:#x} doesn't start with stwu r1 ({first:08x})")
+            words = trace_trampoline(addr, func, fid, first)
+            write_words(iso, addr, words, expect=[0] * len(words))
+            write_words(iso, func, [b(func, addr)], expect=[first])
+            addr += 4 * len(words)
+        assert addr <= 0x80413E00, hex(addr)
+    if "rollback" in patches:
+        write_words(iso, RB_POLL_STUB, [blr()] * 7, expect=[0] * 7)
+        words = rollback_frame_routine()
+        write_words(iso, RB_FRAME_CODE, words, expect=[0] * len(words))
+        write_words(iso, MAIN_ITER_SITE, [b(MAIN_ITER_SITE, RB_FRAME_CODE, link=True)],
+                    expect=[b(MAIN_ITER_SITE, MAIN_ITER, link=True)])
+        for site in MFTB_SITES:
+            write_words(iso, site, [b(site, RB_TIME_STUB, link=True)], expect=[MFTB_R3])
+        for addr, words in ((RB_POLL_CODE, rollback_poll_routine()),
+                            (RB_TICK_CODE, rollback_tick_routine())):
+            write_words(iso, addr, words, expect=[0] * len(words))
+        buf = addi(3, 30, PAD_BUF - 0x803F0000)
+        tail = POLL_TAIL
+        write_words(iso, tail, [b(tail, RB_POLL_CODE, link=True)] + [nop()] * 5,
+                    expect=[buf, b(tail + 4, POLL_CLEAR, link=True), buf,
+                            b(tail + 12, PAD_READ, link=True), buf,
+                            b(tail + 20, REBORN_REMAP, link=True)])
+        write_words(iso, SIM1_SITE, [b(SIM1_SITE, RB_TICK_CODE, link=True)],
+                    expect=[b(SIM1_SITE, SIM1, link=True)])
+        write_words(iso, SIM2_SITE, [nop()], expect=[b(SIM2_SITE, SIM2, link=True)])
     if "netplay" in patches:
         write_words(iso, NETPLAY_STUB, [blr()], expect=[0])
         words = netplay_routine()

@@ -13,8 +13,11 @@ Changes from upstream:
   NFLStreet rendezvous server when `NSR_RENDEZVOUS` is set).
 - `Source/Core/Core/HLE/HLE.cpp`: registers the hook when `NSR_NETPLAY` is set.
 - `Source/Core/Core/CMakeLists.txt`, `Source/Core/DolphinLib.props`: build lists.
-- `.github/workflows/nsr-windows.yml`: Windows x64 build artifact, including
-  the **NSR Netplay** launcher (`Tools/NSR`, vendored from NFLStreet).
+- `.github/workflows/nsr-windows.yml`: the Windows x64 friends zip: Dolphin,
+  the **NSR Netplay** launcher and **NSR-Patcher** (`Tools/NSR`, vendored from
+  NFLStreet), README-FIRST.txt, VERSION.txt, SOURCE.txt and licences. The
+  launcher plays rollback netplay only (stage 4); `nsr-netplay-debug.bat` is a
+  direct-IP debug helper with the same rollback settings.
 
 Design, the game-side patch, and test tooling live in the NFLStreet repo
 (`docs/poc-milestone1.md`, `tools/isopatch.py`, `tools/detrun.py`).
@@ -24,4 +27,6 @@ Room codes: set the repository Actions variable `NSR_RENDEZVOUS` to the room
 server's `host:port` and CI ships it as `nsr-rendezvous.txt` in the download.
 
 CI: `.github/workflows/nsr-windows.yml` builds Release x64 on every push to
-`nsr-netplay`; download the `NFLStreet-dolphin-windows-x64` artifact from the run.
+`nsr-netplay` (or on demand: `gh workflow run nsr-windows.yml --ref <branch>`);
+download the `NFLStreet-rollback-windows-x64` artifact from the run. It
+unzips to one `NFLStreet-Rollback/` folder.

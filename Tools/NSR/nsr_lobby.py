@@ -18,16 +18,27 @@ router needs TCP *and* UDP port 51515 forwarded for internet play.
 Protocol: one TCP connection per joining player to the host, newline-delimited
 JSON messages.
 
-  joiner -> host  {"type": "hello", "name": str, "fingerprint": str, "version": int}
+  joiner -> host  {"type": "hello", "name": str, "fingerprint": str, "version": int,
+                   "mode": "rollback"|"lockstep"}
   host -> joiner  {"type": "reject", "reason": str}                 (then closes)
   host -> all     {"type": "lobby", "players": [name, ...]}          (on any change;
                                                                     index = player number)
-  host -> joiner  {"type": "start", "player": k, "players": n, "delay": d, "seed": u32}
+  host -> joiner  {"type": "start", "player": k, "players": n, "delay": d, "seed": u32,
+                   "mode": str}
   host -> joiner  {"type": "closed"}                                (host cancelled)
 
 The host is always player 0. Players keep their join order. A joiner whose
 game image fingerprint differs from the host's is refused before anything
-starts, since lockstep needs byte-identical images.
+starts, since netplay needs byte-identical images.
+
+Netplay mode. The patched image decides what a machine can play: the
+rollback image (nsr_patcher, this release) lacks the milestone-1 lockstep
+hook and vice versa. So the mode is not a host choice. Every request carries
+the launcher's mode, the host/room refuses a different one with an "update"
+message, and a joiner refuses a start whose mode differs from its own. The
+fingerprint check catches mixed images on its own as well (different recipe,
+different bytes), which is what keeps old room servers that ignore "mode"
+safe (see RENDEZVOUS_VERSION below).
 """
 from __future__ import annotations
 
@@ -40,7 +51,31 @@ from typing import Callable
 
 PORT = 51515
 MAX_PLAYERS = 4
-PROTOCOL_VERSION = 1
+# 2: hello/start carry "mode" (rollback release). Direct-IP lobbies run in the
+# players' own launchers, so bumping it just makes a lockstep-era launcher on
+# either side get a clear "different version" message.
+PROTOCOL_VERSION = 2
+MODES = ("lockstep", "rollback")
+RELEASE_MODE = "rollback"  # what this launcher's image plays (nsr_patcher.NETPLAY_MODE)
+
+
+def _check_mode(mode: str) -> str:
+    if mode not in MODES:
+        raise ValueError("Unknown netplay mode.")
+    return mode
+
+
+def _agreed_mode(msg: dict, expected: str, who: str) -> str:
+    """Mode from a start message. A missing mode (room servers older than the
+    rollback release don't echo it) means ours: the fingerprint check already
+    proved everyone runs the same image, and the image fixes the mode."""
+    mode = str(msg.get("mode", expected))
+    if mode not in MODES:
+        raise ConnectionError(f"{who} selected an unknown netplay mode.")
+    if mode != expected:
+        raise ConnectionError(f"{who} started a {mode} game, but this launcher plays {expected}. "
+                              "Everyone needs the same NSR Netplay download.")
+    return mode
 
 
 @dataclass
@@ -54,6 +89,10 @@ class StartInfo:
     room: str = ""        # room id for UDP registration
     key: str = ""         # our per-player secret for UDP registration
     seed: int = 0x13579BDF  # per-match RNG seed, identical for every player
+    mode: str = RELEASE_MODE  # "rollback": stage-4 lockstep menus + rollback matches
+    room_code: str = ""   # "NSR-4K7QX" (display only; telemetry header)
+    telemetry_url: str = ""    # ingest endpoint granted by the room server
+    telemetry_token: str = ""  # per-session/per-player token (docs/telemetry.md)
 
 
 def _send(sock: socket.socket, msg: dict) -> None:
@@ -92,6 +131,7 @@ class LobbyHost:
     on_reject: Callable[[str, str], None] = lambda who, reason: None
     port: int = PORT
     bind: str = ""
+    mode: str = RELEASE_MODE
     _joiners: list[_Joiner] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _server: socket.socket | None = None
@@ -138,7 +178,11 @@ class LobbyHost:
         name = str(hello.get("name") or "Player")[:24]
         reason = None
         if hello.get("type") != "hello" or hello.get("version") != PROTOCOL_VERSION:
-            reason = "Your launcher is a different version from the host's."
+            reason = ("Your launcher is a different version from the host's. "
+                      "Everyone needs the same NSR Netplay download.")
+        elif hello.get("mode", "lockstep") != self.mode:
+            reason = (f"Your launcher plays {hello.get('mode', 'lockstep')} netplay; this lobby is "
+                      f"{self.mode}. Everyone needs the same NSR Netplay download.")
         elif hello.get("fingerprint") != self.fingerprint:
             reason = (f"Game image mismatch: yours is {hello.get('fingerprint')}, the host's is "
                       f"{self.fingerprint}. Everyone needs the same Reborn version and patches.")
@@ -168,7 +212,12 @@ class LobbyHost:
         if still_here and not self._closed:
             self._notify()
 
-    def start(self, delay: int = 2) -> StartInfo:
+    def start(self, delay: int = 2, mode: str | None = None) -> StartInfo:
+        """Start every peer with the lobby's netplay mode (mode, if given, must
+        equal it: joiners were admitted for that mode)."""
+        mode = _check_mode(mode or self.mode)
+        if mode != self.mode:
+            raise ValueError("This lobby was opened for a different netplay mode.")
         with self._lock:
             joiners = list(self._joiners)
             self._closed = True
@@ -179,10 +228,10 @@ class LobbyHost:
         seed = secrets.randbits(32)  # per-match RNG seed, sent to everyone
         for k, j in enumerate(joiners, start=1):
             _send(j.sock, {"type": "start", "player": k, "players": players, "delay": delay,
-                           "seed": seed})
+                           "seed": seed, "mode": mode})
             j.sock.close()
         self._server.close()
-        return StartInfo(0, players, delay, "", seed=seed)
+        return StartInfo(0, players, delay, "", seed=seed, mode=mode)
 
     def close(self) -> None:
         self._closed = True
@@ -200,7 +249,8 @@ class LobbyHost:
 
 def join(host: str, name: str, fingerprint: str,
          on_lobby: Callable[[list[str]], None] = lambda names: None,
-         cancel: threading.Event | None = None, port: int = PORT) -> StartInfo:
+         cancel: threading.Event | None = None, port: int = PORT,
+         mode: str = RELEASE_MODE) -> StartInfo:
     """Connect to a host's lobby and wait for Start. Raises ConnectionError
     with a readable reason if refused, closed, or unreachable."""
     if ":" in host:
@@ -213,8 +263,9 @@ def join(host: str, name: str, fingerprint: str,
                               "and that the host forwarded TCP+UDP port 51515.") from e
     address = sock.getpeername()[0]
     sock.settimeout(0.5)
+    _check_mode(mode)
     _send(sock, {"type": "hello", "name": name, "fingerprint": fingerprint,
-                 "version": PROTOCOL_VERSION})
+                 "version": PROTOCOL_VERSION, "mode": mode})
     buf = b""
     try:
         while True:
@@ -238,15 +289,22 @@ def join(host: str, name: str, fingerprint: str,
                 elif kind == "closed":
                     raise ConnectionError("The host closed the lobby.")
                 elif kind == "start":
+                    agreed = _agreed_mode(msg, mode, "The host")
                     return StartInfo(int(msg["player"]), int(msg["players"]),
                                      int(msg.get("delay", 2)), address,
-                                     seed=int(msg.get("seed", 0x13579BDF)))
+                                     seed=int(msg.get("seed", 0x13579BDF)), mode=agreed)
     finally:
         sock.close()
 
 
 # --- room codes via the rendezvous server ------------------------------------
 RENDEZVOUS_PORT = 51600
+# Still 2 in the rollback release, on purpose: the deployed room server
+# accepts exactly version 2 and ignores unknown fields, so new launchers keep
+# working against it while it is upgraded. create/join/start now also carry
+# "mode"; an upgraded server compares it and echoes it in "start", an old one
+# ignores it (then the fingerprint check is what keeps a lockstep-image
+# launcher out of a rollback-image room, and _agreed_mode falls back to ours).
 RENDEZVOUS_VERSION = 2
 
 
@@ -267,9 +325,11 @@ class RoomHost:
     fingerprint: str
     on_change: Callable[[list[str]], None] = lambda names: None
     on_error: Callable[[str], None] = lambda reason: None
+    mode: str = RELEASE_MODE
     code: str = ""
     _sock: socket.socket | None = None
     _start: StartInfo | None = None
+    _error: str = ""
     _started: threading.Event = field(default_factory=threading.Event)
 
     def open(self) -> str:
@@ -280,7 +340,7 @@ class RoomHost:
             raise ConnectionError(f"Couldn't reach the room server ({self.rendezvous}): "
                                   f"{e.strerror or e}") from e
         _send(self._sock, {"type": "create", "name": self.name, "fingerprint": self.fingerprint,
-                           "version": RENDEZVOUS_VERSION})
+                           "version": RENDEZVOUS_VERSION, "mode": _check_mode(self.mode)})
         lines = _lines(self._sock)
         first = next(lines, None)
         if not first or first.get("type") != "room":
@@ -299,18 +359,27 @@ class RoomHost:
                 elif kind == "error":
                     self.on_error(msg.get("reason", "error"))
                 elif kind == "start":
-                    self._start = _start_info(msg, self.rendezvous)
+                    try:
+                        self._start = _start_info(msg, self.rendezvous, self.mode)
+                    except ConnectionError as e:
+                        self._error = str(e)
                     self._started.set()
                     return
-        except OSError:
+        except (OSError, ValueError):
             pass
         if not self._started.is_set():
             self.on_error("Lost the connection to the room server.")
 
-    def start(self, delay: int = 2, timeout: float = 10) -> StartInfo:
-        _send(self._sock, {"type": "start", "delay": delay})
+    def start(self, delay: int = 2, timeout: float = 10, mode: str | None = None) -> StartInfo:
+        """Ask the rendezvous service to start the room in its mode."""
+        mode = _check_mode(mode or self.mode)
+        if mode != self.mode:
+            raise ValueError("This room was opened for a different netplay mode.")
+        _send(self._sock, {"type": "start", "delay": delay, "mode": mode})
         if not self._started.wait(timeout):
             raise ConnectionError("The room server didn't confirm the start.")
+        if self._error:
+            raise ConnectionError(self._error)
         return self._start
 
     def close(self) -> None:
@@ -328,18 +397,23 @@ class RoomHost:
                 pass
 
 
-def _start_info(msg: dict, rendezvous: str) -> StartInfo:
+def _start_info(msg: dict, rendezvous: str, expected_mode: str = RELEASE_MODE) -> StartInfo:
     room = str(msg["room"])
     # Older room servers didn't send a seed; the room id is shared by every
     # player, so deriving one from it still keeps all machines identical.
     seed = int(msg["seed"]) if "seed" in msg else int(room[:8], 16)
+    mode = _agreed_mode(msg, expected_mode, "The room server")
+    telemetry = msg.get("telemetry") if isinstance(msg.get("telemetry"), dict) else {}
     return StartInfo(int(msg["player"]), int(msg["players"]), int(msg.get("delay", 2)), "",
-                     rendezvous=rendezvous, room=room, key=str(msg["key"]), seed=seed)
+                     rendezvous=rendezvous, room=room, key=str(msg["key"]), seed=seed,
+                     mode=mode, room_code=str(msg.get("code", ""))[:16],
+                     telemetry_url=str(telemetry.get("url", "")),
+                     telemetry_token=str(telemetry.get("token", "")))
 
 
 def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
               on_lobby: Callable[[list[str]], None] = lambda names: None,
-              cancel: threading.Event | None = None) -> StartInfo:
+              cancel: threading.Event | None = None, mode: str = RELEASE_MODE) -> StartInfo:
     """Join a room by code and wait for the host's Start. Raises
     ConnectionError with a readable reason if refused, closed, or unreachable."""
     host, port = _split(rendezvous, RENDEZVOUS_PORT)
@@ -348,8 +422,9 @@ def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
     except OSError as e:
         raise ConnectionError(f"Couldn't reach the room server ({rendezvous}): {e.strerror or e}") from e
     sock.settimeout(0.5)
+    _check_mode(mode)
     _send(sock, {"type": "join", "code": code, "name": name, "fingerprint": fingerprint,
-                 "version": RENDEZVOUS_VERSION})
+                 "version": RENDEZVOUS_VERSION, "mode": mode})
     buf = b""
     try:
         while True:
@@ -371,6 +446,6 @@ def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
                 elif kind in ("reject", "closed"):
                     raise ConnectionError(msg.get("reason", "Refused."))
                 elif kind == "start":
-                    return _start_info(msg, rendezvous)
+                    return _start_info(msg, rendezvous, mode)
     finally:
         sock.close()

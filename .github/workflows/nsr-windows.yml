@@ -1,7 +1,11 @@
-# NFLStreet POC: Windows x64 build of Dolphin + the NSR netplay hook.
-# Produces a downloadable zip of Binary/x64 (Dolphin.exe with Qt UI and all
-# DLLs, plus the "NSR Netplay.exe" launcher built from Tools/NSR) for friends. Build mirrors Dolphin's own Windows steps
-# (MSBuild on dolphin-emu.sln, VS 2022 / v143, bundled Qt from Externals).
+# NFLStreet POC: Windows x64 build of Dolphin + the NSR rollback netplay hook.
+# Produces ONE friends zip (artifact NFLStreet-rollback-windows-x64, folder
+# NFLStreet-Rollback/): Binary/x64 (Dolphin.exe with Qt UI and all DLLs), the
+# "NSR Netplay.exe" launcher and NSR-Patcher.exe built from Tools/NSR (vendored
+# from NFLStreet by its scripts/sync-launcher-to-fork.sh), README-FIRST.txt,
+# VERSION.txt (fork SHA + build date), SOURCE.txt and the licence texts. No
+# game data. Build mirrors Dolphin's own Windows steps (MSBuild on
+# dolphin-emu.sln, VS 2022 / v143, bundled Qt from Externals).
 name: NSR Windows build
 
 on:
@@ -19,74 +23,210 @@ jobs:
           submodules: recursive
           fetch-depth: 0   # Dolphin's ScmRevGen uses git describe for the version string
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Python first: these take a minute and fail fast, before the long
+      # Dolphin build.
+      - name: Check the vendored NSR tools
+        run: |
+          python -c "import sys; sys.path.insert(0, 'Tools/NSR'); import isopatch, nsr_patcher, nsr_lobby; isopatch.check_patch_set(set(isopatch.NETPLAY_SET)); assert nsr_patcher.NETPLAY_MODE == nsr_lobby.RELEASE_MODE == 'rollback'; print(nsr_patcher.ROLLBACK_RECIPE)"
+          python Tools/NSR/nsr_launcher.py --selftest
+
+      - name: Build the NSR Netplay launcher and NSR-Patcher
+        run: |
+          python -m pip install pyinstaller
+          pyinstaller --noconfirm --noupx --workpath pyi-build --distpath pyi-dist --onefile --windowed --name "NSR Netplay" --paths Tools/NSR Tools/NSR/nsr_launcher.py
+          pyinstaller --noconfirm --noupx --workpath pyi-build --distpath pyi-dist --onefile --console --name NSR-Patcher --paths Tools/NSR Tools/NSR/nsr_patcher.py
+          pyi-dist\NSR-Patcher.exe --help
+          if ($LASTEXITCODE -ne 0) { throw "NSR-Patcher.exe --help failed" }
+
       - uses: microsoft/setup-msbuild@v2
 
       - name: Build (Release x64)
         working-directory: Source
         run: msbuild dolphin-emu.sln /m /v:minimal /p:Configuration=Release /p:Platform=x64
 
-      - name: Add netplay launch helper
+      - name: Add the direct-IP debug helper (rollback profile)
         shell: pwsh
         run: |
+          # Not the friend path (that's "NSR Netplay.exe"): a minimal direct-IP
+          # launch for debugging, with exactly the launcher's rollback profile
+          # (tools/nsr_launcher.py ROLLBACK_ENV). A stale lockstep .bat would
+          # be a release hazard, so the old nsr-netplay.bat is gone.
           @'
           @echo off
-          rem NFLStreet POC netplay launcher (delay-based lockstep, 2-4 players).
-          rem First run NSR-Patcher.exe in this folder once; it makes nsr-net.iso.
-          rem Usage:  nsr-netplay.bat PLAYER PLAYERS [PEERS]
+          rem DEBUG ONLY. Friends: use "NSR Netplay.exe" (room codes) instead.
+          rem NFLStreet rollback netplay by IP address, 2-4 players, same settings
+          rem as the launcher's rollback mode (input delay 1, lockstep menus,
+          rem rollback matches). Run NSR-Patcher.exe once first (makes nsr-net.iso).
+          rem Usage:  nsr-netplay-debug.bat PLAYER PLAYERS [PEERS] [SEED]
           rem   PLAYER  your number, 0..PLAYERS-1 (0 = the player everyone connects to)
           rem   PLAYERS 2, 3 or 4
-          rem   PEERS   ip:port of players 0..PLAYER-1, comma-separated, in order
-          rem           (player 0 leaves this out)
-          rem Examples (4 players):
-          rem   nsr-netplay.bat 0 4
-          rem   nsr-netplay.bat 1 4 203.0.113.5:51515
-          rem   nsr-netplay.bat 3 4 203.0.113.5:51515,198.51.100.7:51515,192.0.2.9:51515
-          rem Every player except the last must forward UDP port 51515.
-          rem Everyone must have the same NSR-Patcher fingerprint.
-          rem This Dolphin is separate from Reborn: portable.txt + -u keep its settings
-          rem and saves in .\User. Reborn's install is only read (HD textures).
+          rem   PEERS   ip:port of player 0 (star topology; player 0 leaves this out,
+          rem           use - when giving a SEED)
+          rem   SEED    match seed; every player must use the same one (default fixed)
+          rem Examples:  nsr-netplay-debug.bat 0 2
+          rem            nsr-netplay-debug.bat 1 2 203.0.113.5:51515
+          rem Player 0 must forward UDP port 51515 for internet play.
+          rem Everyone must have the same nsr-net.iso fingerprint (NSR-Patcher shows it).
+          setlocal
           if not exist "%~dp0nsr-net.iso" (
             echo nsr-net.iso not found. Run NSR-Patcher.exe in this folder first.
             pause
             exit /b 1
           )
+          if "%~2"=="" (
+            echo Usage: nsr-netplay-debug.bat PLAYER PLAYERS [PEERS] [SEED]
+            pause
+            exit /b 1
+          )
           set NSR_NETPLAY=1
-          set NSR_PLAYER=%1
-          set NSR_PLAYERS=%2
+          set NSR_PLAYER=%~1
+          set NSR_PLAYERS=%~2
           set NSR_PORT=51515
-          set NSR_PEERS=%~3
-          set NSR_DELAY=2
-          set NSR_LOG=%~dp0nsr-p%1.log
+          set NSR_TOPOLOGY=star
+          set NSR_PEERS=
+          if not "%~3"=="" if not "%~3"=="-" set NSR_PEERS=%~3
+          set NSR_SEED=0x13579BDF
+          if not "%~4"=="" set NSR_SEED=%~4
+          set NSR_DELAY=1
+          set NSR_RB_NET=1
+          set NSR_RB_DELAY=1
+          set NSR_RB_MAX_PRED=7
+          set NSR_RB_TIME_SYNC=1
+          set NSR_RB_INSTANT_DISC=1
+          set NSR_RB_IO_IDLE=1
+          set NSR_RB_AUDIO_ROLLBACK=1
+          set NSR_RB_VTIME_FROM=
+          set NSR_TELEMETRY_LOCAL=1
+          set NSR_LOG=%~dp0nsr-p%~1.log
+          set SI1=0
+          set SI2=0
+          set SI3=0
+          if %NSR_PLAYERS% GEQ 2 set SI1=6
+          if %NSR_PLAYERS% GEQ 3 set SI2=6
+          if %NSR_PLAYERS% GEQ 4 set SI3=6
           set TEXTURES=
           set REBORN=
           if exist "%~dp0nsr-reborn.txt" (
             set /p REBORN=<"%~dp0nsr-reborn.txt"
           )
           if defined REBORN set TEXTURES=-C "Dolphin.General.LoadPath=%REBORN%\content" -C GFX.Settings.HiresTextures=True
-          "%~dp0Dolphin.exe" -u "%~dp0User" %TEXTURES% -C Dolphin.Core.CPUThread=False -C Dolphin.Core.EnableCustomRTC=True -C Dolphin.Core.CustomRTCValue=0x30000000 -C Dolphin.Core.SIDevice1=6 -C Dolphin.Core.SIDevice2=6 -C Dolphin.Core.SIDevice3=6 -e "%~dp0nsr-net.iso"
-          '@ | Set-Content -Encoding ascii Binary/x64/nsr-netplay.bat
+          "%~dp0Dolphin.exe" -u "%~dp0User" %TEXTURES% -C Dolphin.Interface.UsePanicHandlers=False -C Dolphin.Core.CPUThread=False -C Dolphin.Core.EnableCustomRTC=True -C Dolphin.Core.CustomRTCValue=0x30000000 -C Dolphin.Core.SIDevice0=6 -C Dolphin.Core.SIDevice1=%SI1% -C Dolphin.Core.SIDevice2=%SI2% -C Dolphin.Core.SIDevice3=%SI3% -C Dolphin.Core.FastDiscSpeed=True -b -e "%~dp0nsr-net.iso"
+          endlocal
+          '@ | Set-Content -Encoding ascii Binary/x64/nsr-netplay-debug.bat
           # Portable mode: never read or write the shared Documents\Dolphin
           # Emulator folder (or any other Dolphin's settings, e.g. Reborn's).
           Set-Content -Encoding ascii Binary/x64/portable.txt ""
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Build the NSR Netplay launcher
-        run: |
-          python -m pip install pyinstaller
-          pyinstaller --onefile --windowed --name "NSR Netplay" --paths Tools/NSR Tools/NSR/nsr_launcher.py
-          python Tools/NSR/nsr_launcher.py --selftest
-          Copy-Item "dist/NSR Netplay.exe" Binary/x64/
+          Copy-Item "pyi-dist/NSR Netplay.exe" Binary/x64/
+          Copy-Item "pyi-dist/NSR-Patcher.exe" Binary/x64/
 
       - name: Room server address (if configured)
         if: ${{ vars.NSR_RENDEZVOUS != '' }}
         shell: pwsh
         run: Set-Content -Encoding ascii Binary/x64/nsr-rendezvous.txt "${{ vars.NSR_RENDEZVOUS }}"
 
+      - name: Package (README-FIRST, VERSION, licenses, contents check)
+        shell: pwsh
+        run: |
+          $sha = (git rev-parse --short HEAD).Trim()
+          $date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'")
+          $nfl = (Select-String -Path Tools/NSR/README.md -Pattern 'commit ([0-9a-f]+)').Matches[0].Groups[1].Value
+          $recipe = (python -c "import sys; sys.path.insert(0, 'Tools/NSR'); import nsr_patcher as p; print(p.ROLLBACK_RECIPE)").Trim()
+          $fp = (python -c "import sys; sys.path.insert(0, 'Tools/NSR'); import nsr_patcher as p; print(' '.join(p.fingerprint(o) for _, o in p.KNOWN_INPUTS.values()))").Trim()
+          $repo = "${{ github.server_url }}/${{ github.repository }}"
+          $pkg = "package/NFLStreet-Rollback"
+          New-Item -ItemType Directory -Force $pkg | Out-Null
+          Copy-Item -Recurse Binary/x64/* $pkg
+          # Dolphin's self-updater would offer to replace this fork with an
+          # official Dolphin build (no NSR netplay); friends get updates as a
+          # new zip from Mason instead.
+          Remove-Item -Force -ErrorAction SilentlyContinue "$pkg/Updater.exe"
+          Copy-Item COPYING "$pkg/COPYING.txt"
+          Copy-Item -Recurse LICENSES "$pkg/LICENSES"
+          @"
+          NFLStreet rollback netplay (private test build for Mason and friends)
+          Build:          $sha  ($date)
+          Branch:         ${{ github.ref_name }}
+          Workflow run:   $repo/actions/runs/${{ github.run_id }}
+          NSR tools from: NFLStreet commit $nfl
+          Netplay:        rollback (menus in lockstep, matches in rollback)
+          Image recipe:   $recipe
+          Expected game fingerprint (Reborn 2026.09.12): $fp
+          "@ | Set-Content -Encoding utf8 "$pkg/VERSION.txt"
+          @"
+          This package contains a modified build of Dolphin (GPL-2.0-or-later).
+          Corresponding source: $repo/tree/$sha
+          (fork commit $sha; licence texts in COPYING.txt and LICENSES/).
+          "@ | Set-Content -Encoding utf8 "$pkg/SOURCE.txt"
+          @"
+          NFL STREET ROLLBACK NETPLAY - READ ME FIRST
+          ===========================================
+
+          Version: $sha, built $date (see VERSION.txt).
+          This download has NO game in it. You use your own copy of
+          NFL Street Reborn, and nothing in your Reborn install is changed.
+
+          1. Install NFL Street Reborn from its official site and start it once
+             to make sure it works. Then close it.
+
+          2. Unzip this whole folder somewhere you can write to, for example
+             your Desktop or Documents (not inside Program Files, and not
+             inside the Reborn folder). Keep all the files together.
+
+          3. Double-click NSR-Patcher.exe once. It finds Reborn, makes this
+             folder's own game copy (nsr-net.iso, about 1.4 GB, takes a minute)
+             and shows a fingerprint. Expected: $fp
+             If it can't find Reborn, open "NSR Netplay.exe" and use
+             "Browse for NSR.iso..." (Reborn folder\content\games\NSR.iso).
+
+          4. Double-click "NSR Netplay.exe".
+             - Type your name. Click "Set up controllers" once: your controller
+               is always Port 1. Close that Dolphin window when done.
+             - Host: Host tab -> "Create room" -> send friends the code
+               (NSR-XXXXX) -> "Start game" when everyone is listed.
+             - Join: Join tab -> type the code -> Join -> wait for the host.
+             Everyone must use this same download and have the same game
+             fingerprint; the room tells you if someone doesn't.
+
+          Windows SmartScreen: this test build isn't code-signed, so Windows may
+          say "Windows protected your PC". Click "More info", then "Run anyway".
+          Only do that for a zip you got directly from Mason. Don't turn off
+          your antivirus.
+
+          Windows Firewall: the first time a game starts, Windows may ask
+          whether Dolphin can use the network. Tick "Private networks" (and
+          "Public networks" if you're on a network Windows calls public) and
+          click "Allow access". Netplay can't connect without it.
+
+          The "Send lag/rollback stats" box (on by default) sends connection
+          and rollback numbers, your name and the room code to Mason's server
+          so he can fix lag. Never your button presses or any files. Untick it
+          to send nothing.
+
+          Never share game files: not nsr-net.iso, not NSR.iso, not anything
+          from the Reborn folder. Everyone builds their own copy in step 3.
+
+          If something breaks, tell Mason what the window said, and send the
+          nsr-p*.log files from this folder if he asks.
+          (nsr-netplay-debug.bat is a developer tool; you don't need it.)
+          "@ | Set-Content -Encoding utf8 "$pkg/README-FIRST.txt"
+          # Contents guard: no game images, saves, memory cards, dumps or secrets.
+          $bad = Get-ChildItem -Recurse -File $pkg | Where-Object {
+            $_.Extension -in '.iso','.gcm','.rvz','.wbfs','.ciso','.gcz','.nkit','.gci','.sav','.dtm','.env','.pem','.key' -or
+            $_.Name -in 'nsr-telemetry.txt','nsr-net.iso','nsr-image.json','nsr-reborn.txt','nsr-launcher.json' }
+          if ($bad) { $bad | ForEach-Object { Write-Error "unexpected file in package: $($_.FullName)" }; exit 1 }
+          foreach ($f in 'Dolphin.exe','NSR Netplay.exe','NSR-Patcher.exe','README-FIRST.txt','VERSION.txt','SOURCE.txt','portable.txt') {
+            if (-not (Test-Path "$pkg/$f")) { throw "missing $f" }
+          }
+          if (Test-Path "$pkg/nsr-netplay.bat") { throw "stale lockstep nsr-netplay.bat in package" }
+          if (Test-Path "$pkg/Updater.exe") { throw "Dolphin Updater.exe must not ship (it would replace the fork)" }
+          Get-Content "$pkg/VERSION.txt"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: NFLStreet-dolphin-windows-x64
-          path: Binary/x64
+          name: NFLStreet-rollback-windows-x64
+          path: package
           if-no-files-found: error
