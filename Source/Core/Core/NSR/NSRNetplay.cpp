@@ -6241,6 +6241,8 @@ void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
   s_io_ranges.clear();
   for (auto& slot : r.ring)
     std::fill(slot.begin(), slot.end(), 0);
+  s_dirty.synced.clear();
+  s_slot_seq.clear();
   s_ac_pending.clear();
   s_ac_real.clear();
   s_ac_sfx_start = {};
@@ -6332,6 +6334,8 @@ void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason)
   s_io_ranges.clear();
   for (auto& slot : r.ring)
     std::fill(slot.begin(), slot.end(), 0);
+  s_dirty.synced.clear();
+  s_slot_seq.clear();
   r.rollbacks = 0;
   r.resim_ticks = 0;
   s_rb_watch_rollbacks = 0;
