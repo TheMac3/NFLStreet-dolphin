@@ -10,6 +10,7 @@
 //   - periodic whole-MEM1 hashes, compared with every peer, to detect desyncs.
 
 #include "Core/NSR/NSRNetplay.h"
+#include "Core/NSR/NSRRollbackLogic.h"
 #include "Core/NSR/NSRRollbackNetplay.h"
 #include "Core/NSR/ReplayFollow.h"
 
@@ -1960,7 +1961,7 @@ struct DirtyTracker
       return;
     for (u32 i = 0; i < audit_pages; ++i)
     {
-      const u32 p = hash_pages[audit_next++ % hash_pages.size()];
+      const u32 p = *RollbackLogic::NextRotatingAuditPage(hash_pages, &audit_next);
       if (p < mem1_pages && p >= fifo.first && p < fifo.second)
         continue;  // GX FIFO: left stale on purpose (a live range)
       ++audit_checked;
@@ -2495,7 +2496,7 @@ void RbSave(const u8* ram, std::vector<u8>& slot)
     s_workers.Run(d.mem1_pages + vmem_pages, PAGE_CHUNK, [&](u32 lo, u32 hi) {
       for (u32 p = lo; p < hi; ++p)
       {
-        if (since && d.stamp[p] <= *since)
+        if (!RollbackLogic::PageNeedsCopy(d.stamp[p], since))
           continue;
         if (p < d.mem1_pages)
         {
@@ -2654,6 +2655,17 @@ std::vector<std::pair<u32, u32>> RbLiveRanges(Core::System& system, const u8* ra
   const u32 fb = fifo.CPBase.load() & 0x01FFFFFF, fe = fifo.CPEnd.load() & 0x01FFFFFF;
   if (fe > fb && fe < mem_size)
     live.emplace_back(fb, std::min<u32>(fe + 32, mem_size));
+  // A thread object, queue, stack, and FIFO can overlap. Normalize them once
+  // so snapshots and sidecars describe each per-machine byte only once.
+  std::vector<RollbackLogic::Range> ranges;
+  ranges.reserve(live.size());
+  for (const auto& [lo, hi] : live)
+    ranges.push_back({lo, hi});
+  const std::vector<RollbackLogic::Range> merged = RollbackLogic::MergeRanges(std::move(ranges));
+  live.clear();
+  live.reserve(merged.size());
+  for (const RollbackLogic::Range& range : merged)
+    live.emplace_back(range.lo, range.hi);
   return live;
 }
 
@@ -2734,7 +2746,7 @@ void RbRestore(Core::System& system, u8* ram, const std::vector<u8>& slot)
     s_workers.Run(d.mem1_pages + vmem_pages, PAGE_CHUNK, [&](u32 lo, u32 hi) {
       for (u32 p = lo; p < hi; ++p)
       {
-        if (since && d.stamp[p] <= *since)
+        if (!RollbackLogic::PageNeedsCopy(d.stamp[p], since))
           continue;
         if (p >= d.mem1_pages)
         {
@@ -2899,7 +2911,7 @@ void RbCheck(u32 tick, const u8* ram, const std::vector<u8>& original)
   {
     for (u32 g = lo; g < hi; g += RB_GRANULE)
     {
-      if (since && d.stamp[g / DirtyTracker::PAGE] <= *since)
+      if (!RollbackLogic::PageNeedsCopy(d.stamp[g / DirtyTracker::PAGE], since))
       {
         g = std::min(hi, (g / DirtyTracker::PAGE + 1) * DirtyTracker::PAGE) - RB_GRANULE;
         continue;
@@ -2921,7 +2933,7 @@ void RbCheck(u32 tick, const u8* ram, const std::vector<u8>& original)
   {
     for (u32 g = 0; g < r.vmem_bytes; g += RB_GRANULE)
     {
-      if (since && d.stamp[d.mem1_pages + g / DirtyTracker::PAGE] <= *since)
+      if (!RollbackLogic::PageNeedsCopy(d.stamp[d.mem1_pages + g / DirtyTracker::PAGE], since))
         continue;
       const u32 len = std::min(RB_GRANULE, r.vmem_bytes - g);
       if (std::memcmp(r.vmem + g, original.data() + r.mem1_size + g, len) == 0)
@@ -3716,14 +3728,7 @@ static void RbAdopt(Core::System& system, u8* ram, u32 live)
 // with different seeds model two peers with different rollback patterns.
 static u32 ForcedDepth(u32 live)
 {
-  const std::optional<u32> seed = ConfigForRollback().force_random_seed;
-  if (!seed)
-    return s_rb.force;
-  u64 z = (u64(*seed) << 32 | live) + 0x9E3779B97F4A7C15ULL;
-  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-  z ^= z >> 31;
-  return static_cast<u32>(z % (s_rb.force + 1));
+  return RollbackLogic::ForcedDepth(s_rb.force, ConfigForRollback().force_random_seed, live);
 }
 
 // Misprediction mode: the pads frame t really had (the replayed recording).
@@ -4167,8 +4172,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     {
       const u32 pending = *s_rb_exchange->PendingRollback();
       u32 target = pending;
-      const u32 oldest = r.live >= slots - 1 ? r.live - (slots - 1) : 0;
-      const u32 lower = std::max({oldest, r.vtime_from, r.barrier});
+      const u32 lower = RollbackLogic::RollbackLowerBound(r.live, slots, r.vtime_from, r.barrier);
       bool reachable = pending >= lower;
       while (reachable && target > lower &&
              !(r.io_idle.contains(target) && r.io_idle[target]))
@@ -4217,9 +4221,8 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
       if (r.mispredict_pending != UINT32_MAX)
       {
         u32 target = r.mispredict_pending;
-        const u32 oldest = now >= slots - 1 ? now - (slots - 1) : 0;
         // Never restore before the session, the ring or a load barrier.
-        const u32 lower = std::max({oldest, start, r.barrier});
+        const u32 lower = RollbackLogic::RollbackLowerBound(now, slots, start, r.barrier);
         bool ok = target >= lower;
         if (ok && r.io_idle_mode)
         {
@@ -4271,9 +4274,9 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
         // Only while idle now, to the newest idle snapshot at or before the
         // target still in the ring.
         target = r.live - depth;
-        const u32 oldest = r.live >= slots - 1 ? r.live - (slots - 1) : 0;
         // Never search past the ring, the session start or a load barrier.
-        const u32 lower = std::max({oldest, r.vtime_from, r.barrier});
+        const u32 lower =
+            RollbackLogic::RollbackLowerBound(r.live, slots, r.vtime_from, r.barrier);
         while (target > lower && !(r.io_idle.contains(target) && r.io_idle[target]))
           --target;
         if (!IsIoIdle(ram) || target < lower || !r.io_idle.contains(target) || !r.io_idle[target])
@@ -5461,12 +5464,12 @@ bool AcSoundLayerOn(const AcMem& m)
 constexpr u32 AC_EXTRA_TICKS = AC_BASE + 0xC;
 u32 AcNow(const AcMem& m)
 {
-  return s_rb.tick_running + m.rd(AC_EXTRA_TICKS);
+  return RollbackLogic::AudioNow(s_rb.tick_running, m.rd(AC_EXTRA_TICKS), 0);
 }
 
 u32 AcFramesToMs(u32 frames)
 {
-  return static_cast<u32>(u64(frames) * 1000 / 60);
+  return RollbackLogic::FramesToMs(frames);
 }
 
 // --- speech streams --------------------------------------------------------
@@ -6130,10 +6133,11 @@ void MusicPickHook(const Core::CPUThreadGuard& guard)
   if (!AcPtr(mgr) || m.rd8(mgr + 0x126) != 0)
     return;  // music off: fn_80072424 returns without picking
   const u32 f = AcNow(m);
-  m.wr(AC_MUSIC + 4, f + MusicGapFrames());
-  m.wr(AC_MUSIC, f + MusicGapFrames() + MusicSongFrames());
-  AcLogLine(fmt::format("M {} pick: start {} end {}", f, f + MusicGapFrames(),
-                        f + MusicGapFrames() + MusicSongFrames()));
+  const RollbackLogic::SongTimeline song =
+      RollbackLogic::ScheduleSong(f, MusicGapFrames(), MusicSongFrames());
+  m.wr(AC_MUSIC + 4, song.start);
+  m.wr(AC_MUSIC, song.end);
+  AcLogLine(fmt::format("M {} pick: start {} end {}", f, song.start, song.end));
 }
 
 // Called from ViCallbackHook for the frame routine's VI_PRE_CB call during the
@@ -6337,8 +6341,7 @@ void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
   s_io_ranges.clear();
   for (auto& slot : r.ring)
     std::fill(slot.begin(), slot.end(), 0);
-  s_dirty.synced.clear();
-  s_slot_seq.clear();
+  RollbackLogic::ClearSessionSlotMetadata(&s_dirty.synced, &s_slot_seq);
   s_ac_pending.clear();
   s_ac_real.clear();
   s_ac_sfx_start = {};
@@ -6431,8 +6434,7 @@ void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason)
   s_io_ranges.clear();
   for (auto& slot : r.ring)
     std::fill(slot.begin(), slot.end(), 0);
-  s_dirty.synced.clear();
-  s_slot_seq.clear();
+  RollbackLogic::ClearSessionSlotMetadata(&s_dirty.synced, &s_slot_seq);
   r.rollbacks = 0;
   r.resim_ticks = 0;
   s_rb_watch_rollbacks = 0;

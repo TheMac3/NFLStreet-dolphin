@@ -15,6 +15,7 @@
 //     -o nsr-rollback-netplay-test && ./nsr-rollback-netplay-test
 
 #include "Core/NSR/NSRRollbackNetplay.h"
+#include "Core/NSR/NSRRollbackLogic.h"
 
 #include <algorithm>
 #include <array>
@@ -23,9 +24,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <map>
+#include <random>
+#include <set>
 #include <vector>
 
 namespace RN = NSRNetplay::RollbackNet;
+namespace RL = NSRNetplay::RollbackLogic;
 
 // Serialize between peers just as ENet does, so the test exercises the wire
 // boundary rather than passing trusted Packet objects directly.
@@ -760,6 +765,199 @@ static void TestRelayedConflictAttributedToAuthor()
   assert(leaf1.Assemble(100)[2] == ValidationPad(2, 100));
 }
 
+// Thousands of arbitrary datagrams exercise every strict-length and field
+// validation branch. Accepted packets must remain stable when re-encoded.
+static void TestMalformedDatagramFuzz()
+{
+  std::mt19937 rng(0x4e535242U);
+  std::uniform_int_distribution<std::size_t> size_dist(0, 1024);
+  std::uniform_int_distribution<unsigned int> byte_dist(0, 255);
+  for (int iteration = 0; iteration < 20000; ++iteration)
+  {
+    std::vector<std::uint8_t> bytes(size_dist(rng));
+    for (std::uint8_t& byte : bytes)
+      byte = static_cast<std::uint8_t>(byte_dist(rng));
+    if (const auto packet = RN::Decode(bytes))
+    {
+      const auto roundtrip = RN::Decode(RN::Encode(*packet));
+      assert(roundtrip);
+      assert(roundtrip->sender == packet->sender);
+      assert(roundtrip->players == packet->players);
+      assert(roundtrip->pads == packet->pads);
+    }
+    (void)RN::DecodeHandoff(bytes);
+  }
+
+  RN::Exchange exchange(10, 4, 0, 1, 7, 99);
+  exchange.SubmitLocal(10, {});
+  const std::vector<std::uint8_t> valid = RN::Encode(exchange.BuildPacket(10));
+  for (std::size_t cut = 0; cut < valid.size(); ++cut)
+    assert(!RN::Decode(std::span(valid).first(cut)));
+}
+
+// Multiple late corrections must schedule the earliest affected frame and a
+// matching confirmation must not erase an older pending mismatch.
+static void TestEarliestCorrectionIsSticky()
+{
+  RN::Exchange local(100, 3, 0, 0, 7, 1);
+  RN::Exchange p1(100, 3, 1, 0, 7, 1);
+  RN::Exchange p2(100, 3, 2, 0, 7, 1);
+  RN::Pad one{};
+  RN::Pad two{};
+  one[0] = 1;
+  two[0] = 2;
+  for (std::uint32_t frame = 100; frame <= 106; ++frame)
+  {
+    local.SubmitLocal(frame, {});
+    local.Assemble(frame);
+  }
+  p1.SubmitLocal(104, one);
+  p2.SubmitLocal(102, two);
+  assert(local.Accept(p1.BuildPacket(104)));
+  assert(local.PendingRollback() == 104);
+  assert(local.Accept(p2.BuildPacket(102)));
+  assert(local.PendingRollback() == 102);
+  assert(local.Accept(p1.BuildPacket(104)));  // duplicate
+  assert(local.PendingRollback() == 102);
+}
+
+// Loss, reordered delivery, and duplicates may delay acknowledgement but
+// cannot corrupt the contiguous history or make acknowledged inputs reappear.
+static void TestHistoryUnderLossReorderAndDuplication()
+{
+  RN::Exchange sender(700, 2, 0, 0, 120, 4);
+  RN::Exchange receiver(700, 2, 1, 0, 120, 4);
+  for (std::uint32_t frame = 700; frame < 850; ++frame)
+  {
+    RN::Pad pad{};
+    pad[0] = static_cast<std::uint8_t>(frame);
+    sender.SubmitLocal(frame, pad);
+  }
+
+  RN::Packet first = sender.BuildPacket(849);
+  assert(first.first_frame == 700 && first.pads.size() == RN::MAX_HISTORY);
+  RN::Packet later = first;
+  later.first_frame += 32;
+  later.pads.erase(later.pads.begin(), later.pads.begin() + 32);
+  assert(receiver.Accept(later));  // reordered suffix first
+  assert(receiver.Contiguous()[0] == RN::NO_FRAME);
+  assert(receiver.Accept(later));  // duplicate is idempotent
+  assert(receiver.Accept(first));  // closes the gap
+  assert(receiver.Contiguous()[0] == 763);
+  Deliver(receiver, &sender, 849);  // ack through 763
+  RN::Packet second = sender.BuildPacket(849);
+  assert(second.first_frame == 764);
+  assert(receiver.Accept(second));
+  assert(receiver.Contiguous()[0] == 827);
+  Deliver(receiver, &sender, 850);
+  RN::Packet third = sender.BuildPacket(849);
+  assert(third.first_frame == 828 && third.pads.size() == 22);
+  assert(receiver.Accept(third));
+  assert(receiver.Contiguous()[0] == 849);
+}
+
+// Equal checksums never produce a false positive; once a mismatch is found,
+// later agreement or a newer mismatch cannot hide the first desync.
+static void TestChecksumAgreementAndStickyDesync()
+{
+  RN::Exchange a(900, 2, 0, 0, 7, 5);
+  RN::Exchange b(900, 2, 1, 0, 7, 5);
+  for (std::uint32_t frame = 900; frame <= 904; ++frame)
+  {
+    a.SubmitLocal(frame, {});
+    b.SubmitLocal(frame, {});
+    Deliver(a, &b, frame);
+    Deliver(b, &a, frame);
+    a.SetStateChecksum(frame + 1, frame == 902 ? 11U : frame);
+    b.SetStateChecksum(frame + 1, frame == 902 ? 12U : frame);
+    a.UpdateFinalized();
+    b.UpdateFinalized();
+    Deliver(a, &b, frame);
+    Deliver(b, &a, frame);
+  }
+  assert(a.FirstDesync() == 903);
+  assert(b.FirstDesync() == 903);
+  a.SetStateChecksum(905, 904);  // later agreement cannot clear it
+  assert(a.FirstDesync() == 903);
+}
+
+// Stage-4 transitions are independent generations. Reordered stale packets
+// and a dropped first announcement do not contaminate leave or re-entry.
+static void TestRepeatedHandoffTransitions()
+{
+  const auto run = [](RN::HandoffKind kind, std::uint32_t generation, std::uint32_t frame) {
+    RN::HandoffAgreement agreement(4, 0, kind, generation, frame, 0xfeed0000U + generation);
+    const std::array<RN::HandoffPacket, 3> peers{{
+        {1, 4, kind, generation, frame, 0xfeed0000U + generation},
+        {2, 4, kind, generation, frame, 0xfeed0000U + generation},
+        {3, 4, kind, generation, frame, 0xfeed0000U + generation},
+    }};
+    assert(agreement.Accept(peers[2]));
+    assert(agreement.Accept(peers[0]));
+    assert(agreement.Accept(peers[2]));  // duplicate
+    assert(!agreement.Complete());       // peer 2's first packet was lost
+    assert(agreement.Accept(peers[1]));
+    assert(agreement.Complete());
+  };
+  run(RN::HandoffKind::EnterRollback, 1, 4521);
+  run(RN::HandoffKind::LeaveRollback, 2, 149407);
+  run(RN::HandoffKind::EnterRollback, 3, 153925);
+
+  RN::HandoffAgreement reentry(2, 0, RN::HandoffKind::EnterRollback, 3, 153925, 9);
+  assert(!reentry.Accept({1, 2, RN::HandoffKind::LeaveRollback, 2, 149407, 8}));
+  assert(!reentry.Mismatched());  // stale generation is ignored
+}
+
+// Production helper decisions cover the non-I/O portions of snapshotting,
+// target selection, sidecar normalization, and audio virtual time.
+static void TestPureRollbackHelpers()
+{
+  assert(RL::PageNeedsCopy(7, std::nullopt));
+  assert(!RL::PageNeedsCopy(7, 7));
+  assert(RL::PageNeedsCopy(8, 7));
+  for (std::uint32_t frame = 0; frame < 1000; ++frame)
+    assert(RL::ForcedDepth(7, 123, frame) <= 7);
+  assert(RL::ForcedDepth(7, std::nullopt, 20) == 7);
+  assert(RL::ForcedDepth(0, 123, 20) == 0);
+
+  assert(RL::RollbackLowerBound(100, 24, 80, 90) == 90);
+  std::set<std::uint32_t> idle{92, 95};
+  const auto target = RL::FindIdleTarget(96, 90, true, [&](std::uint32_t frame) {
+    return idle.contains(frame);
+  });
+  assert(target == 95);
+  assert(!RL::FindIdleTarget(89, 90, true, [&](std::uint32_t) { return true; }));
+  assert(!RL::FindIdleTarget(95, 90, false, [&](std::uint32_t) { return true; }));
+
+  std::uint32_t cursor = 0;
+  const std::array<std::uint32_t, 3> pages{4, 8, 12};
+  std::vector<std::uint32_t> audited;
+  for (int i = 0; i < 5; ++i)
+    audited.push_back(*RL::NextRotatingAuditPage(pages, &cursor));
+  assert((audited == std::vector<std::uint32_t>{4, 8, 12, 4, 8}));
+  assert(cursor == 5);
+  assert(RL::NextRotatingAuditPage(pages, &cursor) == 12);
+  assert(RL::NextRotatingAuditPage(pages, &cursor) == 4);
+  const std::span<const std::uint32_t> no_pages;
+  assert(!RL::NextRotatingAuditPage(no_pages, &cursor));
+
+  const auto merged = RL::MergeRanges({{30, 40}, {10, 20}, {20, 25}, {35, 50}, {7, 7}});
+  assert((merged == std::vector<RL::Range>{{10, 25}, {30, 50}}));
+  assert(RL::AudioNow(100, 3, 2) == 105);
+  assert(RL::FramesToMs(75) == 1250);
+  assert(RL::BusyPollCatchups(999, 1000) == 0);
+  assert(RL::BusyPollCatchups(2001, 1000) == 2);
+  assert(RL::Before(9, 10) && !RL::Before(10, 10));
+  const RL::SongTimeline song = RL::ScheduleSong(100, 380, 10800);
+  assert(song.start == 480 && song.end == 11280);
+
+  std::map<const void*, std::uint32_t> synced{{pages.data(), 7}};
+  std::map<const void*, std::uint64_t> sequences{{pages.data(), 9}};
+  RL::ClearSessionSlotMetadata(&synced, &sequences);
+  assert(synced.empty() && sequences.empty());
+  assert(RL::PageNeedsCopy(7, std::nullopt));
+}
+
 int main()
 {
   TestHandoffAgreement();
@@ -778,6 +976,12 @@ int main()
   TestAckAdvanceTrimsRetransmission();
   TestHonestNetworksConverge();
   TestRelayedConflictAttributedToAuthor();
+  TestMalformedDatagramFuzz();
+  TestEarliestCorrectionIsSticky();
+  TestHistoryUnderLossReorderAndDuplication();
+  TestChecksumAgreementAndStickyDesync();
+  TestRepeatedHandoffTransitions();
+  TestPureRollbackHelpers();
   std::puts("NSR rollback exchange tests passed");
   return 0;
 }

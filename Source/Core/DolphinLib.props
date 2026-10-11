@@ -260,6 +260,7 @@
     <ClInclude Include="Core\NSR\NSRNetplay.h" />
     <ClInclude Include="Core\NSR\NSRTelemetry.h" />
     <ClInclude Include="Core\NSR\NSRRollbackNetplay.h" />
+    <ClInclude Include="Core\NSR\NSRRollbackLogic.h" />
     <ClInclude Include="Core\NSR\ReplayFollow.h" />
     <ClInclude Include="Core\HLE\HLE_VarArgs.h" />
     <ClInclude Include="Core\HLE\HLE.h" />

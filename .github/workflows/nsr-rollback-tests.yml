@@ -1,0 +1,28 @@
+# Socket-free rollback protocol and logic checks; no game data or emulator.
+name: NSR rollback tests
+
+on:
+  push:
+    branches: [nsr-netplay]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile with warnings as errors
+        run: |
+          g++ -std=c++20 -Wall -Wextra -Werror -UNDEBUG -I Source/Core \
+            Tools/NSR/NSRRollbackNetplayTest.cpp \
+            Source/Core/Core/NSR/NSRRollbackNetplay.cpp \
+            -o "$RUNNER_TEMP/nsr-rollback-tests"
+      - name: Run rollback tests
+        run: "$RUNNER_TEMP/nsr-rollback-tests"
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
