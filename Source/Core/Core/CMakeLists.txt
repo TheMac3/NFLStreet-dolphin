@@ -665,6 +665,8 @@ PUBLIC
   videosoftware
 
 PRIVATE
+  # Before LZ4: lz4 ships an older xxhash.h (no XXH3) that would shadow it.
+  xxhash::xxhash
   FatFs
   fmt::fmt
   LZO::LZO

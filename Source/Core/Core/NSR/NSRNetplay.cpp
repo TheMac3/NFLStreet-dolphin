@@ -38,6 +38,7 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -45,19 +46,31 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <random>
 #include <set>
 #include <string>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 #include <enet/enet.h>
 #include <fmt/format.h>
+// Portable snapshot dirty tracking hashes pages with XXH3-128 (vendored in
+// Externals/xxhash). Inlined: the page loop wants the fixed-size fast path, and
+// the static copies can't clash with the xxhash library or zstd's private copy.
+#define XXH_INLINE_ALL
+#include <xxhash.h>
+#if !defined(XXH3_SECRET_DEFAULT_SIZE)
+#error "NSRNetplay needs Externals/xxhash (0.8+, XXH3); an older xxhash.h is first on the include path"
+#endif
 
 #include "Common/CommonTypes.h"
 #include "Common/Config/Config.h"
 #include "Common/Swap.h"
+#include "Common/Thread.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
@@ -1378,11 +1391,150 @@ RollbackConfig& ConfigForRollback()
 bool IsIoIdle(const u8* ram);  // defined with the restore helpers
 
 // ---------------------------------------------------------------------------
-// Dirty-page tracking for snapshots (NSR_RB_DIRTY, default on where the
-// kernel supports it; NSR_RB_DIRTY=0 = full copies as before).
+// Snapshot page work on worker threads (NSR_RB_THREADS = threads used for it,
+// counting the CPU thread; default: a quarter of the host's hardware threads,
+// 1..4; 1 = everything on the CPU thread as before).
 //
-// A full snapshot is ~26 MB, but a frame writes only ~0.5-2 MB of it. The
-// kernel tracks which pages of emulated memory were written: every host
+// Snapshot saves, restores and the portable dirty tracker's page hashing are
+// loops over ~6,400 independent 4 KiB pages; one host core moves only ~6-10
+// GB/s, so splitting the loop over a few cores makes them memory-bandwidth
+// bound instead. Run() hands out fixed chunks of the index range from an
+// atomic counter; the calling (CPU) thread works too and returns once every
+// chunk is done, so the caller sees the loop as synchronous.
+//
+// Design notes:
+//   - Workers sleep on a condition variable between loops; the caller starts
+//     on the first chunk immediately, so a slow wake-up costs parallelism, not
+//     latency.
+//   - A worker joins a loop only while chunks are left, and a new loop starts
+//     only when no worker is still inside the previous one (m_active == 0), so
+//     a late worker can't run the previous loop's body over the next loop's
+//     indices.
+//   - Deferred: pinning workers to cores / sizing by physical cores. Revisit if
+//     the per-loop wake-up shows in profiles on hosts with few cores.
+class PageWorkers
+{
+public:
+  ~PageWorkers() { Stop(); }
+
+  void Start(u32 total_threads)
+  {
+    Stop();
+    for (u32 i = 1; i < total_threads; ++i)
+    {
+      m_threads.emplace_back([this] {
+        Common::SetCurrentThreadName("NSR snapshot worker");
+        Loop();
+      });
+    }
+  }
+
+  void Stop()
+  {
+    {
+      std::lock_guard lk(m_mutex);
+      m_stop = true;
+    }
+    m_work_cv.notify_all();
+    for (std::thread& t : m_threads)
+      t.join();
+    m_threads.clear();
+    m_stop = false;
+  }
+
+  u32 Threads() const { return static_cast<u32>(m_threads.size()) + 1; }
+
+  // fn(begin, end) over [0, n) in chunks of `chunk` indices; fn must be safe
+  // to run concurrently on disjoint ranges.
+  template <typename F>
+  void Run(u32 n, u32 chunk, F&& fn)
+  {
+    using Fn = std::remove_reference_t<F>;
+    const u32 chunks = (n + chunk - 1) / chunk;
+    if (m_threads.empty() || chunks < 2)
+    {
+      if (n)
+        fn(0u, n);
+      return;
+    }
+    {
+      std::unique_lock lk(m_mutex);
+      m_idle_cv.wait(lk, [this] { return m_active == 0; });
+      m_call = [](void* ctx, u32 a, u32 b) { (*static_cast<Fn*>(ctx))(a, b); };
+      m_ctx = const_cast<void*>(static_cast<const void*>(&fn));
+      m_n = n;
+      m_chunk = chunk;
+      m_chunks = chunks;
+      m_next.store(0);
+      m_done.store(0);
+      ++m_gen;
+    }
+    m_work_cv.notify_all();
+    Work();
+    while (m_done.load(std::memory_order_acquire) < chunks)
+      std::this_thread::yield();
+  }
+
+private:
+  void Work()
+  {
+    for (;;)
+    {
+      const u32 c = m_next.fetch_add(1);
+      if (c >= m_chunks)
+        return;
+      const u32 a = c * m_chunk;
+      m_call(m_ctx, a, std::min(m_n, a + m_chunk));
+      m_done.fetch_add(1, std::memory_order_release);
+    }
+  }
+
+  void Loop()
+  {
+    u64 seen = 0;
+    std::unique_lock lk(m_mutex);
+    for (;;)
+    {
+      m_work_cv.wait(lk, [&] { return m_stop || m_gen != seen; });
+      if (m_stop)
+        return;
+      seen = m_gen;
+      if (m_next.load() >= m_chunks)
+        continue;  // the caller (or others) already took every chunk
+      ++m_active;
+      lk.unlock();
+      Work();
+      lk.lock();
+      if (--m_active == 0)
+        m_idle_cv.notify_all();
+    }
+  }
+
+  std::vector<std::thread> m_threads;
+  std::mutex m_mutex;
+  std::condition_variable m_work_cv, m_idle_cv;
+  bool m_stop = false;
+  u64 m_gen = 0;
+  u32 m_active = 0;
+  // The current loop; written under m_mutex while no worker is inside one.
+  void (*m_call)(void*, u32, u32) = nullptr;
+  void* m_ctx = nullptr;
+  u32 m_n = 0, m_chunk = 1, m_chunks = 0;
+  std::atomic<u32> m_next{0}, m_done{0};
+};
+PageWorkers s_workers;
+constexpr u32 PAGE_CHUNK = 32;  // pages per work item (128 KiB)
+
+// ---------------------------------------------------------------------------
+// Dirty-page tracking for snapshots (NSR_RB_DIRTY):
+//   1 / unset  kernel tracker where available (Linux 6.7+), else page hashing;
+//   kernel     kernel tracker only (else full copies);
+//   hash       page hashing (portable; forced, e.g. to test it on Linux);
+//   0          full copies as before.
+//
+// A full snapshot is ~26 MB, but a frame writes only ~0.5-2 MB of it.
+//
+// Kernel tracker (Linux 6.7+). The kernel tracks which pages of emulated memory were written: every host
 // mapping of MEM1 and fake VMEM (emulated memory is one shared-memory object
 // mapped at several host addresses: the RAM pointer, the physical and the
 // BAT/logical fastmem views; each has its own page-table entries) is
@@ -1411,11 +1563,64 @@ bool IsIoIdle(const u8* ram);  // defined with the restore helpers
 // Slots without a recorded epoch (new, or not ring slots) get full copies.
 // NSR_RB_DIRTY_VERIFY=1 checks every incremental save and restore against a
 // full comparison and logs any page the tracker missed.
+//
+// Page hashing (portable fallback; Windows and macOS, older Linux kernels).
+// Windows can't use the kernel route: Dolphin maps emulated memory as views
+// of a file mapping, which GetWriteWatch doesn't cover, and mprotect-style
+// tracking would fight Dolphin's fastmem fault handler on every platform.
+// Instead Sample() hashes every page that holds rolled-back bytes (XXH3-128,
+// on the PageWorkers) and stamps the pages whose hash differs from the
+// previous sample's. Only the sample changes; the epoch bookkeeping above is
+// shared, so a save/restore still touches only the stamped pages. Hashing
+// reads all game memory once per sample (no writes, no compare against a
+// second copy), against a full copy's read + write of all of it: ~1.5-2.5 ms
+// per sample vs ~5 ms per full save/restore on a Ryzen 3700X, where both are
+// memory-bandwidth bound. It sees every writer in the process by
+// construction (it looks at content, not at mappings, so BAT remaps don't
+// matter). Deferred: skipping the sample of the save that directly follows a
+// restore (only our own writes in between) would save one sample per
+// rollback, but needs every writer in that gap accounted for; revisit if the
+// fallback's rollback frames miss the frame budget on players' machines.
+//
+// Correctness under hash collisions: a page whose bytes changed but whose
+// hash didn't would be left out of the copy, silently. The hash is 128-bit
+// with a per-session random key (XXH3 secret from the seed), so for a changed
+// page the chance is ~2^-128 per comparison: at most ~5e8 changed-page
+// comparisons per hour of play (~250 changed pages per sample) gives ~1e-30
+// per hour, far below DRAM soft-error rates. Two more guards, so a miss
+// can't stay silent:
+//   - each hashed save also compares NSR_RB_HASH_AUDIT pages (default 16,
+//     rotating over all pages, ~10 us) of the slot with RAM byte for byte; a
+//     difference is logged, repaired in the slot and stamped (so every other
+//     slot treats the page as changed);
+//   - netplay's periodic whole-MEM1 hash exchange catches any divergence
+//     between peers, whatever caused it.
+// Rejected: 64-bit hashes (same speed for 4 KiB inputs, collision chance
+// ~1e-11 per hour; no reason to take it), comparing against a shadow copy
+// (reads 2x the bytes), hashing only on save with per-slot hash arrays (same
+// cost, 24x the memory).
 struct DirtyTracker
 {
   static constexpr u32 PAGE = 0x1000;
-  bool on = false;
+  enum class Mode
+  {
+    Off,     // no tracking: full copies (possibly on worker threads)
+    Kernel,  // userfaultfd + PAGEMAP_SCAN
+    Hash,    // page hashing
+  };
+  Mode mode = Mode::Off;
+  bool on = false;     // stamps are valid (Kernel or Hash)
+  bool paged = false;  // chunk tables built (per-page save/restore loops usable)
   bool verify = false;
+  // Hash mode.
+  const u8* ram = nullptr;
+  const u8* vmem = nullptr;
+  u32 vmem_bytes = 0;
+  std::vector<XXH128_hash_t> hashes;  // per state page: hash at the last sample
+  std::vector<u32> hash_pages;        // state pages that hold rolled-back bytes
+  alignas(64) std::array<u8, XXH3_SECRET_DEFAULT_SIZE> secret{};
+  u32 audit_pages = 0, audit_next = 0;
+  u64 audit_checked = 0, audit_mismatches = 0;
   int uffd = -1;
   int pagemap_fd = -1;
   u32 mem1_bytes = 0;
@@ -1508,6 +1713,8 @@ struct DirtyTracker
   // them may have gone unseen, every page counts as written.
   void RefreshViews(bool remapped = false)
   {
+    if (mode != Mode::Kernel)
+      return;  // hashing reads content through the RAM pointer: no mappings
     auto now = ParseViews();
     const bool same = !remapped && now.size() == views.size() &&
                       std::equal(now.begin(), now.end(), views.begin(), [](const View& x, const View& y) {
@@ -1524,34 +1731,16 @@ struct DirtyTracker
     std::fill(stamp.begin(), stamp.end(), epoch);
   }
 
-  bool Init(const std::vector<std::pair<u32, u32>>& segments, u32 mem1_size, u32 vmem_bytes)
+  // Page geometry and the per-page segment pieces; used by every mode (the
+  // per-page save/restore loops also run full copies on worker threads).
+  void Prepare(const std::vector<std::pair<u32, u32>>& segments, u32 mem1_size, u32 vmem_size)
   {
-#if NSR_HAVE_UFFD
     mem1_bytes = mem1_size;
     mem1_pages = (mem1_size + PAGE - 1) / PAGE;
-    vmem_pages = (vmem_bytes + PAGE - 1) / PAGE;
-    seen_remaps = Memory::g_nsr_logical_remaps;
-    views = ParseViews();
-    if (views.empty())
-      return false;
-    uffd = static_cast<int>(syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY));
-    if (uffd < 0)
-      return false;
-    uffdio_api api{};
-    api.api = UFFD_API;
-    api.features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_HUGETLBFS_SHMEM | UFFD_FEATURE_WP_UNPOPULATED;
-    pagemap_fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
-    if (ioctl(uffd, UFFDIO_API, &api) != 0 || pagemap_fd < 0)
-      return false;
-    for (const View& v : views)
-    {
-      if (!Register(v))
-        return false;
-    }
-    stamp.assign(mem1_pages + vmem_pages, 0);
-    regions.resize(4096);
-    if (!Sample())
-      return false;
+    vmem_bytes = vmem_size;
+    vmem_pages = (vmem_size + PAGE - 1) / PAGE;
+    stamp.assign(mem1_pages + vmem_pages, epoch);  // nothing synced yet
+    chunks.clear();
     page_first.assign(mem1_pages + 1, 0);
     for (u32 p = 0; p < mem1_pages; ++p)
     {
@@ -1566,30 +1755,192 @@ struct DirtyTracker
     }
     page_first[mem1_pages] = static_cast<u32>(chunks.size());
     verify = !Env("NSR_RB_DIRTY_VERIFY").empty();
+    paged = true;
+  }
+
+  bool InitKernel()
+  {
+#if NSR_HAVE_UFFD
+    seen_remaps = Memory::g_nsr_logical_remaps;
+    views = ParseViews();
+    if (views.empty())
+      return false;
+    uffd = static_cast<int>(syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY));
+    if (uffd < 0)
+      return ReleaseKernel();
+    uffdio_api api{};
+    api.api = UFFD_API;
+    api.features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_HUGETLBFS_SHMEM | UFFD_FEATURE_WP_UNPOPULATED;
+    pagemap_fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+    if (ioctl(uffd, UFFDIO_API, &api) != 0 || pagemap_fd < 0)
+      return ReleaseKernel();
+    for (const View& v : views)
+    {
+      if (!Register(v))
+        return ReleaseKernel();
+    }
+    regions.resize(4096);
+    mode = Mode::Kernel;
+    if (!Sample())
+    {
+      mode = Mode::Off;
+      return ReleaseKernel();
+    }
     std::fill(stamp.begin(), stamp.end(), epoch);  // nothing synced yet
     return true;
 #else
-    (void)segments, (void)mem1_size, (void)vmem_bytes;
     return false;
 #endif
   }
 
-  // Release the kernel handles and forget everything (core shutdown; the
-  // next session initialises again).
-  void Reset()
+  // Undo a partial kernel set-up (old kernel, missing feature): closing the
+  // userfaultfd drops its registrations. Returns false for the callers.
+  bool ReleaseKernel()
   {
 #if NSR_HAVE_UFFD
     if (uffd >= 0)
       close(uffd);
     if (pagemap_fd >= 0)
       close(pagemap_fd);
+    uffd = pagemap_fd = -1;
+    views.clear();
+    regions.clear();
 #endif
+    return false;
+  }
+
+  bool InitHash(const u8* ram_base, const u8* vmem_base)
+  {
+    ram = ram_base;
+    vmem = vmem_base;
+    if (!ram || (vmem_pages && !vmem))
+      return false;
+    // Pages without rolled-back bytes (wholly inside keep ranges) are never
+    // saved, restored or checked: don't hash them.
+    hash_pages.clear();
+    for (u32 p = 0; p < mem1_pages; ++p)
+    {
+      if (page_first[p] != page_first[p + 1])
+        hash_pages.push_back(p);
+    }
+    for (u32 q = 0; q < vmem_pages; ++q)
+      hash_pages.push_back(mem1_pages + q);
+    // Per-session random key: a collision can't be reproduced or arranged
+    // across sessions (see the collision note above).
+    std::random_device rd;
+    const u64 seed = (u64{rd()} << 32) ^ rd();
+    XXH3_generateSecret_fromSeed(secret.data(), seed);
+    hashes.assign(mem1_pages + vmem_pages, XXH128_hash_t{});
+    audit_pages = ParseU32(Env("NSR_RB_HASH_AUDIT")).value_or(16);
+    mode = Mode::Hash;
+    Sample();
+    std::fill(stamp.begin(), stamp.end(), epoch);  // nothing synced yet
+    pages_seen = 0;
+    return true;
+  }
+
+  // Host bytes of state page p (MEM1, then the fake VMEM prefix).
+  std::pair<const u8*, u32> PageBytes(u32 p) const
+  {
+    if (p < mem1_pages)
+      return {ram + p * PAGE, std::min(PAGE, mem1_bytes - p * PAGE)};
+    const u32 a = (p - mem1_pages) * PAGE;
+    return {vmem + a, std::min(PAGE, vmem_bytes - a)};
+  }
+
+  // Hash mode's Sample(): stamp the pages whose content hash changed since
+  // the previous sample. Workers write disjoint hashes[]/stamp[] entries.
+  void SampleHash()
+  {
+    const u32 now = epoch;
+    std::atomic<u64> changed{0};
+    s_workers.Run(static_cast<u32>(hash_pages.size()), PAGE_CHUNK, [&](u32 a, u32 b) {
+      u64 n = 0;
+      for (u32 i = a; i < b; ++i)
+      {
+        const u32 p = hash_pages[i];
+        const auto [bytes, len] = PageBytes(p);
+        const XXH128_hash_t h = XXH3_128bits_withSecret(bytes, len, secret.data(), secret.size());
+        if (!XXH128_isEqual(h, hashes[p]))
+        {
+          hashes[p] = h;
+          stamp[p] = now;
+          ++n;
+        }
+      }
+      changed.fetch_add(n, std::memory_order_relaxed);
+    });
+    pages_seen += changed.load();
+  }
+
+  // Hash mode: byte-compare a few pages of a just-saved slot with RAM. A
+  // difference means a hash collision hid a change (or a tracking bug):
+  // repair the slot, and stamp the page so other slots resync it too.
+  void Audit(std::vector<u8>& slot, std::pair<u32, u32> fifo)
+  {
+    if (mode != Mode::Hash || !audit_pages || hash_pages.empty())
+      return;
+    for (u32 i = 0; i < audit_pages; ++i)
+    {
+      const u32 p = hash_pages[audit_next++ % hash_pages.size()];
+      if (p < mem1_pages && p >= fifo.first && p < fifo.second)
+        continue;  // GX FIFO: left stale on purpose (a live range)
+      ++audit_checked;
+      bool differs = false;
+      if (p < mem1_pages)
+      {
+        for (u32 c = page_first[p]; c < page_first[p + 1]; ++c)
+        {
+          const auto [a, b] = chunks[c];
+          if (std::memcmp(slot.data() + a, ram + a, b - a) != 0)
+          {
+            std::memcpy(slot.data() + a, ram + a, b - a);
+            differs = true;
+          }
+        }
+      }
+      else
+      {
+        const auto [bytes, len] = PageBytes(p);
+        u8* dst = slot.data() + mem1_bytes + (p - mem1_pages) * PAGE;
+        if (std::memcmp(dst, bytes, len) != 0)
+        {
+          std::memcpy(dst, bytes, len);
+          differs = true;
+        }
+      }
+      if (differs)
+      {
+        stamp[p] = epoch;
+        if (audit_mismatches++ < 20)
+          Log("SNAPSHOT HASH AUDIT: state page {:#x} differed from RAM after a hashed save "
+              "(repaired)", p);
+      }
+    }
+  }
+
+  // Release the kernel handles and forget everything (core shutdown; the
+  // next session initialises again).
+  void Reset()
+  {
+    ReleaseKernel();
     *this = DirtyTracker{};
   }
 
   // Stamp the pages written since the previous sample and protect them again.
   bool Sample()
   {
+    if (mode == Mode::Hash)
+    {
+      const auto t0 = std::chrono::steady_clock::now();
+      ++epoch;
+      SampleHash();
+      ++samples;
+      sample_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+      return true;
+    }
 #if NSR_HAVE_UFFD
     // Dolphin remapped its logical views (a BAT write) since we last looked:
     // re-read the mappings first (RefreshViews samples again by itself).
@@ -1903,14 +2254,30 @@ void RbInit(Core::System& system)
     r.ring.assign(r.io_idle_mode ? std::max<u32>(depth + 1, ParseU32(Env("NSR_RB_RING")).value_or(24))
                                  : depth + 1,
                   std::vector<u8>(size + r.vmem_bytes));
-    if (Env("NSR_RB_DIRTY", "1") != "0")
+    // Snapshot page work: worker threads, then the dirty tracker (see
+    // PageWorkers and DirtyTracker for the modes).
+    const u32 hw = std::max(1u, std::thread::hardware_concurrency());
+    const u32 threads =
+        std::clamp<u32>(ParseU32(Env("NSR_RB_THREADS")).value_or(hw / 4), 1, 16);
+    s_workers.Start(threads);
+    s_dirty.Prepare(r.segments, size, r.vmem_bytes);
+    const std::string dirty = Env("NSR_RB_DIRTY", "1");
+    if (dirty != "0")
     {
-      s_dirty.on = s_dirty.Init(r.segments, size, r.vmem_bytes);
-      Log("snapshot dirty-page tracking: {} ({} mappings of game memory)",
-          s_dirty.on ? "on" : "unavailable, full copies", s_dirty.views.size());
-      for (const auto& v : s_dirty.views)
-        Log("  mapping {:x}: state pages {:#x}+{:#x}", v.host, v.first, v.count);
+      if (dirty != "hash")
+        s_dirty.on = s_dirty.InitKernel();
+      if (!s_dirty.on && dirty != "kernel")
+        s_dirty.on = s_dirty.InitHash(system.GetMemory().GetRAM(), r.vmem);
     }
+    using Mode = DirtyTracker::Mode;
+    Log("snapshot dirty-page tracking: {} ({} mappings of game memory, {} hashed pages); "
+        "{} snapshot thread(s)",
+        s_dirty.mode == Mode::Kernel ? "kernel" :
+        s_dirty.mode == Mode::Hash   ? "page hashing" :
+                                       "off, full copies",
+        s_dirty.views.size(), s_dirty.hash_pages.size(), s_workers.Threads());
+    for (const auto& v : s_dirty.views)
+      Log("  mapping {:x}: state pages {:#x}+{:#x}", v.host, v.first, v.count);
   }
   if (r.net_enabled)
   {
@@ -2029,34 +2396,57 @@ void RbSave(const u8* ram, std::vector<u8>& slot)
   PhaseTimer timer(PH_SAVE);
   DirtyTracker& d = s_dirty;
   const bool full_slot = s_rb.vmem_bytes == 0 || slot.size() >= s_rb.mem1_size + s_rb.vmem_bytes;
-  if (d.on && full_slot)
+  // Per-page path: with dirty tracking (only pages stamped since the slot was
+  // synced), or for full copies split over the snapshot worker threads.
+  const bool parallel_full = !d.on && d.paged && s_workers.Threads() > 1 &&
+                             slot.size() >= s_rb.mem1_size + s_rb.vmem_bytes;
+  if ((d.on && full_slot) || parallel_full)
   {
-    d.Sample();
-    const auto [fifo_lo, fifo_hi] = d.FifoPages();
-    const auto since = d.Synced(slot);
-    for (u32 p = 0; p < d.mem1_pages; ++p)
+    std::optional<u32> since;
+    std::pair<u32, u32> fifo{0, 0};
+    if (d.on)
     {
-      if (since && d.stamp[p] <= *since)
-        continue;
-      if (since && p >= fifo_lo && p < fifo_hi)
+      d.Sample();
+      fifo = d.FifoPages();
+      since = d.Synced(slot);
+    }
+    const auto [fifo_lo, fifo_hi] = fifo;
+    const u32 vmem_pages = s_rb.vmem_bytes ? d.vmem_pages : 0;
+    std::atomic<u32> fifo_skipped{0};
+    std::atomic<u64> copied{0};  // NSR telemetry
+    s_workers.Run(d.mem1_pages + vmem_pages, PAGE_CHUNK, [&](u32 lo, u32 hi) {
+      for (u32 p = lo; p < hi; ++p)
       {
-        ++d.fifo_skipped;
-        continue;
+        if (since && d.stamp[p] <= *since)
+          continue;
+        if (p < d.mem1_pages)
+        {
+          if (since && p >= fifo_lo && p < fifo_hi)
+          {
+            fifo_skipped.fetch_add(1, std::memory_order_relaxed);
+            continue;
+          }
+          copied.fetch_add(1, std::memory_order_relaxed);
+          for (u32 c = d.page_first[p]; c < d.page_first[p + 1]; ++c)
+            std::memcpy(slot.data() + d.chunks[c].first, ram + d.chunks[c].first,
+                        d.chunks[c].second - d.chunks[c].first);
+        }
+        else
+        {
+          copied.fetch_add(1, std::memory_order_relaxed);
+          const u32 a = (p - d.mem1_pages) * DirtyTracker::PAGE;
+          const u32 n = std::min(DirtyTracker::PAGE, s_rb.vmem_bytes - a);
+          std::memcpy(slot.data() + s_rb.mem1_size + a, s_rb.vmem + a, n);
+        }
       }
-      ++d.pages_copied;  // NSR telemetry
-      for (u32 c = d.page_first[p]; c < d.page_first[p + 1]; ++c)
-        std::memcpy(slot.data() + d.chunks[c].first, ram + d.chunks[c].first,
-                    d.chunks[c].second - d.chunks[c].first);
-    }
-    for (u32 q = 0; q < d.vmem_pages && s_rb.vmem_bytes; ++q)
-    {
-      if (since && d.stamp[d.mem1_pages + q] <= *since)
-        continue;
-      const u32 a = q * DirtyTracker::PAGE, n = std::min(DirtyTracker::PAGE, s_rb.vmem_bytes - a);
-      ++d.pages_copied;  // NSR telemetry
-      std::memcpy(slot.data() + s_rb.mem1_size + a, s_rb.vmem + a, n);
-    }
+    });
+    d.fifo_skipped += fifo_skipped.load();
+    d.pages_copied += copied.load();  // NSR telemetry
+    if (!d.on)
+      return;
     d.synced[slot.data()] = d.epoch;
+    if (since)
+      d.Audit(slot, fifo);
     if (d.verify)
     {
       u32 missed = 0;
@@ -2243,36 +2633,48 @@ void RbRestore(Core::System& system, u8* ram, const std::vector<u8>& slot)
     fifo = d.FifoPages();
     since = d.Synced(slot);
   }
-  if (since)
+  const bool sized = slot.size() >= s_rb.mem1_size + s_rb.vmem_bytes;
+  if (since || (d.paged && s_workers.Threads() > 1 && sized))
   {
-    // Only pages written since the slot equalled RAM can differ from it.
-    // GX FIFO pages are skipped: the live FIFO is put back below anyway.
+    // Page by page, split over the snapshot workers. With a sync point, only
+    // pages written since the slot equalled RAM can differ from it, and GX
+    // FIFO pages are skipped (the live FIFO is put back below anyway);
+    // without one, every page is compared (the full restore, in parallel).
     const auto [fifo_lo, fifo_hi] = fifo;
-    for (u32 p = 0; p < d.mem1_pages; ++p)
-    {
-      if (d.stamp[p] <= *since || (p >= fifo_lo && p < fifo_hi))
-        continue;
-      bool page_changed = false;
-      for (u32 c = d.page_first[p]; c < d.page_first[p + 1]; ++c)
+    const u32 vmem_pages = s_rb.vmem_bytes ? d.vmem_pages : 0;
+    std::vector<u8> page_changed(d.mem1_pages, 0);
+    std::atomic<bool> any_vmem{false};
+    s_workers.Run(d.mem1_pages + vmem_pages, PAGE_CHUNK, [&](u32 lo, u32 hi) {
+      for (u32 p = lo; p < hi; ++p)
       {
-        const auto [a, b] = d.chunks[c];
-        if (std::memcmp(ram + a, slot.data() + a, b - a) != 0)
+        if (since && d.stamp[p] <= *since)
+          continue;
+        if (p >= d.mem1_pages)
         {
-          std::memcpy(ram + a, slot.data() + a, b - a);
-          page_changed = true;
+          const u32 a = (p - d.mem1_pages) * PAGE, n = std::min(PAGE, s_rb.vmem_bytes - a);
+          std::memcpy(s_rb.vmem + a, slot.data() + s_rb.mem1_size + a, n);
+          any_vmem.store(true, std::memory_order_relaxed);
+          continue;
+        }
+        if (since && p >= fifo_lo && p < fifo_hi)
+          continue;
+        for (u32 c = d.page_first[p]; c < d.page_first[p + 1]; ++c)
+        {
+          const auto [a, b] = d.chunks[c];
+          if (std::memcmp(ram + a, slot.data() + a, b - a) != 0)
+          {
+            std::memcpy(ram + a, slot.data() + a, b - a);
+            page_changed[p] = 1;
+          }
         }
       }
-      if (page_changed)
+    });
+    for (u32 p = 0; p < d.mem1_pages; ++p)
+    {
+      if (page_changed[p])
         changed.push_back(p * PAGE);
     }
-    for (u32 q = 0; q < d.vmem_pages && s_rb.vmem_bytes; ++q)
-    {
-      if (d.stamp[d.mem1_pages + q] <= *since)
-        continue;
-      const u32 a = q * PAGE, n = std::min(PAGE, s_rb.vmem_bytes - a);
-      std::memcpy(s_rb.vmem + a, slot.data() + s_rb.mem1_size + a, n);
-      vmem_restored = true;
-    }
+    vmem_restored = any_vmem.load();
   }
   else
   {
@@ -3937,7 +4339,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     if (s_rb_exchange)
       s_rb_exchange->TrimBefore(t - 600);
   }
-  if (s_dirty.on && (t % 600 == 0 || t == r.vtime_from))
+  if (s_dirty.mode == DirtyTracker::Mode::Kernel && (t % 600 == 0 || t == r.vtime_from))
     s_dirty.RefreshViews();
   if (t % 600 == 0)
   {
@@ -3946,6 +4348,9 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
           "pages/sample, {} GX FIFO page copies skipped",
           s_dirty.samples, s_dirty.sample_ns / 1e3 / s_dirty.samples, s_dirty.remaps,
           static_cast<double>(s_dirty.pages_seen) / s_dirty.samples, s_dirty.fifo_skipped);
+    if (s_dirty.mode == DirtyTracker::Mode::Hash)
+      Log("snapshot hash audit: {} pages compared, {} differed", s_dirty.audit_checked,
+          s_dirty.audit_mismatches);
     Log("tick {}: rollbacks {}, re-simulated {}, mismatched checks {}/{}; audio gate: "
         "recorded {}, replayed {}, mismatched {}; load barriers {} (clamped {}, in re-sim {}); "
         "io-idle skips {}; mispredictions {} (uncorrectable {}); net stalls {} sync waits {}",
@@ -5963,6 +6368,7 @@ void Shutdown(const Core::CPUThreadGuard& guard)
     enet_host_destroy(s.host);
   }
   s_dirty.Reset();
+  s_workers.Stop();
   if (s_rb.record)
     std::fclose(s_rb.record);
   if (s_rb.ac_log)
