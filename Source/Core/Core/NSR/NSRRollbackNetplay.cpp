@@ -302,11 +302,76 @@ Packet Exchange::BuildPacket(std::uint32_t live_frame, std::uint32_t send_us) co
   return packet;
 }
 
+std::uint32_t Exchange::FutureInputLimit() const
+{
+  // See the header for the derivation.  Before any local input exists a
+  // peer may predict at most max_prediction frames from the epoch start.
+  const std::uint32_t contiguous = m_contiguous[m_me];
+  const std::uint64_t base =
+      contiguous == NO_FRAME ? std::uint64_t{m_start} : std::uint64_t{contiguous} + 1;
+  const std::uint64_t limit =
+      base + m_max_prediction + m_delay + std::uint64_t{FUTURE_INPUT_SLACK};
+  // NO_FRAME is a sentinel, never a storable frame.
+  return static_cast<std::uint32_t>(std::min<std::uint64_t>(limit, NO_FRAME - 1));
+}
+
+// Check every field that would mutate protocol state, without mutating any.
+// Accept applies a datagram only after this returns nullopt, so a rejected
+// packet cannot half-apply (for example, advance an ack but drop its pads).
+std::optional<ProtocolViolation> Exchange::Validate(const Packet& packet) const
+{
+  // An honest ack is the sender's contiguous view of our input, which is
+  // anchored at m_start and can never pass our own contiguous local prefix.
+  // Stale (lower) acks remain valid; Accept simply does not regress on them.
+  const std::uint32_t ack = packet.ack[m_me];
+  const std::uint32_t local = m_contiguous[m_me];
+  if (ack != NO_FRAME && (local == NO_FRAME || ack > local || ack < m_start))
+    return ProtocolViolation{packet.sender, ViolationKind::ImpossibleAck, ack};
+
+  const std::uint32_t limit = FutureInputLimit();
+  const auto& known = m_confirmed[packet.sender];
+  for (std::size_t i = 0; i < packet.pads.size(); ++i)
+  {
+    // Decode guarantees first_frame + count - 1 does not wrap.
+    const std::uint32_t frame = packet.first_frame + static_cast<std::uint32_t>(i);
+    if (frame > limit)
+      return ProtocolViolation{packet.sender, ViolationKind::InputOutOfWindow, frame};
+    // Redundant retransmission is the normal case and must be identical.
+    // Frames already trimmed from history cannot be compared; Accept skips
+    // them instead of resurrecting them.
+    if (const auto it = known.find(frame);
+        it != known.end() && it->second != Canonical(packet.pads[i]))
+    {
+      return ProtocolViolation{packet.sender, ViolationKind::ConflictingInput, frame};
+    }
+  }
+
+  // A finalized checksum can only cover a state whose inputs, including
+  // ours, the sender has confirmed, so the same window applies.
+  if (packet.checksum_frame != NO_FRAME && packet.checksum_frame > limit)
+  {
+    return ProtocolViolation{packet.sender, ViolationKind::ChecksumOutOfWindow,
+                             packet.checksum_frame};
+  }
+  return std::nullopt;
+}
+
 bool Exchange::Accept(const Packet& packet, std::uint32_t receive_us)
 {
+  // Stale epochs and misaddressed datagrams are expected under unsequenced
+  // delivery; they are dropped without counting as a violation.
   if (packet.session != m_session || packet.players != m_players || packet.sender >= m_players ||
       packet.sender == m_me || packet.pads.size() > MAX_HISTORY)
   {
+    return false;
+  }
+  if (const auto violation = Validate(packet))
+  {
+    // Saturate rather than wrap so a flood cannot make the count look clean.
+    if (m_violations != std::numeric_limits<std::uint32_t>::max())
+      ++m_violations;
+    if (!m_first_violation)
+      m_first_violation = violation;
     return false;
   }
   if (receive_us != 0)
@@ -317,13 +382,23 @@ bool Exchange::Accept(const Packet& packet, std::uint32_t receive_us)
   {
     m_peer_ack[packet.sender] = ack;
   }
+  auto& inputs = m_confirmed[packet.sender];
+  const std::uint32_t contiguous = m_contiguous[packet.sender];
   for (std::size_t i = 0; i < packet.pads.size(); ++i)
   {
     const std::uint32_t frame = packet.first_frame + static_cast<std::uint32_t>(i);
-    const Pad pad = Canonical(packet.pads[i]);
-    const auto [it, inserted] = m_confirmed[packet.sender].try_emplace(frame, pad);
-    if (!inserted || frame < m_start)
+    // Nothing precedes the epoch, and a frame at or below the contiguous
+    // prefix that is no longer held was trimmed after confirmation.  A
+    // reordered retransmission must not resurrect either into history.
+    if (frame < m_start ||
+        (contiguous != NO_FRAME && frame <= contiguous && !inputs.contains(frame)))
+    {
       continue;
+    }
+    const Pad pad = Canonical(packet.pads[i]);
+    const auto [it, inserted] = inputs.try_emplace(frame, pad);
+    if (!inserted)
+      continue;  // Validate proved the stored value is identical.
     if (const auto ran = m_ran.find(frame); ran != m_ran.end() &&
         (m_predicted[frame] & (1U << packet.sender)) != 0)
     {
@@ -506,6 +581,12 @@ void Exchange::TrimBefore(std::uint32_t frame)
 {
   // Keep one input before the cutoff because repeat-last prediction needs it.
   // Local history also remains available until every peer has acknowledged it.
+  //
+  // Remote history above FutureInputLimit() is also dropped.  Accept never
+  // stores such input and the limit only grows, so this is a no-op for honest
+  // peers; it is defense in depth so that retention is bounded on both sides
+  // of the live frame rather than relying on a single insertion check.
+  const std::uint32_t limit = FutureInputLimit();
   for (std::uint8_t player = 0; player < m_players; ++player)
   {
     auto& inputs = m_confirmed[player];
@@ -514,6 +595,10 @@ void Exchange::TrimBefore(std::uint32_t frame)
     {
       if (const auto unacked = OldestUnackedLocal())
         cutoff = std::min(cutoff, *unacked);
+    }
+    else
+    {
+      inputs.erase(inputs.upper_bound(limit), inputs.end());
     }
     auto keep = inputs.lower_bound(cutoff);
     if (keep != inputs.begin())
@@ -525,7 +610,23 @@ void Exchange::TrimBefore(std::uint32_t frame)
   m_predicted.erase(m_predicted.begin(), m_predicted.lower_bound(frame));
   m_local_checksums.erase(m_local_checksums.begin(), m_local_checksums.lower_bound(frame));
   for (auto& checksums : m_remote_checksums)
+  {
     checksums.erase(checksums.begin(), checksums.lower_bound(frame));
+    checksums.erase(checksums.upper_bound(limit), checksums.end());
+  }
+}
+
+std::size_t Exchange::HeldInputs(std::uint8_t player) const
+{
+  return player < m_players ? m_confirmed[player].size() : 0;
+}
+
+std::optional<std::pair<std::uint32_t, std::uint32_t>>
+Exchange::HeldInputRange(std::uint8_t player) const
+{
+  if (player >= m_players || m_confirmed[player].empty())
+    return std::nullopt;
+  return std::pair{m_confirmed[player].begin()->first, m_confirmed[player].rbegin()->first};
 }
 
 std::optional<std::uint32_t> Exchange::FirstDesync() const
