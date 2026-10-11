@@ -16,6 +16,7 @@
 #include <map>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace NSRNetplay::RollbackNet
@@ -28,6 +29,13 @@ constexpr std::size_t MAX_PLAYERS = 4;
 constexpr std::size_t PAD_SIZE = 12;
 constexpr std::size_t MAX_HISTORY = 64;
 constexpr std::uint32_t NO_FRAME = UINT32_MAX;
+// Extra frames of remote input/checksum lookahead tolerated beyond what this
+// peer's own delay and prediction settings permit.  Delay and prediction are
+// per-process settings (the adapter clamps them to <= 8 and <= 60), so a
+// legitimate peer may be configured more permissively than we are.  Two
+// datagram windows cover that whole clamp range while still bounding how much
+// attacker-chosen future input a single sender can make us retain.
+constexpr std::uint32_t FUTURE_INPUT_SLACK = static_cast<std::uint32_t>(2 * MAX_HISTORY);
 
 using Pad = std::array<std::uint8_t, PAD_SIZE>;
 using Pads = std::array<Pad, MAX_PLAYERS>;
@@ -107,10 +115,42 @@ private:
 std::vector<std::uint8_t> Encode(const Packet& packet);
 std::optional<Packet> Decode(std::span<const std::uint8_t> bytes);
 
+// A well-formed datagram for this epoch whose contents no honest peer can
+// produce.  These are distinct from stale or foreign packets (wrong session,
+// player count, or self-addressed), which unsequenced delivery makes normal
+// and which Accept therefore rejects without recording a violation.
+enum class ViolationKind : std::uint8_t
+{
+  // The sender acknowledged local input we have not produced yet (or a frame
+  // before the epoch start).  Honoring it would stop retransmission.
+  ImpossibleAck = 1,
+  // The sender restated an already-confirmed frame with different input.
+  // Local samples are immutable once submitted, so this is a cheat or a
+  // corrupted peer, and silently keeping either value would hide a desync.
+  ConflictingInput = 2,
+  // Input lies beyond FutureInputLimit(); see FUTURE_INPUT_SLACK.
+  InputOutOfWindow = 3,
+  // A finalized checksum frame lies beyond FutureInputLimit().
+  ChecksumOutOfWindow = 4,
+};
+
+struct ProtocolViolation
+{
+  std::uint8_t player = 0;
+  ViolationKind kind = ViolationKind::ImpossibleAck;
+  std::uint32_t frame = NO_FRAME;
+};
+
 // Exchange is CPU-thread-owned.  A transport may deliver packets in any
 // order and may duplicate them; insertion and acknowledgements are
 // idempotent.  Assemble records exactly what a frame ran with so a later
 // confirmed input can identify the earliest wrong prediction.
+//
+// Accept validates a whole datagram before applying any of it: a packet that
+// carries an impossible acknowledgement, a conflicting restatement of a
+// confirmed input, or input/checksums outside the plausible window returns
+// false, leaves acknowledgement, input, timing, and checksum state untouched,
+// and is recorded in ViolationCount()/FirstViolation() for the adapter.
 class Exchange
 {
 public:
@@ -132,6 +172,19 @@ public:
   void TrimBefore(std::uint32_t frame);
   std::optional<std::uint32_t> FirstDesync() const;
   std::optional<std::uint32_t> OldestUnackedLocal() const;
+  // Highest remote input or checksum frame Accept will store.  A peer's
+  // ShouldStall keeps its live frame within max_prediction of its contiguous
+  // view of our input (plus one, because the adapter submits before it
+  // checks the stall), that view can never pass our own contiguous local
+  // prefix, and its samples land delay frames later.  Our own delay and
+  // prediction plus FUTURE_INPUT_SLACK therefore bound every honest sender,
+  // including senders whose datagrams the star host relays unchanged.
+  std::uint32_t FutureInputLimit() const;
+  std::uint32_t ViolationCount() const { return m_violations; }
+  const std::optional<ProtocolViolation>& FirstViolation() const { return m_first_violation; }
+  // Retained confirmed input for one player, for diagnostics and tests.
+  std::size_t HeldInputs(std::uint8_t player) const;
+  std::optional<std::pair<std::uint32_t, std::uint32_t>> HeldInputRange(std::uint8_t player) const;
   // Positive frame advantage means this peer is genuinely ahead after
   // projecting each reported remote frame forward by half of the measured
   // RTT.  TimeSyncWaitUs applies a wide deadband and a 30-frame cadence so
@@ -153,6 +206,7 @@ private:
   void AdvanceContiguous(std::uint8_t player);
   void CompareChecksum(std::uint8_t player, std::uint32_t frame);
   void ObserveTiming(const Packet& packet, std::uint32_t receive_us);
+  std::optional<ProtocolViolation> Validate(const Packet& packet) const;
 
   struct PeerTiming
   {
@@ -188,5 +242,7 @@ private:
   std::array<std::map<std::uint32_t, std::uint64_t>, MAX_PLAYERS> m_remote_checksums;
   std::uint32_t m_finalized = NO_FRAME;
   std::optional<std::uint32_t> m_first_desync;
+  std::uint32_t m_violations = 0;
+  std::optional<ProtocolViolation> m_first_violation;
 };
 }  // namespace NSRNetplay::RollbackNet
