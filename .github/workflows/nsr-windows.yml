@@ -140,6 +140,10 @@ jobs:
           $pkg = "package/NFLStreet-Rollback"
           New-Item -ItemType Directory -Force $pkg | Out-Null
           Copy-Item -Recurse Binary/x64/* $pkg
+          # Dolphin's self-updater would offer to replace this fork with an
+          # official Dolphin build (no NSR netplay); friends get updates as a
+          # new zip from Mason instead.
+          Remove-Item -Force -ErrorAction SilentlyContinue "$pkg/Updater.exe"
           Copy-Item COPYING "$pkg/COPYING.txt"
           Copy-Item -Recurse LICENSES "$pkg/LICENSES"
           @"
@@ -192,6 +196,11 @@ jobs:
           Only do that for a zip you got directly from Mason. Don't turn off
           your antivirus.
 
+          Windows Firewall: the first time a game starts, Windows may ask
+          whether Dolphin can use the network. Tick "Private networks" (and
+          "Public networks" if you're on a network Windows calls public) and
+          click "Allow access". Netplay can't connect without it.
+
           The "Send lag/rollback stats" box (on by default) sends connection
           and rollback numbers, your name and the room code to Mason's server
           so he can fix lag. Never your button presses or any files. Untick it
@@ -213,6 +222,7 @@ jobs:
             if (-not (Test-Path "$pkg/$f")) { throw "missing $f" }
           }
           if (Test-Path "$pkg/nsr-netplay.bat") { throw "stale lockstep nsr-netplay.bat in package" }
+          if (Test-Path "$pkg/Updater.exe") { throw "Dolphin Updater.exe must not ship (it would replace the fork)" }
           Get-Content "$pkg/VERSION.txt"
 
       - uses: actions/upload-artifact@v4

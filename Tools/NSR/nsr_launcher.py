@@ -51,6 +51,11 @@ CONFIG_NAME = "nsr-launcher.json"
 # "playtest fixed setting" until automatic delay exists); 0..MAX_DELAY offered.
 DEFAULT_DELAY = 1
 MAX_DELAY = 4
+# Lockstep input delay for the menus around rollback matches (stage 4), the
+# fork's default and what every stage-4 gate ran with. Menus wait on real
+# input each frame, so a larger value only smooths them; the host's choice
+# above is the rollback (match) delay, NSR_RB_DELAY.
+MENU_LOCKSTEP_DELAY = 2
 
 # Stage-4 rollback profile (release plan 3.2), exactly what the rollback
 # netplay gates ran with (tools/detrun.py "rollback" profile) minus the fixed
@@ -165,6 +170,7 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
             # unnecessary and unsafe here.
             env.update(ROLLBACK_ENV)
             env["NSR_RB_DELAY"] = str(start.delay)
+            env["NSR_DELAY"] = str(MENU_LOCKSTEP_DELAY)
             args += ["-C", "Dolphin.Core.FastDiscSpeed=True"]
         if start.rendezvous:
             # Room code: hole punching through the rendezvous server.
