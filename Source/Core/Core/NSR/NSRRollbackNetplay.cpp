@@ -89,7 +89,7 @@ std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes)
 HandoffAgreement::HandoffAgreement(std::uint8_t players, std::uint8_t me, HandoffKind kind,
                                    std::uint32_t transition, std::uint32_t frame,
                                    std::uint64_t semantic_hash)
-    : m_players(std::clamp<std::uint8_t>(players, 2, MAX_PLAYERS)),
+    : m_players(std::clamp<std::uint8_t>(players, 2, static_cast<std::uint8_t>(MAX_PLAYERS))),
       m_me(std::min<std::uint8_t>(me, m_players - 1)),
       m_local{m_me, m_players, kind, transition, frame, semantic_hash}
 {
@@ -205,7 +205,8 @@ std::optional<Packet> Decode(std::span<const std::uint8_t> bytes)
 Exchange::Exchange(std::uint32_t start, std::uint8_t players, std::uint8_t me,
                    std::uint32_t delay, std::uint32_t max_prediction,
                    std::uint32_t session)
-    : m_start(start), m_players(std::clamp<std::uint8_t>(players, 2, MAX_PLAYERS)),
+    : m_start(start),
+      m_players(std::clamp<std::uint8_t>(players, 2, static_cast<std::uint8_t>(MAX_PLAYERS))),
       m_me(std::min<std::uint8_t>(me, m_players - 1)), m_delay(delay),
       m_max_prediction(max_prediction), m_session(session)
 {
