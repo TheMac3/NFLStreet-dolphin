@@ -22,7 +22,7 @@ namespace NSRNetplay::RollbackNet
 {
 constexpr std::uint32_t MAGIC = 0x4E535242;  // 'NSRB'
 constexpr std::uint32_t HANDOFF_MAGIC = 0x4E535248;  // 'NSRH'
-constexpr std::uint8_t VERSION = 3;
+constexpr std::uint8_t VERSION = 4;
 constexpr std::uint8_t HANDOFF_VERSION = 1;
 constexpr std::size_t MAX_PLAYERS = 4;
 constexpr std::size_t PAD_SIZE = 12;
@@ -43,6 +43,13 @@ struct Packet
   std::uint32_t session = 0;
   std::uint32_t sender_frame = 0;
   std::uint32_t send_us = 0;
+  // Each peer reflects the newest timestamp seen from every other peer and
+  // how long it held that timestamp.  The originator can therefore measure
+  // an end-to-end RTT without synchronized host clocks, including a star
+  // relay hop.  Unsigned subtraction deliberately handles the 32-bit clock
+  // wrapping about every 71 minutes.
+  std::array<std::uint32_t, MAX_PLAYERS> echo_us{};
+  std::array<std::uint32_t, MAX_PLAYERS> echo_age_us{};
   std::array<std::uint32_t, MAX_PLAYERS> ack{NO_FRAME, NO_FRAME, NO_FRAME, NO_FRAME};
   std::uint32_t checksum_frame = NO_FRAME;
   std::uint64_t checksum = 0;
@@ -112,7 +119,7 @@ public:
 
   void SubmitLocal(std::uint32_t live_frame, Pad pad);
   Packet BuildPacket(std::uint32_t live_frame, std::uint32_t send_us = 0) const;
-  bool Accept(const Packet& packet);
+  bool Accept(const Packet& packet, std::uint32_t receive_us = 0);
   Pads Assemble(std::uint32_t frame);
 
   bool ShouldStall(std::uint32_t frame) const;
@@ -125,7 +132,14 @@ public:
   void TrimBefore(std::uint32_t frame);
   std::optional<std::uint32_t> FirstDesync() const;
   std::optional<std::uint32_t> OldestUnackedLocal() const;
-  int FrameAdvantage(std::uint32_t local_frame) const;
+  // Positive frame advantage means this peer is genuinely ahead after
+  // projecting each reported remote frame forward by half of the measured
+  // RTT.  TimeSyncWaitUs applies a wide deadband and a 30-frame cadence so
+  // only the faster peer occasionally stretches a frame.
+  double FrameAdvantage() const;
+  double FrameAdvantage(std::uint32_t) const { return FrameAdvantage(); }
+  std::uint32_t TimeSyncWaitUs(std::uint32_t local_frame);
+  std::optional<std::uint32_t> SmoothedRttUs(std::uint8_t player) const;
 
   std::uint32_t Start() const { return m_start; }
   std::uint32_t Session() const { return m_session; }
@@ -138,6 +152,20 @@ private:
   Pad Predict(std::uint8_t player, std::uint32_t frame) const;
   void AdvanceContiguous(std::uint8_t player);
   void CompareChecksum(std::uint8_t player, std::uint32_t frame);
+  void ObserveTiming(const Packet& packet, std::uint32_t receive_us);
+
+  struct PeerTiming
+  {
+    bool have_remote_timestamp = false;
+    bool have_rtt = false;
+    std::uint32_t remote_send_us = 0;
+    std::uint32_t remote_received_us = 0;
+    std::uint32_t rtt_us = 0;
+    std::uint32_t sampled_frame = NO_FRAME;
+    std::array<double, 30> advantage{};
+    std::size_t advantage_count = 0;
+    std::size_t advantage_next = 0;
+  };
 
   std::uint32_t m_start;
   std::uint8_t m_players;
@@ -150,8 +178,9 @@ private:
                                                       NO_FRAME};
   std::array<std::uint32_t, MAX_PLAYERS> m_peer_ack{NO_FRAME, NO_FRAME, NO_FRAME,
                                                     NO_FRAME};
-  std::array<std::uint32_t, MAX_PLAYERS> m_remote_frame{NO_FRAME, NO_FRAME, NO_FRAME,
-                                                        NO_FRAME};
+  std::array<PeerTiming, MAX_PLAYERS> m_timing;
+  std::uint32_t m_local_frame = NO_FRAME;
+  std::uint32_t m_last_sync_frame = NO_FRAME;
   std::map<std::uint32_t, Pads> m_ran;
   std::map<std::uint32_t, std::uint8_t> m_predicted;
   std::optional<std::uint32_t> m_pending;

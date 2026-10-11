@@ -208,6 +208,16 @@ std::string Env(const char* name, const char* fallback = "")
   return v ? v : fallback;
 }
 
+// Return a compact monotonic timestamp for the rollback wire protocol.  Only
+// timestamp differences are used, so peers need neither a common epoch nor
+// synchronized host clocks.
+u32 HostNowUs()
+{
+  return static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count());
+}
+
 // Host-time phase accounting for NSR_RB_COST (cumulative nanoseconds; the cost
 // log prints per-unit deltas). GPU and DSP time are summed by Fifo.cpp and
 // SystemTimers.cpp into g_nsr_host_ns[] while g_nsr_host_timing is set.
@@ -614,7 +624,7 @@ void HandlePacket(const ENetPacket* packet)
         }
       }
     }
-    s_rb_exchange->Accept(*decoded);
+    s_rb_exchange->Accept(*decoded, HostNowUs());
     return;
   }
   if (packet->dataLength < offsetof(Packet, pads))
@@ -806,10 +816,7 @@ void SendRollbackLatest(u32 live_frame)
   Session& s = s_session;
   if (!s_rb_exchange || !s.host)
     return;
-  const u32 send_us = static_cast<u32>(
-      std::chrono::duration_cast<std::chrono::microseconds>(
-          std::chrono::steady_clock::now().time_since_epoch())
-          .count());
+  const u32 send_us = HostNowUs();
   const std::vector<u8> bytes = RollbackNet::Encode(s_rb_exchange->BuildPacket(live_frame, send_us));
   for (u32 i = 0; i < s.players; ++i)
   {
@@ -3795,8 +3802,10 @@ static bool RbNetworkPreflight(u32 live)
   Session& s = s_session;
   if (!r.net_enabled || !s_rb_exchange)
     return true;
-  Service(0);
   s_rb_exchange->SubmitLocal(live, ToNetPad(r.latest[0]));
+  // Publish the current local frame before draining arrivals so timing
+  // samples compare progress at the same live-frame boundary.
+  Service(0);
   s_rb_exchange->UpdateFinalized();
   SendRollbackLatest(live);
   {
@@ -3825,7 +3834,7 @@ static bool RbNetworkPreflight(u32 live)
                                 .count());
   };
 
-  auto wait_until = [&](auto predicate, std::chrono::milliseconds limit, bool starvation) {
+  auto wait_until = [&](auto predicate, std::chrono::microseconds limit, bool starvation) {
     const auto start = std::chrono::steady_clock::now();
     auto last_send = start;
     while (predicate() && !s.failed)
@@ -3865,14 +3874,17 @@ static bool RbNetworkPreflight(u32 live)
     if (!ok)
       return false;
   }
-  // Basic Slippi-style frame advantage: the peer more than one frame ahead
-  // yields at most one 60 Hz interval, while still servicing the transport.
-  if (r.time_sync && s_rb_exchange->FrameAdvantage(live) > 1)
+  // Check twice per second after compensating remote progress for one-way
+  // latency.  Only the genuinely faster peer stretches this frame, by less
+  // than one frame; game state and virtual time are untouched.
+  const u32 sync_wait_us = r.time_sync ? s_rb_exchange->TimeSyncWaitUs(live) : 0;
+  if (sync_wait_us != 0)
   {
     ++r.sync_waits;
     const auto sync_start = std::chrono::steady_clock::now();  // NSR telemetry
-    wait_until([&] { return s_rb_exchange->FrameAdvantage(live) > 1; },
-               std::chrono::milliseconds(17), false);
+    Log("time sync frame {}: advantage {:.3f} frames, stretch {} us", live,
+        s_rb_exchange->FrameAdvantage(), sync_wait_us);
+    wait_until([] { return true; }, std::chrono::microseconds(sync_wait_us), false);
     NSRTelemetry::Count(NSRTelemetry::Counter::SyncWaits);
     NSRTelemetry::Observe(NSRTelemetry::Hist::TimeSyncWaitUs, waited_us(sync_start));
   }
