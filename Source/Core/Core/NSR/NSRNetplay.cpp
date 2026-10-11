@@ -193,6 +193,8 @@ std::optional<RollbackNet::HandoffAgreement> s_rb_handoff;
 std::optional<u32> s_rb_logged_desync;
 bool s_rb_bad_session_logged = false;
 bool s_rb_peer_desync_logged = false;
+// One log line per epoch for the first rejected (protocol-violating) packet.
+bool s_rb_violation_logged = false;
 
 template <typename... Args>
 void Log(fmt::format_string<Args...> format, Args&&... args)
@@ -624,7 +626,25 @@ void HandlePacket(const ENetPacket* packet)
         }
       }
     }
-    s_rb_exchange->Accept(*decoded, HostNowUs());
+    // Accept validates the whole datagram first (impossible ack, conflicting
+    // restatement, out-of-window input/checksum) and applies nothing when it
+    // fails.  Surface the first violation once: from an honest peer it means
+    // a bug or corruption, so it is the place to start a desync investigation.
+    if (!s_rb_exchange->Accept(*decoded, HostNowUs()))
+    {
+      NSRTelemetry::Count(NSRTelemetry::Counter::PacketsRejected, 1, decoded->sender);
+      const auto& v = s_rb_exchange->FirstViolation();
+      if (v && !s_rb_violation_logged)
+      {
+        s_rb_violation_logged = true;
+        Log("rejected rollback packet from player {}: protocol violation kind {} at frame {}",
+            v->player, static_cast<int>(v->kind), v->frame);
+        NSRTelemetry::Event(NSRTelemetry::EventKind::Note, TelemetryLiveFrame(),  // NSR telemetry
+                            {NSRTelemetry::Int("protocol_violation", static_cast<int>(v->kind)),
+                             NSRTelemetry::Int("player", v->player),
+                             NSRTelemetry::Int("frame", static_cast<s64>(v->frame))});
+      }
+    }
     return;
   }
   if (packet->dataLength < offsetof(Packet, pads))
@@ -6193,6 +6213,7 @@ void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
         r.max_prediction, session);
     s_rb_logged_desync.reset();
     s_rb_bad_session_logged = false;
+    s_rb_violation_logged = false;
     s_rb_peer_desync_logged = false;
     Log("rollback network epoch {:08x}: player {} of {}, delay {}, max prediction {}", session,
         s_session.me, s_session.players, r.net_delay, r.max_prediction);
@@ -6298,6 +6319,7 @@ void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason)
   s_rb_handoff.reset();
   s_rb_logged_desync.reset();
   s_rb_bad_session_logged = false;
+  s_rb_violation_logged = false;
   s_rb_peer_desync_logged = false;
   r.in_unit = false;
   r.in_resim = false;
@@ -6411,6 +6433,7 @@ void Shutdown(const Core::CPUThreadGuard& guard)
   s_rb_handoff.reset();
   s_rb_logged_desync.reset();
   s_rb_bad_session_logged = false;
+  s_rb_violation_logged = false;
   s_rb_peer_desync_logged = false;
   s_io_ranges.clear();
   s_rb_last_tick_ms = 0;
