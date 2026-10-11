@@ -70,6 +70,7 @@
 #include "Core/PowerPC/PPCCache.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
+#include "Core/NSR/NSRTelemetry.h"  // NSR telemetry
 #include "VideoCommon/CommandProcessor.h"
 #include "VideoCommon/Fifo.h"
 
@@ -514,6 +515,8 @@ void CheckHash(u32 player, u32 frame)
   }
 }
 
+u32 TelemetryLiveFrame();  // NSR telemetry: next live frame (defined with the glue)
+
 void HandlePacket(const ENetPacket* packet)
 {
   Session& s = s_session;
@@ -553,9 +556,13 @@ void HandlePacket(const ENetPacket* packet)
         std::span<const u8>(static_cast<const u8*>(packet->data), packet->dataLength));
     if (!decoded || !s_rb_exchange || decoded->players != s.players || decoded->sender == s.me ||
         decoded->sender >= s.players)
+    {
+      NSRTelemetry::Count(NSRTelemetry::Counter::PacketsRejected);  // NSR telemetry
       return;
+    }
     if (decoded->session != s_rb_exchange->Session())
     {
+      NSRTelemetry::Count(NSRTelemetry::Counter::PacketsRejected, 1, decoded->sender);
       if (!s_rb_bad_session_logged)
       {
         s_rb_bad_session_logged = true;
@@ -568,6 +575,17 @@ void HandlePacket(const ENetPacket* packet)
     {
       s_rb_peer_desync_logged = true;
       Log("player {} reports a confirmed semantic checksum mismatch", decoded->sender);
+      NSRTelemetry::Event(NSRTelemetry::EventKind::PeerDesync, TelemetryLiveFrame(),  // NSR telemetry
+                          {NSRTelemetry::Int("player", decoded->sender)});
+    }
+    // NSR telemetry: arrivals, and how late the newest input is for our live frame.
+    NSRTelemetry::Count(NSRTelemetry::Counter::PacketsReceived, 1, decoded->sender);
+    if (!decoded->pads.empty())
+    {
+      const u32 newest = decoded->first_frame + static_cast<u32>(decoded->pads.size()) - 1;
+      const u32 live = TelemetryLiveFrame();
+      NSRTelemetry::Observe(NSRTelemetry::Hist::RemoteInputLateFrames,
+                            live > newest ? live - newest : 0, decoded->sender);
     }
     // The host relays the original authenticated session datagram unchanged;
     // every receiver performs the same strict parser and session check.
@@ -783,8 +801,11 @@ void SendRollbackLatest(u32 live_frame)
   for (u32 i = 0; i < s.players; ++i)
   {
     if (i != s.me && Linked(i))
+    {
       enet_peer_send(s.peers[i], 0,
                      enet_packet_create(bytes.data(), bytes.size(), ENET_PACKET_FLAG_UNSEQUENCED));
+      NSRTelemetry::Count(NSRTelemetry::Counter::PacketsSent, 1, static_cast<int>(i));
+    }
   }
   enet_host_flush(s.host);
 }
@@ -1254,6 +1275,12 @@ std::jthread s_rb_watchdog;
 
 void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame);
 void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason);
+// NSR telemetry glue: defined in the block at the end of this file.
+void TelemetryUnitStart(std::chrono::steady_clock::time_point step_start);
+void TelemetryUnitEnd(const Core::CPUThreadGuard& guard);
+void TelemetrySessionEnter();
+void TelemetrySessionLeave(const char* reason);
+void TelemetryShutdown();
 
 std::optional<u64> ParseU64(const std::string& text)
 {
@@ -1410,6 +1437,7 @@ struct DirtyTracker
   std::vector<std::pair<u32, u32>> chunks;
   std::vector<u32> page_first;
   u64 samples = 0, sample_ns = 0, pages_seen = 0, failures = 0, remaps = 0;
+  u64 pages_copied = 0;  // NSR telemetry: pages RbSave copied (dirty or never synced)
   u32 seen_remaps = 0;
 
   // All host mappings of the tracked shared memory, from /proc/self/maps.
@@ -1944,6 +1972,9 @@ void RbInit(Core::System& system)
             Log("HANG: no tick for {} ms after {} rollbacks (live {}); PPC/RAM sampling "
                 "is deferred to CPU-thread diagnostics",
                 now - last, rollbacks, live);
+            NSRTelemetry::Event(NSRTelemetry::EventKind::Hang, live,  // NSR telemetry
+                                {NSRTelemetry::Int("ms_since_tick", now - last),
+                                 NSRTelemetry::Int("rollbacks", static_cast<s64>(rollbacks))});
             return;
           }
         });
@@ -2012,6 +2043,7 @@ void RbSave(const u8* ram, std::vector<u8>& slot)
         ++d.fifo_skipped;
         continue;
       }
+      ++d.pages_copied;  // NSR telemetry
       for (u32 c = d.page_first[p]; c < d.page_first[p + 1]; ++c)
         std::memcpy(slot.data() + d.chunks[c].first, ram + d.chunks[c].first,
                     d.chunks[c].second - d.chunks[c].first);
@@ -2021,6 +2053,7 @@ void RbSave(const u8* ram, std::vector<u8>& slot)
       if (since && d.stamp[d.mem1_pages + q] <= *since)
         continue;
       const u32 a = q * DirtyTracker::PAGE, n = std::min(DirtyTracker::PAGE, s_rb.vmem_bytes - a);
+      ++d.pages_copied;  // NSR telemetry
       std::memcpy(slot.data() + s_rb.mem1_size + a, s_rb.vmem + a, n);
     }
     d.synced[slot.data()] = d.epoch;
@@ -3364,6 +3397,31 @@ static bool RbNetworkPreflight(u32 live)
   s_rb_exchange->SubmitLocal(live, ToNetPad(r.latest[0]));
   s_rb_exchange->UpdateFinalized();
   SendRollbackLatest(live);
+  {
+    // NSR telemetry: ENet link quality per peer and the prediction window.
+    namespace T = NSRTelemetry;
+    for (u32 i = 0; i < s.players; ++i)
+    {
+      if (i == s.me || !Linked(i))
+        continue;
+      const ENetPeer* peer = s.peers[i];
+      T::SetGauge(T::Gauge::NetRttMs, peer->roundTripTime, static_cast<int>(i));
+      T::SetGauge(T::Gauge::NetRttVarMs, peer->roundTripTimeVariance, static_cast<int>(i));
+      T::SetGauge(T::Gauge::NetLossPct,
+                  100.0 * peer->packetLoss / ENET_PEER_PACKET_LOSS_SCALE, static_cast<int>(i));
+    }
+    T::SetGauge(T::Gauge::FrameAdvantage, s_rb_exchange->FrameAdvantage(live));
+    T::SetGauge(T::Gauge::InputDelay, r.net_delay);
+    T::SetGauge(T::Gauge::MaxPrediction, r.max_prediction);
+    if (const u32 confirmed = s_rb_exchange->ConfirmedThrough();
+        confirmed != RollbackNet::NO_FRAME && confirmed <= live)
+      T::Observe(T::Hist::PredictionFrames, live - confirmed);
+  }
+  const auto waited_us = [](std::chrono::steady_clock::time_point since) {  // NSR telemetry
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - since)
+                                .count());
+  };
 
   auto wait_until = [&](auto predicate, std::chrono::milliseconds limit, bool starvation) {
     const auto start = std::chrono::steady_clock::now();
@@ -3384,6 +3442,9 @@ static bool RbNetworkPreflight(u32 live)
     {
       Log("rollback input timeout at frame {} (confirmed through {})", live,
           s_rb_exchange->ConfirmedThrough());
+      NSRTelemetry::Event(NSRTelemetry::EventKind::InputTimeout, live,  // NSR telemetry
+                          {NSRTelemetry::Int("confirmed_through",
+                                             s_rb_exchange->ConfirmedThrough())});
       s.failed = true;
       Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
       return false;
@@ -3394,8 +3455,12 @@ static bool RbNetworkPreflight(u32 live)
   if (s_rb_exchange->ShouldStall(live))
   {
     ++r.net_stalls;
-    if (!wait_until([&] { return s_rb_exchange->ShouldStall(live); },
-                    std::chrono::milliseconds(PEER_TIMEOUT_MS), true))
+    const auto stall_start = std::chrono::steady_clock::now();  // NSR telemetry
+    const bool ok = wait_until([&] { return s_rb_exchange->ShouldStall(live); },
+                               std::chrono::milliseconds(PEER_TIMEOUT_MS), true);
+    NSRTelemetry::Count(NSRTelemetry::Counter::NetStalls);
+    NSRTelemetry::Observe(NSRTelemetry::Hist::NetStallUs, waited_us(stall_start));
+    if (!ok)
       return false;
   }
   // Basic Slippi-style frame advantage: the peer more than one frame ahead
@@ -3403,14 +3468,20 @@ static bool RbNetworkPreflight(u32 live)
   if (r.time_sync && s_rb_exchange->FrameAdvantage(live) > 1)
   {
     ++r.sync_waits;
+    const auto sync_start = std::chrono::steady_clock::now();  // NSR telemetry
     wait_until([&] { return s_rb_exchange->FrameAdvantage(live) > 1; },
                std::chrono::milliseconds(17), false);
+    NSRTelemetry::Count(NSRTelemetry::Counter::SyncWaits);
+    NSRTelemetry::Observe(NSRTelemetry::Hist::TimeSyncWaitUs, waited_us(sync_start));
   }
   if (const auto desync = s_rb_exchange->FirstDesync();
       desync && (!s_rb_logged_desync || *desync < *s_rb_logged_desync))
   {
     s_rb_logged_desync = desync;
     Log("DESYNC: first confirmed semantic checksum mismatch at frame {}", *desync);
+    // NSR telemetry: the exchange keeps only the frame (no checksum accessor yet).
+    NSRTelemetry::Count(NSRTelemetry::Counter::Desyncs);
+    NSRTelemetry::Event(NSRTelemetry::EventKind::Desync, *desync, {}, "semantic checksum");
   }
   return !s.failed;
 }
@@ -4276,6 +4347,7 @@ void RollbackFrameHook(const Core::CPUThreadGuard& guard)
   AudioClockFrameLog(guard);
   ResimSpeed(guard, r.in_unit && r.in_resim);
   CostFrameStart(guard, step_start);
+  TelemetryUnitStart(step_start);  // NSR telemetry
 }
 
 void RollbackFrameEndHook(const Core::CPUThreadGuard& guard)
@@ -4287,6 +4359,7 @@ void RollbackFrameEndHook(const Core::CPUThreadGuard& guard)
     PowerPC::MMU::HostWrite<u32>(guard, PowerPC::MMU::HostRead<u32>(guard, VI_POST_COUNTER) + 1,
                                  VI_POST_COUNTER);
   CostFrameEnd(guard);
+  TelemetryUnitEnd(guard);  // NSR telemetry
   s_hp_phase = 0;
   ResimSpeed(guard, false);
   r.in_unit = false;
@@ -5770,6 +5843,7 @@ void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
   s_rb_watch_rollbacks = 0;
   Log("rollback session {} entered at frame {} (base {:016x})", r.session_generation, frame,
       r.vtime_base);
+  TelemetrySessionEnter();  // NSR telemetry
 }
 
 // End the rollback epoch at a completed live frame.  Clearing the guest model
@@ -5781,6 +5855,7 @@ void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason)
   if (!r.vtime_on)
     return;
   Log("rollback session {} left after frame {}: {}", r.session_generation, r.tick_running, reason);
+  TelemetrySessionLeave(reason);  // NSR telemetry (before the counters reset)
   if (r.force > 0)
     RbReport(40);
 
@@ -5859,6 +5934,7 @@ void Shutdown(const Core::CPUThreadGuard& guard)
     s_rb_watchdog.request_stop();
     s_rb_watchdog.join();
   }
+  TelemetryShutdown();  // NSR telemetry: after the watchdog, which can report HANG
   if (s_follow)
     Config::SetCurrent(Config::MAIN_EMULATION_SPEED, s_follow_speed);
   s_follow.reset();
@@ -5919,3 +5995,197 @@ void Shutdown(const Core::CPUThreadGuard& guard)
   s_rb_watch_rollbacks = 0;
 }
 }  // namespace NSRNetplay
+
+// ===========================================================================
+// NSR telemetry glue (NSRTelemetry.h; NFLStreet docs/telemetry.md).
+// Everything the rollback code reports lives here, so the call sites above are
+// one line each.  Per live frame it turns the rollback counters into deltas
+// and host times into histograms; it only reads host-side counters and, for
+// the audio clock, one word of the session model (no writes, no guest-visible
+// effect).  All functions are CPU-thread only.
+// Deferred: stage-2 network metrics (RTT, loss, lateness, time sync, desync
+// checksums) are fed by the netcode itself through NSRTelemetry's API; see the
+// integration list in NSRTelemetry.h.  Revisit when stage 2 lands.
+// ===========================================================================
+namespace NSRNetplay
+{
+namespace
+{
+struct TelemetryGlue
+{
+  bool step_open = false;     // a live step (restore + re-sims + live unit) is running
+  bool have_last_end = false;
+  std::chrono::steady_clock::time_point step_begin, live_begin, last_live_end;
+  std::array<u64, PH_COUNT> phase{};
+  u64 rollbacks = 0, resim = 0, mispredictions = 0, uncorrectable = 0, skipped_busy = 0;
+  u64 pages_copied = 0, pages_seen = 0;
+  u32 ac_extra = 0;
+};
+TelemetryGlue s_tm;
+
+void TelemetryBaseline()
+{
+  const Rollback& r = s_rb;
+  std::copy(std::begin(s_phase_ns), std::end(s_phase_ns), s_tm.phase.begin());
+  s_tm.rollbacks = r.rollbacks;
+  s_tm.resim = r.resim_ticks;
+  s_tm.mispredictions = r.mispredictions;
+  s_tm.uncorrectable = r.uncorrectable;
+  s_tm.skipped_busy = r.skipped_busy;
+  s_tm.pages_copied = s_dirty.pages_copied;
+  s_tm.pages_seen = s_dirty.pages_seen;
+  s_tm.ac_extra = 0;  // the audio model restarts with the session
+  s_tm.step_open = false;
+  s_tm.have_last_end = false;
+}
+
+void TelemetryUnitStart(std::chrono::steady_clock::time_point step_start)
+{
+  const Rollback& r = s_rb;
+  if (!r.vtime_on || !r.in_unit || !NSRTelemetry::Enabled())
+    return;
+  if (!s_tm.step_open)
+  {
+    s_tm.step_open = true;
+    s_tm.step_begin = step_start;
+  }
+  if (!r.in_resim)
+    s_tm.live_begin = std::chrono::steady_clock::now();
+}
+
+void TelemetryUnitEnd(const Core::CPUThreadGuard& guard)
+{
+  namespace T = NSRTelemetry;
+  const Rollback& r = s_rb;
+  if (!r.vtime_on || r.in_resim || !s_tm.step_open || !T::Enabled())
+    return;
+  const auto now = std::chrono::steady_clock::now();
+  const auto us = [](auto d) {
+    return static_cast<u64>(std::max<s64>(
+        0, std::chrono::duration_cast<std::chrono::microseconds>(d).count()));
+  };
+  T::Observe(T::Hist::StepUs, us(s_tm.live_begin - s_tm.step_begin));
+  T::Observe(T::Hist::LiveUnitUs, us(now - s_tm.live_begin));
+  if (s_tm.have_last_end)
+  {
+    const u64 interval = us(now - s_tm.last_live_end);
+    T::Observe(T::Hist::FrameIntervalUs, interval);
+    if (interval > 17535)  // 16.7 ms frame budget + 5%
+      T::Count(T::Counter::FramesOverBudget);
+    if (interval > 50000)
+      T::Count(T::Counter::HostStalls);
+  }
+  constexpr std::array<std::pair<HostPhase, T::Hist>, PH_COUNT> PHASES{{
+      {PH_SAVE, T::Hist::SaveUs},
+      {PH_RESTORE, T::Hist::RestoreUs},
+      {PH_LIVE, T::Hist::LiveRangesUs},
+      {PH_JIT, T::Hist::JitUs},
+      {PH_CHECK, T::Hist::CheckUs},
+  }};
+  for (const auto& [phase, hist] : PHASES)
+  {
+    const u64 delta = s_phase_ns[phase] - s_tm.phase[phase];
+    s_tm.phase[phase] = s_phase_ns[phase];
+    if (delta > 0 || phase == PH_SAVE)
+      T::Observe(hist, delta / 1000);
+  }
+
+  const u64 d_rb = r.rollbacks - s_tm.rollbacks;
+  const u64 d_resim = r.resim_ticks - s_tm.resim;
+  if (d_rb > 0)
+  {
+    T::Count(T::Counter::Rollbacks, d_rb);
+    for (u64 i = 0; i < d_rb; ++i)  // normally one restore per live step
+      T::Observe(T::Hist::RollbackDepth, d_resim / d_rb);
+  }
+  T::Count(T::Counter::ResimFrames, d_resim);
+  T::Count(T::Counter::Mispredictions, r.mispredictions - s_tm.mispredictions);
+  T::Count(T::Counter::QuietSkips, r.skipped_busy - s_tm.skipped_busy);
+  if (r.uncorrectable > s_tm.uncorrectable)
+  {
+    T::Count(T::Counter::Uncorrectable, r.uncorrectable - s_tm.uncorrectable);
+    T::Event(T::EventKind::Uncorrectable, r.tick_running,
+             {T::Int("total", static_cast<s64>(r.uncorrectable)),
+              T::Int("ring_slots", static_cast<s64>(r.ring.size())),
+              T::Int("barrier", r.barrier)});
+  }
+  s_tm.rollbacks = r.rollbacks;
+  s_tm.resim = r.resim_ticks;
+  s_tm.mispredictions = r.mispredictions;
+  s_tm.uncorrectable = r.uncorrectable;
+  s_tm.skipped_busy = r.skipped_busy;
+  if (s_dirty.on)
+  {
+    T::Count(T::Counter::DirtyPagesCopied, s_dirty.pages_copied - s_tm.pages_copied);
+    T::Count(T::Counter::DirtyPagesWritten, s_dirty.pages_seen - s_tm.pages_seen);
+    s_tm.pages_copied = s_dirty.pages_copied;
+    s_tm.pages_seen = s_dirty.pages_seen;
+  }
+  if (AcModeNow() != AcMode::Off)
+  {
+    const AcMem m{guard};
+    if (m.rd(AC_BASE) == AC_MAGIC)
+    {
+      const u32 extra = m.rd(AC_EXTRA_TICKS);
+      if (extra > s_tm.ac_extra)
+        T::Count(T::Counter::AudioClockCatchups, extra - s_tm.ac_extra);
+      s_tm.ac_extra = extra;
+    }
+  }
+  s_tm.step_open = false;
+  s_tm.have_last_end = true;
+  s_tm.last_live_end = now;
+  T::LiveFrame(r.tick_running, now);
+}
+
+void TelemetrySessionEnter()
+{
+  NSRTelemetry::Rearm();  // a new boot after a previous core shutdown
+  if (!NSRTelemetry::Enabled())
+    return;
+  const Rollback& r = s_rb;
+  TelemetryBaseline();
+  NSRTelemetry::RollbackInfo info;
+  info.enter_frame = r.vtime_from;
+  info.generation = r.session_generation;
+  info.force = r.force;
+  info.mispredict = r.mispredict;
+  info.ring_slots = static_cast<u32>(r.ring.size());
+  info.io_idle = r.io_idle_mode;
+  info.audio_rollback = r.audio_rollback;
+  info.dirty_tracking = s_dirty.on;
+  info.frame_mode = r.frame_mode;
+  info.vmem_bytes = r.vmem_bytes;
+  NSRTelemetry::SessionEnter(info);
+}
+
+void TelemetrySessionLeave(const char* reason)
+{
+  namespace T = NSRTelemetry;
+  if (!T::Enabled())
+    return;
+  const Rollback& r = s_rb;
+  T::SessionLeave(r.tick_running, reason ? reason : "",
+                  {T::Int("generation", r.session_generation),
+                   T::Int("rollbacks", static_cast<s64>(r.rollbacks)),
+                   T::Int("resim_frames", static_cast<s64>(r.resim_ticks)),
+                   T::Int("mispredictions", static_cast<s64>(r.mispredictions)),
+                   T::Int("uncorrectable", static_cast<s64>(r.uncorrectable)),
+                   T::Int("quiet_skips", static_cast<s64>(r.skipped_busy))});
+  s_tm.step_open = false;
+  s_tm.have_last_end = false;
+}
+
+void TelemetryShutdown()
+{
+  NSRTelemetry::Shutdown();
+  s_tm = TelemetryGlue{};
+}
+
+u32 TelemetryLiveFrame()
+{
+  return s_rb.live;
+}
+}  // namespace
+}  // namespace NSRNetplay
+// ===== end NSR telemetry glue =====
