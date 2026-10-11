@@ -46,6 +46,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -1872,8 +1873,49 @@ void RbInit(Core::System& system)
       keep.size(), r.hash_log, r.net_enabled, r.net_delay, r.max_prediction);
 }
 
+// Per-machine heap blocks (sidecar, see WritePerMachineSidecar): blocks the
+// game's allocator hands to audio code. The audio middleware, the game's sound
+// layer and stream source, and PathFinder allocate from the shared game heap
+// (descriptor 0x804CB810, id 1, together with game state) and from the small
+// stream-source heap; which addresses they get depends on the mode (Quick Play
+// vs Demo Mode), so they are found by watching the allocator, not by address.
+// The set must follow rollback: snapshots remember the event sequence number
+// when they were saved, and a restore undoes later allocations and frees.
+struct AllocEvent
+{
+  u64 seq;
+  bool alloc;
+  u32 lo, hi;
+};
+std::map<u32, u32> s_audio_blocks;  // payload start -> end (virtual)
+std::vector<AllocEvent> s_alloc_log;
+u64 s_alloc_seq = 0;
+std::map<const u8*, u64> s_slot_seq;  // snapshot slot -> s_alloc_seq when saved
+
+void AllocUndoTo(u64 seq)
+{
+  while (!s_alloc_log.empty() && s_alloc_log.back().seq > seq)
+  {
+    const AllocEvent e = s_alloc_log.back();
+    s_alloc_log.pop_back();
+    if (e.alloc)
+      s_audio_blocks.erase(e.lo);
+    else
+      s_audio_blocks[e.lo] = e.hi;
+  }
+}
+
 void RbSave(const u8* ram, std::vector<u8>& slot)
 {
+  s_slot_seq[slot.data()] = s_alloc_seq;
+  // Keep the undo log bounded by the oldest snapshot still remembered.
+  if (s_alloc_log.size() > 65536 && !s_slot_seq.empty())
+  {
+    u64 oldest = UINT64_MAX;
+    for (const auto& [ptr, seq] : s_slot_seq)
+      oldest = std::min(oldest, seq);
+    std::erase_if(s_alloc_log, [&](const AllocEvent& e) { return e.seq <= oldest; });
+  }
   PhaseTimer timer(PH_SAVE);
   DirtyTracker& d = s_dirty;
   const bool full_slot = s_rb.vmem_bytes == 0 || slot.size() >= s_rb.mem1_size + s_rb.vmem_bytes;
@@ -1931,7 +1973,7 @@ void RbSave(const u8* ram, std::vector<u8>& slot)
 //   - every alarm on the alarm queue (head at 0x803ED078, next at +0x14,
 //     0x28 bytes each);
 //   - the GX FIFO, from the command processor's base/end registers.
-std::vector<std::pair<u32, u32>> RbLiveRanges(Core::System& system, const u8* ram)
+std::vector<std::pair<u32, u32>> RbLiveRanges(Core::System& system, const u8* ram, bool all = false)
 {
   // Layouts from the Dolphin SDK headers / decomp (checked by the Codex audit
   // in NFLStreet local/work/codex/live-objects-audit.md). Every walk is
@@ -1950,9 +1992,10 @@ std::vector<std::pair<u32, u32>> RbLiveRanges(Core::System& system, const u8* ra
   u32 t = rd(0x800000DC);
   for (int n = 0; n < 32 && valid(t); ++n, t = rd(t + 0x2FC))
   {
-    if (t == DISC_WORKER_THREAD && s_rb.io_idle_mode)
+    // (all: every per-machine object, for the dump sidecar)
+    if (t == DISC_WORKER_THREAD && s_rb.io_idle_mode && !all)
       continue;  // restored with everything else in I/O-idle mode
-    if (t == AUDIO_THREAD && s_rb.audio_rollback)
+    if (t == AUDIO_THREAD && s_rb.audio_rollback && !all)
       continue;  // restored with the rest of audio
     if (t != 0x803A3F30)  // main thread: its OSThread and stack are kept statically
     {
@@ -2000,7 +2043,7 @@ std::vector<std::pair<u32, u32>> RbLiveRanges(Core::System& system, const u8* ra
   // by fn_80269C70 on the audio thread, nodes {next, ?, callback, arg} living
   // in game memory. A restore that rewound a still-linked node left a null
   // callback (crash on the audio thread).
-  if (!s_rb.audio_rollback)
+  if (!s_rb.audio_rollback || all)
   {
     u32 node = rd(0x803A6BCC);
     for (int n = 0; n < 256 && valid(node); ++n, node = rd(node))
@@ -2010,7 +2053,7 @@ std::vector<std::pair<u32, u32>> RbLiveRanges(Core::System& system, const u8* ra
   if (const u32 outer = rd(TICK_CLOCK_PTR); valid(outer))
     keep(rd(outer + 0xC), 0x10);
   // GX FIFO, from the command processor's registers.
-  if (!s_rb.io_idle_mode)
+  if (!s_rb.io_idle_mode || all)
   {
     for (const auto& [lo, hi] : s_io_ranges)
       if (hi <= mem_size)
@@ -2068,6 +2111,8 @@ void RbRestore(Core::System& system, u8* ram, const std::vector<u8>& slot)
   // Copy page by page and tell the JIT about every page whose bytes changed:
   // restored memory can hold code (e.g. code the audio engine generates in the
   // heap), and compiled blocks for the old bytes must not keep running.
+  if (const auto it = s_slot_seq.find(slot.data()); it != s_slot_seq.end())
+    AllocUndoTo(it->second);
   std::optional<PhaseTimer> timer(std::in_place, PH_LIVE);
   const auto live = RbLiveRanges(system, ram);
   std::vector<std::vector<u8>> keep;
@@ -2708,6 +2753,275 @@ static void RbTransplant(Core::System& system, u8* ram, u32 live, u32 frame)
   Log("transplanted {} bytes before {}", moved, key);
 }
 
+// ---------------------------------------------------------------------------
+// Per-machine sidecar: next to every MEM1 dump (NSR_RB_DUMP_AT,
+// NSR_RB_DUMP_UNIT), <dump>.permachine lists memory that follows this
+// machine's own emulated time and is never read by the sim, found
+// structurally at dump time, so NFLStreet tools/rbdiff.py can compare dumps
+// of any mode (its fixed Quick Play addresses were wrong in Demo Mode, where
+// the same audio objects sit elsewhere in the heap). Lines: "lo hi kind",
+// virtual addresses, [lo, hi). Kinds:
+//   audio-heap   heap blocks handed to audio code (AllocHook), header included;
+//   os-live      RbLiveRanges(all): non-main threads (OSThread + stack, incl.
+//                the disc worker and the audio thread), thread queues and
+//                mutexes of every thread, alarms, DVD command blocks, ARQ
+//                requests, the audio callback-list nodes, the tick
+//                accumulator, disc staging/descriptor, disc stream
+//                destinations, the GX FIFO (CP registers).
+// Static per-machine words (.data/.bss, the same in every mode) stay in
+// rbdiff's own list.
+// ---------------------------------------------------------------------------
+namespace
+{
+// Code whose allocations are audio state: the audio middleware, the game's
+// sound layer and stream source (fn_801F3000..), PathFinder music; plus
+// anything allocated on the audio thread.
+constexpr std::array<std::pair<u32, u32>, 5> AUDIO_ALLOC_OWNERS{{
+    {0x80263000, 0x80285A90},  // audio middleware text
+    {0x801F3000, 0x801F7800},  // sound layer, stream source
+    {0x801B1000, 0x801B9200},  // PathFinder
+    // fn_801AA220: 0x180-byte buffers for world objects' sounds, sample data
+    // with a word (+0x40) that changes with audio timing; written by DMA (a
+    // memory watch on it never fires), not by game code.
+    {0x801AA220, 0x801AA24C},
+    // fn_801E10F0: the audio system's allocator object (EA IAllocator method,
+    // reached only through its vtable) used by the game's sound code and
+    // PathFinder/AEMS for their objects and handles.
+    {0x801E10F0, 0x801E1168},
+}};
+// Allocator internals (GN7E69): fn_801D28A8 does the work; its three callers
+// resume at these addresses with the payload in r3. Heap block header: 16
+// bytes before the payload, next block's payload - 0x10 at payload - 4.
+constexpr std::array<u32, 3> ALLOC_RETURNS{0x801D2BA0, 0x801D2BC0, 0x801D300C};
+constexpr u32 FREE_FN = 0x801D2BD0;
+
+bool AudioOwnedAllocation(const Core::CPUThreadGuard& guard, const PowerPC::PowerPCState& ppc)
+{
+  using PowerPC::MMU;
+  if (MMU::HostRead<u32>(guard, 0x800000E4) == AUDIO_THREAD)
+    return true;
+  auto in_owner = [](u32 a) {
+    return std::any_of(AUDIO_ALLOC_OWNERS.begin(), AUDIO_ALLOC_OWNERS.end(),
+                       [a](const auto& r) { return a >= r.first && a < r.second; });
+  };
+  // Return addresses up the stack (EABI back chain: the LR save word of a
+  // frame is at back_chain + 4).
+  u32 sp = ppc.gpr[1];
+  for (int i = 0; i < 16; ++i)
+  {
+    const u32 next = MMU::HostRead<u32>(guard, sp);
+    if ((next >> 24) != 0x80 || next <= sp)
+      break;
+    if (in_owner(MMU::HostRead<u32>(guard, next + 4)))
+      return true;
+    sp = next;
+  }
+  return false;
+}
+
+// Payload end of an allocated block: its header's last word is the address
+// of the next block's header (the payload runs right up to it).
+u32 BlockEnd(const u8* ram, u32 p)
+{
+  auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
+  const u32 next = rd(p - 4);
+  if ((next >> 24) == 0x80 || (next >> 24) == 0x81)
+    if (next > p && next - p < 0x01000000)
+      return next;
+  return 0;
+}
+}  // namespace
+
+// HookType::Start at ALLOC_RETURNS: record audio-owned allocations.
+void AllocHook(const Core::CPUThreadGuard& guard)
+{
+  auto& system = guard.GetSystem();
+  auto& ppc = system.GetPPCState();
+  const u32 p = ppc.gpr[3];
+  if ((p >> 24) != 0x80 && (p >> 24) != 0x81)
+    return;
+  // Diagnostics: NSR_RB_ALLOC_TRACE=lo-hi logs every allocation overlapping
+  // that range with its return-address chain (who owns a block?).
+  static const std::pair<u32, u32> trace = [] {
+    const auto parts = Split(Env("NSR_RB_ALLOC_TRACE"), '-');
+    if (parts.size() == 2)
+      return std::pair<u32, u32>{ParseU32(parts[0]).value_or(0), ParseU32(parts[1]).value_or(0)};
+    return std::pair<u32, u32>{0, 0};
+  }();
+  if (trace.second)
+  {
+    const u32 e = BlockEnd(system.GetMemory().GetRAM(), p);
+    if (p < trace.second && (e > trace.first || p >= trace.first))
+    {
+      std::string chain;
+      u32 sp = ppc.gpr[1];
+      for (int i = 0; i < 12; ++i)
+      {
+        const u32 next = PowerPC::MMU::HostRead<u32>(guard, sp);
+        if ((next >> 24) != 0x80 || next <= sp)
+          break;
+        chain += fmt::format(" {:08x}", PowerPC::MMU::HostRead<u32>(guard, next + 4));
+        sp = next;
+      }
+      Log("alloc {:08x}..{:08x} thread {:08x} frame {} audio {}:{}", p, e,
+          PowerPC::MMU::HostRead<u32>(guard, 0x800000E4), s_rb.live,
+          AudioOwnedAllocation(guard, ppc), chain);
+    }
+  }
+  if (!AudioOwnedAllocation(guard, ppc))
+    return;
+  // The header's next link may not be final yet (e.g. the block was carved
+  // from the end of the free area): then the extent is read at dump time.
+  const u32 end = BlockEnd(system.GetMemory().GetRAM(), p);
+  s_audio_blocks[p] = end;
+  s_alloc_log.push_back({++s_alloc_seq, true, p, end});
+}
+
+// HookType::Start at FREE_FN (r3 = payload).
+void FreeHook(const Core::CPUThreadGuard& guard)
+{
+  const u32 p = guard.GetSystem().GetPPCState().gpr[3];
+  const auto it = s_audio_blocks.find(p);
+  if (it == s_audio_blocks.end())
+    return;
+  s_alloc_log.push_back({++s_alloc_seq, false, p, it->second});
+  s_audio_blocks.erase(it);
+}
+
+std::vector<unsigned int> AllocHookAddresses()
+{
+  return {ALLOC_RETURNS.begin(), ALLOC_RETURNS.end()};
+}
+
+namespace
+{
+// Disc/stream I/O objects (the game's stream source and disc worker: file
+// readers, read requests, the worker's buffers) are allocated at boot, before
+// the allocator watch is installed, and are shared with game loads, so they
+// are found from their static roots instead: words in .data/.sbss that point
+// at (or into) them. Measured in Quick Play; the roots are fixed addresses in
+// the DOL, the blocks move with the mode.
+constexpr std::array<u32, 5> IO_ROOT_WORDS{0x803EBC24, 0x803EBC28, 0x803ED628, 0x803D55E8, 0x803D55EC};
+constexpr std::pair<u32, u32> IO_ROOT_TABLE{0x802C8840, 0x802C89E0};  // stream source request table
+
+// The allocated heap block containing p: scan back for a header whose heap
+// descriptor word points at a descriptor that points at itself (+4), whose
+// "used" byte is set and whose next-header word lies beyond p. [header, next).
+std::optional<std::pair<u32, u32>> EnclosingBlock(const u8* ram, u32 p)
+{
+  auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
+  auto ptr = [](u32 a) { return a >= 0x80003100 && a < 0x817FFFF0; };  // (reads up to +0xC stay in MEM1)
+  if (!ptr(p))
+    return std::nullopt;
+  for (u32 h = (p & ~3u) - 0x10, n = 0; ptr(h) && n < 0x10000; h -= 4, ++n)
+  {
+    const u32 heap = rd(h + 8), next = rd(h + 0xC);
+    if (ptr(heap) && rd(heap + 4) == heap && (rd(h + 4) & 0xFF00) == 0x0100 && next > p &&
+        ptr(next) && next - h < 0x00400000)
+      return std::pair<u32, u32>{h, next};
+  }
+  return std::nullopt;
+}
+}  // namespace
+
+static void WritePerMachineSidecar(Core::System& system, const u8* ram, const std::string& dump)
+{
+  FILE* f = std::fopen((dump + ".permachine").c_str(), "w");
+  if (!f)
+    return;
+  std::fprintf(f, "# per-machine ranges at dump time: lo hi kind (virtual, [lo, hi)); "
+                  "NSRNetplay WritePerMachineSidecar\n");
+  size_t blocks = 0;
+  for (const auto& [p, recorded] : s_audio_blocks)
+  {
+    // The header's links can change as neighbours are allocated/freed; the
+    // block's own extent is fixed while it is allocated.
+    const u32 end = BlockEnd(ram, p) ? BlockEnd(ram, p) : recorded;
+    if (!end)
+      continue;
+    std::fprintf(f, "%08x %08x audio-heap\n", p - 0x10, end);
+    ++blocks;
+  }
+  for (const auto& [lo, hi] : RbLiveRanges(system, ram, true))
+    std::fprintf(f, "%08x %08x os-live\n", 0x80000000 | lo, 0x80000000 | hi);
+  auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
+  std::vector<u32> roots(IO_ROOT_WORDS.begin(), IO_ROOT_WORDS.end());
+  for (u32 a = IO_ROOT_TABLE.first; a < IO_ROOT_TABLE.second; a += 4)
+    roots.push_back(a);
+  std::map<u32, u32> io;
+  for (const u32 root : roots)
+  {
+    if (const auto b = EnclosingBlock(ram, rd(root)))
+      io[b->first] = b->second;
+  }
+  for (const auto& [lo, hi] : io)
+    std::fprintf(f, "%08x %08x io-object\n", lo, hi);
+  // Audio data blocks the allocator watch cannot attribute (loaded by the
+  // game's file loader, e.g. PathFinder project data 'PFDx', whose variables
+  // the audio thread updates): heap blocks that an audio-heap block points
+  // into and whose payload starts with a known audio data magic.
+  constexpr std::array<u32, 1> AUDIO_DATA_MAGICS{0x50464478};  // 'PFDx'
+  std::map<u32, u32> data;
+  for (const auto& [p, recorded] : s_audio_blocks)
+  {
+    const u32 end = BlockEnd(ram, p) ? BlockEnd(ram, p) : recorded;
+    for (u32 a = p; a + 4 <= end && a < p + 0x40000; a += 4)
+    {
+      const u32 q = rd(a);
+      if (q >= p && q < end)
+        continue;
+      // Only pointers to a block's payload start (O(1) header check).
+      if (q < 0x80003110 || q >= 0x817FFFF0 || (q & 3) || data.contains(q - 0x10) ||
+          std::find(AUDIO_DATA_MAGICS.begin(), AUDIO_DATA_MAGICS.end(), rd(q)) == AUDIO_DATA_MAGICS.end())
+        continue;
+      const u32 heap = rd(q - 8), next = rd(q - 4);
+      if (heap >= 0x80003100 && heap < 0x817FFFF0 && rd(heap + 4) == heap && next > q &&
+          next < 0x81800000 && next - q < 0x00400000)
+        data[q - 0x10] = next;
+    }
+  }
+  for (const auto& [lo, hi] : data)
+    std::fprintf(f, "%08x %08x audio-data\n", lo, hi);
+  // Heaps that hold audio blocks also hold game blocks (e.g. the small heap
+  // 0x804C4810 the audio allocator object fn_801E10F0 uses is shared with UI
+  // text), and audio code allocates and frees there on audio time. Its effect
+  // on such a heap is bookkeeping, not game state: the descriptor's block
+  // counters (+0x24..+0x30) and the stale bytes in free blocks (rbdiff only
+  // ignores a free range where it is free in both dumps). Free blocks
+  // are found by walking the heap's block chain from its start (+0x14) to its
+  // end (+0x18) through each header's next link; a header whose "used" byte
+  // is clear is free.
+  std::set<u32> heaps;
+  for (const auto& [p, recorded] : s_audio_blocks)
+  {
+    const u32 heap = rd(p - 8);
+    if (heap >= 0x80003100 && heap < 0x817FFFF0 && rd(heap + 4) == heap)
+      heaps.insert(heap);
+  }
+  for (const u32 heap : heaps)
+  {
+    std::fprintf(f, "%08x %08x heap-counters\n", heap + 0x24, heap + 0x30);
+    const u32 start = rd(heap + 0x14), end = rd(heap + 0x18);
+    u32 h = start;
+    for (int n = 0; n < 200000 && h >= start && h + 0x20 <= end && h < 0x817FFFF0; ++n)
+    {
+      // Aligned blocks (size class 0x1C) start with a 16-byte pre-header
+      // {back link, 0x001C0000, 0, 0}; their real header follows it.
+      u32 hdr = h;
+      if (rd(h + 8) != heap && rd(h + 0xC) == 0 && (rd(h + 4) & 0xFFFF0000) == 0x001C0000)
+        hdr = h + 0x10;
+      const u32 next = rd(hdr + 0xC);
+      if (rd(hdr + 8) == heap && (rd(hdr + 4) & 0xFF00) == 0 && next > hdr + 0x10 && next <= end)
+        std::fprintf(f, "%08x %08x heap-free\n", hdr + 0x10, next);
+      if (next <= h || next > end)
+        break;
+      h = next;
+    }
+  }
+  std::fclose(f);
+  Log("wrote {}.permachine ({} audio heap blocks)", dump, blocks);
+}
+
 // Diagnostics: NSR_RB_DUMP_UNIT=live:frame,... writes all of MEM1 right
 // before frame `frame` runs during live frame `live`'s step (live == frame
 // for the live frame itself), to NSR_DUMP_PREFIX-unit-<live>-<frame>.bin.
@@ -2724,6 +3038,7 @@ static void RbDumpUnit(Core::System& system, const u8* ram, u32 live, u32 frame)
     std::fwrite(ram, 1, system.GetMemory().GetRamSizeReal(), f);
     std::fclose(f);
     Log("wrote {}", path);
+    WritePerMachineSidecar(system, ram, path);
   }
   if (s_rb.vmem_bytes)
   {
@@ -3253,6 +3568,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
       std::fwrite(ram, 1, system.GetMemory().GetRamSizeReal(), f);
       std::fclose(f);
       Log("wrote {}", path);
+      WritePerMachineSidecar(system, ram, path);
     }
   }
   if (r.hash_log && t % 60 == 0)

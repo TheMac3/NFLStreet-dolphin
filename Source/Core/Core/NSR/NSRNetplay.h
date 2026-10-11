@@ -293,6 +293,13 @@ constexpr unsigned int SIM_WAIT_TRAMP_ADDR = 0x80416AF4;
 constexpr unsigned int MUSIC_TRAMP_ADDR = 0x80416AF8;
 constexpr unsigned int MUSIC_PICK_SONG_FN = 0x80072424;
 std::vector<unsigned int> MusicDispatchers();
+// Per-machine sidecar (<dump>.permachine next to every MEM1 dump): the
+// allocator hooks record heap blocks handed to audio code, so the sidecar can
+// list them wherever the mode put them (see NSRNetplay.cpp).
+void AllocHook(const Core::CPUThreadGuard& guard);  // HookType::Start, after fn_801D28A8 returns
+void FreeHook(const Core::CPUThreadGuard& guard);   // HookType::Start, fn_801D2BD0
+constexpr unsigned int FREE_FN_ADDR = 0x801D2BD0;
+std::vector<unsigned int> AllocHookAddresses();
 
 // Diagnostics: NSR_RB_PROBES=addr,... installs ProbeHook (HookType::Start)
 // at those function entries; inside the NSR_RB_WATCH window it logs each
