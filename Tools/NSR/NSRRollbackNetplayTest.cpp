@@ -31,6 +31,7 @@
 #include <map>
 #include <random>
 #include <set>
+#include <string_view>
 #include <vector>
 
 namespace RN = NSRNetplay::RollbackNet;
@@ -912,6 +913,161 @@ static void TestRepeatedHandoffTransitions()
   assert(!reentry.Mismatched());  // stale generation is ignored
 }
 
+// ---------------------------------------------------------------------------
+// Config agreement (final review M2) and final-only digest comparison (H4).
+// ---------------------------------------------------------------------------
+
+static RN::ConfigFingerprint TestConfig(std::uint64_t salt)
+{
+  RN::ConfigFingerprint config;
+  for (std::size_t i = 0; i < RN::CONFIG_FIELDS; ++i)
+    config.fields[i] = 0x1000 * (i + 1) + salt;
+  return config;
+}
+
+// Every field survives the wire; a proposal whose configuration differs is
+// reported as a config mismatch naming exactly the differing fields, takes
+// precedence over a state-hash difference, and blocks completion.  Stale
+// transitions are still ignored, whatever their configuration.
+static void TestHandoffConfigAgreement()
+{
+  const RN::ConfigFingerprint local = TestConfig(0);
+  RN::HandoffPacket same{1, 2, RN::HandoffKind::EnterRollback, 4, 3080, 0x55, local};
+  const auto bytes = RN::EncodeHandoff(same);
+  const auto decoded = RN::DecodeHandoff(bytes);
+  assert(decoded && decoded->config == local && decoded->semantic_hash == 0x55);
+
+  RN::HandoffAgreement ok(2, 0, RN::HandoffKind::EnterRollback, 4, 3080, 0x55, local);
+  assert(ok.Accept(*decoded));
+  assert(ok.Complete() && !ok.ConfigMismatch());
+
+  RN::ConfigFingerprint remote = local;
+  remote[RN::ConfigField::VtimeBase] ^= 1;
+  remote[RN::ConfigField::AudioRollback] = 0;
+  const auto differs = RN::ConfigDifferences(local, remote);
+  assert(differs.size() == 2);
+  assert(differs[0] == RN::ConfigField::VtimeBase && differs[1] == RN::ConfigField::AudioRollback);
+  assert(std::string_view(RN::ConfigFieldName(differs[0])) == "vtime_base");
+  assert(std::string_view(RN::ConfigFieldName(differs[1])) == "audio_rollback");
+  assert(RN::ConfigDigest(local) != RN::ConfigDigest(remote));
+
+  RN::HandoffAgreement refuse(2, 0, RN::HandoffKind::EnterRollback, 4, 3080, 0x55, local);
+  RN::HandoffPacket stale{1, 2, RN::HandoffKind::LeaveRollback, 3, 2000, 0x99, remote};
+  assert(!refuse.Accept(stale));
+  assert(!refuse.Mismatched());  // an older transition says nothing about this one
+  RN::HandoffPacket wrong{1, 2, RN::HandoffKind::EnterRollback, 4, 3080, 0x66, remote};
+  const auto wire = RN::DecodeHandoff(RN::EncodeHandoff(wrong));
+  assert(wire);
+  assert(!refuse.Accept(*wire));
+  assert(refuse.Mismatched() && !refuse.Complete());
+  assert(refuse.ConfigMismatch() && !refuse.Mismatch());  // config reported first
+  assert(RN::ConfigDifferences(local, refuse.ConfigMismatch()->config) == differs);
+  // A later matching proposal cannot clear it.
+  assert(!refuse.Accept(*decoded) || refuse.Mismatched());
+  assert(!refuse.Complete());
+
+  // Field count and size are part of the format.
+  std::vector<std::uint8_t> malformed = bytes;
+  malformed[24] = static_cast<std::uint8_t>(RN::CONFIG_FIELDS - 1);
+  assert(!RN::DecodeHandoff(malformed));
+  malformed = bytes;
+  malformed.push_back(0);
+  assert(!RN::DecodeHandoff(malformed));
+}
+
+// A datagram from a differently configured peer in the same epoch changes
+// nothing, is not a protocol violation, and is reported once with the peer.
+static void TestExchangeConfigMismatch()
+{
+  constexpr std::uint32_t session = 0x77;
+  RN::Exchange local(600, 2, 0, 1, 7, session, 0xAAAA);
+  RN::Exchange other(600, 2, 1, 1, 7, session, 0xBBBB);
+  local.SubmitLocal(600, {});
+  other.SubmitLocal(600, ValidationPad(1, 600));
+  const auto before = Fingerprint(local, 600);
+  const auto packet = RN::Decode(RN::Encode(other.BuildPacket(600, 1000)));
+  assert(packet && packet->config == 0xBBBB);
+  assert(!local.Accept(*packet, 2000));
+  assert(Fingerprint(local, 600) == before);
+  assert(local.ViolationCount() == 0);
+  assert(local.ConfigMismatch() && local.ConfigMismatch()->player == 1 &&
+         local.ConfigMismatch()->remote == 0xBBBB);
+
+  RN::Exchange agreeing(600, 2, 1, 1, 7, session, 0xAAAA);
+  agreeing.SubmitLocal(600, {});
+  Deliver(agreeing, &local, 600);
+}
+
+// The digest of a frame start computed with mispredicted remote input must
+// not be compared (a sticky false desync), nor advertised during the
+// re-simulation that replaces it.  Once recomputed with confirmed input the
+// same frame is compared and agrees; a real difference is still caught.
+static void TestDigestComparedOnlyWhenFinal()
+{
+  RN::Exchange a(500, 2, 0, 0, 7, 21);
+  RN::Exchange b(500, 2, 1, 0, 7, 21);
+  const RN::Pad pad_b = ValidationPad(1, 500);
+  // State digest model: start of frame f+1 = f(inputs through f).
+  const auto digest = [](const RN::Pads& pads, std::uint64_t prior) {
+    std::uint64_t h = prior * 1099511628211ULL;
+    for (const auto& pad : pads)
+      for (const std::uint8_t byte : pad)
+        h = (h ^ byte) * 1099511628211ULL;
+    return h;
+  };
+  a.SubmitLocal(500, {});
+  b.SubmitLocal(500, pad_b);
+  Deliver(a, &b, 500);
+  // a runs 500 and 501 predicting b's (unknown) input as neutral.
+  const std::uint64_t a501 = digest(a.Assemble(500), 1);
+  a.SetStateChecksum(501, a501);
+  a.SubmitLocal(501, {});
+  const std::uint64_t a502 = digest(a.Assemble(501), a501);
+  a.SetStateChecksum(502, a502);
+  a.UpdateFinalized();
+  // b ran 500 with a's confirmed input and finalizes its start of 501.
+  const std::uint64_t b501 = digest(b.Assemble(500), 1);
+  assert(b501 != a501);
+  b.SetStateChecksum(501, b501);
+  b.SubmitLocal(501, pad_b);
+  b.UpdateFinalized();
+  Deliver(b, &a, 501);  // b's real input for 500/501 and its digest of 501
+  assert(a.PendingRollback() == 500u);
+  assert(!a.FirstDesync());  // a's 501 digest is speculative: not compared
+  a.UpdateFinalized();
+  assert(!a.FirstDesync());
+  assert(a.BuildPacket(501).checksum_frame == RN::NO_FRAME);  // nothing final yet
+
+  // Rollback to 500 and re-simulate 500 only (501 is the next unit).
+  a.BeginRollback();
+  a.DiscardChecksumsAfter(500);
+  const std::uint64_t r501 = digest(a.Assemble(500), 1);
+  assert(r501 == b501);
+  a.SetStateChecksum(501, r501);
+  a.UpdateFinalized();
+  // The stale 502 digest from the abandoned timeline is never advertised.
+  const RN::Packet out = a.BuildPacket(501);
+  assert(out.checksum_frame == 501 && out.checksum == b501);
+  assert(!a.FirstDesync());
+
+  // A genuine difference between two final digests is still reported.
+  RN::Exchange c(700, 2, 0, 0, 7, 22);
+  RN::Exchange d(700, 2, 1, 0, 7, 22);
+  c.SubmitLocal(700, {});
+  d.SubmitLocal(700, {});
+  Deliver(c, &d, 700);
+  Deliver(d, &c, 700);
+  d.SetStateChecksum(701, 0xD);
+  d.UpdateFinalized();
+  Deliver(d, &c, 700);  // arrives before c's own digest exists
+  assert(!c.FirstDesync());
+  c.SetStateChecksum(701, 0xC);
+  c.UpdateFinalized();  // now final locally: compared
+  assert(c.FirstDesync() == 701u);
+  assert(c.FirstDesyncInfo() && c.FirstDesyncInfo()->local == 0xC &&
+         c.FirstDesyncInfo()->remote == 0xD && c.FirstDesyncInfo()->player == 1);
+}
+
 // Production helper decisions cover the non-I/O portions of snapshotting,
 // target selection, sidecar normalization, and audio virtual time.
 static void TestPureRollbackHelpers()
@@ -1144,6 +1300,9 @@ int main()
   TestHistoryUnderLossReorderAndDuplication();
   TestChecksumAgreementAndStickyDesync();
   TestRepeatedHandoffTransitions();
+  TestHandoffConfigAgreement();
+  TestExchangeConfigMismatch();
+  TestDigestComparedOnlyWhenFinal();
   TestPureRollbackHelpers();
   TestWindowUndoLog();
   TestTelemetryFinalFlushIsBounded();

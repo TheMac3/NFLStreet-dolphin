@@ -2,7 +2,9 @@
 # Produces ONE friends zip (artifact NFLStreet-rollback-windows-x64, folder
 # NFLStreet-Rollback/): Binary/x64 (Dolphin.exe with Qt UI and all DLLs), the
 # "NSR Netplay.exe" launcher and NSR-Patcher.exe built from Tools/NSR (vendored
-# from NFLStreet by its scripts/sync-launcher-to-fork.sh), README-FIRST.txt,
+# from NFLStreet by its scripts/sync-launcher-to-fork.sh; the launcher's web UI
+# is Tools/NSR/nsr_launcher_ui.html shown through pywebview/Edge WebView2,
+# with a tkinter fallback), README-FIRST.txt,
 # VERSION.txt (fork SHA + build date), SOURCE.txt and the licence texts. No
 # game data. Build mirrors Dolphin's own Windows steps (MSBuild on
 # dolphin-emu.sln, VS 2022 / v143, bundled Qt from Externals).
@@ -27,20 +29,37 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Python first: these take a minute and fail fast, before the long
-      # Dolphin build.
+      # Python first: these take a few minutes and fail fast, before the long
+      # Dolphin build. pywebview pinned (6.2.1, 2026-04) so a new release
+      # can't change the friends' exe silently; it pulls pythonnet for the
+      # Edge WebView2 backend.
       - name: Check the vendored NSR tools
         run: |
+          python -m pip install pyinstaller "pywebview==6.2.1"
           python -c "import sys; sys.path.insert(0, 'Tools/NSR'); import isopatch, nsr_patcher, nsr_lobby; isopatch.check_patch_set(set(isopatch.NETPLAY_SET)); assert nsr_patcher.NETPLAY_MODE == nsr_lobby.RELEASE_MODE == 'rollback'; print(nsr_patcher.ROLLBACK_RECIPE)"
+          $env:NSR_APP_DIR = (New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/nsr-selftest").FullName
+          python -c "import sys; sys.path.insert(0, 'Tools/NSR'); import nsr_launcher as L; print('WebView2 Runtime:', L.webview2_version(), '-> UI:', L.choose_ui(webview2=L.webview2_version()))"
+          # Web UI: the page must load in WebView2 and render a real snapshot.
           python Tools/NSR/nsr_launcher.py --selftest
+          if ($LASTEXITCODE -ne 0) { throw "launcher web UI selftest failed" }
+          # The tkinter fallback (PCs without WebView2) must still come up.
+          python Tools/NSR/nsr_launcher.py --selftest --tk
+          if ($LASTEXITCODE -ne 0) { throw "launcher tkinter selftest failed" }
 
       - name: Build the NSR Netplay launcher and NSR-Patcher
         run: |
-          python -m pip install pyinstaller
-          pyinstaller --noconfirm --noupx --workpath pyi-build --distpath pyi-dist --onefile --windowed --name "NSR Netplay" --paths Tools/NSR Tools/NSR/nsr_launcher.py
+          # --collect-all: pywebview's WebView2 DLLs and pythonnet's runtime
+          # are data/binaries PyInstaller would otherwise miss.
+          pyinstaller --noconfirm --noupx --workpath pyi-build --distpath pyi-dist --onefile --windowed --name "NSR Netplay" --paths Tools/NSR --add-data "Tools/NSR/nsr_launcher_ui.html;." --collect-all webview --collect-all pythonnet --collect-all clr_loader Tools/NSR/nsr_launcher.py
           pyinstaller --noconfirm --noupx --workpath pyi-build --distpath pyi-dist --onefile --console --name NSR-Patcher --paths Tools/NSR Tools/NSR/nsr_patcher.py
           pyi-dist\NSR-Patcher.exe --help
           if ($LASTEXITCODE -ne 0) { throw "NSR-Patcher.exe --help failed" }
+          # The frozen launcher must find its bundled page and WebView2 too.
+          $env:NSR_APP_DIR = (New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/nsr-selftest-exe").FullName
+          $p = Start-Process -FilePath "pyi-dist/NSR Netplay.exe" -ArgumentList "--selftest" -Wait -PassThru
+          Get-Content -ErrorAction SilentlyContinue "$env:NSR_APP_DIR/nsr-launcher.log"
+          if ($p.ExitCode -ne 0) { throw "NSR Netplay.exe --selftest failed ($($p.ExitCode))" }
+          "NSR Netplay.exe: {0:N1} MB" -f ((Get-Item "pyi-dist/NSR Netplay.exe").Length / 1MB)
 
       - uses: microsoft/setup-msbuild@v2
 
@@ -183,13 +202,24 @@ jobs:
              "Browse for NSR.iso..." (Reborn folder\content\games\NSR.iso).
 
           4. Double-click "NSR Netplay.exe".
-             - Type your name. Click "Set up controllers" once: your controller
-               is always Port 1. Close that Dolphin window when done.
-             - Host: Host tab -> "Create room" -> send friends the code
+             - Settings: type your name.
+             - Controllers: nothing to do if your controller works in
+               NFL Street Reborn. NSR Netplay copies your Reborn controller
+               setup (from Reborn's launcher, Controllers page) every time it
+               starts a game. Your controller is always Port 1. Plug it in
+               before you start.
+               To change it: change it in Reborn's launcher, then click
+               "Use my Reborn controller settings". Or click "Set up
+               controllers..." to map it in NSR Netplay's own Dolphin only;
+               that mapping is kept until you click "Use my Reborn
+               controller settings" again.
+             - Host: Host -> "Create room" -> send friends the code
                (NSR-XXXXX) -> "Start game" when everyone is listed.
-             - Join: Join tab -> type the code -> Join -> wait for the host.
+             - Join: Join -> type the code -> "Join room" -> wait for the host.
              Everyone must use this same download and have the same game
              fingerprint; the room tells you if someone doesn't.
+             If the window looks plain (no sidebar), Windows is missing the
+             Microsoft Edge WebView2 Runtime; everything still works.
 
           Windows SmartScreen: this test build isn't code-signed, so Windows may
           say "Windows protected your PC". Click "More info", then "Run anyway".
@@ -216,7 +246,7 @@ jobs:
           # Contents guard: no game images, saves, memory cards, dumps or secrets.
           $bad = Get-ChildItem -Recurse -File $pkg | Where-Object {
             $_.Extension -in '.iso','.gcm','.rvz','.wbfs','.ciso','.gcz','.nkit','.gci','.sav','.dtm','.env','.pem','.key' -or
-            $_.Name -in 'nsr-telemetry.txt','nsr-net.iso','nsr-image.json','nsr-reborn.txt','nsr-launcher.json' }
+            $_.Name -in 'nsr-telemetry.txt','nsr-net.iso','nsr-image.json','nsr-reborn.txt','nsr-launcher.json','nsr-launcher.log','GCPadNew.ini.before-reborn-import' }
           if ($bad) { $bad | ForEach-Object { Write-Error "unexpected file in package: $($_.FullName)" }; exit 1 }
           foreach ($f in 'Dolphin.exe','NSR Netplay.exe','NSR-Patcher.exe','README-FIRST.txt','VERSION.txt','SOURCE.txt','portable.txt') {
             if (-not (Test-Path "$pkg/$f")) { throw "missing $f" }

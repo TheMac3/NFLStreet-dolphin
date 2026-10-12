@@ -23,8 +23,13 @@ namespace NSRNetplay::RollbackNet
 {
 constexpr std::uint32_t MAGIC = 0x4E535242;  // 'NSRB'
 constexpr std::uint32_t HANDOFF_MAGIC = 0x4E535248;  // 'NSRH'
-constexpr std::uint8_t VERSION = 4;
-constexpr std::uint8_t HANDOFF_VERSION = 1;
+// VERSION 5: the checksum field carries the canonical state digest (see
+// NSRNetplay's StateDigest) instead of the nine-word semantic hash, and every
+// datagram carries the sender's ConfigDigest.  HANDOFF_VERSION 2: proposals
+// carry the full ConfigFingerprint.  Mixed builds therefore fail to parse each
+// other instead of comparing values that mean different things.
+constexpr std::uint8_t VERSION = 5;
+constexpr std::uint8_t HANDOFF_VERSION = 2;
 constexpr std::size_t MAX_PLAYERS = 4;
 constexpr std::size_t PAD_SIZE = 12;
 constexpr std::size_t MAX_HISTORY = 64;
@@ -40,6 +45,66 @@ constexpr std::uint32_t FUTURE_INPUT_SLACK = static_cast<std::uint32_t>(2 * MAX_
 using Pad = std::array<std::uint8_t, PAD_SIZE>;
 using Pads = std::array<Pad, MAX_PLAYERS>;
 
+// ---------------------------------------------------------------------------
+// Build/config agreement (final review M2).  Peers that differ in anything
+// that changes the simulation or the meaning of the state digest must refuse
+// to enter a rollback epoch, naming what differs, instead of desyncing late
+// and opaquely.  The adapter fills one 64-bit value per field (a parsed value
+// where one exists, otherwise a hash of the option's canonical form); this
+// component only transports and compares them, so the agreement logic is
+// testable without Dolphin.
+//
+// Per-player input delay and prediction are deliberately absent: inputs carry
+// their target frame, so they only change local stalling/correction policy
+// (FutureInputLimit's slack bounds the asymmetry).
+//
+// Adding a field changes the handoff wire size: bump HANDOFF_VERSION.
+// ---------------------------------------------------------------------------
+enum class ConfigField : std::uint8_t
+{
+  Protocol,        // NSRB/NSRH wire versions
+  StateDigest,     // canonical-range version + digest mode
+  VtimeBase,       // NSR_RB_VTIME_BASE (virtual time base, rounded to a frame)
+  VmemBytes,       // NSR_RB_VMEM_BYTES (snapshotted fake-VMEM prefix)
+  ResimSpeed,      // NSR_RB_RESIM_{,GPU_,ARAM_,AUDIO_}SPEED, NSR_RB_RESIM_DRAW
+  InstantDisc,     // NSR_RB_INSTANT_DISC
+  IoIdle,          // NSR_RB_IO_IDLE (forced on with NSR_RB_NET)
+  AudioRollback,   // NSR_RB_AUDIO_ROLLBACK (forced on with NSR_RB_NET)
+  GameImage,       // game ID + revision + hash of the loaded executable text
+  LauncherImage,   // NSR_FINGERPRINT (the launcher's image fingerprint)
+  Seed,            // NSR_SEED
+  RestoreRanges,   // restored segments (RB_KEEP/AUDIO_KEEP + NSR_RB_KEEP/RANGES)
+  AudioClock,      // NSR_AC and NSR_AC_* model parameters
+  ResimGates,      // audio/effect gates, skip lists, resim vsync, async present, PEEKZ
+  SessionRules,    // fixed epoch, NSR_RB_SESSION_END, auto re-entry, auto handoff
+  DolphinCore,     // cheats, MMU, MEM1 override, FPRF, accurate NaNs, custom RTC
+  Count
+};
+constexpr std::size_t CONFIG_FIELDS = static_cast<std::size_t>(ConfigField::Count);
+
+struct ConfigFingerprint
+{
+  std::array<std::uint64_t, CONFIG_FIELDS> fields{};
+
+  std::uint64_t& operator[](ConfigField field)
+  {
+    return fields[static_cast<std::size_t>(field)];
+  }
+  std::uint64_t operator[](ConfigField field) const
+  {
+    return fields[static_cast<std::size_t>(field)];
+  }
+  bool operator==(const ConfigFingerprint&) const = default;
+};
+
+// Stable lower-case name of a field for logs and telemetry.
+const char* ConfigFieldName(ConfigField field);
+// Fields whose values differ, in enum order.
+std::vector<ConfigField> ConfigDifferences(const ConfigFingerprint& a, const ConfigFingerprint& b);
+// One 64-bit summary (FNV-1a over the fields) carried by every NSRB datagram,
+// so a fixed-epoch session without a handoff barrier still fails closed.
+std::uint64_t ConfigDigest(const ConfigFingerprint& config);
+
 // The decoded form of an NSRB datagram.  Encode/Decode use explicit little
 // endian fields so recordings and loopback tests do not inherit host ABI
 // padding or alignment.
@@ -49,6 +114,8 @@ struct Packet
   std::uint8_t players = 0;
   std::uint8_t flags = 0;
   std::uint32_t session = 0;
+  // ConfigDigest of the sender's configuration (VERSION 5).
+  std::uint64_t config = 0;
   std::uint32_t sender_frame = 0;
   std::uint32_t send_us = 0;
   // Each peer reflects the newest timestamp seen from every other peer and
@@ -59,6 +126,7 @@ struct Packet
   std::array<std::uint32_t, MAX_PLAYERS> echo_us{};
   std::array<std::uint32_t, MAX_PLAYERS> echo_age_us{};
   std::array<std::uint32_t, MAX_PLAYERS> ack{NO_FRAME, NO_FRAME, NO_FRAME, NO_FRAME};
+  // Canonical state digest of the sender's newest finalized frame start.
   std::uint32_t checksum_frame = NO_FRAME;
   std::uint64_t checksum = 0;
   std::uint32_t first_frame = 0;
@@ -67,8 +135,10 @@ struct Packet
 
 // Match transitions use a separate fixed-size message because the entry
 // barrier exists before an NSRB rollback epoch does.  The absolute frame is
-// assigned by the confirmed lockstep timeline; the semantic hash proves that
-// every peer reached the same deterministic game state at that boundary.
+// assigned by the confirmed lockstep timeline; the state hash (the canonical
+// state digest since HANDOFF_VERSION 2) proves that every peer reached the
+// same deterministic game state at that boundary, and the config fingerprint
+// that they will simulate the epoch the same way.
 enum class HandoffKind : std::uint8_t
 {
   EnterRollback = 1,
@@ -82,7 +152,8 @@ struct HandoffPacket
   HandoffKind kind = HandoffKind::EnterRollback;
   std::uint32_t transition = 0;
   std::uint32_t frame = 0;
-  std::uint64_t semantic_hash = 0;
+  std::uint64_t semantic_hash = 0;  // canonical state digest (name kept for history)
+  ConfigFingerprint config{};
 };
 
 std::vector<std::uint8_t> EncodeHandoff(const HandoffPacket& packet);
@@ -91,18 +162,22 @@ std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes);
 // HandoffAgreement is deliberately transport-free.  Each peer proposes the
 // same kind/frame/hash tuple and accepts duplicate, reordered announcements;
 // the first conflicting tuple is sticky so the adapter can abort loudly.
+// A differing configuration is reported separately (ConfigMismatch) and takes
+// precedence: a peer configured differently cannot be expected to reach the
+// same state, and naming the option is the actionable message.
 class HandoffAgreement
 {
 public:
   HandoffAgreement(std::uint8_t players, std::uint8_t me, HandoffKind kind,
                    std::uint32_t transition, std::uint32_t frame,
-                   std::uint64_t semantic_hash);
+                   std::uint64_t semantic_hash, const ConfigFingerprint& config = {});
 
   bool Accept(const HandoffPacket& packet);
   bool Complete() const;
-  bool Mismatched() const { return m_mismatch.has_value(); }
+  bool Mismatched() const { return m_mismatch.has_value() || m_config_mismatch.has_value(); }
   const HandoffPacket& Local() const { return m_local; }
   const std::optional<HandoffPacket>& Mismatch() const { return m_mismatch; }
+  const std::optional<HandoffPacket>& ConfigMismatch() const { return m_config_mismatch; }
 
 private:
   std::uint8_t m_players;
@@ -110,6 +185,7 @@ private:
   HandoffPacket m_local;
   std::array<bool, MAX_PLAYERS> m_seen{};
   std::optional<HandoffPacket> m_mismatch;
+  std::optional<HandoffPacket> m_config_mismatch;
 };
 
 std::vector<std::uint8_t> Encode(const Packet& packet);
@@ -141,6 +217,23 @@ struct ProtocolViolation
   std::uint32_t frame = NO_FRAME;
 };
 
+// An honest but differently configured peer (M2): not a protocol violation,
+// but nothing it sends can be used.
+struct ConfigMismatchInfo
+{
+  std::uint8_t player = 0;
+  std::uint64_t remote = 0;
+};
+
+// The first confirmed state mismatch, with both digests for the log.
+struct DesyncInfo
+{
+  std::uint8_t player = 0;
+  std::uint32_t frame = NO_FRAME;
+  std::uint64_t local = 0;
+  std::uint64_t remote = 0;
+};
+
 // Exchange is CPU-thread-owned.  A transport may deliver packets in any
 // order and may duplicate them; insertion and acknowledgements are
 // idempotent.  Assemble records exactly what a frame ran with so a later
@@ -155,7 +248,8 @@ class Exchange
 {
 public:
   Exchange(std::uint32_t start, std::uint8_t players, std::uint8_t me,
-           std::uint32_t delay, std::uint32_t max_prediction, std::uint32_t session);
+           std::uint32_t delay, std::uint32_t max_prediction, std::uint32_t session,
+           std::uint64_t config = 0);
 
   void SubmitLocal(std::uint32_t live_frame, Pad pad);
   Packet BuildPacket(std::uint32_t live_frame, std::uint32_t send_us = 0) const;
@@ -167,10 +261,26 @@ public:
   std::optional<std::uint32_t> PendingRollback() const;
   void BeginRollback();
 
+  // Record the digest of the state at the start of `frame`.  Re-simulation
+  // calls it again for the same frame; the newest value wins.
   void SetStateChecksum(std::uint32_t frame, std::uint64_t checksum);
+  // A rollback restored the state at the start of `frame`: every recorded
+  // digest of a later frame start describes the abandoned timeline.  Without
+  // this, finalization during re-simulation could advertise (and compare) a
+  // stale mispredicted digest before re-simulation recomputes it.
+  void DiscardChecksumsAfter(std::uint32_t frame);
   void UpdateFinalized();
   void TrimBefore(std::uint32_t frame);
+  // Digests are compared only once the local digest is final too (frame <=
+  // our finalized frame): before that it may describe a mispredicted state,
+  // and the first mismatch is sticky.
   std::optional<std::uint32_t> FirstDesync() const;
+  const std::optional<DesyncInfo>& FirstDesyncInfo() const { return m_first_desync_info; }
+  // Every mismatching final frame in compare order (diagnostics; capped).
+  const std::vector<DesyncInfo>& Desyncs() const { return m_desyncs; }
+  std::uint32_t Finalized() const { return m_finalized; }
+  std::uint64_t Config() const { return m_config; }
+  const std::optional<ConfigMismatchInfo>& ConfigMismatch() const { return m_config_mismatch; }
   std::optional<std::uint32_t> OldestUnackedLocal() const;
   // Highest remote input or checksum frame Accept will store.  A peer's
   // ShouldStall keeps its live frame within max_prediction of its contiguous
@@ -227,6 +337,7 @@ private:
   std::uint32_t m_delay;
   std::uint32_t m_max_prediction;
   std::uint32_t m_session;
+  std::uint64_t m_config;
   std::array<std::map<std::uint32_t, Pad>, MAX_PLAYERS> m_confirmed;
   std::array<std::uint32_t, MAX_PLAYERS> m_contiguous{NO_FRAME, NO_FRAME, NO_FRAME,
                                                       NO_FRAME};
@@ -242,6 +353,9 @@ private:
   std::array<std::map<std::uint32_t, std::uint64_t>, MAX_PLAYERS> m_remote_checksums;
   std::uint32_t m_finalized = NO_FRAME;
   std::optional<std::uint32_t> m_first_desync;
+  std::optional<DesyncInfo> m_first_desync_info;
+  std::vector<DesyncInfo> m_desyncs;
+  std::optional<ConfigMismatchInfo> m_config_mismatch;
   std::uint32_t m_violations = 0;
   std::optional<ProtocolViolation> m_first_violation;
 };
