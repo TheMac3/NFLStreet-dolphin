@@ -24,7 +24,7 @@ namespace NSRNetplay::RollbackNet
 constexpr std::uint32_t MAGIC = 0x4E535242;  // 'NSRB'
 constexpr std::uint32_t HANDOFF_MAGIC = 0x4E535248;  // 'NSRH'
 constexpr std::uint8_t VERSION = 4;
-constexpr std::uint8_t HANDOFF_VERSION = 1;
+constexpr std::uint8_t HANDOFF_VERSION = 2;
 constexpr std::size_t MAX_PLAYERS = 4;
 constexpr std::size_t PAD_SIZE = 12;
 constexpr std::size_t MAX_HISTORY = 64;
@@ -83,32 +83,40 @@ struct HandoffPacket
   std::uint32_t transition = 0;
   std::uint32_t frame = 0;
   std::uint64_t semantic_hash = 0;
+  // Player 0's proposal supplies the VI counter baseline adopted at entry.
+  // This field is deliberately not part of agreement equality: peers reach
+  // the same lockstep frame with host-scheduling-dependent counter values.
+  std::uint32_t sync_clock = 0;
 };
 
 std::vector<std::uint8_t> EncodeHandoff(const HandoffPacket& packet);
 std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes);
 
 // HandoffAgreement is deliberately transport-free.  Each peer proposes the
-// same kind/frame/hash tuple and accepts duplicate, reordered announcements;
-// the first conflicting tuple is sticky so the adapter can abort loudly.
+// same kind/frame/hash tuple and accepts duplicate, reordered announcements.
+// Clocks are retained per sender rather than compared, allowing the adapter
+// to adopt player 0's baseline. The first conflicting tuple is sticky so the
+// adapter can abort loudly.
 class HandoffAgreement
 {
 public:
   HandoffAgreement(std::uint8_t players, std::uint8_t me, HandoffKind kind,
                    std::uint32_t transition, std::uint32_t frame,
-                   std::uint64_t semantic_hash);
+                   std::uint64_t semantic_hash, std::uint32_t sync_clock = 0);
 
   bool Accept(const HandoffPacket& packet);
   bool Complete() const;
   bool Mismatched() const { return m_mismatch.has_value(); }
   const HandoffPacket& Local() const { return m_local; }
   const std::optional<HandoffPacket>& Mismatch() const { return m_mismatch; }
+  std::optional<std::uint32_t> HostClock() const;
 
 private:
   std::uint8_t m_players;
   std::uint8_t m_me;
   HandoffPacket m_local;
   std::array<bool, MAX_PLAYERS> m_seen{};
+  std::array<std::uint32_t, MAX_PLAYERS> m_sync_clocks{};
   std::optional<HandoffPacket> m_mismatch;
 };
 

@@ -586,6 +586,8 @@ void HandlePacket(const ENetPacket* packet, u32 source)
       return;
     // The star host relays the original proposal unchanged.  Agreement is
     // still all-to-all: every receiver validates the sender and full tuple.
+    // Reliability must survive this second hop; otherwise the sender can
+    // leave its barrier before one leaf ever observes the proposal.
     if (s.star && s.me == 0)
     {
       for (u32 i = 1; i < s.players; ++i)
@@ -594,7 +596,7 @@ void HandlePacket(const ENetPacket* packet, u32 source)
         {
           enet_peer_send(s.peers[i], 0,
                          enet_packet_create(packet->data, packet->dataLength,
-                                            ENET_PACKET_FLAG_UNSEQUENCED));
+                                            ENET_PACKET_FLAG_RELIABLE));
         }
       }
     }
@@ -903,9 +905,10 @@ void SendRollbackLatest(u32 live_frame)
   enet_host_flush(s.host);
 }
 
-// Broadcast the current transition proposal.  Like input history, it is
-// deliberately unsequenced and periodically resent by the CPU-thread
-// barrier; duplicate/reordered delivery is handled by HandoffAgreement.
+// Broadcast the current transition proposal.  Unlike continuously repeated
+// input history, a peer stops announcing this proposal as soon as its local
+// barrier completes. ENet reliability therefore closes the window where one
+// leaf misses a relayed proposal after the other peers have already left.
 void SendHandoff()
 {
   Session& s = s_session;
@@ -916,7 +919,7 @@ void SendHandoff()
   {
     if (i != s.me && Linked(i))
       enet_peer_send(s.peers[i], 0,
-                     enet_packet_create(bytes.data(), bytes.size(), ENET_PACKET_FLAG_UNSEQUENCED));
+                     enet_packet_create(bytes.data(), bytes.size(), ENET_PACKET_FLAG_RELIABLE));
   }
   enet_host_flush(s.host);
 }
@@ -1431,9 +1434,11 @@ RollbackConfig& ConfigForRollback()
   c.async_present = !Env("NSR_RB_ASYNC_PRESENT").empty();
   c.peek_z = ParseU32(Env("NSR_RB_PEEKZ")).value_or(0);
   c.keep_resim_vsync = !Env("NSR_RB_RESIM_VSYNC").empty();
-  const std::string audio_gate = Env("NSR_RB_AUDIO_GATE");
-  c.audio_gate_only =
-      audio_gate == "1" ? std::vector<u32>{0x8026AAF0} : ParseAddressList(audio_gate);
+  const std::string audio_gate = Env("NSR_RB_AUDIO_GATE", "1");
+  if (audio_gate == "1")
+    c.audio_gate_only = {0x8026AAF0};
+  else if (audio_gate != "0")
+    c.audio_gate_only = ParseAddressList(audio_gate);
   c.effect_gates = ParseAddressList(Env("NSR_RB_EFFECT_GATE"));
   c.audio_trace = ParseAddressList(Env("NSR_AC_TRACE"));
   c.probes = ParseAddressList(Env("NSR_RB_PROBES"));
@@ -4230,7 +4235,7 @@ static bool ConfirmRollbackTail(u32 completed_frame)
 // and each proposal is resent until every player has acknowledged the same
 // kind/frame/hash tuple.
 static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::HandoffKind kind,
-                           u32 frame)
+                           u32 frame, u32* host_clock = nullptr)
 {
   Session& s = s_session;
   if (!s.enabled || s.failed || (!AllConnected() && !WaitForConnection()))
@@ -4243,8 +4248,9 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
   const u32 transition = kind == RollbackNet::HandoffKind::EnterRollback ?
                              s_rb.session_generation * 2 :
                              s_rb.session_generation * 2 - 1;
+  const u32 sync_clock = PowerPC::MMU::HostRead<u32>(guard, VI_POST_COUNTER);
   s_rb_handoff.emplace(static_cast<u8>(s.players), static_cast<u8>(s.me), kind, transition, frame,
-                       semantic);
+                       semantic, sync_clock);
   SendHandoff();
   const auto start = std::chrono::steady_clock::now();
   auto last_send = start;
@@ -4274,9 +4280,14 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
   }
   if (s.failed)
     return FailHandoff(fmt::format("transport failed at handoff frame {}", frame));
-  Log("handoff {} transition {} agreed at frame {} semantic {:016x}",
+  const std::optional<u32> agreed_clock = s_rb_handoff->HostClock();
+  if (!agreed_clock)
+    return FailHandoff(fmt::format("handoff at frame {} completed without player 0", frame));
+  if (host_clock)
+    *host_clock = *agreed_clock;
+  Log("handoff {} transition {} agreed at frame {} semantic {:016x} host clock {}",
       kind == RollbackNet::HandoffKind::EnterRollback ? "entry" : "leave", transition, frame,
-      semantic);
+      semantic, *agreed_clock);
   s_rb_handoff.reset();
   return true;
 }
@@ -4482,9 +4493,16 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
   const bool automatic_entry = r.enter_pending && r.auto_handoff;
   if (!r.vtime_on && (fixed_entry || test_reentry || automatic_entry))
   {
+    u32 host_clock = 0;
     if (!automatic_entry ||
-        HandoffBarrier(guard, RollbackNet::HandoffKind::EnterRollback, t))
+        HandoffBarrier(guard, RollbackNet::HandoffKind::EnterRollback, t, &host_clock))
     {
+      // Lockstep proves the semantic state, but VI retrace callbacks are
+      // scheduled independently on each host. The game reads this counter
+      // for timers and sound rate limiting, so every peer adopts player 0's
+      // natural baseline before the rollback epoch starts.
+      if (automatic_entry)
+        PowerPC::MMU::HostWrite<u32>(guard, host_clock, VI_POST_COUNTER);
       EnterRollbackSession(guard, t);
     }
   }
@@ -5582,6 +5600,11 @@ void SetHookPc(unsigned int pc)
   s_hook_pc = pc;
 }
 
+std::vector<unsigned int> AudioGateList()
+{
+  return ConfigForRollback().audio_gate_only;
+}
+
 void AudioGateHook(const Core::CPUThreadGuard& guard)
 {
   Rollback& r = s_rb;
@@ -5592,10 +5615,12 @@ void AudioGateHook(const Core::CPUThreadGuard& guard)
       PowerPC::MMU::HostRead<u32>(guard, 0x800000E4) != 0x803A3F30)
     return;  // npc unchanged: run the function
   const u32 entry = s_hook_pc;
-  // NSR_RB_AUDIO_GATE=1 gates the sound-start path only (0x8026AAF0, called
-  // from fn_801F4050); =addr,... gates exactly those entries. Gating every
-  // entry crashes (some return pointers or fill out-parameters in game
-  // memory that a skipped call leaves unwritten).
+  // The sound-start path (0x8026AAF0, called from fn_801F4050) is gated by
+  // default. Reissuing it during re-simulation made the audio heap diverge
+  // and eventually corrupted both this middleware and frontend transitions.
+  // NSR_RB_AUDIO_GATE=0 disables it for diagnostics; =addr,... gates exactly
+  // those entries. Gating every entry crashes (some return pointers or fill
+  // out-parameters in game memory that a skipped call leaves unwritten).
   const auto& only = r.config.audio_gate_only;
   const auto& effects = r.config.effect_gates;
   if (!only.empty() && std::find(only.begin(), only.end(), entry) == only.end() &&

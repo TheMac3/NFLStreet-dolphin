@@ -16,7 +16,7 @@ namespace NSRNetplay::RollbackNet
 namespace
 {
 constexpr std::size_t HEADER_SIZE = 88;
-constexpr std::size_t HANDOFF_SIZE = 24;
+constexpr std::size_t HANDOFF_SIZE = 28;
 constexpr double FRAME_US = 16683.0;
 constexpr std::uint32_t MAX_TIMING_RTT_US = 2'000'000;
 constexpr std::size_t MIN_TIMING_SAMPLES = 6;
@@ -58,6 +58,7 @@ std::vector<std::uint8_t> EncodeHandoff(const HandoffPacket& packet)
   Put(out, packet.transition);
   Put(out, packet.frame);
   Put(out, packet.semantic_hash);
+  Put(out, packet.sync_clock);
   return out;
 }
 
@@ -74,7 +75,8 @@ std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes)
       !Get(bytes, at, &packet.sender) || !Get(bytes, at, &packet.players) ||
       !Get(bytes, at, &kind) || !Get(bytes, at, &packet.transition) ||
       !Get(bytes, at, &packet.frame) ||
-      !Get(bytes, at, &packet.semantic_hash) || magic != HANDOFF_MAGIC ||
+      !Get(bytes, at, &packet.semantic_hash) || !Get(bytes, at, &packet.sync_clock) ||
+      magic != HANDOFF_MAGIC ||
       version != HANDOFF_VERSION || packet.players < 2 || packet.players > MAX_PLAYERS ||
       packet.sender >= packet.players ||
       (kind != static_cast<std::uint8_t>(HandoffKind::EnterRollback) &&
@@ -88,12 +90,13 @@ std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes)
 
 HandoffAgreement::HandoffAgreement(std::uint8_t players, std::uint8_t me, HandoffKind kind,
                                    std::uint32_t transition, std::uint32_t frame,
-                                   std::uint64_t semantic_hash)
+                                   std::uint64_t semantic_hash, std::uint32_t sync_clock)
     : m_players(std::clamp<std::uint8_t>(players, 2, static_cast<std::uint8_t>(MAX_PLAYERS))),
       m_me(std::min<std::uint8_t>(me, m_players - 1)),
-      m_local{m_me, m_players, kind, transition, frame, semantic_hash}
+      m_local{m_me, m_players, kind, transition, frame, semantic_hash, sync_clock}
 {
   m_seen[m_me] = true;
+  m_sync_clocks[m_me] = sync_clock;
 }
 
 bool HandoffAgreement::Accept(const HandoffPacket& packet)
@@ -111,7 +114,17 @@ bool HandoffAgreement::Accept(const HandoffPacket& packet)
       m_mismatch = packet;
     return false;
   }
+  // Different peers are expected to propose different clocks, but one
+  // sender's retransmissions must be immutable so leaves cannot adopt
+  // different player-0 baselines after reordering.
+  if (m_seen[packet.sender] && m_sync_clocks[packet.sender] != packet.sync_clock)
+  {
+    if (!m_mismatch)
+      m_mismatch = packet;
+    return false;
+  }
   m_seen[packet.sender] = true;
+  m_sync_clocks[packet.sender] = packet.sync_clock;
   return true;
 }
 
@@ -119,6 +132,13 @@ bool HandoffAgreement::Complete() const
 {
   return !m_mismatch &&
          std::all_of(m_seen.begin(), m_seen.begin() + m_players, [](bool seen) { return seen; });
+}
+
+std::optional<std::uint32_t> HandoffAgreement::HostClock() const
+{
+  if (!m_seen[0])
+    return std::nullopt;
+  return m_sync_clocks[0];
 }
 
 std::vector<std::uint8_t> Encode(const Packet& packet)
@@ -562,12 +582,32 @@ void Exchange::UpdateFinalized()
   if (candidate == m_local_checksums.begin())
     return;
   --candidate;
-  if (m_finalized == NO_FRAME || candidate->first > m_finalized)
-    m_finalized = candidate->first;
+  if (m_finalized != NO_FRAME && candidate->first <= m_finalized)
+    return;
+  const std::uint32_t previous = m_finalized;
+  m_finalized = candidate->first;
+  // A checksum can arrive while our copy of its frame is still speculative.
+  // Re-check every stored remote checksum that became final in this advance;
+  // comparing it at receipt time would report a rollback-correctable state as
+  // a permanent desync.
+  for (std::uint8_t player = 0; player < m_players; ++player)
+  {
+    if (player == m_me)
+      continue;
+    auto it = previous == NO_FRAME ? m_remote_checksums[player].begin() :
+                                     m_remote_checksums[player].upper_bound(previous);
+    while (it != m_remote_checksums[player].end() && it->first <= m_finalized)
+    {
+      CompareChecksum(player, it->first);
+      ++it;
+    }
+  }
 }
 
 void Exchange::CompareChecksum(std::uint8_t player, std::uint32_t frame)
 {
+  if (m_finalized == NO_FRAME || frame > m_finalized)
+    return;
   const auto local = m_local_checksums.find(frame);
   const auto remote = m_remote_checksums[player].find(frame);
   if (local != m_local_checksums.end() && remote != m_remote_checksums[player].end() &&

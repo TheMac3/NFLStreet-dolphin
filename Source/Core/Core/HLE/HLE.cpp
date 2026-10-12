@@ -178,11 +178,8 @@ void PatchFixedFunctions(Core::System& system)
     Patch(system, NSRNetplay::LOAD_DONE_FN, "NSR_LoadBarrier");
     // Gated calls (audio or effect) return through this stub: always install.
     Patch(system, NSRNetplay::RB_GATE_RETURN, "NSR_AudioGateReturn");
-    if (std::getenv("NSR_RB_AUDIO_GATE"))  // opt-in while it's being tuned
-    {
-      for (const u32 entry : NSRNetplay::AUDIO_GATE_ENTRIES)
-        Patch(system, entry, "NSR_AudioGate");
-    }
+    for (const u32 entry : NSRNetplay::AudioGateList())
+      Patch(system, entry, "NSR_AudioGate");
     // Audio clock: the sim's view of audio follows frames (always installed;
     // inactive outside the rollback session; NSR_AC=0 turns it off).
     for (const u32 a : NSRNetplay::AudioClockQueryHooks())

@@ -235,8 +235,9 @@ void RollbackTimeHook(const Core::CPUThreadGuard& guard);  // TBL in r3 (mftb si
 // and the game gets the same handles. Entry points: functions in
 // 0x80263000..0x80285A90 (audio middleware, between the SDK text chunks)
 // called from code below 0x8025E000 (game, EA engine). Generated from
-// main.dol call sites. Opt-in: NSR_RB_AUDIO_GATE=1 (sound-start path only)
-// or =addr,... (gating every entry crashes; see AudioGateHook).
+// main.dol call sites. The sound-start path is enabled by default;
+// NSR_RB_AUDIO_GATE=0 disables it for diagnostics, while =addr,... selects
+// exact entries (gating every entry crashes; see AudioGateHook).
 constexpr std::array<unsigned int, 75> AUDIO_GATE_ENTRIES{{
     0x80266CB8, 0x80266D00, 0x802692B8, 0x802697D8, 0x8026A2DC, 0x8026A4D4,
     0x8026A870, 0x8026A96C, 0x8026A980, 0x8026A9F4, 0x8026AAF0, 0x8026AB88,
@@ -253,6 +254,7 @@ constexpr std::array<unsigned int, 75> AUDIO_GATE_ENTRIES{{
     0x802856D8, 0x8028572C, 0x802857D8,
 }};
 constexpr unsigned int RB_GATE_RETURN = 0x80416910;  // gated calls return here (HLE)
+std::vector<unsigned int> AudioGateList();
 void AudioGateHook(const Core::CPUThreadGuard& guard);
 void AudioGateReturnHook(const Core::CPUThreadGuard& guard);
 

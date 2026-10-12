@@ -48,12 +48,14 @@ static void Deliver(const RN::Exchange& from, RN::Exchange* to, std::uint32_t fr
 
 // Match entry/leave proposals are independently encoded and require the same
 // transition kind, absolute lockstep frame, and deterministic-state hash from
-// every peer.  Duplicates are harmless and the first conflict stays visible.
+// every peer. Per-peer clocks may differ, player 0's survives wire encoding,
+// duplicates are harmless, and the first conflict stays visible.
 static void TestHandoffAgreement()
 {
-  RN::HandoffAgreement agreement(3, 0, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd);
-  RN::HandoffPacket peer1{1, 3, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd};
-  RN::HandoffPacket peer2{2, 3, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd};
+  RN::HandoffAgreement agreement(3, 0, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd,
+                                 100);
+  RN::HandoffPacket peer1{1, 3, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd, 111};
+  RN::HandoffPacket peer2{2, 3, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd, 122};
   const auto bytes = RN::EncodeHandoff(peer1);
   const auto decoded = RN::DecodeHandoff(bytes);
   assert(decoded);
@@ -62,6 +64,14 @@ static void TestHandoffAgreement()
   assert(!agreement.Complete());
   assert(agreement.Accept(peer2));
   assert(agreement.Complete());
+  assert(agreement.HostClock() == 100);
+
+  RN::HandoffAgreement leaf(3, 2, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd,
+                            122);
+  assert(leaf.Accept({0, 3, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd, 100}));
+  assert(leaf.HostClock() == 100);
+  assert(leaf.Accept(peer1));
+  assert(leaf.Complete());
 
   RN::HandoffAgreement mismatch(2, 0, RN::HandoffKind::LeaveRollback, 3, 2000, 0x1234);
   RN::HandoffPacket stale{1, 2, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd};
@@ -295,6 +305,42 @@ static void TestChecksumMismatch()
   Deliver(b, &a, 301);
   assert(a.FirstDesync() == 301);
   assert(b.FirstDesync() == 301);
+}
+
+// A remote finalized checksum may arrive while our copy of that frame is
+// speculative. It becomes comparable only when local input confirmation
+// finalizes the frame; a correction before then must prevent a false desync.
+static void TestSpeculativeChecksumIsDeferred()
+{
+  const auto packet = [] {
+    RN::Packet out;
+    out.sender = 1;
+    out.players = 2;
+    out.session = 91;
+    out.sender_frame = 300;
+    out.checksum_frame = 301;
+    out.checksum = 0xbbbb;
+    out.first_frame = 300;
+    out.pads.push_back({});
+    return out;
+  }();
+
+  RN::Exchange mismatch(300, 2, 0, 0, 7, 91);
+  mismatch.SubmitLocal(300, {});
+  mismatch.SetStateChecksum(301, 0xaaaa);
+  assert(mismatch.Accept(packet));
+  assert(!mismatch.FirstDesync());
+  mismatch.UpdateFinalized();
+  assert(mismatch.FirstDesync() == 301);
+
+  RN::Exchange corrected(300, 2, 0, 0, 7, 91);
+  corrected.SubmitLocal(300, {});
+  corrected.SetStateChecksum(301, 0xaaaa);
+  assert(corrected.Accept(packet));
+  assert(!corrected.FirstDesync());
+  corrected.SetStateChecksum(301, 0xbbbb);
+  corrected.UpdateFinalized();
+  assert(!corrected.FirstDesync());
 }
 
 // With local input delay, the confirmed input prefix can lead the most recent
@@ -1130,6 +1176,7 @@ int main()
   TestLatencyDoesNotCreateTwoLeaders();
   TestClockRateConvergence();
   TestChecksumMismatch();
+  TestSpeculativeChecksumIsDeferred();
   TestDelayedChecksumFinalization();
   TestWireValidation();
   // Protocol validation section.
