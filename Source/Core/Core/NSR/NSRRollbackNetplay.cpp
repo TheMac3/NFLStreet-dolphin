@@ -15,8 +15,8 @@ namespace NSRNetplay::RollbackNet
 {
 namespace
 {
-constexpr std::size_t HEADER_SIZE = 88;
-constexpr std::size_t HANDOFF_SIZE = 28;
+constexpr std::size_t HEADER_SIZE = 96;
+constexpr std::size_t HANDOFF_SIZE = 29 + 8 * CONFIG_FIELDS;
 constexpr double FRAME_US = 16683.0;
 constexpr std::uint32_t MAX_TIMING_RTT_US = 2'000'000;
 constexpr std::size_t MIN_TIMING_SAMPLES = 6;
@@ -46,6 +46,40 @@ bool Get(std::span<const std::uint8_t> bytes, std::size_t& at, T* value)
 }
 }  // namespace
 
+const char* ConfigFieldName(ConfigField field)
+{
+  static constexpr std::array<const char*, CONFIG_FIELDS> NAMES{
+      "protocol",       "state_digest",    "vtime_base",     "vmem_bytes",
+      "resim_speed",    "instant_disc",    "io_idle",        "audio_rollback",
+      "game_image",     "launcher_image",  "seed",           "restore_ranges",
+      "audio_clock",    "resim_gates",     "session_rules",  "dolphin_core",
+  };
+  const auto index = static_cast<std::size_t>(field);
+  return index < NAMES.size() ? NAMES[index] : "unknown";
+}
+
+std::vector<ConfigField> ConfigDifferences(const ConfigFingerprint& a, const ConfigFingerprint& b)
+{
+  std::vector<ConfigField> out;
+  for (std::size_t i = 0; i < CONFIG_FIELDS; ++i)
+  {
+    if (a.fields[i] != b.fields[i])
+      out.push_back(static_cast<ConfigField>(i));
+  }
+  return out;
+}
+
+std::uint64_t ConfigDigest(const ConfigFingerprint& config)
+{
+  std::uint64_t hash = 1469598103934665603ULL;
+  for (const std::uint64_t value : config.fields)
+  {
+    for (int shift = 0; shift < 64; shift += 8)
+      hash = (hash ^ ((value >> shift) & 0xFF)) * 1099511628211ULL;
+  }
+  return hash;
+}
+
 std::vector<std::uint8_t> EncodeHandoff(const HandoffPacket& packet)
 {
   std::vector<std::uint8_t> out;
@@ -58,6 +92,9 @@ std::vector<std::uint8_t> EncodeHandoff(const HandoffPacket& packet)
   Put(out, packet.transition);
   Put(out, packet.frame);
   Put(out, packet.semantic_hash);
+  Put(out, static_cast<std::uint8_t>(CONFIG_FIELDS));
+  for (const std::uint64_t value : packet.config.fields)
+    Put(out, value);
   Put(out, packet.sync_clock);
   return out;
 }
@@ -70,13 +107,14 @@ std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes)
   std::uint32_t magic = 0;
   std::uint8_t version = 0;
   std::uint8_t kind = 0;
+  std::uint8_t fields = 0;
   HandoffPacket packet;
   if (!Get(bytes, at, &magic) || !Get(bytes, at, &version) ||
       !Get(bytes, at, &packet.sender) || !Get(bytes, at, &packet.players) ||
       !Get(bytes, at, &kind) || !Get(bytes, at, &packet.transition) ||
       !Get(bytes, at, &packet.frame) ||
-      !Get(bytes, at, &packet.semantic_hash) || !Get(bytes, at, &packet.sync_clock) ||
-      magic != HANDOFF_MAGIC ||
+      !Get(bytes, at, &packet.semantic_hash) || !Get(bytes, at, &fields) ||
+      fields != CONFIG_FIELDS || magic != HANDOFF_MAGIC ||
       version != HANDOFF_VERSION || packet.players < 2 || packet.players > MAX_PLAYERS ||
       packet.sender >= packet.players ||
       (kind != static_cast<std::uint8_t>(HandoffKind::EnterRollback) &&
@@ -84,16 +122,24 @@ std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes)
   {
     return std::nullopt;
   }
+  for (std::uint64_t& value : packet.config.fields)
+  {
+    if (!Get(bytes, at, &value))
+      return std::nullopt;
+  }
+  if (!Get(bytes, at, &packet.sync_clock))
+    return std::nullopt;
   packet.kind = static_cast<HandoffKind>(kind);
   return packet;
 }
 
 HandoffAgreement::HandoffAgreement(std::uint8_t players, std::uint8_t me, HandoffKind kind,
                                    std::uint32_t transition, std::uint32_t frame,
-                                   std::uint64_t semantic_hash, std::uint32_t sync_clock)
+                                   std::uint64_t semantic_hash, const ConfigFingerprint& config,
+                                   std::uint32_t sync_clock)
     : m_players(std::clamp<std::uint8_t>(players, 2, static_cast<std::uint8_t>(MAX_PLAYERS))),
       m_me(std::min<std::uint8_t>(me, m_players - 1)),
-      m_local{m_me, m_players, kind, transition, frame, semantic_hash, sync_clock}
+      m_local{m_me, m_players, kind, transition, frame, semantic_hash, config, sync_clock}
 {
   m_seen[m_me] = true;
   m_sync_clocks[m_me] = sync_clock;
@@ -107,6 +153,12 @@ bool HandoffAgreement::Accept(const HandoffPacket& packet)
   // They are not evidence of disagreement about this transition.
   if (packet.transition != m_local.transition)
     return false;
+  if (packet.config != m_local.config)
+  {
+    if (!m_config_mismatch)
+      m_config_mismatch = packet;
+    return false;
+  }
   if (packet.kind != m_local.kind || packet.frame != m_local.frame ||
       packet.semantic_hash != m_local.semantic_hash)
   {
@@ -130,7 +182,7 @@ bool HandoffAgreement::Accept(const HandoffPacket& packet)
 
 bool HandoffAgreement::Complete() const
 {
-  return !m_mismatch &&
+  return !Mismatched() &&
          std::all_of(m_seen.begin(), m_seen.begin() + m_players, [](bool seen) { return seen; });
 }
 
@@ -152,6 +204,7 @@ std::vector<std::uint8_t> Encode(const Packet& packet)
   Put(out, packet.players);
   Put(out, packet.flags);
   Put(out, packet.session);
+  Put(out, packet.config);
   Put(out, packet.sender_frame);
   Put(out, packet.send_us);
   for (const std::uint32_t echo : packet.echo_us)
@@ -183,7 +236,7 @@ std::optional<Packet> Decode(std::span<const std::uint8_t> bytes)
   if (!Get(bytes, at, &magic) || !Get(bytes, at, &version) ||
       !Get(bytes, at, &packet.sender) || !Get(bytes, at, &packet.players) ||
       !Get(bytes, at, &packet.flags) || !Get(bytes, at, &packet.session) ||
-      !Get(bytes, at, &packet.sender_frame) || !Get(bytes, at, &packet.send_us))
+      !Get(bytes, at, &packet.config) || !Get(bytes, at, &packet.sender_frame) || !Get(bytes, at, &packet.send_us))
   {
     return std::nullopt;
   }
@@ -224,11 +277,11 @@ std::optional<Packet> Decode(std::span<const std::uint8_t> bytes)
 
 Exchange::Exchange(std::uint32_t start, std::uint8_t players, std::uint8_t me,
                    std::uint32_t delay, std::uint32_t max_prediction,
-                   std::uint32_t session)
+                   std::uint32_t session, std::uint64_t config)
     : m_start(start),
       m_players(std::clamp<std::uint8_t>(players, 2, static_cast<std::uint8_t>(MAX_PLAYERS))),
       m_me(std::min<std::uint8_t>(me, m_players - 1)), m_delay(delay),
-      m_max_prediction(max_prediction), m_session(session)
+      m_max_prediction(max_prediction), m_session(session), m_config(config)
 {
   // Delay slots are real confirmed local inputs.  Sending the neutral prefix
   // lets peers acknowledge it exactly like later controller samples.
@@ -275,6 +328,7 @@ Packet Exchange::BuildPacket(std::uint32_t live_frame, std::uint32_t send_us) co
   packet.sender = m_me;
   packet.players = m_players;
   packet.session = m_session;
+  packet.config = m_config;
   packet.sender_frame = live_frame;
   packet.send_us = send_us;
   for (std::uint8_t player = 0; player < m_players; ++player)
@@ -383,6 +437,14 @@ bool Exchange::Accept(const Packet& packet, std::uint32_t receive_us)
   if (packet.session != m_session || packet.players != m_players || packet.sender >= m_players ||
       packet.sender == m_me || packet.pads.size() > MAX_HISTORY)
   {
+    return false;
+  }
+  // Same epoch, different configuration: an honest peer that will not
+  // simulate the same game.  Nothing it says is usable; the adapter stops.
+  if (packet.config != m_config)
+  {
+    if (!m_config_mismatch)
+      m_config_mismatch = ConfigMismatchInfo{packet.sender, packet.config};
     return false;
   }
   if (const auto violation = Validate(packet))
@@ -567,6 +629,11 @@ void Exchange::SetStateChecksum(std::uint32_t frame, std::uint64_t checksum)
   }
 }
 
+void Exchange::DiscardChecksumsAfter(std::uint32_t frame)
+{
+  m_local_checksums.erase(m_local_checksums.upper_bound(frame), m_local_checksums.end());
+}
+
 void Exchange::UpdateFinalized()
 {
   const std::uint32_t confirmed = ConfirmedThrough();
@@ -586,34 +653,44 @@ void Exchange::UpdateFinalized()
     return;
   const std::uint32_t previous = m_finalized;
   m_finalized = candidate->first;
-  // A checksum can arrive while our copy of its frame is still speculative.
-  // Re-check every stored remote checksum that became final in this advance;
-  // comparing it at receipt time would report a rollback-correctable state as
-  // a permanent desync.
+  // Remote digests that arrived before our own state at that frame was
+  // final are compared now.
   for (std::uint8_t player = 0; player < m_players; ++player)
   {
     if (player == m_me)
       continue;
-    auto it = previous == NO_FRAME ? m_remote_checksums[player].begin() :
-                                     m_remote_checksums[player].upper_bound(previous);
-    while (it != m_remote_checksums[player].end() && it->first <= m_finalized)
-    {
+    const auto& remote = m_remote_checksums[player];
+    auto it = previous == NO_FRAME ? remote.begin() : remote.upper_bound(previous);
+    for (; it != remote.end() && it->first <= m_finalized; ++it)
       CompareChecksum(player, it->first);
-      ++it;
-    }
   }
 }
 
 void Exchange::CompareChecksum(std::uint8_t player, std::uint32_t frame)
 {
+  // A local digest beyond our finalized frame may still describe a
+  // mispredicted state (a correction can be pending, or not yet received).
   if (m_finalized == NO_FRAME || frame > m_finalized)
     return;
   const auto local = m_local_checksums.find(frame);
   const auto remote = m_remote_checksums[player].find(frame);
-  if (local != m_local_checksums.end() && remote != m_remote_checksums[player].end() &&
-      local->second != remote->second && (!m_first_desync || frame < *m_first_desync))
+  if (local == m_local_checksums.end() || remote == m_remote_checksums[player].end() ||
+      local->second == remote->second)
+  {
+    return;
+  }
+  const DesyncInfo info{player, frame, local->second, remote->second};
+  if (m_desyncs.size() < 256 &&
+      std::none_of(m_desyncs.begin(), m_desyncs.end(), [&](const DesyncInfo& seen) {
+        return seen.frame == frame && seen.player == player;
+      }))
+  {
+    m_desyncs.push_back(info);
+  }
+  if (!m_first_desync || frame < *m_first_desync)
   {
     m_first_desync = frame;
+    m_first_desync_info = info;
   }
 }
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """nsr_launcher.py: "NSR Netplay", the friend-facing launcher for NFLStreet netplay.
 
-A small window that replaces command lines and .bat files. It lives in the
-NFLStreet-dolphin folder (next to Dolphin.exe) and does three things:
+A window that replaces command lines and .bat files. It lives in the
+NFLStreet-dolphin folder (next to Dolphin.exe) and does four things:
 
   1. Game: find NFL Street Reborn's NSR.iso (or browse to it), build the
      rollback netplay image (nsr_patcher.prepare_image), and show its
@@ -17,30 +17,48 @@ NFLStreet-dolphin folder (next to Dolphin.exe) and does three things:
      input delay chosen by the host for everyone, and passive lag/rollback
      telemetry unless the player unticks it (then NSR_TELEMETRY=0).
   3. Practice offline, and "Set up controllers" (opens Dolphin's own window).
+  4. Controllers: the player's NFL Street Reborn controller setup is copied
+     into this Dolphin automatically (nsr_controllers.py), so a pad mapped in
+     Reborn's launcher works here without mapping it twice.
 
 Reborn is never modified: its files are only read, this Dolphin runs in
 portable mode with its own settings and saves (User/ next to it), and
 Reborn's HD textures are loaded read-only from its install.
 
-Run from source:  python3 tools/nsr_launcher.py   (needs tkinter)
+Structure: pure helpers (dolphin_command & co., unit-tested), then Launcher,
+the UI-agnostic state machine every button calls (also tested, with fake
+lobby/Popen), then two views over it: the web UI (nsr_launcher_ui.html in
+pywebview / Edge WebView2, styled as a sibling of Reborn's launcher) and the
+plain tkinter fallback for PCs without WebView2 (choose_ui).
+
+Why pywebview over customtkinter: the Reborn launcher look (cards, gradients,
+big type, sidebar) is plain CSS, while customtkinter would still be
+hand-placed Tk widgets; WebView2 ships with Windows 11 and current Windows 10,
+and the tkinter fallback covers the rest. Cost: ~10 MB more exe (pythonnet).
+
+Run from source:  python3 tools/nsr_launcher.py   (pywebview if installed, else tkinter)
 Dev overrides:    NSR_APP_DIR (folder with Dolphin + nsr-net.iso),
-                  NSR_DOLPHIN (Dolphin executable), NSR_DOLPHIN_ARGS (extra args)
+                  NSR_DOLPHIN (Dolphin executable), NSR_DOLPHIN_ARGS (extra args),
+                  NSR_UI=tk|web (force a view), NSR_UI_DEBUG=1 (WebView2 devtools)
+Self-test (CI):   nsr_launcher.py --selftest [--tk]  builds the UI, waits until the
+                  page has rendered from a real snapshot, closes; exit 0 = ok.
 """
 from __future__ import annotations
 
 import json
 import os
-import queue
 import secrets
 import shlex
 import socket
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import isopatch  # noqa: E402
+import nsr_controllers as controllers  # noqa: E402
 import nsr_lobby as lobby  # noqa: E402
 import nsr_patcher as patcher  # noqa: E402
 
@@ -72,6 +90,20 @@ ROLLBACK_ENV = {
     "NSR_RB_IO_IDLE": "1",
     "NSR_RB_AUDIO_ROLLBACK": "1",
 }
+
+# Audio for netplay launches (host-side only: the mixer and the throttle's
+# catch-up allowance, never emulated state, so no determinism impact).
+# Rollback resimulation and time-sync slowdowns stall audio production for a
+# few frames; with Dolphin's default 80 ms buffer that is heard as chop. This
+# Dolphin (2512+) has no AudioStretch/AudioStretchMaxLatency any more: the
+# granule mixer (AudioCommon/Mixer.cpp) stretches by replaying recent audio
+# when the queue runs dry ("Fill Audio Gaps", Core.AudioFillGaps), sized by
+# Core.AudioBufferSize (16..512 ms, steps of 8). 128 ms (default 80) gives
+# the mixer room to absorb those stalls for ~48 ms more audio latency, which
+# is not felt in a football game. Offline practice keeps Dolphin's defaults.
+NETPLAY_AUDIO_BUFFER_MS = 128
+NETPLAY_AUDIO_ARGS = ["-C", "Dolphin.Core.AudioFillGaps=True",
+                      "-C", f"Dolphin.Core.AudioBufferSize={NETPLAY_AUDIO_BUFFER_MS}"]
 
 
 # --- pure helpers (tested without a GUI) --------------------------------------
@@ -136,6 +168,10 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     args = [exe, "-u", os.path.join(folder, "User")]
     args += shlex.split(os.environ.get("NSR_DOLPHIN_ARGS", ""))
     env = {k: v for k, v in os.environ.items() if not k.startswith("NSR_")}
+    # Reborn's SDL hints (imported into our Dolphin.ini [SDL_Hints]) for every
+    # launch, controller window included, so devices enumerate and are named
+    # exactly as in Reborn and the imported mapping's Device lines resolve.
+    env.update(controllers.sdl_hint_env(os.path.join(folder, "User")))
     if open_ui:
         return args, env
     players = start.players if start else 1
@@ -172,6 +208,7 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
             env["NSR_RB_DELAY"] = str(start.delay)
             env["NSR_DELAY"] = str(MENU_LOCKSTEP_DELAY)
             args += ["-C", "Dolphin.Core.FastDiscSpeed=True"]
+        args += NETPLAY_AUDIO_ARGS
         if start.rendezvous:
             # Room code: hole punching through the rendezvous server.
             env.update({"NSR_RENDEZVOUS": start.rendezvous, "NSR_ROOM": start.room,
@@ -240,20 +277,546 @@ def save_config(folder: str, cfg: dict) -> None:
         pass
 
 
-# --- GUI ------------------------------------------------------------------------
-def run_gui(selftest: bool = False) -> int:
+
+
+LOG_NAME = "nsr-launcher.log"
+
+
+def log(folder: str, msg: str) -> None:
+    """Append to nsr-launcher.log (the windowed exe has no console). Kept small."""
+    path = os.path.join(folder, LOG_NAME)
+    try:
+        if os.path.getsize(path) > 256 * 1024:
+            os.replace(path, path + ".old")
+    except OSError:
+        pass
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
+def resource_path(name: str) -> str:
+    """A data file bundled next to this module (or inside the PyInstaller exe)."""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, name)
+
+
+UI_HTML = "nsr_launcher_ui.html"
+# Evergreen WebView2 Runtime client id (Microsoft's documented detection keys).
+WEBVIEW2_CLIENT = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+
+
+def _read_registry(hive: str, key: str, value: str) -> str | None:
+    try:
+        import winreg
+        root = {"HKLM": winreg.HKEY_LOCAL_MACHINE, "HKCU": winreg.HKEY_CURRENT_USER}[hive]
+        with winreg.OpenKey(root, key) as k:
+            return str(winreg.QueryValueEx(k, value)[0])
+    except (ImportError, OSError):
+        return None
+
+
+def webview2_version(read=_read_registry) -> str | None:
+    """Installed WebView2 Runtime version, or None (pv missing or 0.0.0.0)."""
+    client = "\\Microsoft\\EdgeUpdate\\Clients\\" + WEBVIEW2_CLIENT
+    for hive, key in (("HKLM", "SOFTWARE\\WOW6432Node" + client), ("HKLM", "SOFTWARE" + client),
+                      ("HKCU", "Software" + client)):
+        v = (read(hive, key, "pv") or "").strip()
+        if v and v != "0.0.0.0":
+            return v
+    return None
+
+
+def choose_ui(env=os.environ, platform: str = sys.platform, has_webview: bool | None = None,
+              webview2: str | None = None) -> str:
+    """"web" (pywebview) or "tk" (fallback). NSR_UI=tk|web forces one; on
+    Windows the web UI needs the WebView2 Runtime, elsewhere just pywebview."""
+    forced = env.get("NSR_UI", "").lower()
+    if forced in ("tk", "web"):
+        return forced
+    if has_webview is None:
+        import importlib.util
+        has_webview = importlib.util.find_spec("webview") is not None
+    if not has_webview:
+        return "tk"
+    if platform == "win32" and not webview2:
+        return "tk"
+    return "web"
+
+
+# --- Launcher: the state machine both views drive ---------------------------------
+CONTROLLER_STATES = {"first-import": "synced", "imported": "synced", "updated": "synced",
+                     "up-to-date": "synced", "kept-yours": "yours", "no-reborn": "no-reborn",
+                     "error": "error"}
+
+
+class Launcher:
+    """Everything behind the buttons, independent of the view.
+
+    Views call the action methods (they return at once; slow work runs via
+    spawn) and render snapshot(), a JSON-able dict whose "rev" changes on
+    every update. Messages that used to be popups are state["notice"]
+    ({id, text, kind}); views show each new id once. spawn/popen/lobby_mod are
+    injectable so tests run every flow synchronously without a network or
+    Dolphin.
+    """
+
+    def __init__(self, folder: str | None = None, spawn=None, popen=None, lobby_mod=None,
+                 patcher_mod=None, env=os.environ):
+        self.folder = folder or app_dir()
+        self.cfg = load_config(self.folder)
+        self._spawn = spawn or (lambda fn: threading.Thread(target=fn, daemon=True).start())
+        self._popen = popen or subprocess.Popen
+        self._lobby = lobby_mod or lobby
+        self._patcher = patcher_mod or patcher
+        self._env = env
+        self._lock = threading.RLock()
+        self._host = None
+        self._join_cancel = None
+        self.rv_server = rendezvous_server(self.folder)
+        self.rev = 0
+        self._notice_id = 0
+        cfg = self.cfg
+        self.state = {
+            "app": APP_TITLE, "folder": self.folder,
+            "name": str(cfg.get("name", env.get("USERNAME", "Player")))[:24],
+            "telemetry": bool(cfg.get("telemetry", True)),
+            # "rb_delay", not the lockstep-era "delay" (2 by default), so an old
+            # config doesn't carry a lockstep value into rollback.
+            "delay": self._clamp_delay(cfg.get("rb_delay", DEFAULT_DELAY)),
+            "max_delay": MAX_DELAY, "last_host": str(cfg.get("last_host", "")),
+            "rooms": bool(self.rv_server),
+            "game": {"state": "checking", "text": "Checking your game copy…", "fingerprint": "",
+                     "note": "", "progress": None, "busy": False},
+            "host": {"state": "idle", "mode": "", "code": "", "players": [], "can_start": False,
+                     "info": "" if self.rv_server else "Room codes aren't set up in this download "
+                             "(no room server). Use “Host by IP”."},
+            "join": {"state": "idle", "info": "", "players": []},
+            "controllers": {"state": "checking", "message": "", "source": "",
+                            "port1": controllers.port1_summary(self.user_dir), "backup": ""},
+            "notice": None,
+        }
+
+    # -- state plumbing --
+    @property
+    def user_dir(self) -> str:
+        return os.path.join(self.folder, "User")
+
+    @staticmethod
+    def _clamp_delay(value) -> int:
+        try:
+            return max(0, min(int(value), MAX_DELAY))
+        except (TypeError, ValueError):
+            return DEFAULT_DELAY
+
+    def _set(self, section: str | None = None, **kw) -> None:
+        with self._lock:
+            (self.state if section is None else self.state[section]).update(kw)
+            self.rev += 1
+
+    def notify(self, text: str, kind: str = "info") -> None:
+        with self._lock:
+            self._notice_id += 1
+            self.state["notice"] = {"id": self._notice_id, "text": text, "kind": kind}
+            self.rev += 1
+
+    def snapshot(self, since: int = -1) -> dict | None:
+        """Current state (a copy), or None if nothing changed since rev `since`."""
+        with self._lock:
+            if since == self.rev:
+                return None
+            snap = json.loads(json.dumps(self.state))
+            snap["rev"] = self.rev
+            return snap
+
+    def _save(self) -> None:
+        save_config(self.folder, self.cfg)
+
+    # -- settings --
+    def set_name(self, name: str) -> None:
+        name = (name or "").strip()[:24] or "Player"
+        self.cfg["name"] = name
+        self._save()
+        self._set(name=name)
+
+    def set_telemetry(self, on: bool) -> None:
+        self.cfg["telemetry"] = bool(on)
+        self._save()
+        self._set(telemetry=bool(on))
+
+    def set_delay(self, delay) -> None:
+        self._set(delay=self._clamp_delay(delay))
+
+    def need_game(self) -> bool:
+        if not self.state["game"]["fingerprint"]:
+            self.notify("Set up your game copy first (Settings → Game copy).", "error")
+            return True
+        return False
+
+    # -- game image --
+    def _ready(self, fp: str, note: str = "") -> None:
+        self._set("game", state="ready", fingerprint=fp, note=note.strip(), progress=None,
+                  text="Ready for rollback netplay. Everyone you play with must have the same fingerprint.")
+
+    def check_game(self) -> None:
+        def work():
+            st = self._patcher.image_status(self.folder)
+            if st is None:
+                self._set("game", state="missing", fingerprint="",
+                          text="Not set up yet. Click “Find Reborn automatically”.")
+            elif st.playable:
+                self._ready(st.fingerprint, {"release": "", "custom": "Unrecognized Reborn version: "
+                                             "compare fingerprints with friends."}.get(
+                    st.kind, "Custom game copy (e.g. a ratings pack): everyone needs the identical copy."))
+            else:
+                self._set("game", state="stale", fingerprint="",
+                          text=f"Your game copy ({st.fingerprint}) is {st.note} and can't play this "
+                               "version's rollback netplay. Click “Find Reborn automatically” to "
+                               "rebuild it (about a minute).")
+        self._spawn(work)
+
+    def find_game(self) -> None:
+        if self.state["game"]["busy"]:
+            return
+        self._set("game", text="Looking for NFL Street Reborn…")
+
+        def work():
+            iso = self._patcher.find_reborn_iso()
+            if iso:
+                self.prepare(iso)
+            else:
+                self._set("game", text="Couldn't find Reborn automatically. Click “Browse for "
+                                       "NSR.iso…” and pick content\\games\\NSR.iso in your Reborn folder.")
+        self._spawn(work)
+
+    def prepare(self, iso: str) -> None:
+        with self._lock:
+            if self.state["game"]["busy"]:
+                return
+            self._set("game", busy=True, state="building", progress=0, text="Checking Reborn's game file…")
+        labels = {"check": "Checking Reborn's game file…", "build": "Building the netplay copy…",
+                  "verify": "Fingerprinting…"}
+
+        def work():
+            try:
+                r = self._patcher.prepare_image(iso, self.folder, progress=lambda st, d, t: self._set(
+                    "game", text=labels.get(st, st), progress=round(d * 100 / max(t, 1))))
+                self.cfg["reborn_iso"] = iso
+                self.cfg["reborn_install"] = r.reborn_install
+                self._save()
+                self._ready(r.fingerprint, "" if r.matches_reference else (
+                    "Unrecognized Reborn version: compare fingerprints with friends."
+                    if r.matches_reference is None else
+                    "WARNING: doesn't match the reference build; ask Mason before playing."))
+                self.sync_controllers()  # the install may be new to us: pick up its pad setup
+            except isopatch.PatchError:
+                self._set("game", state="error", progress=None,
+                          text="This Reborn version isn't supported yet (the game code changed). "
+                               "Nothing was written. Ask Mason for an updated launcher.")
+            except OSError as e:
+                self._set("game", state="error", progress=None, text=f"Couldn't build the game copy: {e}")
+            finally:
+                self._set("game", busy=False)
+        self._spawn(work)
+
+    # -- controllers --
+    def reborn_install(self, search: bool = False) -> str | None:
+        """Reborn's install folder: from the last image build, else (search=True)
+        found on disk like NSR-Patcher does."""
+        install = self.cfg.get("reborn_install") or self._patcher.saved_reborn_install(self.folder)
+        if not install and self.cfg.get("reborn_iso"):
+            install = self._patcher.reborn_install_of(self.cfg["reborn_iso"])
+        if not install and search:
+            iso = self._patcher.find_reborn_iso()
+            install = self._patcher.reborn_install_of(iso) if iso else None
+        return install if install and os.path.isdir(install) else None
+
+    def sync_controllers_now(self, force: bool = False, search: bool = False) -> controllers.SyncResult:
+        source = controllers.find_reborn_source(self.reborn_install(search), self._env)
+        res = controllers.sync_controllers(self.user_dir, source, self.cfg.get("controllers"), force)
+        if res.record != self.cfg.get("controllers"):
+            self.cfg["controllers"] = res.record
+            self._save()
+        if res.backup:
+            log(self.folder, f"controllers: {res.action}; previous mapping saved as {res.backup}")
+        self._set("controllers", state=CONTROLLER_STATES.get(res.action, res.action), message=res.message,
+                  source=source.gcpad if source else "", backup=res.backup or "",
+                  port1=controllers.port1_summary(self.user_dir))
+        return res
+
+    def sync_controllers(self, force: bool = False) -> None:
+        def work():
+            res = self.sync_controllers_now(force=force, search=True)
+            if force:
+                ok = res.action in ("imported", "first-import", "updated", "up-to-date")
+                self.notify(("Imported your Reborn controller settings."
+                             + (" Your previous mapping was saved next to it." if res.backup else ""))
+                            if ok else res.message, "info" if ok else "error")
+        self._spawn(work)
+
+    def import_controllers(self) -> None:
+        self.sync_controllers(force=True)
+
+    def refresh_controllers(self) -> None:
+        self.sync_controllers(force=False)
+
+    # -- launching --
+    def launch(self, start, open_ui: bool = False) -> bool:
+        if not open_ui and self.need_game():
+            return False
+        try:  # never let a controller-file problem block a match
+            self.sync_controllers_now()
+        except Exception as e:  # noqa: BLE001
+            log(self.folder, f"controller sync failed: {e!r}")
+        args, env = dolphin_command(self.folder, start, self.reborn_install(), open_ui=open_ui,
+                                    name=self.state["name"], fingerprint=self.state["game"]["fingerprint"],
+                                    telemetry=self.state["telemetry"])
+        try:
+            self._popen(args, env=env, cwd=self.folder)
+        except OSError as e:
+            self.notify(f"Couldn't start Dolphin ({args[0]}): {e}", "error")
+            return False
+        return True
+
+    def play_offline(self) -> None:
+        self.launch(None)
+
+    def setup_controllers(self) -> None:
+        self.launch(None, open_ui=True)
+
+    # -- host --
+    def _roster(self, names) -> None:
+        self._set("host", players=list(names), can_start=len(names) > 1)
+
+    def host_room(self) -> None:
+        if self.need_game() or self._host or self.state["host"]["state"] != "idle":
+            return
+        if not self.rv_server:
+            self.notify("Room codes aren't set up in this download. Use “Host by IP”.", "error")
+            return
+        self._set("host", state="opening", mode="room", info="Creating a room…")
+        h = self._lobby.RoomHost(self.rv_server, self.state["name"], self.state["game"]["fingerprint"],
+                                 on_change=self._roster, on_error=lambda why: self._set("host", info=why))
+
+        def work():
+            try:
+                code = h.open()
+            except ConnectionError as e:
+                self._set("host", state="idle", mode="", info=f"{e}\nYou can still host by IP address.")
+                return
+            self._host = h
+            self._set("host", state="open", code=code,
+                      info="Room open. Give your friends this code; click Start when everyone's listed.")
+        self._spawn(work)
+
+    def host_ip(self) -> None:
+        if self.need_game() or self._host or self.state["host"]["state"] != "idle":
+            return
+        try:
+            h = self._lobby.LobbyHost(self.state["name"], self.state["game"]["fingerprint"],
+                                      on_change=self._roster,
+                                      on_reject=lambda who, why: self._set("host", info=f"Refused {who}: {why}"))
+            h.open()
+        except OSError as e:
+            self.notify(f"Couldn't open the lobby on port {self._lobby.PORT}: {e}", "error")
+            return
+        self._host = h
+        lan = lan_address()
+        self._set("host", state="open", mode="ip", code=lan,
+                  info=f"Lobby open (by IP). Same network? Friends join with:  {lan}\n"
+                       "Finding your internet address…")
+
+        def find_public():
+            pub = public_address()
+            self._set("host", info=(
+                f"Lobby open (by IP). Friends join with your address:\n"
+                f"Internet:  {pub}      Same network:  {lan}\n"
+                f"For internet play, forward TCP and UDP port {self._lobby.PORT} on your router to this PC.")
+                if pub else f"Lobby open (by IP). Same network? Friends join with:  {lan}\n"
+                            "(Couldn't look up your internet address.)")
+        self._spawn(find_public)
+
+    def start_game(self, delay=None) -> None:
+        h = self._host
+        if not h or self.state["host"]["state"] != "open":
+            return
+        if delay is not None:
+            self.set_delay(delay)
+        delay = self.state["delay"]
+        self._set("host", state="starting")
+
+        def work():
+            try:
+                me = h.start(delay=delay)
+            except (ValueError, ConnectionError) as e:
+                self._set("host", state="open")
+                self.notify(str(e), "error")
+                return
+            self.cfg["rb_delay"] = delay
+            self._save()
+            self._host = None
+            self._set("host", state="idle", mode="", code="", players=[], can_start=False,
+                      info=f"Started a {me.players}-player game. Have fun!")
+            self.launch(me)
+        self._spawn(work)
+
+    def close_room(self) -> None:
+        if self._host:
+            self._host.close()
+            self._host = None
+        self._set("host", state="idle", mode="", code="", players=[], can_start=False, info="Closed.")
+
+    # -- join --
+    def join(self, target: str) -> None:
+        if self.need_game() or self.state["join"]["state"] != "idle":
+            return
+        target = (target or "").strip()
+        if not target:
+            self._set("join", info="Type the room code from the host.")
+            return
+        direct = looks_like_ip(target)
+        if not direct and not self.rv_server:
+            self._set("join", info="Room codes aren't set up in this download. Ask the host for "
+                                   "their IP address instead.")
+            return
+        self.cfg["name"] = self.state["name"]
+        self.cfg["last_host"] = target
+        self._save()
+        cancel = threading.Event()
+        self._join_cancel = cancel
+        self._set(last_host=target)
+        self._set("join", state="waiting", players=[], info=f"Joining {target}… waiting for the host to start.")
+        on_lobby = lambda names: self._set("join", players=list(names))  # noqa: E731
+
+        def work():
+            try:
+                if direct:
+                    start = self._lobby.join(target, self.state["name"], self.state["game"]["fingerprint"],
+                                             on_lobby=on_lobby, cancel=cancel)
+                else:
+                    start = self._lobby.join_room(self.rv_server, target, self.state["name"],
+                                                  self.state["game"]["fingerprint"],
+                                                  on_lobby=on_lobby, cancel=cancel)
+            except ConnectionError as e:
+                self._set("join", state="idle", info=str(e))
+                return
+            self._set("join", state="idle",
+                      info=f"Starting! You're player {start.player + 1} of {start.players}.")
+            self.launch(start)
+        self._spawn(work)
+
+    def leave(self) -> None:
+        if self._join_cancel:
+            self._join_cancel.set()
+
+    def startup(self) -> None:
+        self.check_game()
+        self.sync_controllers()
+
+    def shutdown(self) -> None:
+        if self._host:
+            self._host.close()
+            self._host = None
+        self.leave()
+
+
+# --- web view (pywebview) ------------------------------------------------------------
+def copy_to_clipboard(text: str) -> bool:
+    if sys.platform != "win32":
+        return False
+    try:  # clip.exe reads UTF-16 with a BOM correctly; room codes are ASCII anyway
+        subprocess.run(["clip"], input=("﻿" + text).encode("utf-16-le"), check=False,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=5)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+class WebApi:
+    """window.pywebview.api: thin pass-through to Launcher. Only methods are
+    public; pywebview exposes public attributes too, so state stays private."""
+
+    def __init__(self, launcher: Launcher):
+        self._l = launcher
+        self._window = None
+        self._ready = threading.Event()
+        self._ready_info: dict = {}
+
+    def snapshot(self, since=-1):
+        return self._l.snapshot(since)
+
+    def ui_ready(self, info=None):
+        self._ready_info = dict(info or {})
+        self._ready.set()
+
+    def set_name(self, name): self._l.set_name(name)
+    def set_telemetry(self, on): self._l.set_telemetry(bool(on))
+    def set_delay(self, delay): self._l.set_delay(delay)
+    def find_game(self): self._l.find_game()
+    def host_room(self): self._l.host_room()
+    def host_ip(self): self._l.host_ip()
+    def start_game(self, delay=None): self._l.start_game(delay)
+    def close_room(self): self._l.close_room()
+    def join(self, target): self._l.join(target)
+    def leave(self): self._l.leave()
+    def play_offline(self): self._l.play_offline()
+    def setup_controllers(self): self._l.setup_controllers()
+    def import_controllers(self): self._l.import_controllers()
+    def refresh_controllers(self): self._l.refresh_controllers()
+    def copy_text(self, text): return copy_to_clipboard(str(text))
+
+    def browse_iso(self):
+        import webview
+        kind = getattr(getattr(webview, "FileDialog", None), "OPEN", None) or webview.OPEN_DIALOG
+        try:  # pywebview filters must be "Label (*.ext)"; NSR.iso sits in content\games
+            picked = self._window.create_file_dialog(kind, file_types=("Disc images (*.iso)",))
+        except Exception:  # noqa: BLE001  (a pywebview that rejects the filter)
+            picked = self._window.create_file_dialog(kind)
+        if picked:
+            self._l.prepare(picked[0] if isinstance(picked, (list, tuple)) else picked)
+
+
+def run_web(launcher: Launcher, selftest: bool = False) -> int:
+    """Run the web UI. Returns the exit code; raises if pywebview/WebView2 fails
+    so run_gui can fall back to tkinter."""
+    import webview
+    with open(resource_path(UI_HTML), encoding="utf-8") as f:
+        html = f.read()
+    api = WebApi(launcher)
+    window = webview.create_window(APP_TITLE, html=html, js_api=api, width=1200, height=780,
+                                   min_size=(980, 660), background_color="#0b0b0e")
+    api._window = window
+    result = {"code": 0}
+
+    def probe():  # selftest: the page must render a real snapshot, then close
+        ok = api._ready.wait(60)
+        info = api._ready_info
+        result["code"] = 0 if ok and info.get("rendered") and info.get("pages", 0) >= 6 else 1
+        print(f"selftest web ui: ready={ok} info={info}", flush=True)
+        log(launcher.folder, f"selftest web ui: ready={ok} info={info}")
+        window.destroy()
+
+    launcher.startup()
+    webview.start(probe if selftest else None, gui="edgechromium" if sys.platform == "win32" else None,
+                  debug=bool(os.environ.get("NSR_UI_DEBUG")))
+    launcher.shutdown()
+    if not selftest and not api._ready.is_set():
+        raise RuntimeError("web UI never came up")
+    return result["code"]
+
+
+# --- tkinter fallback view -------------------------------------------------------------
+def run_tk(launcher: Launcher, selftest: bool = False) -> int:
+    """Plain fallback window over the same Launcher (no WebView2 on this PC)."""
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
-    folder = app_dir()
-    cfg = load_config(folder)
-    events: queue.Queue = queue.Queue()  # (callable,) from worker threads
-    state = {"fingerprint": None, "host": None, "join_cancel": None, "busy": False}
-
     root = tk.Tk()
     root.title(APP_TITLE)
-    root.minsize(560, 520)
-    bg, panel, fg, accent, muted = "#141419", "#1e1e26", "#f2f2f2", "#d7263d", "#9a9aa8"
+    root.minsize(620, 600)
+    bg, panel, fg, accent, muted = "#0b0b0e", "#15151a", "#f2f2f2", "#e3262f", "#9b9ba7"
     root.configure(bg=bg)
     style = ttk.Style(root)
     style.theme_use("clam")
@@ -261,409 +824,189 @@ def run_gui(selftest: bool = False) -> int:
     style.configure("Panel.TFrame", background=panel)
     style.configure("Panel.TLabel", background=panel, foreground=fg)
     style.configure("Muted.TLabel", background=panel, foreground=muted)
-    style.configure("Title.TLabel", background=bg, foreground=fg, font=("Segoe UI", 18, "bold"))
-    style.configure("Sub.TLabel", background=bg, foreground=muted)
+    style.configure("Title.TLabel", background=bg, foreground=fg, font=("Segoe UI", 20, "bold italic"))
+    style.configure("Code.TLabel", background=panel, foreground=fg, font=("Segoe UI", 22, "bold"))
     style.configure("Big.TLabel", background=panel, foreground=fg, font=("Segoe UI", 12, "bold"))
     style.configure("Accent.TButton", background=accent, foreground="white", padding=8,
                     font=("Segoe UI", 10, "bold"))
-    style.map("Accent.TButton", background=[("active", "#b81f33"), ("disabled", "#5a2a31")])
-    style.configure("TButton", background=panel, foreground=fg, padding=6)
+    style.map("Accent.TButton", background=[("active", "#b81b23"), ("disabled", "#4a2226")])
+    style.configure("TButton", background="#23232a", foreground=fg, padding=6)
     style.configure("TNotebook", background=bg, borderwidth=0)
     style.configure("TNotebook.Tab", background=panel, foreground=fg, padding=(14, 6))
     style.map("TNotebook.Tab", background=[("selected", accent)])
     style.configure("Horizontal.TProgressbar", background=accent, troughcolor=panel)
 
-    def ui(fn):  # run fn on the Tk thread
-        events.put(fn)
-
-    def pump():
-        try:
-            while True:
-                events.get_nowait()()
-        except queue.Empty:
-            pass
-        root.after(50, pump)
-
     outer = ttk.Frame(root, padding=16)
     outer.pack(fill="both", expand=True)
-    ttk.Label(outer, text="NFL Street Netplay", style="Title.TLabel").pack(anchor="w")
-    ttk.Label(outer, text="Play NFL Street Reborn online with friends (2–4 players, rollback netcode). "
-                          "Reborn itself is never changed.", style="Sub.TLabel").pack(anchor="w", pady=(0, 10))
+    ttk.Label(outer, text="NSR NETPLAY", style="Title.TLabel").pack(anchor="w")
+    status = ttk.Label(outer, text="", foreground=muted)
+    status.pack(anchor="w", pady=(0, 8))
 
-    # 1. Game
-    game = ttk.Frame(outer, style="Panel.TFrame", padding=12)
-    game.pack(fill="x")
-    ttk.Label(game, text="1. Game", style="Big.TLabel").grid(row=0, column=0, sticky="w")
-    game_status = ttk.Label(game, text="Checking your game copy…", style="Panel.TLabel", wraplength=500)
-    game_status.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 6))
-    progress = ttk.Progressbar(game, length=300, mode="determinate")
-    btn_find = ttk.Button(game, text="Find Reborn automatically")
-    btn_browse = ttk.Button(game, text="Browse for NSR.iso…")
-    btn_find.grid(row=3, column=0, sticky="w")
-    btn_browse.grid(row=3, column=1, sticky="w", padx=6)
-
-    # 2. You + play
-    you = ttk.Frame(outer, style="Panel.TFrame", padding=12)
-    you.pack(fill="x", pady=10)
-    ttk.Label(you, text="2. Play", style="Big.TLabel").grid(row=0, column=0, sticky="w")
-    ttk.Label(you, text="Your name", style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=4)
-    name_var = tk.StringVar(value=cfg.get("name", os.environ.get("USERNAME", "Player"))[:24])
-    ttk.Entry(you, textvariable=name_var, width=24).grid(row=1, column=1, sticky="w")
-    ttk.Label(you, text="Your controller is always Dolphin's Port 1.", style="Muted.TLabel") \
-        .grid(row=2, column=0, columnspan=2, sticky="w")
-    ttk.Button(you, text="Set up controllers", command=lambda: launch(None, open_ui=True)) \
-        .grid(row=1, column=2, padx=8)
-    # On by default (Mason's call for the friends playtest), but labelled with
-    # exactly what goes out; unticked = NSR_TELEMETRY=0, nothing is sent or kept.
-    telemetry_var = tk.BooleanVar(value=cfg.get("telemetry", True))
-    ttk.Checkbutton(you, text="Send lag/rollback stats to Mason's server to help fix netplay",
-                    variable=telemetry_var).grid(row=3, column=0, columnspan=3, sticky="w")
-    ttk.Label(you, text="Connection and rollback counters, your name and the room code. "
-                        "Never your button presses, files, or game data. Untick to send nothing.",
-              style="Muted.TLabel", wraplength=520, justify="left") \
-        .grid(row=4, column=0, columnspan=3, sticky="w")
+    def label(parent, row, style="Panel.TLabel", **grid):
+        w = ttk.Label(parent, text="", style=style, wraplength=560, justify="left")
+        w.grid(**{"row": row, "column": 0, "columnspan": 4, "sticky": "w", "pady": (4, 4), **grid})
+        return w
 
     tabs = ttk.Notebook(outer)
     tabs.pack(fill="both", expand=True)
-    host_tab = ttk.Frame(tabs, style="Panel.TFrame", padding=12)
-    join_tab = ttk.Frame(tabs, style="Panel.TFrame", padding=12)
-    solo_tab = ttk.Frame(tabs, style="Panel.TFrame", padding=12)
-    tabs.add(host_tab, text="Host")
-    tabs.add(join_tab, text="Join")
-    tabs.add(solo_tab, text="Practice offline")
+    pages = {k: ttk.Frame(tabs, style="Panel.TFrame", padding=12) for k in
+             ("Host", "Join", "Controllers", "Settings")}
+    for k, f in pages.items():
+        tabs.add(f, text=k)
 
-    # Host tab
-    rv_server = rendezvous_server(folder)
-    host_info = ttk.Label(host_tab, text=(
-        "Create a room and give your friends the code. No router setup needed."
-        if rv_server else "Room codes aren't set up in this download (no room server). "
-                          "Use “Host by IP address” below."),
-        style="Panel.TLabel", wraplength=500, justify="left")
-    host_info.grid(row=0, column=0, columnspan=4, sticky="w")
-    code_var = tk.StringVar(value="")
-    code_label = ttk.Label(host_tab, textvariable=code_var, style="Title.TLabel")
-    code_label.configure(background=panel)
-    code_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
-    btn_copy = ttk.Button(host_tab, text="Copy code",
-                          command=lambda: (root.clipboard_clear(), root.clipboard_append(code_var.get())))
-    roster_host = tk.Listbox(host_tab, height=4, bg=bg, fg=fg, highlightthickness=0, borderwidth=0)
-    roster_host.grid(row=2, column=0, columnspan=4, sticky="we", pady=8)
-    btn_open = ttk.Button(host_tab, text="Create room", style="Accent.TButton",
-                          state="normal" if rv_server else "disabled")
-    btn_start = ttk.Button(host_tab, text="Start game", style="Accent.TButton", state="disabled")
-    btn_close = ttk.Button(host_tab, text="Close", state="disabled")
-    btn_open_ip = ttk.Button(host_tab, text="Host by IP address (advanced)")
-    btn_open.grid(row=3, column=0, sticky="w")
-    btn_start.grid(row=3, column=1, sticky="w", padx=6)
-    btn_close.grid(row=3, column=2, sticky="w")
-    btn_open_ip.grid(row=3, column=3, sticky="e", padx=(12, 0))
-    # "rb_delay", not the lockstep-era "delay" (2 by default), so an old
-    # config doesn't carry a lockstep value into rollback.
-    delay_var = tk.IntVar(value=min(int(cfg.get("rb_delay", DEFAULT_DELAY)), MAX_DELAY))
-    ttk.Label(host_tab, text="Input delay for everyone (frames; 1 suits most games, "
-                             "try 2 if it stutters):", style="Muted.TLabel") \
-        .grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
-    ttk.Spinbox(host_tab, from_=0, to=MAX_DELAY, textvariable=delay_var, width=4) \
-        .grid(row=4, column=2, sticky="w", pady=(10, 0))
+    # Host
+    hp = pages["Host"]
+    host_code = ttk.Label(hp, text="", style="Code.TLabel")
+    host_code.grid(row=0, column=0, columnspan=4, sticky="w")
+    host_info = label(hp, 1)
+    host_roster = tk.Listbox(hp, height=4, bg=bg, fg=fg, highlightthickness=0, borderwidth=0)
+    host_roster.grid(row=2, column=0, columnspan=4, sticky="we", pady=6)
+    b_open = ttk.Button(hp, text="Create room", style="Accent.TButton", command=launcher.host_room)
+    b_start = ttk.Button(hp, text="Start game", style="Accent.TButton",
+                         command=lambda: launcher.start_game(delay_var.get()))
+    b_close = ttk.Button(hp, text="Close", command=launcher.close_room)
+    b_ip = ttk.Button(hp, text="Host by IP address (advanced)", command=launcher.host_ip)
+    for i, b in enumerate((b_open, b_start, b_close, b_ip)):
+        b.grid(row=3, column=i, sticky="w", padx=(0, 6))
+    delay_var = tk.IntVar(value=launcher.state["delay"])
+    ttk.Label(hp, text="Input delay for everyone (frames; 1 suits most games, try 2 if it stutters):",
+              style="Muted.TLabel").grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
+    ttk.Spinbox(hp, from_=0, to=MAX_DELAY, textvariable=delay_var, width=4,
+                command=lambda: launcher.set_delay(delay_var.get())).grid(row=4, column=3, sticky="w", pady=(10, 0))
+    ttk.Button(hp, text="Practice offline", command=launcher.play_offline).grid(row=5, column=0, sticky="w", pady=8)
 
-    # Join tab
-    ttk.Label(join_tab, text="Room code (or host IP)", style="Panel.TLabel").grid(row=0, column=0, sticky="w")
-    addr_var = tk.StringVar(value=cfg.get("last_host", ""))
-    ttk.Entry(join_tab, textvariable=addr_var, width=30).grid(row=0, column=1, sticky="w", padx=6)
-    join_info = ttk.Label(join_tab, text="", style="Panel.TLabel", wraplength=500, justify="left")
-    join_info.grid(row=1, column=0, columnspan=3, sticky="w", pady=6)
-    roster_join = tk.Listbox(join_tab, height=4, bg=bg, fg=fg, highlightthickness=0, borderwidth=0)
-    roster_join.grid(row=2, column=0, columnspan=3, sticky="we")
-    btn_join = ttk.Button(join_tab, text="Join", style="Accent.TButton")
-    btn_leave = ttk.Button(join_tab, text="Leave", state="disabled")
-    btn_join.grid(row=3, column=0, sticky="w", pady=8)
-    btn_leave.grid(row=3, column=1, sticky="w")
+    # Join
+    jp = pages["Join"]
+    ttk.Label(jp, text="Room code (or host IP)", style="Panel.TLabel").grid(row=0, column=0, sticky="w")
+    addr_var = tk.StringVar(value=launcher.state["last_host"])
+    ttk.Entry(jp, textvariable=addr_var, width=30).grid(row=0, column=1, sticky="w", padx=6)
+    join_info = label(jp, 1)
+    join_roster = tk.Listbox(jp, height=4, bg=bg, fg=fg, highlightthickness=0, borderwidth=0)
+    join_roster.grid(row=2, column=0, columnspan=4, sticky="we")
+    b_join = ttk.Button(jp, text="Join", style="Accent.TButton", command=lambda: launcher.join(addr_var.get()))
+    b_leave = ttk.Button(jp, text="Leave", command=launcher.leave)
+    b_join.grid(row=3, column=0, sticky="w", pady=8)
+    b_leave.grid(row=3, column=1, sticky="w")
 
-    # Practice tab
-    ttk.Label(solo_tab, text="Play on this PC only (same setup as netplay, no network).",
-              style="Panel.TLabel").pack(anchor="w")
-    btn_solo = ttk.Button(solo_tab, text="Play offline", style="Accent.TButton",
-                          command=lambda: launch(None))
-    btn_solo.pack(anchor="w", pady=8)
+    # Controllers
+    cp = pages["Controllers"]
+    ctl_dev = label(cp, 1, style="Big.TLabel")
+    ctl_msg = label(cp, 2)
+    ttk.Label(cp, text="Your controller is always Port 1.", style="Muted.TLabel").grid(row=3, column=0, columnspan=4, sticky="w")
+    ttk.Button(cp, text="Use my Reborn controller settings", style="Accent.TButton",
+               command=launcher.import_controllers).grid(row=4, column=0, sticky="w", pady=8)
+    ttk.Button(cp, text="Set up controllers…", command=launcher.setup_controllers).grid(row=4, column=1, sticky="w", padx=6)
+    ctl_binds = label(cp, 5, style="Muted.TLabel")
 
-    def set_roster(box, names):
-        box.delete(0, "end")
-        for i, n in enumerate(names):
-            box.insert("end", f"  Player {i + 1}: {n}" + ("  (host)" if i == 0 else ""))
-
-    def need_game() -> bool:
-        if not state["fingerprint"]:
-            messagebox.showinfo(APP_TITLE, "Set up the game first (step 1).")
-            return True
-        return False
-
-    # --- game image -------------------------------------------------------
-    def show_ready(fp, note=""):
-        state["fingerprint"] = fp
-        game_status.configure(text=f"✓ Ready for rollback netplay. Game fingerprint {fp}{note}\n"
-                                   "Everyone you play with must have the same fingerprint.")
-        progress.grid_forget()
-
-    def show_stale(st):
-        state["fingerprint"] = None
-        game_status.configure(text=f"Your game copy ({st.fingerprint}) is {st.note} and can't play "
-                                   "this version's rollback netplay. Click “Find Reborn "
-                                   "automatically” to rebuild it (about a minute).")
-        progress.grid_forget()
-
-    def prepare(iso):
-        if state["busy"]:
-            return
-        state["busy"] = True
-        btn_find.state(["disabled"]); btn_browse.state(["disabled"])
-        progress.grid(row=2, column=0, columnspan=3, sticky="w", pady=4)
-        labels = {"check": "Checking Reborn's game file…", "build": "Building the netplay copy…",
-                  "verify": "Fingerprinting…"}
-
-        def work():
-            try:
-                r = patcher.prepare_image(iso, folder, progress=lambda st, d, t: ui(
-                    lambda: (game_status.configure(text=labels[st]),
-                             progress.configure(value=d * 100 / max(t, 1)))))
-                note = "" if r.matches_reference else (
-                    "\n(Unrecognized Reborn version: compare fingerprints with friends.)"
-                    if r.matches_reference is None else
-                    "\nWARNING: doesn't match the reference build; ask Mason before playing.")
-                cfg["reborn_iso"] = iso
-                cfg["reborn_install"] = r.reborn_install
-                save_config(folder, cfg)
-                ui(lambda: show_ready(r.fingerprint, note))
-            except isopatch.PatchError:
-                ui(lambda: game_status.configure(
-                    text="This Reborn version isn't supported yet (the game code changed). "
-                         "Nothing was written. Ask Mason for an updated launcher."))
-            except OSError as e:
-                ui(lambda e=e: game_status.configure(text=f"Couldn't build the game copy: {e}"))
-            finally:
-                state["busy"] = False
-                ui(lambda: (btn_find.state(["!disabled"]), btn_browse.state(["!disabled"])))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def find_auto():
-        game_status.configure(text="Looking for NFL Street Reborn…")
-
-        def work():
-            iso = patcher.find_reborn_iso()
-            ui(lambda: prepare(iso) if iso else game_status.configure(
-                text="Couldn't find Reborn automatically. Click “Browse for NSR.iso…” and pick "
-                     "the file in your Reborn folder: content\\games\\NSR.iso"))
-
-        threading.Thread(target=work, daemon=True).start()
+    # Settings
+    sp = pages["Settings"]
+    ttk.Label(sp, text="Your name", style="Panel.TLabel").grid(row=0, column=0, sticky="w", pady=4)
+    name_var = tk.StringVar(value=launcher.state["name"])
+    name_entry = ttk.Entry(sp, textvariable=name_var, width=24)
+    name_entry.grid(row=0, column=1, sticky="w")
+    name_entry.bind("<FocusOut>", lambda e: launcher.set_name(name_var.get()))
+    telemetry_var = tk.BooleanVar(value=launcher.state["telemetry"])
+    ttk.Checkbutton(sp, text="Send lag/rollback stats to Mason's server to help fix netplay",
+                    variable=telemetry_var, command=lambda: launcher.set_telemetry(telemetry_var.get())) \
+        .grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+    ttk.Label(sp, text="Connection and rollback counters, your name and the room code. Never your button "
+                       "presses, files, or game data. Untick to send nothing.", style="Muted.TLabel",
+              wraplength=560, justify="left").grid(row=2, column=0, columnspan=4, sticky="w")
+    game_text = label(sp, 3, pady=(14, 4))
+    progress = ttk.Progressbar(sp, length=300, mode="determinate")
+    b_find = ttk.Button(sp, text="Find Reborn automatically", command=launcher.find_game)
+    b_browse = ttk.Button(sp, text="Browse for NSR.iso…")
+    b_find.grid(row=5, column=0, sticky="w")
+    b_browse.grid(row=5, column=1, sticky="w", padx=6)
 
     def browse():
         iso = filedialog.askopenfilename(title="Pick NFL Street Reborn's NSR.iso (content\\games)",
                                          filetypes=[("Reborn game image", "NSR.iso"), ("ISO", "*.iso")])
         if iso:
-            prepare(iso)
+            launcher.prepare(iso)
+    b_browse.configure(command=browse)
 
-    btn_find.configure(command=find_auto)
-    btn_browse.configure(command=browse)
+    def set_list(box, names):
+        box.delete(0, "end")
+        for i, n in enumerate(names):
+            box.insert("end", f"  Player {i + 1}: {n}" + ("  (host)" if i == 0 else ""))
 
-    def check_existing():
-        def work():
-            st = patcher.image_status(folder)
-            if st is None:
-                ui(lambda: game_status.configure(
-                    text="Not set up yet. Click “Find Reborn automatically”."))
-            elif st.playable:
-                note = {"release": "",
-                        "custom": "\n(Unrecognized Reborn version: compare fingerprints with friends.)",
-                        }.get(st.kind, "\n(Custom game copy, e.g. a ratings pack: everyone needs "
-                                       "the identical copy.)")
-                ui(lambda: show_ready(st.fingerprint, note))
+    def enable(btn, on):
+        btn.state(["!disabled"] if on else ["disabled"])
+
+    seen = {"rev": -1, "notice": 0, "rendered": False}
+
+    def render():
+        s = launcher.snapshot(seen["rev"])
+        if s is not None:
+            seen["rev"] = s["rev"]
+            g, h, j, c = s["game"], s["host"], s["join"], s["controllers"]
+            status.configure(text=("● Ready to play" if g["state"] == "ready" else "● " + g["text"])
+                             + f"     {s['name']} · Port 1")
+            host_code.configure(text=h["code"] if h["state"] in ("open", "starting") else "")
+            host_info.configure(text=h["info"])
+            set_list(host_roster, h["players"])
+            idle = h["state"] == "idle"
+            enable(b_open, idle and s["rooms"]); enable(b_ip, idle)
+            enable(b_close, not idle); enable(b_start, h["state"] == "open" and h["can_start"])
+            join_info.configure(text=j["info"])
+            set_list(join_roster, j["players"])
+            enable(b_join, j["state"] == "idle"); enable(b_leave, j["state"] == "waiting")
+            p1 = c["port1"]
+            ctl_dev.configure(text=f"{p1['family']}  ({p1['device']})" if p1["mapped"] else "No controller mapped")
+            ctl_msg.configure(text=c["message"] + (f"\nFrom: {c['source']}" if c["source"] else ""))
+            ctl_binds.configure(text="   ".join(f"{b['control']}: {b['input'] or '-'}" for b in p1["bindings"]))
+            game_text.configure(text=(f"Fingerprint {g['fingerprint']}\n" if g["fingerprint"] else "")
+                                + g["text"] + (f"\n{g['note']}" if g["note"] else ""))
+            if g["progress"] is None:
+                progress.grid_forget()
             else:
-                ui(lambda: show_stale(st))
-        threading.Thread(target=work, daemon=True).start()
-
-    # --- launching -----------------------------------------------------------
-    def launch(start, open_ui=False):
-        if not open_ui and need_game():
-            return
-        cfg["telemetry"] = bool(telemetry_var.get())
-        reborn = cfg.get("reborn_install") or patcher.saved_reborn_install(folder)
-        args, env = dolphin_command(folder, start, reborn, open_ui=open_ui,
-                                    name=name_var.get().strip() or "Player",
-                                    fingerprint=state["fingerprint"] or "",
-                                    telemetry=cfg["telemetry"])
-        try:
-            subprocess.Popen(args, env=env, cwd=folder)
-        except OSError as e:
-            messagebox.showerror(APP_TITLE, f"Couldn't start Dolphin ({args[0]}): {e}")
-
-    # --- host -----------------------------------------------------------------
-    def roster_changed(names):
-        ui(lambda: (set_roster(roster_host, names),
-                    btn_start.state(["!disabled"] if len(names) > 1 else ["disabled"])))
-
-    def hosting_ui(active: bool):
-        for b in (btn_open, btn_open_ip):
-            b.state(["disabled"] if active or (b is btn_open and not rv_server) else ["!disabled"])
-        btn_close.state(["!disabled"] if active else ["disabled"])
-        if not active:
-            btn_start.state(["disabled"])
-            code_var.set("")
-            btn_copy.grid_forget()
-            set_roster(roster_host, [])
-
-    def host_room():
-        if need_game():
-            return
-        cfg["name"] = name_var.get().strip() or "Host"
-        save_config(folder, cfg)
-        hosting_ui(True)
-        host_info.configure(text="Creating a room…")
-        h = lobby.RoomHost(rv_server, cfg["name"], state["fingerprint"], on_change=roster_changed,
-                           on_error=lambda why: ui(lambda: host_info.configure(text=why)))
-
-        def work():
-            try:
-                code = h.open()
-            except ConnectionError as e:
-                ui(lambda e=e: (host_info.configure(text=f"{e}\nYou can still “Host by IP address”."),
-                                hosting_ui(False)))
-                return
-            state["host"] = h
-            ui(lambda: (code_var.set(code), btn_copy.grid(row=1, column=2, sticky="w"),
-                        host_info.configure(text="Room open. Give your friends this code; "
-                                                 "click Start when everyone's listed.")))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def host_ip():
-        if need_game():
-            return
-        cfg["name"] = name_var.get().strip() or "Host"
-        save_config(folder, cfg)
-        try:
-            h = lobby.LobbyHost(cfg["name"], state["fingerprint"], on_change=roster_changed,
-                                on_reject=lambda who, why: ui(lambda: host_info.configure(
-                                    text=f"Refused {who}: {why}")))
-            h.open()
-        except OSError as e:
-            messagebox.showerror(APP_TITLE, f"Couldn't open the lobby on port {lobby.PORT}: {e}")
-            return
-        state["host"] = h
-        hosting_ui(True)
-        lan = lan_address()
-        host_info.configure(text=f"Lobby open. Same network? Friends join with:  {lan}\n"
-                                 "Finding your internet address…")
-
-        def find_public():
-            pub = public_address()
-            ui(lambda: host_info.configure(text=(
-                f"Lobby open (by IP). Friends join with your address:\n"
-                f"   Internet:  {pub}      Same network:  {lan}\n"
-                f"For internet play, forward TCP and UDP port {lobby.PORT} on your router to this PC.")
-                if pub else f"Lobby open (by IP). Same network? Friends join with:  {lan}\n"
-                            f"(Couldn't look up your internet address.)"))
-
-        threading.Thread(target=find_public, daemon=True).start()
-
-    def host_start():
-        h = state["host"]
-        if not h:
-            return
-        btn_start.state(["disabled"])
-
-        def work():
-            try:
-                me = h.start(delay=max(0, min(int(delay_var.get()), MAX_DELAY)))
-            except (ValueError, ConnectionError) as e:
-                ui(lambda e=e: (messagebox.showinfo(APP_TITLE, str(e)), btn_start.state(["!disabled"])))
-                return
-            cfg["rb_delay"] = delay_var.get()
-            save_config(folder, cfg)
-            state["host"] = None
-            ui(lambda: (hosting_ui(False),
-                        host_info.configure(text=f"Started a {me.players}-player game. Have fun!"),
-                        launch(me)))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def host_close():
-        if state["host"]:
-            state["host"].close()
-            state["host"] = None
-        hosting_ui(False)
-        host_info.configure(text="Closed.")
-
-    btn_open.configure(command=host_room)
-    btn_open_ip.configure(command=host_ip)
-    btn_start.configure(command=host_start)
-    btn_close.configure(command=host_close)
-
-    # --- join -----------------------------------------------------------------
-    def do_join():
-        if need_game():
-            return
-        target = addr_var.get().strip()
-        if not target:
-            join_info.configure(text="Type the room code from the host.")
-            return
-        direct = looks_like_ip(target)
-        if not direct and not rv_server:
-            join_info.configure(text="Room codes aren't set up in this download. Ask the host for "
-                                     "their IP address instead.")
-            return
-        cfg["name"] = name_var.get().strip() or "Player"
-        cfg["last_host"] = target
-        save_config(folder, cfg)
-        cancel = threading.Event()
-        state["join_cancel"] = cancel
-        btn_join.state(["disabled"]); btn_leave.state(["!disabled"])
-        join_info.configure(text=f"Joining {target}… waiting for the host to start.")
-        on_lobby = lambda names: ui(lambda: set_roster(roster_join, names))  # noqa: E731
-
-        def work():
-            try:
-                if direct:
-                    start = lobby.join(target, cfg["name"], state["fingerprint"],
-                                       on_lobby=on_lobby, cancel=cancel)
-                else:
-                    start = lobby.join_room(rv_server, target, cfg["name"], state["fingerprint"],
-                                            on_lobby=on_lobby, cancel=cancel)
-                ui(lambda: (join_info.configure(
-                    text=f"Starting! You're player {start.player + 1} of {start.players}."),
-                    launch(start)))
-            except ConnectionError as e:
-                ui(lambda e=e: join_info.configure(text=str(e)))
-            finally:
-                ui(lambda: (btn_join.state(["!disabled"]), btn_leave.state(["disabled"])))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def do_leave():
-        if state["join_cancel"]:
-            state["join_cancel"].set()
-
-    btn_join.configure(command=do_join)
-    btn_leave.configure(command=do_leave)
+                progress.grid(row=4, column=0, columnspan=3, sticky="w", pady=4)
+                progress.configure(value=g["progress"])
+            enable(b_find, not g["busy"]); enable(b_browse, not g["busy"])
+            n = s["notice"]
+            if n and n["id"] != seen["notice"]:
+                seen["notice"] = n["id"]
+                if not selftest:
+                    (messagebox.showerror if n["kind"] == "error" else messagebox.showinfo)(APP_TITLE, n["text"])
+            seen["rendered"] = True
+        root.after(100, render)
 
     def on_close():
-        if state["host"]:
-            state["host"].close()
-        do_leave()
+        launcher.shutdown()
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
-    pump()
-    check_existing()
+    launcher.startup()
+    render()
     if selftest:
         root.update()
-        root.after(300, root.destroy)
+        root.after(500, on_close)
     root.mainloop()
+    if selftest:
+        print(f"selftest tk ui: rendered={seen['rendered']}", flush=True)
+        return 0 if seen["rendered"] else 1
     return 0
+
+
+def run_gui(selftest: bool = False, force_tk: bool = False) -> int:
+    launcher = Launcher()
+    ui = "tk" if force_tk else choose_ui(webview2=webview2_version() if sys.platform == "win32" else None)
+    if ui == "web":
+        try:
+            return run_web(launcher, selftest)
+        except Exception as e:  # noqa: BLE001  (no WebView2, broken pythonnet, ...)
+            log(launcher.folder, f"web UI unavailable, using the basic window: {e!r}")
+            if selftest:
+                print(f"selftest web ui failed: {e!r}", flush=True)
+                return 1
+            launcher = Launcher()
+    return run_tk(launcher, selftest)
 
 
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    return run_gui(selftest="--selftest" in argv)
+    return run_gui(selftest="--selftest" in argv, force_tk="--tk" in argv)
 
 
 if __name__ == "__main__":
