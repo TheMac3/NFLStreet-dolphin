@@ -843,14 +843,9 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     status = ttk.Label(outer, text="", foreground=muted)
     status.pack(anchor="w", pady=(0, 8))
 
-    def box(parent, title):
-        f = ttk.Frame(parent, style="Panel.TFrame", padding=12)
-        ttk.Label(f, text=title, style="Big.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
-        return f
-
     def label(parent, row, style="Panel.TLabel", **grid):
         w = ttk.Label(parent, text="", style=style, wraplength=560, justify="left")
-        w.grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 4), **grid)
+        w.grid(**{"row": row, "column": 0, "columnspan": 4, "sticky": "w", "pady": (4, 4), **grid})
         return w
 
     tabs = ttk.Notebook(outer)
