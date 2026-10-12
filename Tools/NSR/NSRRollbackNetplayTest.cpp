@@ -952,6 +952,7 @@ static void TestPureRollbackHelpers()
   assert(RL::BusyPollCatchups(999, 1000) == 0);
   assert(RL::BusyPollCatchups(2001, 1000) == 2);
   assert(RL::Before(9, 10) && !RL::Before(10, 10));
+  assert(!RL::PausedFrame(0) && RL::PausedFrame(1) && RL::PausedFrame(2));
   const RL::SongTimeline song = RL::ScheduleSong(100, 380, 10800);
   assert(song.start == 480 && song.end == 11280);
 

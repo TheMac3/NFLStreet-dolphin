@@ -135,6 +135,14 @@ constexpr bool Before(std::uint32_t frame, std::uint32_t end)
   return static_cast<std::int32_t>(frame - end) < 0;
 }
 
+// Stock InGame feeds its fixed-step tick accumulator only while the pause
+// nesting depth is zero, so a frame that starts paused runs no sim tick
+// (fix/pausetime). The rollback tick hook must reproduce that decision.
+constexpr bool PausedFrame(std::uint32_t pause_depth)
+{
+  return pause_depth != 0;
+}
+
 // Undo log for rollback-owned bytes that live outside the MEM1/VMEM snapshots
 // (final-review M1: the game's ARAM replay ring). Instead of copying the
 // window into every ring slot, each guest write into the window first records

@@ -1096,6 +1096,14 @@ using Pads = std::array<Pad, MAX_PLAYERS>;
 // each re-simulated tick. The inner accumulator (outer+0xC -> 0x10 bytes)
 // follows real time and is never restored.
 constexpr u32 TICK_CLOCK_PTR = 0x803EC138;  // -0x6168(r13)
+// The game's pause nesting depth (fix/pausetime). Pause entry fn_8002885C
+// increments it, exit fn_800288B0 decrements it. InGame (0x80028604) feeds
+// the tick accumulator (fn_80237830(1)) only while it is zero, so stock runs
+// no sim tick at all while the pause menu is open: the play clock, game
+// timers and the tick clock outer+4 stand still. It is game .sbss (restored
+// by rollback, identical on every peer), so TickCountHook may key on it.
+// Not the flag at -0x5CA0(r13): fn_80028918 also writes that from sim code.
+constexpr u32 PAUSE_DEPTH = 0x803EC5FC;  // -0x5CA4(r13)
 
 // The game's disc worker (GN7E69): thread, its semaphores (request queue at
 // 0x80381C10), descriptor and DVD staging buffer (Codex audit). In I/O-idle
@@ -5351,11 +5359,13 @@ void InGameHook(const Core::CPUThreadGuard& guard)
     r.session_saw_in_game = true;
 }
 
-// Frame mode, during the session: exactly one tick per frame. Replaces the
-// real-time accumulator drain fn_802378C8 (which returns the ticks due and
-// adds them to the game clock outer+4): the first call in a frame returns
-// the fixed step and advances the clock; later calls return 0. Frames, not
-// wall-clock time, then drive the game, as on every machine (Slippi's model).
+// Frame mode, during the session: exactly one tick per unpaused frame.
+// Replaces the real-time accumulator drain fn_802378C8 (which returns the
+// ticks due and adds them to the game clock outer+4): the first call in a
+// frame returns the fixed step and advances the clock; later calls return 0.
+// A frame with the pause menu open (PAUSE_DEPTH != 0) gets no tick, as in
+// stock. Frames, not wall-clock time, then drive the game, as on every
+// machine (Slippi's model).
 void TickCountHook(const Core::CPUThreadGuard& guard)
 {
   Rollback& r = s_rb;
@@ -5371,7 +5381,19 @@ void TickCountHook(const Core::CPUThreadGuard& guard)
   if (step == 0)
     step = 1;
   u32 n = 0;
-  if (!r.frame_tick_done)
+  if (!r.frame_tick_done && RollbackLogic::PausedFrame(MMU::HostRead<u32>(guard, PAUSE_DEPTH)))
+  {
+    // Paused (fix/pausetime): stock skipped the accumulator feed this frame,
+    // so its drain finds nothing due and returns 0 (fn_802379DC also stores
+    // the 0 at inner+8). Handing out the frame's tick anyway ran the sim
+    // under the pause menu: the play clock kept counting while its display
+    // was frozen, so after resume the CPU snapped on a clock that still
+    // showed time. One drain call per frame either way: the loop stops on 0.
+    r.frame_tick_done = true;
+    if ((inner >> 24) == 0x80)
+      MMU::HostWrite<u32>(guard, 0, inner + 8);
+  }
+  else if (!r.frame_tick_done)
   {
     r.frame_tick_done = true;
     n = step;
