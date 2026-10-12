@@ -6812,6 +6812,7 @@ void TickCountHook(const Core::CPUThreadGuard& guard)
     r.frame_tick_done = true;
     if ((inner >> 24) == 0x80)
       MMU::HostWrite<u32>(guard, 0, inner + 8);
+    MusicHoldPausedFrame(guard);
   }
   else if (!r.frame_tick_done)
   {
@@ -7998,6 +7999,31 @@ void MusicPickHook(const Core::CPUThreadGuard& guard)
   m.wr(AC_MUSIC + 4, song.start);
   m.wr(AC_MUSIC, song.end);
   AcLogLine(fmt::format("M {} pick: start {} end {}", f, song.start, song.end));
+}
+
+// Called by TickCountHook once per paused frame (fix/pausetime): push the
+// pending song start/end one frame later. In stock the pause menu stops the
+// game's sounds, music included (a stock run paused for ~1.3 s plays the
+// rest of the match audio exactly 1.3 s later than an unpaused one), but the
+// model counts frames, which keep running under the menu: its end event
+// then cut the audible song early by each pause and the next song and its
+// now-playing banner arrived ahead of the track. Holding the deadlines keeps
+// the model's remaining song time equal to the real stream's. Frame-driven
+// and in restored MEM1, so every peer and every re-simulation agree.
+// Deferred: speech/SFX model durations (AcNow) still run during a pause; a
+// stopped commentary line can count as finished on resume. Revisit if
+// commentary overlaps or skips right after unpausing.
+void MusicHoldPausedFrame(const Core::CPUThreadGuard& guard)
+{
+  if (AcModeNow() != AcMode::On)
+    return;
+  const AcMem m{guard};
+  if (m.rd(AC_BASE) != AC_MAGIC)
+    return;
+  const RollbackLogic::SongTimeline held =
+      RollbackLogic::HoldSongOneFrame({m.rd(AC_MUSIC + 4), m.rd(AC_MUSIC)});
+  m.wr(AC_MUSIC + 4, held.start);
+  m.wr(AC_MUSIC, held.end);
 }
 
 // Called from ViCallbackHook for the frame routine's VI_PRE_CB call during the

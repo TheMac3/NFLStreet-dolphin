@@ -290,6 +290,7 @@ void MusicSessionStart(const Core::CPUThreadGuard& guard, u32 frame);
 void MusicDispatchHook(const Core::CPUThreadGuard& guard);  // HookType::Gate
 void MusicPickHook(const Core::CPUThreadGuard& guard);      // HookType::Start (fn_80072424)
 void MusicInjectEvent(const Core::CPUThreadGuard& guard);   // from ViCallbackHook
+void MusicHoldPausedFrame(const Core::CPUThreadGuard& guard);  // from TickCountHook
 void MusicTrampHook(const Core::CPUThreadGuard& guard);     // HookType::Replace
 // Retrace waits inside the sim during the session count as one virtual
 // retrace each (see NSRNetplay.cpp, SimWaitBegin).

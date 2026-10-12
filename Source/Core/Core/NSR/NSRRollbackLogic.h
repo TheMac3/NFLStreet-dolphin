@@ -253,4 +253,16 @@ constexpr SongTimeline ScheduleSong(std::uint32_t now, std::uint32_t gap,
 {
   return {now + gap, now + gap + duration};
 }
+
+// While the game is paused the music model's pending deadlines move one
+// frame later per paused frame (fix/pausetime), as the real stream is
+// stopped. Zero means "no event" and stays zero.
+constexpr SongTimeline HoldSongOneFrame(SongTimeline song)
+{
+  if (song.start)
+    ++song.start;
+  if (song.end)
+    ++song.end;
+  return song;
+}
 }  // namespace NSRNetplay::RollbackLogic
