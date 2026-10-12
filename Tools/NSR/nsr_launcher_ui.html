@@ -1,0 +1,548 @@
+<!doctype html>
+<!--
+  nsr_launcher_ui.html: the "NSR Netplay" window (pywebview / Edge WebView2).
+
+  A view only: every action calls the Python Launcher (tools/nsr_launcher.py)
+  through window.pywebview.api, and the page re-renders from api.snapshot()
+  (polled; the snapshot carries a revision so unchanged state costs nothing).
+  Styled as a sibling of NFL Street Reborn's launcher (dark, red accent,
+  sidebar, rounded cards) with no Reborn artwork, logos or trademarks: text
+  and simple self-drawn icons only. Self-contained (no network, no fonts) so
+  it works offline and bundles into the PyInstaller exe as one data file.
+
+  Player names come from other machines: they are only ever set with
+  textContent, never innerHTML.
+
+  ?demo=<page> (no pywebview) renders canned state for screenshots and design
+  work; it never runs inside the launcher.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NSR Netplay</title>
+<style>
+:root {
+  --bg: #0b0b0e; --side: #0f0f13; --line: #1f1f26; --panel: #15151a; --panel2: #1b1b21;
+  --text: #f4f4f6; --muted: #9b9ba7; --faint: #6b6b76;
+  --red: #e3262f; --red2: #b81b23; --blue: #1d4fc4; --green: #187a43; --ok: #2fd27a; --warn: #f5b942;
+  --radius: 14px;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+  font: 14px/1.45 "Segoe UI", "Segoe UI Variable", system-ui, -apple-system, Roboto, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased; user-select: none; overflow: hidden; }
+button, input { font: inherit; color: inherit; }
+.app { display: grid; grid-template-columns: 200px 1fr; height: 100vh; }
+
+/* sidebar */
+.side { background: var(--side); border-right: 1px solid var(--line); display: flex; flex-direction: column; padding: 18px 12px; }
+.brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px 22px; }
+.mark { width: 42px; height: 42px; border-radius: 11px; display: grid; place-items: center;
+  background: linear-gradient(135deg, var(--red), #7d0f15); font-weight: 900; font-style: italic;
+  letter-spacing: -1px; font-size: 17px; box-shadow: 0 6px 18px rgba(227,38,47,.35); }
+.brand b { display: block; font-size: 15px; letter-spacing: .2px; }
+.brand span { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1.4px; }
+.nav { display: flex; flex-direction: column; gap: 4px; }
+.nav button { all: unset; cursor: pointer; display: flex; align-items: center; gap: 12px; padding: 10px 12px;
+  border-radius: 10px; color: #c9c9d1; position: relative; }
+.nav button:hover { background: #17171c; color: var(--text); }
+.nav button.on { background: #222228; color: var(--text); font-weight: 600; }
+.nav button.on::before { content: ""; position: absolute; left: -12px; top: 9px; bottom: 9px; width: 3px; border-radius: 3px; background: var(--red); }
+.nav svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.nav .badge { margin-left: auto; width: 8px; height: 8px; border-radius: 50%; background: var(--red); }
+.grow { flex: 1; }
+
+/* main */
+.main { position: relative; overflow: auto; }
+.page { display: none; padding: 32px 40px 40px; min-height: 100%; }
+.page.on { display: block; }
+h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spacing: -.5px; }
+.sub { color: var(--muted); margin: 6px 0 24px; font-size: 15px; }
+.head { display: flex; align-items: flex-start; gap: 16px; }
+.head .grow { min-width: 0; }
+.pill { display: inline-flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 999px;
+  background: #15151a; border: 1px solid var(--line); color: #d7d7de; font-size: 13px; white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: none; }
+.dot.warn { background: var(--warn); } .dot.err { background: var(--red); } .dot.busy { background: #5aa2ff; animation: pulse 1s infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+
+.btn { all: unset; box-sizing: border-box; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+  padding: 11px 18px; border-radius: 11px; background: #23232a; border: 1px solid #2c2c34; font-weight: 600; text-align: center; }
+.btn:hover { background: #2a2a32; }
+.btn.red { background: linear-gradient(180deg, #ec3039, var(--red2)); border-color: #f0434b; box-shadow: 0 8px 22px rgba(227,38,47,.28); }
+.btn.red:hover { filter: brightness(1.08); }
+.btn.big { font-size: 19px; padding: 16px 34px; border-radius: 12px; min-width: 250px; }
+.btn.ghost { background: transparent; }
+.btn[disabled] { opacity: .38; cursor: default; filter: none; box-shadow: none; pointer-events: none; }
+.btn svg { width: 16px; height: 16px; fill: currentColor; }
+
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; }
+.label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1.3px; font-weight: 600; }
+.muted { color: var(--muted); } .faint { color: var(--faint); }
+.mono { font-family: "Cascadia Mono", Consolas, "SF Mono", monospace; }
+
+/* play hero */
+#page-play { padding: 0; }
+.hero { position: relative; display: flex; flex-direction: column; padding: 56px 56px 32px; min-height: 100vh;
+  background:
+    radial-gradient(900px 480px at 85% 20%, rgba(70,48,140,.55), transparent 70%),
+    radial-gradient(700px 400px at 10% 90%, rgba(227,38,47,.18), transparent 70%),
+    repeating-linear-gradient(90deg, transparent 0 118px, rgba(255,255,255,.035) 118px 120px),
+    linear-gradient(180deg, #121120, #0b0b0e);
+  overflow: hidden; }
+.hero::after { content: ""; position: absolute; right: -80px; top: 40px; width: 520px; height: 520px; border-radius: 50%;
+  border: 2px solid rgba(255,255,255,.05); box-shadow: inset 0 0 0 60px rgba(255,255,255,.015); }
+.hero .user { position: absolute; top: 22px; right: 26px; }
+.logo { position: relative; z-index: 1; margin: auto 0 34px; padding-top: 40px; }
+.logo .nsr { font-size: 120px; line-height: .9; font-weight: 900; font-style: italic; letter-spacing: -6px;
+  background: linear-gradient(180deg, #ffffff 30%, #c9c9d6); -webkit-background-clip: text; background-clip: text; color: transparent;
+  filter: drop-shadow(0 6px 0 rgba(227,38,47,.9)) drop-shadow(0 18px 30px rgba(0,0,0,.6)); }
+.logo .np { display: inline-block; margin-top: 10px; padding: 5px 16px 5px 14px; background: var(--red); transform: skewX(-12deg);
+  font-weight: 900; letter-spacing: 6px; font-size: 20px; }
+.logo .np span { display: inline-block; transform: skewX(12deg); }
+.logo .tagline { margin-top: 16px; color: #c4c4d0; font-size: 15px; max-width: 520px; }
+.cta { position: relative; z-index: 1; display: flex; gap: 12px; align-items: center; }
+.status { margin: 14px 0 48px; display: flex; gap: 8px; align-items: center; font-weight: 600; font-size: 13px; position: relative; z-index: 1; }
+.tiles { position: relative; z-index: 1; display: grid; grid-template-columns: repeat(3, 1fr); margin-top: auto; background: rgba(21,21,26,.92);
+  border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+.tile { all: unset; cursor: pointer; padding: 16px 20px; border-right: 1px solid var(--line); display: flex; align-items: center; gap: 12px; }
+.tile:last-child { border-right: 0; }
+.tile:hover { background: #1b1b21; }
+.tile b { display: block; font-size: 15px; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile .grow { min-width: 0; }
+.chev { color: var(--muted); font-size: 18px; }
+
+/* host / join */
+.grid { display: grid; grid-template-columns: 1fr 300px; gap: 20px; align-items: start; }
+.modes { display: grid; grid-template-columns: 1.4fr 1fr; grid-template-rows: 1fr 1fr; gap: 14px; height: 340px; }
+.mode { position: relative; border-radius: var(--radius); padding: 22px; display: flex; flex-direction: column; justify-content: flex-end;
+  border: 1px solid rgba(255,255,255,.07); overflow: hidden; cursor: pointer; }
+.mode.red { grid-row: span 2; background: linear-gradient(160deg, #8e1219 0%, #3c0b10 55%, #15151a 100%); }
+.mode.blue { background: linear-gradient(160deg, #1b3f9c 0%, #121a35 70%, #15151a 100%); }
+.mode.green { background: linear-gradient(160deg, #13693a 0%, #0f2a1c 70%, #15151a 100%); }
+.mode.sel { outline: 2px solid var(--red); outline-offset: -2px; }
+.mode h2 { margin: 0; font-size: 26px; font-weight: 800; letter-spacing: -.3px; }
+.mode p { margin: 4px 0 0; color: #d0d0da; font-size: 13px; }
+.mode .corner { position: absolute; top: 14px; right: 14px; }
+.code { font-size: 56px; font-weight: 900; letter-spacing: 2px; line-height: 1; margin: 6px 0 10px; font-family: "Segoe UI", system-ui, sans-serif; }
+.code.empty { color: rgba(255,255,255,.28); }
+.row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.seg { display: inline-flex; background: #121216; border: 1px solid var(--line); border-radius: 11px; padding: 4px; }
+.seg button { all: unset; cursor: pointer; padding: 8px 14px; border-radius: 8px; color: #c4c4cc; font-weight: 600; min-width: 14px; text-align: center; }
+.seg button.on { background: #2a2a31; color: var(--text); }
+.info { margin-top: 14px; color: #c9c9d3; white-space: pre-line; min-height: 20px; }
+.players h3 { margin: 0; font-size: 17px; }
+.players .ph { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 10px; }
+.players ol { list-style: none; margin: 0; padding: 0; }
+.players li { display: flex; align-items: center; gap: 12px; padding: 11px 4px; border-top: 1px solid var(--line); }
+.players li .n { width: 18px; color: var(--muted); font-weight: 700; text-align: center; }
+.av { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; font-weight: 800; font-size: 14px; flex: none; }
+.players li.wait .av { background: transparent; border: 1px dashed #34343c; }
+.players li .who { flex: 1; min-width: 0; }
+.players li .who b { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.players li .who span { font-size: 12px; color: var(--muted); }
+.tag { font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 6px; background: #26262d; color: #d7d7de; }
+.tag.host { background: rgba(227,38,47,.18); color: #ff8a8f; }
+.field { width: 100%; background: #0e0e12; border: 1px solid #2a2a32; border-radius: 12px; padding: 14px 16px; outline: none; user-select: text; }
+.field:focus { border-color: var(--red); }
+.field.code-in { font-size: 34px; font-weight: 800; letter-spacing: 3px; text-transform: uppercase; padding: 16px 18px; }
+
+/* controllers */
+.cgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start; }
+.devbox { display: flex; gap: 16px; align-items: center; margin: 12px 0 16px; }
+.pad { width: 64px; height: 64px; border-radius: 16px; background: linear-gradient(135deg, #24242c, #16161b); border: 1px solid #2c2c34; display: grid; place-items: center; }
+.pad svg { width: 38px; height: 38px; stroke: #e9e9ef; fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.devbox b { font-size: 20px; display: block; }
+.binds { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px 14px; margin-top: 8px; }
+.bind { display: flex; justify-content: space-between; gap: 10px; padding: 7px 10px; background: #111115; border-radius: 8px; font-size: 13px; }
+.bind span:last-child { color: #d9d9e2; font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bind.none span:last-child { color: var(--faint); }
+.note { font-size: 13px; color: var(--muted); margin-top: 12px; }
+.path { font-size: 12px; color: var(--faint); word-break: break-all; margin-top: 6px; user-select: text; }
+
+/* settings */
+.sgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start; }
+.toggle { display: flex; gap: 14px; align-items: flex-start; cursor: pointer; }
+.switch { width: 44px; height: 26px; border-radius: 13px; background: #2c2c34; position: relative; flex: none; transition: background .15s; }
+.switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%; background: #fff; transition: left .15s; }
+.toggle.on .switch { background: var(--red); } .toggle.on .switch::after { left: 21px; }
+.bar { height: 8px; border-radius: 4px; background: #24242b; overflow: hidden; margin-top: 12px; }
+.bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--red), #ff6a5c); transition: width .2s; }
+.fp { font-size: 22px; font-weight: 800; letter-spacing: 1px; margin: 4px 0 2px; }
+.help ol { padding-left: 20px; margin: 0; } .help li { margin: 0 0 10px; color: #d2d2db; }
+.help h3 { margin: 0 0 10px; font-size: 16px; }
+
+.toast { position: fixed; right: 22px; bottom: 22px; max-width: 420px; padding: 14px 18px; border-radius: 12px; background: #1d1d23;
+  border: 1px solid #2d2d35; box-shadow: 0 16px 40px rgba(0,0,0,.5); opacity: 0; transform: translateY(10px); transition: all .2s; pointer-events: none; white-space: pre-line; }
+.toast.show { opacity: 1; transform: none; pointer-events: auto; }
+.toast.error { border-color: rgba(227,38,47,.6); }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand"><div class="mark">NSR</div><div><b>NSR Netplay</b><span>Rollback</span></div></div>
+    <nav class="nav" id="nav">
+      <button data-page="play" class="on"><svg viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg>Play</button>
+      <button data-page="host"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="2.5"/><path d="M7.8 7.8a6 6 0 0 0 0 8.4M16.2 7.8a6 6 0 0 1 0 8.4M4.9 4.9a10 10 0 0 0 0 14.2M19.1 4.9a10 10 0 0 1 0 14.2"/></svg>Host</button>
+      <button data-page="join"><svg viewBox="0 0 24 24"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4M10 16l4-4-4-4M14 12H3"/></svg>Join</button>
+      <button data-page="controllers"><svg viewBox="0 0 24 24"><path d="M7 8h10a5 5 0 0 1 4.6 7l-.6 1.4a2.4 2.4 0 0 1-4 .5L15.5 15h-7L7 16.9a2.4 2.4 0 0 1-4-.5L2.4 15A5 5 0 0 1 7 8z"/><path d="M7.5 10.5v3M6 12h3M15.5 11.2h.01M17.5 13h.01"/></svg>Controllers<i class="badge" id="ctlBadge" hidden></i></button>
+    </nav>
+    <div class="grow"></div>
+    <nav class="nav">
+      <button data-page="settings"><svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>Settings<i class="badge" id="gameBadge" hidden></i></button>
+      <button data-page="help"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.6 2.6 0 1 1 3.6 2.4c-.7.3-1.1.9-1.1 1.6v.5M12 17h.01"/></svg>Help</button>
+    </nav>
+  </aside>
+
+  <main class="main">
+    <!-- PLAY -->
+    <section class="page on" id="page-play">
+      <div class="hero">
+        <div class="user pill"><span class="dot" id="userDot"></span><span id="userName">Player</span><span class="faint">· Port 1</span></div>
+        <div class="logo">
+          <div class="nsr">NSR</div>
+          <div class="np"><span>NETPLAY</span></div>
+          <div class="tagline">Play NFL Street Reborn online with friends: 2 to 4 players, rollback netcode, room codes. Your Reborn install is never changed.</div>
+        </div>
+        <div class="cta">
+          <button class="btn red big" id="playHost"><svg viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg>Host a game</button>
+          <button class="btn big" id="playJoin" style="min-width:190px">Join with a code</button>
+        </div>
+        <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Checking…</span></div>
+        <div class="tiles">
+          <button class="tile" data-go="controllers"><div class="grow"><div class="label">Controllers</div><b id="tileCtl">…</b></div><span class="chev">›</span></button>
+          <button class="tile" data-go="settings"><div class="grow"><div class="label">Game copy</div><b id="tileGame">…</b></div><span class="chev">›</span></button>
+          <button class="tile" id="tilePractice"><div class="grow"><div class="label">Practice</div><b>Play offline</b></div><span class="chev">›</span></button>
+        </div>
+      </div>
+    </section>
+
+    <!-- HOST -->
+    <section class="page" id="page-host">
+      <div class="head"><div class="grow"><h1>Host</h1><div class="sub">Make a room, send your friends the code, start when everyone's in.</div></div>
+        <span class="pill"><span class="dot" id="roomsDot"></span><span id="roomsText">Room codes on</span></span></div>
+      <div class="grid">
+        <div>
+          <div class="modes">
+            <div class="mode red sel" id="modeRoom">
+              <span class="corner pill" id="hostCount"><span class="dot"></span><span>0 joined</span></span>
+              <div class="label" style="color:#ffb3b6">Room code</div>
+              <div class="code empty" id="roomCode">NSR-·····</div>
+              <h2 id="roomTitle">Create a room</h2>
+              <p id="roomHint">No router setup needed. Up to 4 players.</p>
+              <div class="row" style="margin-top:16px">
+                <button class="btn red" id="btnOpen">Create room</button>
+                <button class="btn" id="btnCopy" hidden>Copy code</button>
+                <button class="btn ghost" id="btnClose" hidden>Close room</button>
+              </div>
+            </div>
+            <div class="mode blue" id="modeIp"><h2>Host by IP</h2><p>Advanced: friends type your address. Needs port 51515 forwarded for internet play.</p></div>
+            <div class="mode green" id="modePractice"><h2>Practice</h2><p>Same setup on this PC only, no network.</p></div>
+          </div>
+          <div class="row" style="margin-top:18px">
+            <div><div class="label" style="margin-bottom:6px">Input delay (frames, for everyone)</div><div class="seg" id="delaySeg"></div></div>
+            <div class="grow"></div>
+            <button class="btn red big" id="btnStart" disabled>Start game</button>
+          </div>
+          <div class="note">1 suits most games; try 2 if it stutters. The host's choice applies to everyone.</div>
+          <div class="info" id="hostInfo"></div>
+        </div>
+        <div class="card players"><div class="ph"><h3>Players</h3><span class="faint" id="hostSlots">0 / 4</span></div><ol id="hostPlayers"></ol></div>
+      </div>
+    </section>
+
+    <!-- JOIN -->
+    <section class="page" id="page-join">
+      <div class="head"><div class="grow"><h1>Join</h1><div class="sub">Type the code your host sent you. The game starts by itself when they click Start.</div></div></div>
+      <div class="grid">
+        <div class="card" style="padding:26px">
+          <div class="label" style="margin-bottom:8px">Room code (or host IP address)</div>
+          <input class="field code-in" id="joinCode" placeholder="NSR-XXXXX" maxlength="64" spellcheck="false" autocomplete="off">
+          <div class="row" style="margin-top:16px">
+            <button class="btn red big" id="btnJoin">Join room</button>
+            <button class="btn" id="btnLeave" disabled>Leave</button>
+          </div>
+          <div class="info" id="joinInfo"></div>
+        </div>
+        <div class="card players"><div class="ph"><h3>Players</h3><span class="faint" id="joinSlots">–</span></div><ol id="joinPlayers"></ol></div>
+      </div>
+    </section>
+
+    <!-- CONTROLLERS -->
+    <section class="page" id="page-controllers">
+      <div class="head"><div class="grow"><h1>Controllers</h1><div class="sub">Your controller is always Port 1. NSR Netplay uses the setup from NFL Street Reborn's Controllers page.</div></div>
+        <span class="pill"><span class="dot" id="ctlDot"></span><span id="ctlState">Checking…</span></span></div>
+      <div class="cgrid">
+        <div class="card">
+          <div class="label">Port 1 · your controller</div>
+          <div class="devbox"><div class="pad"><svg viewBox="0 0 24 24"><path d="M7 8h10a5 5 0 0 1 4.6 7l-.6 1.4a2.4 2.4 0 0 1-4 .5L15.5 15h-7L7 16.9a2.4 2.4 0 0 1-4-.5L2.4 15A5 5 0 0 1 7 8z"/><path d="M7.5 10.5v3M6 12h3M15.5 11.2h.01M17.5 13h.01"/></svg></div>
+            <div><b id="ctlFamily">…</b><div class="muted mono" id="ctlDevice"></div></div></div>
+          <div class="row">
+            <button class="btn red" id="btnImport">Use my Reborn controller settings</button>
+            <button class="btn" id="btnSetup">Set up controllers…</button>
+          </div>
+          <div class="note" id="ctlMessage"></div>
+          <div class="path" id="ctlSource"></div>
+        </div>
+        <div class="card"><div class="label">Port 1 buttons</div><div class="binds" id="binds"></div>
+          <div class="note">Change these in Reborn's Controllers page, then click “Use my Reborn controller settings”. Or use “Set up controllers…” to map them in NSR Netplay's own Dolphin; that mapping is then kept until you re-import.</div></div>
+      </div>
+    </section>
+
+    <!-- SETTINGS -->
+    <section class="page" id="page-settings">
+      <div class="head"><div class="grow"><h1>Settings</h1><div class="sub">Your name, your game copy and what gets shared.</div></div></div>
+      <div class="sgrid">
+        <div class="card">
+          <div class="label" style="margin-bottom:8px">Your name</div>
+          <input class="field" id="nameIn" maxlength="24" spellcheck="false" autocomplete="off">
+          <div class="note">Shown to the other players in the room.</div>
+          <div style="height:22px"></div>
+          <div class="toggle" id="telemetry"><div class="switch"></div><div><b>Send lag/rollback stats to Mason's server</b>
+            <div class="note" style="margin-top:4px">Connection and rollback counters, your name and the room code, to help fix netplay. Never your button presses, files, or game data. Off: nothing is sent or kept.</div></div></div>
+        </div>
+        <div class="card">
+          <div class="label">Game copy</div>
+          <div class="fp mono" id="gameFp">–</div>
+          <div class="info" id="gameText" style="margin-top:6px"></div>
+          <div class="bar" id="gameBar" hidden><i id="gameProg"></i></div>
+          <div class="row" style="margin-top:16px">
+            <button class="btn red" id="btnFind">Find Reborn automatically</button>
+            <button class="btn" id="btnBrowse">Browse for NSR.iso…</button>
+          </div>
+          <div class="note">Everyone you play with must have the same fingerprint.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- HELP -->
+    <section class="page" id="page-help">
+      <div class="head"><div class="grow"><h1>Help</h1><div class="sub">Getting a game going, and what to do when it doesn't.</div></div></div>
+      <div class="sgrid help">
+        <div class="card"><h3>Playing</h3><ol>
+          <li>Settings: type your name. The game copy is built once from your Reborn install (about a minute).</li>
+          <li>Controllers: your Reborn controller setup is used automatically. Port 1 is you.</li>
+          <li>Host: Create room, send friends the NSR-XXXXX code, Start when everyone is listed.</li>
+          <li>Join: type the code, click Join, wait for the host to start.</li>
+        </ol></div>
+        <div class="card"><h3>If something's wrong</h3><ol>
+          <li>Windows Firewall asks about Dolphin the first time: tick Private (and Public) networks and allow it.</li>
+          <li>“Fingerprints differ”: everyone needs the same download and the same Reborn version.</li>
+          <li>Controller not responding: plug it in before starting, then Controllers → Use my Reborn controller settings.</li>
+          <li>Send Mason the nsr-p*.log files from this folder if he asks.</li>
+        </ol><div class="path" id="folderPath"></div></div>
+      </div>
+    </section>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const S = { snap: null, rev: -1, page: "play", started: false, noticeId: 0, delaySet: false };
+const AVATAR = ["#e3262f", "#1d4fc4", "#187a43", "#b8860b"];
+
+function api() { return window.pywebview && window.pywebview.api; }
+async function call(name, ...args) {
+  try { return await api()[name](...args); }
+  catch (e) { toast(String(e && e.message || e), "error"); }
+}
+function setText(id, text) { const el = $(id); if (el && el.textContent !== text) el.textContent = text; }
+function show(id, on) { $(id).hidden = !on; }
+function enable(id, on) { $(id).disabled = !on; }
+function setValue(id, v) { const el = $(id); if (document.activeElement !== el && el.value !== v) el.value = v; }
+
+let toastTimer = 0;
+function toast(text, kind) {
+  const t = $("toast"); t.textContent = text; t.className = "toast show " + (kind || "");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.className = "toast", 6000);
+}
+
+function go(page) {
+  S.page = page;
+  document.querySelectorAll(".nav button").forEach(b => b.classList.toggle("on", b.dataset.page === page));
+  document.querySelectorAll(".page").forEach(p => p.classList.toggle("on", p.id === "page-" + page));
+  if (page === "controllers") call("refresh_controllers");
+}
+
+function renderPlayers(listId, slotsId, players, max) {
+  const ol = $(listId); ol.textContent = "";
+  for (let i = 0; i < max; i++) {
+    const li = document.createElement("li"), n = document.createElement("span"), av = document.createElement("span");
+    const who = document.createElement("div"), b = document.createElement("b"), sub = document.createElement("span");
+    n.className = "n"; n.textContent = String(i + 1); av.className = "av"; who.className = "who";
+    if (i < players.length) {
+      av.style.background = AVATAR[i]; av.textContent = (players[i] || "?").trim().charAt(0).toUpperCase() || "?";
+      b.textContent = players[i]; sub.textContent = i === 0 ? "Host" : "Player " + (i + 1);
+    } else { li.className = "wait"; b.textContent = "Open slot"; b.className = "faint"; sub.textContent = "Waiting…"; }
+    who.append(b, sub); li.append(n, av, who);
+    if (i === 0 && players.length) { const t = document.createElement("span"); t.className = "tag host"; t.textContent = "HOST"; li.append(t); }
+    ol.append(li);
+  }
+  setText(slotsId, players.length ? players.length + " / " + max : "–");
+}
+
+function statusOf(s) {
+  const g = s.game;
+  if (g.state === "ready") return ["", "Ready to play"];
+  if (g.state === "building" || g.state === "checking") return ["busy", g.text || "Working…"];
+  if (g.state === "stale" || g.state === "missing") return ["warn", "Set up your game copy in Settings"];
+  return ["err", g.text || "Game copy problem"];
+}
+
+function render(s) {
+  const g = s.game, h = s.host, j = s.join, c = s.controllers;
+  // header bits
+  setText("userName", s.name || "Player");
+  const [lvl, text] = statusOf(s);
+  $("statusDot").className = "dot " + lvl; $("userDot").className = "dot " + lvl;
+  setText("statusText", text);
+  setText("tileCtl", c.port1 && c.port1.mapped ? c.port1.family : "Set up a controller");
+  setText("tileGame", g.fingerprint ? g.fingerprint : (g.state === "ready" ? "Ready" : "Not set up"));
+  show("gameBadge", g.state !== "ready" && g.state !== "checking");
+  show("ctlBadge", !(c.port1 && c.port1.mapped));
+
+  // host
+  $("roomsDot").className = "dot " + (s.rooms ? "" : "warn");
+  setText("roomsText", s.rooms ? "Room codes on" : "Room codes off in this download");
+  const open = h.state === "open" || h.state === "starting";
+  const roomCode = h.mode === "room" ? h.code : (h.mode === "ip" ? "BY IP" : "");
+  setText("roomCode", roomCode || "NSR-·····"); $("roomCode").classList.toggle("empty", !roomCode);
+  setText("roomTitle", open ? (h.mode === "ip" ? "Lobby open (by IP)" : "Room open") : h.state === "opening" ? "Creating…" : "Create a room");
+  setText("roomHint", open ? "Send the code, then Start when everyone's listed." : "No router setup needed. Up to 4 players.");
+  show("btnOpen", !open); enable("btnOpen", s.rooms && h.state === "idle");
+  show("btnCopy", open && h.mode === "room"); show("btnClose", open);
+  enable("btnStart", h.can_start && h.state === "open");
+  setText("btnStart", h.state === "starting" ? "Starting…" : "Start game");
+  $("hostCount").lastChild.textContent = Math.max(0, h.players.length - 1) + " joined";
+  setText("hostInfo", h.info || "");
+  renderPlayers("hostPlayers", "hostSlots", h.players, 4);
+  const seg = $("delaySeg");
+  if (!seg.children.length) for (let d = 0; d <= s.max_delay; d++) {
+    const b = document.createElement("button"); b.textContent = String(d); b.dataset.d = d;
+    b.onclick = () => { S.delay = d; call("set_delay", d); renderDelay(d); }; seg.append(b);
+  }
+  renderDelay(S.delay != null ? S.delay : s.delay);
+
+  // join
+  setValue("joinCode", S.joinTyped ? $("joinCode").value : (s.last_host || ""));
+  const waiting = j.state === "waiting";
+  enable("btnJoin", !waiting); enable("btnLeave", waiting); $("joinCode").disabled = waiting;
+  setText("btnJoin", waiting ? "Waiting for host…" : "Join room");
+  setText("joinInfo", j.info || "");
+  renderPlayers("joinPlayers", "joinSlots", j.players, 4);
+
+  // controllers
+  const p1 = c.port1 || { bindings: [] };
+  const ok = c.state === "synced" || c.state === "yours";
+  $("ctlDot").className = "dot " + (c.state === "checking" ? "busy" : ok && p1.mapped ? "" : "warn");
+  setText("ctlState", { synced: "Synced with Reborn", yours: "Your own mapping", "no-reborn": "Reborn settings not found",
+    error: "Problem", checking: "Checking…" }[c.state] || c.state);
+  setText("ctlFamily", p1.mapped ? p1.family : "No controller mapped");
+  setText("ctlDevice", p1.device || "");
+  setText("ctlMessage", c.message || "");
+  setText("ctlSource", c.source ? "From: " + c.source : "");
+  const binds = $("binds"), sig = JSON.stringify(p1.bindings);
+  if (binds.dataset.sig !== sig) {
+    binds.dataset.sig = sig; binds.textContent = "";
+    for (const bd of p1.bindings) {
+      const row = document.createElement("div"), a = document.createElement("span"), v = document.createElement("span");
+      row.className = "bind" + (bd.input ? "" : " none"); a.textContent = bd.control; v.textContent = bd.input || "—";
+      row.append(a, v); binds.append(row);
+    }
+  }
+
+  // settings
+  setValue("nameIn", s.name || "");
+  $("telemetry").classList.toggle("on", !!s.telemetry);
+  setText("gameFp", g.fingerprint || "–");
+  setText("gameText", (g.text || "") + (g.note ? "\n" + g.note : ""));
+  show("gameBar", g.progress != null); $("gameProg").style.width = (g.progress || 0) + "%";
+  enable("btnFind", !g.busy); enable("btnBrowse", !g.busy);
+  setText("folderPath", "This folder: " + (s.folder || ""));
+
+  if (s.notice && s.notice.id !== S.noticeId) { S.noticeId = s.notice.id; toast(s.notice.text, s.notice.kind); }
+}
+function renderDelay(d) { document.querySelectorAll("#delaySeg button").forEach(b => b.classList.toggle("on", +b.dataset.d === +d)); }
+
+async function poll() {
+  try {
+    const s = await api().snapshot(S.rev);
+    if (s) { S.snap = s; S.rev = s.rev; render(s); }
+  } catch (e) { /* window closing */ }
+  setTimeout(poll, 250);
+}
+
+function wire() {
+  document.querySelectorAll(".nav button").forEach(b => b.onclick = () => go(b.dataset.page));
+  document.querySelectorAll("[data-go]").forEach(b => b.onclick = () => go(b.dataset.go));
+  $("playHost").onclick = () => go("host");
+  $("playJoin").onclick = () => { go("join"); $("joinCode").focus(); };
+  $("tilePractice").onclick = $("modePractice").onclick = () => call("play_offline");
+  $("modeIp").onclick = () => call("host_ip");
+  $("btnOpen").onclick = (e) => { e.stopPropagation(); call("host_room"); };
+  $("btnCopy").onclick = (e) => { e.stopPropagation(); if (S.snap) { call("copy_text", S.snap.host.code); toast("Copied " + S.snap.host.code); } };
+  $("btnClose").onclick = (e) => { e.stopPropagation(); call("close_room"); };
+  $("btnStart").onclick = () => call("start_game", S.delay != null ? S.delay : S.snap.delay);
+  $("joinCode").oninput = () => { S.joinTyped = true; };
+  $("joinCode").onkeydown = (e) => { if (e.key === "Enter") $("btnJoin").click(); };
+  $("btnJoin").onclick = () => call("join", $("joinCode").value.trim());
+  $("btnLeave").onclick = () => call("leave");
+  $("btnImport").onclick = () => call("import_controllers");
+  $("btnSetup").onclick = () => call("setup_controllers");
+  $("nameIn").onchange = () => call("set_name", $("nameIn").value.trim());
+  $("telemetry").onclick = () => call("set_telemetry", !(S.snap && S.snap.telemetry));
+  $("btnFind").onclick = () => call("find_game");
+  $("btnBrowse").onclick = () => call("browse_iso");
+  document.addEventListener("contextmenu", (e) => { if (!(e.target instanceof HTMLInputElement)) e.preventDefault(); });
+}
+
+async function start() {
+  if (S.started || !api()) return;
+  S.started = true;
+  wire();
+  const s = await api().snapshot(-1);
+  if (s) { S.snap = s; S.rev = s.rev; render(s); }
+  if (S.demoPage) go(S.demoPage);
+  setTimeout(poll, 250);
+  call("ui_ready", { pages: document.querySelectorAll(".page").length,
+                     nav: document.querySelectorAll(".nav button").length, rendered: !!s });
+}
+
+// --- demo mode (design/screenshots only; see header comment) ---
+function demoApi(page) {
+  const names = { host: ["Mason", "Tuna", "wolfspeedy"], join: ["Marcus", "Mason"] };
+  const base = { rev: 1, name: "Mason", telemetry: true, delay: 1, max_delay: 4, last_host: "", rooms: true,
+    folder: "C:\\Users\\mason\\Desktop\\NFLStreet-Rollback",
+    game: { state: "ready", text: "Ready for rollback netplay.", fingerprint: "7F3A-29C4", note: "", progress: null, busy: false },
+    host: { state: "idle", mode: "", code: "", info: "", players: [], can_start: false },
+    join: { state: "idle", info: "", players: [] },
+    controllers: { state: "synced", message: "Using your Reborn controller settings.",
+      source: "C:\\Games\\NFL Street Reborn\\runtime\\User\\Config\\GCPadNew.ini",
+      port1: { mapped: true, family: "PlayStation 4 controller", device: "DInput/0/Wireless Controller",
+        bindings: [["A","Button 1"],["B","Button 0"],["X","Button 2"],["Y","Button 3"],["Z","Button 5"],["Start","Button 9"],
+          ["L","Button 6"],["R","Button 7"],["Stick up","Axis Y-"],["Stick down","Axis Y+"],["Stick left","Axis X-"],["Stick right","Axis X+"],
+          ["C up","Axis Zr-"],["C down","Axis Zr+"],["C left","Axis Z-"],["C right","Axis Z+"],["D-pad up","Hat 0 N"],["D-pad down","Hat 0 S"],
+          ["D-pad left","Hat 0 W"],["D-pad right","Hat 0 E"]].map(([control, input]) => ({ control, input })) } },
+    notice: null };
+  if (page === "host") Object.assign(base.host, { state: "open", mode: "room", code: "NSR-4K7QX", players: names.host, can_start: true,
+    info: "Room open. Give your friends this code; click Start when everyone's listed." });
+  if (page === "join") base.last_host = "NSR-4K7QX";
+  if (page === "join") Object.assign(base.join, { state: "waiting", players: names.join, info: "Joined NSR-4K7QX… waiting for the host to start." });
+  if (page === "settings") Object.assign(base.game, { state: "building", text: "Building the netplay copy…", fingerprint: "", progress: 62, busy: true });
+  return new Proxy({ snapshot: async (since) => since === base.rev ? null : base }, { get: (t, k) => t[k] || (async () => null) });
+}
+const demo = new URLSearchParams(location.search).get("demo");
+if (demo && !window.pywebview) { S.demoPage = demo; window.pywebview = { api: demoApi(demo) }; }
+// pywebview attaches the api methods, then fires pywebviewready (possibly
+// before this script ran, hence the snapshot check).
+window.addEventListener("pywebviewready", start);
+if (api() && typeof api().snapshot === "function") start();
+</script>
+</body>
+</html>
