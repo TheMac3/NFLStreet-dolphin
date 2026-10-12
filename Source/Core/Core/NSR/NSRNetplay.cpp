@@ -1241,6 +1241,10 @@ struct RollbackConfig
   // NSR_RB_DIGEST=semantic: exchange only the nine semantic words, as before
   // the canonical state digest (diagnostics: shows what the old check misses).
   bool digest_semantic_only = false;
+  // NSR_RB_DIGEST_EVERY=n (1..60, default 1): digest and exchange only frame
+  // starts that are multiples of n (peers must agree; it is in the config
+  // fingerprint).  A slow host trades detection latency for host time.
+  u32 digest_every = 1;
   // NSR_RB_TEST_CORRUPT=frame:addr (diagnostics, one peer only): flip one byte
   // of game state at the start of `frame` (live and re-simulated alike, so a
   // rollback cannot undo it) to prove the desync check detects divergence.
@@ -1504,6 +1508,7 @@ RollbackConfig& ConfigForRollback()
   c.ac_song_frames = std::max<u32>(1, ParseU32(Env("NSR_AC_SONG_FRAMES")).value_or(10800));
   c.ac_song_gap = ParseU32(Env("NSR_AC_SONG_GAP")).value_or(380);
   c.digest_semantic_only = Env("NSR_RB_DIGEST") == "semantic";
+  c.digest_every = std::clamp<u32>(ParseU32(Env("NSR_RB_DIGEST_EVERY")).value_or(1), 1, 60);
   if (const auto parts = Split(Env("NSR_RB_TEST_CORRUPT"), ':'); parts.size() == 2)
   {
     const auto frame = ParseU32(parts[0]);
@@ -1746,6 +1751,7 @@ struct DirtyTracker
   std::vector<XXH128_hash_t> hashes;  // per state page: hash at the last sample
   std::vector<u32> hash_pages;        // state pages that hold rolled-back bytes
   alignas(64) std::array<u8, XXH3_SECRET_DEFAULT_SIZE> secret{};
+  std::optional<u64> shared_key;  // set by Rekey: the agreed seed of `secret`
   u32 audit_pages = 0, audit_next = 0;
   u64 audit_checked = 0, audit_mismatches = 0;
   int uffd = -1;
@@ -1964,6 +1970,25 @@ struct DirtyTracker
     std::fill(stamp.begin(), stamp.end(), epoch);  // nothing synced yet
     pages_seen = 0;
     return true;
+  }
+
+  // Hash mode, at a rollback epoch start: rekey with a secret every peer
+  // derives from the agreed epoch, so the per-page hashes the snapshot path
+  // computes anyway are also the canonical state digest's page values for
+  // whole restored pages (no rehash for the digest; the Windows path).  The
+  // key stays unpredictable before the epoch exists and differs per epoch;
+  // the collision argument above only needs the key not to be chosen by the
+  // memory contents.  Every page counts as written once (synced slots were
+  // just cleared by the session start anyway).
+  void Rekey(u64 seed)
+  {
+    if (mode != Mode::Hash)
+      return;
+    XXH3_generateSecret_fromSeed(secret.data(), seed);
+    shared_key = seed;
+    std::fill(hashes.begin(), hashes.end(), XXH128_hash_t{});
+    Sample();
+    std::fill(stamp.begin(), stamp.end(), epoch);
   }
 
   // Host bytes of state page p (MEM1, then the fake VMEM prefix).
@@ -4387,6 +4412,13 @@ struct StateDigest
   // (the session's ARAM observer counts both) and the window is the same.
   std::optional<std::array<u64, 6>> aram_key;
   u64 aram_hash = 0;
+  // Page values within an epoch: XXH3-128 (folded) with the secret derived
+  // from the agreed epoch seed, identical to the hash-mode dirty tracker's
+  // page hashes after DirtyTracker::Rekey, so a Windows peer reuses those
+  // while a kernel-tracker peer computes the same values itself.
+  alignas(64) std::array<u8, XXH3_SECRET_DEFAULT_SIZE> secret{};
+  std::optional<u64> secret_seed;
+  u64 reused = 0;  // page values taken from the dirty tracker
   u64 digests = 0, total_ns = 0, classify_ns = 0, rehashed = 0, direct = 0;
   u64 per_machine_ns = 0, heap_ns = 0;  // parts of classify_ns
 
@@ -4563,6 +4595,20 @@ static u64 RbAramDigest(Core::System& system, bool use_cache)
   return hash;
 }
 
+// Start an epoch's page-hash key (both the digest's and, in hash mode, the
+// dirty tracker's): call at every rollback session start, before its first
+// snapshot, with a seed all peers agree on.
+static void RbDigestEpochKey(u64 seed)
+{
+  StateDigest& sd = s_digest;
+  XXH3_generateSecret_fromSeed(sd.secret.data(), seed);
+  sd.secret_seed = seed;
+  std::fill(sd.valid.begin(), sd.valid.end(), u8{0});
+  std::fill(sd.part_valid.begin(), sd.part_valid.end(), u8{0});
+  sd.epoch.reset();
+  s_dirty.Rekey(seed);
+}
+
 // Digest of the state at the start of `frame`.  `slot` is the ring slot just
 // saved for that frame (incremental: the cache source), or null for a one-off
 // full digest of RAM (handoff barriers).  Call it after the frame's pads are
@@ -4629,20 +4675,31 @@ static u64 RbStateDigest(Core::System& system, const std::vector<u8>* slot, u64 
   const u8* cache_src = slot ? slot->data() : ram;
   const u8* vmem_src = slot ? slot->data() + r.mem1_size : r.vmem;
   const std::vector<RollbackLogic::Range>& excluded = sd.excluded;
-  std::atomic<u64> rehashed{0}, direct{0};
+  std::atomic<u64> rehashed{0}, direct{0}, reused{0};
+  const bool keyed = slot && sd.secret_seed.has_value();
+  const bool reuse_tracker = keyed && d.on && d.mode == DirtyTracker::Mode::Hash &&
+                             d.shared_key == sd.secret_seed;
   s_workers.Run(pages, PAGE_CHUNK, [&](u32 lo, u32 hi) {
     std::array<u8, PAGE> buf;
-    u64 n_rehashed = 0, n_direct = 0;
+    u64 n_rehashed = 0, n_direct = 0, n_reused = 0;
     // Hash page p's restored bytes (its segment pieces) from `base`.
+    // Epoch digests use the keyed 128-bit hash (see StateDigest::secret);
+    // one-off barrier digests the plain one (no epoch key exists yet).
+    auto hash_bytes = [&](const u8* bytes, size_t len) -> u64 {
+      if (!keyed)
+        return XXH3_64bits(bytes, len);
+      const XXH128_hash_t h = XXH3_128bits_withSecret(bytes, len, sd.secret.data(), sd.secret.size());
+      return h.low64 ^ h.high64;
+    };
     auto hash_page = [&](const u8* base, u32 p) -> u64 {
       if (p >= mem1_pages)
       {
         const u32 a = (p - mem1_pages) * PAGE;
-        return XXH3_64bits(vmem_src + a, std::min(PAGE, r.vmem_bytes - a));
+        return hash_bytes(vmem_src + a, std::min(PAGE, r.vmem_bytes - a));
       }
       const u32 c0 = d.page_first[p], c1 = d.page_first[p + 1];
       if (c1 == c0 + 1)
-        return XXH3_64bits(base + d.chunks[c0].first, d.chunks[c0].second - d.chunks[c0].first);
+        return hash_bytes(base + d.chunks[c0].first, d.chunks[c0].second - d.chunks[c0].first);
       size_t n = 0;
       for (u32 c = c0; c < c1; ++c)
       {
@@ -4650,7 +4707,7 @@ static u64 RbStateDigest(Core::System& system, const std::vector<u8>* slot, u64 
         std::memcpy(buf.data() + n, base + a, b - a);
         n += b - a;
       }
-      return XXH3_64bits(buf.data(), n);
+      return hash_bytes(buf.data(), n);
     };
     for (u32 p = lo; p < hi; ++p)
     {
@@ -4694,7 +4751,7 @@ static u64 RbStateDigest(Core::System& system, const std::vector<u8>* slot, u64 
             a = e;
           }
         }
-        sd.values[p] = XXH3_64bits(buf.data(), n);
+        sd.values[p] = hash_bytes(buf.data(), n);
         if (slot)
         {
           sd.part[p] = sd.values[p];
@@ -4709,6 +4766,16 @@ static u64 RbStateDigest(Core::System& system, const std::vector<u8>* slot, u64 
         sd.values[p] = hash_page(ram, p);
         continue;
       }
+      if (reuse_tracker && (p >= mem1_pages || (d.page_first[p + 1] == d.page_first[p] + 1 &&
+                                                d.chunks[d.page_first[p]].first == p * PAGE &&
+                                                d.chunks[d.page_first[p]].second == (p + 1) * PAGE)))
+      {
+        // A whole restored page: the tracker hashed exactly these bytes at
+        // the save's sample (the slot equals RAM there) with the same key.
+        sd.values[p] = d.hashes[p].low64 ^ d.hashes[p].high64;
+        ++n_reused;
+        continue;
+      }
       if (!sd.valid[p])
       {
         sd.page[p] = hash_page(cache_src, p);
@@ -4719,6 +4786,7 @@ static u64 RbStateDigest(Core::System& system, const std::vector<u8>* slot, u64 
     }
     rehashed.fetch_add(n_rehashed, std::memory_order_relaxed);
     direct.fetch_add(n_direct, std::memory_order_relaxed);
+    reused.fetch_add(n_reused, std::memory_order_relaxed);
   });
   if (slot)
   {
@@ -4762,6 +4830,7 @@ static u64 RbStateDigest(Core::System& system, const std::vector<u8>* slot, u64 
       std::chrono::duration_cast<std::chrono::nanoseconds>(classified - start).count();
   sd.rehashed += rehashed.load();
   sd.direct += direct.load();
+  sd.reused += reused.load();
   return digest;
 }
 
@@ -4911,8 +4980,9 @@ static RollbackNet::ConfigFingerprint LocalConfigFingerprint(Core::System& syste
     return text;
   };
   fp[ConfigField::Protocol] = (u64{RollbackNet::VERSION} << 8) | RollbackNet::HANDOFF_VERSION;
-  fp[ConfigField::StateDigest] =
-      (u64{STATE_DIGEST_RANGES_VERSION} << 8) | (c.digest_semantic_only ? 1u : 0u);
+  fp[ConfigField::StateDigest] = (u64{c.digest_every} << 16) |
+                                 (u64{STATE_DIGEST_RANGES_VERSION} << 8) |
+                                 (c.digest_semantic_only ? 1u : 0u);
   constexpr u64 TB_PER_FRAME = 40500000 / 60;  // as EnterRollbackSession
   fp[ConfigField::VtimeBase] =
       ParseU64(Env("NSR_RB_VTIME_BASE")).value_or(TB_PER_FRAME << 37) / TB_PER_FRAME * TB_PER_FRAME;
@@ -5345,8 +5415,10 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
   const bool automatic_entry = r.enter_pending && r.auto_handoff;
   if (!r.vtime_on && (fixed_entry || test_reentry || automatic_entry))
   {
+    // A failed session (e.g. a refused config) is already stopping: don't
+    // retry the barrier every frame until the core stops.
     if (!automatic_entry ||
-        HandoffBarrier(guard, RollbackNet::HandoffKind::EnterRollback, t))
+        (!s_session.failed && HandoffBarrier(guard, RollbackNet::HandoffKind::EnterRollback, t)))
     {
       EnterRollbackSession(guard, t);
     }
@@ -5604,9 +5676,10 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     if (r.net_enabled && s_rb_exchange)
     {
       // Same point as the live unit's digest: snapshot saved, pads written.
-      s_rb_exchange->SetStateChecksum(
-          r.cursor, RbStateDigest(system, &r.ring[r.cursor % slots], RbSemanticChecksum(guard),
-                                  r.cursor));
+      if (r.cursor % r.config.digest_every == 0)
+        s_rb_exchange->SetStateChecksum(
+            r.cursor, RbStateDigest(system, &r.ring[r.cursor % slots],
+                                    RbSemanticChecksum(guard), r.cursor));
       s_rb_exchange->UpdateFinalized();
     }
     RbDumpUnit(system, ram, r.live, r.cursor);
@@ -5719,8 +5792,9 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     // The digest describes exactly what a re-simulation of t starts from:
     // the final snapshot of t (after the session-start model) with t's pads
     // written (the pad buffer itself is excluded).
-    s_rb_exchange->SetStateChecksum(
-        t, RbStateDigest(system, &r.ring[t % slots], RbSemanticChecksum(guard), t));
+    if (t % r.config.digest_every == 0)
+      s_rb_exchange->SetStateChecksum(
+          t, RbStateDigest(system, &r.ring[t % slots], RbSemanticChecksum(guard), t));
     s_rb_exchange->UpdateFinalized();
   }
   r.in_unit = true;
@@ -5757,12 +5831,14 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     if (s_digest.digests)
       Log("state digest: {} digests, {:.1f} us/digest (classify {:.1f} us: per-machine {:.1f}, "
           "heaps {:.1f}), {:.1f} pages "
-          "rehashed/digest, {:.1f} partly excluded pages/digest, {} excluded ranges",
+          "rehashed/digest, {:.1f} partly excluded pages/digest, {:.1f} tracker hashes reused/"
+          "digest, {} excluded ranges",
           s_digest.digests, s_digest.total_ns / 1e3 / s_digest.digests,
           s_digest.classify_ns / 1e3 / s_digest.digests,
           s_digest.per_machine_ns / 1e3 / s_digest.digests, s_digest.heap_ns / 1e3 / s_digest.digests,
           static_cast<double>(s_digest.rehashed) / s_digest.digests,
-          static_cast<double>(s_digest.direct) / s_digest.digests, s_digest.excluded.size());
+          static_cast<double>(s_digest.direct) / s_digest.digests,
+          static_cast<double>(s_digest.reused) / s_digest.digests, s_digest.excluded.size());
     Log("tick {}: rollbacks {}, re-simulated {}, mismatched checks {}/{}; audio gate: "
         "recorded {}, replayed {}, mismatched {}; load barriers {} (clamped {}, in re-sim {}); "
         "io-idle skips {}; mispredictions {} (uncorrectable {}); net stalls {} sync waits {}",
@@ -7657,6 +7733,12 @@ void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
     std::fill(slot.begin(), slot.end(), 0);
   RollbackLogic::ClearSessionSlotMetadata(&s_dirty.synced, &s_slot_seq);
   s_digest.Invalidate();  // the state digest cache describes the cleared slots
+  if (s_rb_exchange)
+  {
+    // The epoch's page-hash key (digest and hash-mode tracker), from values
+    // every peer agreed: the epoch's session id and config digest.
+    RbDigestEpochKey((u64{s_rb_exchange->Session()} << 32) ^ s_rb_exchange->Config());
+  }
   AramRingSession(guard.GetSystem(), true);  // ARAM replay ring (final-review M1)
   s_ac_pending.clear();
   s_ac_real.clear();
