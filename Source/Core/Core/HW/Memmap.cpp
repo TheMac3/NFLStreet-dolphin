@@ -164,6 +164,31 @@ bool MemoryManager::IsAddressInFastmemArea(const u8* address) const
   return address >= m_fastmem_arena && address < m_fastmem_arena + m_fastmem_arena_size;
 }
 
+// Return all direct aliases through which this process can write MEM1 or fake
+// VMEM. The logical list changes after BAT writes; callers use
+// g_nsr_logical_remaps to rebuild protection conservatively.
+std::vector<NSRMemoryView> MemoryManager::GetNSRMemoryViews() const
+{
+  std::vector<NSRMemoryView> views;
+  views.reserve(4 + m_logical_mapped_entries.size());
+  if (m_ram)
+    views.push_back({m_ram, 0, GetRamSize()});
+  if (m_fake_vmem)
+    views.push_back({m_fake_vmem, 0x7E000000, GetFakeVMemSize()});
+  if (m_physical_base)
+  {
+    views.push_back({m_physical_base, 0, GetRamSize()});
+    if (m_fake_vmem)
+      views.push_back({m_physical_base + 0x7E000000, 0x7E000000, GetFakeVMemSize()});
+  }
+  for (const LogicalMemoryView& view : m_logical_mapped_entries)
+  {
+    views.push_back(
+        {static_cast<u8*>(view.mapped_pointer), view.physical_address, view.mapped_size});
+  }
+  return views;
+}
+
 bool MemoryManager::InitFastmemArena()
 {
   // Here we set up memory mappings for fastmem. The basic idea of fastmem is that we reserve 4 GiB
@@ -299,7 +324,8 @@ void MemoryManager::UpdateLogicalMemory(const PowerPC::BatTable& dbat_table)
                   intersection_start, mapped_size, logical_address);
               exit(0);
             }
-            m_logical_mapped_entries.push_back({mapped_pointer, mapped_size});
+            m_logical_mapped_entries.push_back(
+                {mapped_pointer, mapped_size, intersection_start});
           }
 
           m_logical_page_mappings[i] =

@@ -3,6 +3,7 @@
 
 #include "Core/MemTools.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -41,6 +42,42 @@
 
 namespace EMM
 {
+namespace
+{
+std::atomic<MemoryFaultHandler> s_memory_fault_handler{nullptr};
+std::atomic<u32> s_memory_fault_handlers_active{0};
+
+// Claim a client-owned protection fault without racing handler replacement.
+// The second pointer read closes the load-before-unregister window: an old
+// callback that starts late observes the replacement and returns without
+// entering client code.
+bool HandleMemoryFault(uintptr_t fault_address)
+{
+  MemoryFaultHandler handler = s_memory_fault_handler.load(std::memory_order_acquire);
+  if (!handler)
+    return false;
+  s_memory_fault_handlers_active.fetch_add(1, std::memory_order_acq_rel);
+  if (handler != s_memory_fault_handler.load(std::memory_order_acquire))
+  {
+    s_memory_fault_handlers_active.fetch_sub(1, std::memory_order_release);
+    return false;
+  }
+  const bool handled = handler(fault_address);
+  s_memory_fault_handlers_active.fetch_sub(1, std::memory_order_release);
+  return handled;
+}
+}  // namespace
+
+void SetMemoryFaultHandler(MemoryFaultHandler handler)
+{
+  s_memory_fault_handler.store(handler, std::memory_order_release);
+  if (!handler)
+  {
+    while (s_memory_fault_handlers_active.load(std::memory_order_acquire) != 0)
+      Common::YieldCPU();
+  }
+}
+
 #ifdef _WIN32
 
 static PVOID s_veh_handle;
@@ -61,6 +98,10 @@ static LONG NTAPI Handler(PEXCEPTION_POINTERS pPtrs)
     uintptr_t fault_address = (uintptr_t)pPtrs->ExceptionRecord->ExceptionInformation[1];
     SContext* ctx = pPtrs->ContextRecord;
 
+    if (access_type == 1 && HandleMemoryFault(fault_address))
+    {
+      return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (Core::System::GetInstance().GetJitInterface().HandleFault(fault_address, ctx))
     {
       return EXCEPTION_CONTINUE_EXECUTION;
@@ -191,8 +232,9 @@ static void ExceptionThread(mach_port_t port)
 
     thread_state64_t* state = (thread_state64_t*)msg_in.old_state;
 
-    bool ok =
-        Core::System::GetInstance().GetJitInterface().HandleFault((uintptr_t)msg_in.code[1], state);
+    const uintptr_t fault_address = static_cast<uintptr_t>(msg_in.code[1]);
+    bool ok = HandleMemoryFault(fault_address) ||
+              Core::System::GetInstance().GetJitInterface().HandleFault(fault_address, state);
 
     // Set up the reply.
     msg_out.Head.msgh_bits = MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(msg_in.Head.msgh_bits), 0);
@@ -282,8 +324,10 @@ static void sigsegv_handler(int sig, siginfo_t* info, void* raw_context)
 #else
   mcontext_t* ctx = &context->uc_mcontext;
 #endif
-  // assume it's not a write
-  if (!Core::System::GetInstance().GetJitInterface().HandleFault(bad_address,
+  // A registered tracker only protects readable pages, so a protection fault
+  // in one of its ranges is necessarily the first write to that page.
+  if (!HandleMemoryFault(bad_address) &&
+      !Core::System::GetInstance().GetJitInterface().HandleFault(bad_address,
 #ifdef __APPLE__
                                                                  *ctx
 #else

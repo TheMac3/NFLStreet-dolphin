@@ -981,7 +981,8 @@ void SessionEnter(const RollbackInfo& info)
         {Int("generation", info.generation), Int("force", info.force),
          Int("mispredict", info.mispredict), Int("ring_slots", info.ring_slots),
          Int("io_idle", info.io_idle), Int("audio_rollback", info.audio_rollback),
-         Int("dirty_tracking", info.dirty_tracking), Int("frame_mode", info.frame_mode),
+         Int("dirty_tracking", info.dirty_tracking), Int("dirty_mode", info.dirty_mode),
+         Int("frame_mode", info.frame_mode),
          Int("vmem_bytes", info.vmem_bytes)});
 }
 

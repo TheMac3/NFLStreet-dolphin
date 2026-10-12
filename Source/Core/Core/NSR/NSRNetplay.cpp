@@ -19,6 +19,11 @@
 #include <ucontext.h>
 #include <dlfcn.h>
 #endif
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
 #include <ctime>
 #include <csignal>
 #include <cerrno>
@@ -79,6 +84,7 @@
 #include "Core/HW/DSP.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/SystemTimers.h"
+#include "Core/MemTools.h"
 #include "Core/PowerPC/BreakPoints.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/MMU.h"
@@ -1607,8 +1613,9 @@ constexpr u32 PAGE_CHUNK = 32;  // pages per work item (128 KiB)
 
 // ---------------------------------------------------------------------------
 // Dirty-page tracking for snapshots (NSR_RB_DIRTY):
-//   1 / unset  kernel tracker where available (Linux 6.7+), else page hashing;
+//   1 / unset  kernel tracker on Linux; protect tracker on Windows/macOS;
 //   kernel     kernel tracker only (else full copies);
+//   protect    portable first-write protection, with hashing as a safe fallback;
 //   hash       page hashing (portable; forced, e.g. to test it on Linux);
 //   0          full copies as before.
 //
@@ -1628,8 +1635,10 @@ constexpr u32 PAGE_CHUNK = 32;  // pages per work item (128 KiB)
 // HostWrite/DMA copies, kernel copies into the buffer, and our restores.
 //
 // Alternatives measured and rejected: soft-dirty bits (clear_refs) clear the
-// whole process's page tables, ~7.5 ms per sample with the snapshot ring;
-// mprotect would collide with Dolphin's own fastmem fault handler.
+// whole process's page tables, ~7.5 ms per sample with the snapshot ring.
+// Portable protection is safe only because MemTools gives this tracker first
+// refusal on faults, before the JIT can mistake them for MMIO and backpatch a
+// store site permanently.
 //
 // Bookkeeping: Sample() stamps every page written since the previous sample
 // with a new epoch number. A snapshot slot remembers the epoch at which it
@@ -1644,12 +1653,19 @@ constexpr u32 PAGE_CHUNK = 32;  // pages per work item (128 KiB)
 // NSR_RB_DIRTY_VERIFY=1 checks every incremental save and restore against a
 // full comparison and logs any page the tracker missed.
 //
-// Page hashing (portable fallback; Windows and macOS, older Linux kernels).
-// Windows can't use the kernel route: Dolphin maps emulated memory as views
-// of a file mapping, which GetWriteWatch doesn't cover, and mprotect-style
-// tracking would fight Dolphin's fastmem fault handler on every platform.
-// Instead Sample() hashes every page that holds rolled-back bytes (XXH3-128,
-// on the PageWorkers) and stamps the pages whose hash differs from the
+// Portable protection (Windows/macOS and explicitly selectable on Linux).
+// Every writable alias of MEM1/fake VMEM is made read-only after a sample.
+// The first writer faults, marks the state page dirty, and restores write
+// access to that alias. This covers JIT fastmem, MMU slowmem, DMA, HLE copies,
+// fake VMEM, and NSR's own restore/model writes without per-writer hooks.
+// Logical BAT remaps rebuild the view list and conservatively dirty all pages.
+// A startup write/restore self-test must observe its own fault; any failure
+// removes all protection and selects hashing, never an unchecked tracker.
+// NSR_RB_DIRTY_AUDIT=1 hashes every tracked page at every sample and repairs
+// any page whose content changed without a protection fault.
+//
+// Page hashing (portable fallback). Sample() hashes every page that holds
+// rolled-back bytes (XXH3-128, on the PageWorkers) and stamps pages whose hash differs from the
 // previous sample's. Only the sample changes; the epoch bookkeeping above is
 // shared, so a save/restore still touches only the stamped pages. Hashing
 // reads all game memory once per sample (no writes, no compare against a
@@ -1684,17 +1700,20 @@ struct DirtyTracker
   static constexpr u32 PAGE = 0x1000;
   enum class Mode
   {
-    Off,     // no tracking: full copies (possibly on worker threads)
-    Kernel,  // userfaultfd + PAGEMAP_SCAN
-    Hash,    // page hashing
+    Off,      // no tracking: full copies (possibly on worker threads)
+    Kernel,   // userfaultfd + PAGEMAP_SCAN
+    Protect,  // VirtualProtect/mprotect + MemTools first-fault callback
+    Hash,     // page hashing
   };
   Mode mode = Mode::Off;
   bool on = false;     // stamps are valid (Kernel or Hash)
   bool paged = false;  // chunk tables built (per-page save/restore loops usable)
   bool verify = false;
+  bool exhaustive_audit = false;
+  bool protect_fallback = false;
   // Hash mode.
-  const u8* ram = nullptr;
-  const u8* vmem = nullptr;
+  u8* ram = nullptr;
+  u8* vmem = nullptr;
   u32 vmem_bytes = 0;
   std::vector<XXH128_hash_t> hashes;  // per state page: hash at the last sample
   std::vector<u32> hash_pages;        // state pages that hold rolled-back bytes
@@ -1724,6 +1743,13 @@ struct DirtyTracker
   u64 samples = 0, sample_ns = 0, pages_seen = 0, failures = 0, remaps = 0;
   u64 pages_copied = 0;  // NSR telemetry: pages RbSave copied (dirty or never synced)
   u32 seen_remaps = 0;
+  Memory::MemoryManager* memory = nullptr;
+  std::unique_ptr<std::atomic<u8>[]> protect_dirty;
+  std::vector<u8> protect_observed;
+  std::atomic<bool> protect_fault_failed{false};
+  std::atomic<u64> protect_faults{0};
+  u64 protect_audit_checked = 0, protect_audit_misses = 0;
+  inline static DirtyTracker* active_protect_tracker = nullptr;
 
   // All host mappings of the tracked shared memory, from /proc/self/maps.
   std::vector<View> ParseViews() const
@@ -1835,7 +1861,271 @@ struct DirtyTracker
     }
     page_first[mem1_pages] = static_cast<u32>(chunks.size());
     verify = !Env("NSR_RB_DIRTY_VERIFY").empty();
+    exhaustive_audit = !Env("NSR_RB_DIRTY_AUDIT").empty();
     paged = true;
+  }
+
+  bool IsTrackedPage(u32 page) const
+  {
+    return page >= mem1_pages || page_first[page] != page_first[page + 1];
+  }
+
+  // Build state-space views from Dolphin's authoritative alias list. Each
+  // resulting view maps page `first` to host and is clipped to the bytes this
+  // rollback session snapshots.
+  void BuildPortableViews()
+  {
+    views.clear();
+    if (!memory)
+      return;
+    for (const Memory::NSRMemoryView& alias : memory->GetNSRMemoryViews())
+    {
+      auto add = [&](u32 physical_base, u32 bytes, u32 first_state) {
+        const u64 alias_lo = alias.physical_address;
+        const u64 alias_hi = alias_lo + alias.size;
+        const u64 wanted_lo = physical_base;
+        const u64 wanted_hi = wanted_lo + bytes;
+        const u64 lo = std::max(alias_lo, wanted_lo);
+        const u64 hi = std::min(alias_hi, wanted_hi);
+        if (lo >= hi)
+          return;
+        views.push_back({reinterpret_cast<uintptr_t>(alias.host) +
+                             static_cast<uintptr_t>(lo - alias_lo),
+                         first_state + static_cast<u32>((lo - wanted_lo) / PAGE),
+                         static_cast<u32>((hi - lo + PAGE - 1) / PAGE)});
+      };
+      add(0, mem1_bytes, 0);
+      if (vmem_bytes)
+        add(0x7E000000, vmem_bytes, mem1_pages);
+    }
+  }
+
+  static bool SetPageProtection(uintptr_t host, u32 count, bool read_only)
+  {
+    const size_t bytes = static_cast<size_t>(count) * PAGE;
+#if defined(_WIN32)
+    DWORD old_protection = 0;
+    return VirtualProtect(reinterpret_cast<void*>(host), bytes,
+                          read_only ? PAGE_READONLY : PAGE_READWRITE, &old_protection) != 0;
+#else
+    return mprotect(reinterpret_cast<void*>(host), bytes,
+                    read_only ? PROT_READ : PROT_READ | PROT_WRITE) == 0;
+#endif
+  }
+
+  // Change protection in maximal runs so a sample costs syscalls per dirty
+  // run, not per page. `dirty_only` is used after the first full protection.
+  bool SetPortableProtection(bool read_only, bool dirty_only)
+  {
+    bool ok = true;
+    for (const View& view : views)
+    {
+      u32 run = 0;
+      for (u32 q = 0; q <= view.count; ++q)
+      {
+        const u32 page = view.first + q;
+        const bool in_fifo = page < mem1_pages && page >= fifo_pages.first &&
+                             page < fifo_pages.second;
+        const bool selected = q < view.count && IsTrackedPage(page) && !(read_only && in_fifo) &&
+                              (!dirty_only || protect_dirty[page].load(std::memory_order_relaxed));
+        if (selected && run == 0)
+          run = q + 1;
+        if (!selected && run != 0)
+        {
+          const u32 first = run - 1;
+          if (!SetPageProtection(view.host + static_cast<uintptr_t>(first) * PAGE, q - first,
+                                 read_only))
+            ok = false;
+          run = 0;
+        }
+      }
+    }
+    return ok;
+  }
+
+  bool SetStateRangeProtection(u32 first, u32 end, bool read_only)
+  {
+    bool ok = true;
+    for (const View& view : views)
+    {
+      const u32 lo = std::max(first, view.first);
+      const u32 hi = std::min(end, view.first + view.count);
+      if (lo < hi &&
+          !SetPageProtection(view.host + static_cast<uintptr_t>(lo - view.first) * PAGE, hi - lo,
+                             read_only))
+        ok = false;
+    }
+    return ok;
+  }
+
+  static bool PortableFaultThunk(uintptr_t fault_address)
+  {
+    return active_protect_tracker && active_protect_tracker->HandlePortableFault(fault_address);
+  }
+
+  // Exception-context first-write handler. Only atomics and one platform page
+  // protection call are allowed here; logging/fallback happens at Sample().
+  bool HandlePortableFault(uintptr_t fault_address)
+  {
+    if (mode != Mode::Protect || !protect_dirty)
+      return false;
+    for (const View& view : views)
+    {
+      const u64 end = static_cast<u64>(view.host) + static_cast<u64>(view.count) * PAGE;
+      if (fault_address < view.host || static_cast<u64>(fault_address) >= end)
+        continue;
+      const u32 q = static_cast<u32>((fault_address - view.host) / PAGE);
+      const u32 page = view.first + q;
+      if (!IsTrackedPage(page))
+        return false;
+      protect_dirty[page].store(1, std::memory_order_release);
+      if (!SetPageProtection(view.host + static_cast<uintptr_t>(q) * PAGE, 1, false))
+      {
+        protect_fault_failed.store(true, std::memory_order_release);
+        return false;
+      }
+      protect_faults.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+    return false;
+  }
+
+  void PrepareHashPages()
+  {
+    hash_pages.clear();
+    for (u32 p = 0; p < mem1_pages; ++p)
+    {
+      if (IsTrackedPage(p))
+        hash_pages.push_back(p);
+    }
+    for (u32 q = 0; q < vmem_pages; ++q)
+      hash_pages.push_back(mem1_pages + q);
+    std::random_device rd;
+    const u64 seed = (u64{rd()} << 32) ^ rd();
+    XXH3_generateSecret_fromSeed(secret.data(), seed);
+    hashes.assign(mem1_pages + vmem_pages, XXH128_hash_t{});
+  }
+
+  void HashBaseline()
+  {
+    s_workers.Run(static_cast<u32>(hash_pages.size()), PAGE_CHUNK, [&](u32 a, u32 b) {
+      for (u32 i = a; i < b; ++i)
+      {
+        const u32 page = hash_pages[i];
+        if (page < mem1_pages && page >= fifo_pages.first && page < fifo_pages.second)
+          continue;
+        const auto [bytes, len] = PageBytes(page);
+        hashes[page] = XXH3_128bits_withSecret(bytes, len, secret.data(), secret.size());
+      }
+    });
+  }
+
+  // Audit protection against a complete content scan. A miss is repaired by
+  // stamping it dirty, so audit mode remains deterministic while making the
+  // tracker defect visible in logs and telemetry counters.
+  u64 AuditPortable(const std::vector<u8>& observed, u32 now)
+  {
+    std::atomic<u64> checked{0};
+    std::atomic<u64> missed{0};
+    s_workers.Run(static_cast<u32>(hash_pages.size()), PAGE_CHUNK, [&](u32 a, u32 b) {
+      u64 local_missed = 0;
+      for (u32 i = a; i < b; ++i)
+      {
+        const u32 page = hash_pages[i];
+        if (page < mem1_pages && page >= fifo_pages.first && page < fifo_pages.second)
+          continue;
+        const auto [bytes, len] = PageBytes(page);
+        const XXH128_hash_t hash =
+            XXH3_128bits_withSecret(bytes, len, secret.data(), secret.size());
+        if (!XXH128_isEqual(hash, hashes[page]))
+        {
+          hashes[page] = hash;
+          if (!observed[page])
+          {
+            stamp[page] = now;
+            ++local_missed;
+          }
+        }
+      }
+      checked.fetch_add(b - a, std::memory_order_relaxed);
+      missed.fetch_add(local_missed, std::memory_order_relaxed);
+    });
+    protect_audit_checked += checked.load();
+    const u64 new_misses = missed.load();
+    if (new_misses != 0 && protect_audit_misses < 20)
+      Log("DIRTY PROTECT AUDIT: {} changed page(s) had no first-write fault", new_misses);
+    protect_audit_misses += new_misses;
+    return new_misses;
+  }
+
+  bool InitProtect(Memory::MemoryManager& memory_manager, u8* ram_base, u8* vmem_base)
+  {
+    memory = &memory_manager;
+    ram = ram_base;
+    vmem = vmem_base;
+    if (!EMM::IsExceptionHandlerSupported() || !ram || (vmem_pages && !vmem))
+      return false;
+    BuildPortableViews();
+    if (views.empty())
+      return false;
+    seen_remaps = Memory::g_nsr_logical_remaps;
+    protect_dirty = std::make_unique<std::atomic<u8>[]>(mem1_pages + vmem_pages);
+    protect_observed.assign(mem1_pages + vmem_pages, 0);
+    for (u32 page = 0; page < mem1_pages + vmem_pages; ++page)
+      protect_dirty[page].store(0, std::memory_order_relaxed);
+    mode = Mode::Protect;
+    active_protect_tracker = this;
+    EMM::SetMemoryFaultHandler(&PortableFaultThunk);
+    if (!SetPortableProtection(true, false))
+      return ReleaseProtect();
+
+    // Startup self-test: change and restore one tracked canonical byte. A
+    // missing fault disables this mode before any incremental snapshot can
+    // trust it (especially important for untested Windows host revisions).
+    u32 page = 0;
+    while (page < mem1_pages && !IsTrackedPage(page))
+      ++page;
+    if (page == mem1_pages && vmem_pages == 0)
+      return ReleaseProtect();
+    volatile u8* const byte =
+        page < mem1_pages ? ram + static_cast<size_t>(page) * PAGE :
+                            vmem + static_cast<size_t>(page - mem1_pages) * PAGE;
+    const u8 saved = *byte;
+    const u64 before = protect_faults.load(std::memory_order_relaxed);
+    *byte = static_cast<u8>(saved ^ 1);
+    *byte = saved;
+    const bool self_test_ok = protect_dirty[page].load(std::memory_order_acquire) != 0 &&
+                              protect_faults.load(std::memory_order_relaxed) > before &&
+                              !protect_fault_failed.load(std::memory_order_acquire);
+    if (!self_test_ok)
+      return ReleaseProtect();
+    if (!SetPortableProtection(true, true))
+      return ReleaseProtect();
+    for (u32 p = 0; p < mem1_pages + vmem_pages; ++p)
+      protect_dirty[p].store(0, std::memory_order_relaxed);
+    if (exhaustive_audit)
+    {
+      PrepareHashPages();
+      HashBaseline();
+    }
+    std::fill(stamp.begin(), stamp.end(), epoch);
+    pages_seen = 0;
+    return true;
+  }
+
+  bool ReleaseProtect()
+  {
+    if (mode == Mode::Protect)
+    {
+      SetPortableProtection(false, false);
+      EMM::SetMemoryFaultHandler(nullptr);
+      active_protect_tracker = nullptr;
+    }
+    protect_dirty.reset();
+    protect_observed.clear();
+    views.clear();
+    mode = Mode::Off;
+    return false;
   }
 
   bool InitKernel()
@@ -1891,26 +2181,13 @@ struct DirtyTracker
 
   bool InitHash(const u8* ram_base, const u8* vmem_base)
   {
-    ram = ram_base;
-    vmem = vmem_base;
+    ram = const_cast<u8*>(ram_base);
+    vmem = const_cast<u8*>(vmem_base);
     if (!ram || (vmem_pages && !vmem))
       return false;
     // Pages without rolled-back bytes (wholly inside keep ranges) are never
     // saved, restored or checked: don't hash them.
-    hash_pages.clear();
-    for (u32 p = 0; p < mem1_pages; ++p)
-    {
-      if (page_first[p] != page_first[p + 1])
-        hash_pages.push_back(p);
-    }
-    for (u32 q = 0; q < vmem_pages; ++q)
-      hash_pages.push_back(mem1_pages + q);
-    // Per-session random key: a collision can't be reproduced or arranged
-    // across sessions (see the collision note above).
-    std::random_device rd;
-    const u64 seed = (u64{rd()} << 32) ^ rd();
-    XXH3_generateSecret_fromSeed(secret.data(), seed);
-    hashes.assign(mem1_pages + vmem_pages, XXH128_hash_t{});
+    PrepareHashPages();
     audit_pages = ParseU32(Env("NSR_RB_HASH_AUDIT")).value_or(16);
     mode = Mode::Hash;
     Sample();
@@ -1939,6 +2216,8 @@ struct DirtyTracker
       for (u32 i = a; i < b; ++i)
       {
         const u32 p = hash_pages[i];
+        if (p < mem1_pages && p >= fifo_pages.first && p < fifo_pages.second)
+          continue;
         const auto [bytes, len] = PageBytes(p);
         const XXH128_hash_t h = XXH3_128bits_withSecret(bytes, len, secret.data(), secret.size());
         if (!XXH128_isEqual(h, hashes[p]))
@@ -1999,17 +2278,88 @@ struct DirtyTracker
     }
   }
 
+  bool RefreshPortableViews()
+  {
+    // Old logical mappings may already be gone, so an unprotect failure here
+    // is harmless. Canonical and physical aliases are made writable before
+    // unregistering the callback, leaving no protected page without an owner.
+    SetPortableProtection(false, false);
+    EMM::SetMemoryFaultHandler(nullptr);
+    active_protect_tracker = nullptr;
+    BuildPortableViews();
+    if (views.empty())
+      return false;
+    for (u32 page = 0; page < mem1_pages + vmem_pages; ++page)
+      protect_dirty[page].store(IsTrackedPage(page) ? 1 : 0, std::memory_order_relaxed);
+    active_protect_tracker = this;
+    EMM::SetMemoryFaultHandler(&PortableFaultThunk);
+    return SetPortableProtection(true, false);
+  }
+
+  bool ProtectFallbackToHash(const char* reason)
+  {
+    u8* const ram_base = ram;
+    u8* const vmem_base = vmem;
+    ReleaseProtect();
+    protect_fallback = true;
+    on = InitHash(ram_base, vmem_base);
+    Log("snapshot protect tracker failed ({}); {}", reason,
+        on ? "falling back to page hashing" : "falling back to full copies");
+    return on;
+  }
+
   // Release the kernel handles and forget everything (core shutdown; the
   // next session initialises again).
   void Reset()
   {
+    ReleaseProtect();
     ReleaseKernel();
-    *this = DirtyTracker{};
+    std::destroy_at(this);
+    std::construct_at(this);
   }
 
   // Stamp the pages written since the previous sample and protect them again.
   bool Sample()
   {
+    if (mode == Mode::Protect)
+    {
+      const auto t0 = std::chrono::steady_clock::now();
+      if (seen_remaps != Memory::g_nsr_logical_remaps)
+      {
+        seen_remaps = Memory::g_nsr_logical_remaps;
+        ++remaps;
+        if (!RefreshPortableViews())
+          return ProtectFallbackToHash("view remap");
+      }
+      if (protect_fault_failed.load(std::memory_order_acquire))
+        return ProtectFallbackToHash("fault handler could not restore write access");
+
+      // Close every page that faulted during this epoch before consuming its
+      // bit. A concurrent first write after protection sets the bit again and
+      // is included by the exchange below.
+      if (!SetPortableProtection(true, true))
+        return ProtectFallbackToHash("page reprotection");
+      ++epoch;
+      std::fill(protect_observed.begin(), protect_observed.end(), 0);
+      u64 dirty_pages = 0;
+      for (u32 page = 0; page < mem1_pages + vmem_pages; ++page)
+      {
+        if (protect_dirty[page].exchange(0, std::memory_order_acq_rel) != 0)
+        {
+          protect_observed[page] = 1;
+          stamp[page] = epoch;
+          ++dirty_pages;
+        }
+      }
+      pages_seen += dirty_pages;
+      if (exhaustive_audit && AuditPortable(protect_observed, epoch) != 0)
+        return ProtectFallbackToHash("exhaustive hash audit mismatch");
+      ++samples;
+      sample_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+      return true;
+    }
     if (mode == Mode::Hash)
     {
       const auto t0 = std::chrono::steady_clock::now();
@@ -2109,6 +2459,24 @@ struct DirtyTracker
     {
       if (fifo_pages.second != 0)
         Log("snapshot dirty tracking: GX FIFO moved; all snapshots resync");
+      if (mode == Mode::Protect)
+      {
+        // The FIFO is retained live across restores. Leaving its command
+        // stream writable avoids hundreds of useless first-write faults per
+        // frame. A former FIFO range becomes ordinary tracked state again.
+        if (fifo_pages.first < fifo_pages.second)
+        {
+          for (u32 page = fifo_pages.first; page < fifo_pages.second; ++page)
+            protect_dirty[page].store(1, std::memory_order_relaxed);
+          if (!SetStateRangeProtection(fifo_pages.first, fifo_pages.second, true))
+            protect_fault_failed.store(true, std::memory_order_release);
+        }
+        if (pages.first < pages.second)
+        {
+          if (!SetStateRangeProtection(pages.first, pages.second, false))
+            protect_fault_failed.store(true, std::memory_order_release);
+        }
+      }
       fifo_pages = pages;
       synced.clear();
     }
@@ -2344,15 +2712,48 @@ void RbInit(Core::System& system)
     const std::string dirty = Env("NSR_RB_DIRTY", "1");
     if (dirty != "0")
     {
-      if (dirty != "hash")
+      if (dirty == "protect")
+      {
+        s_dirty.on = s_dirty.InitProtect(system.GetMemory(), system.GetMemory().GetRAM(), r.vmem);
+        if (!s_dirty.on)
+        {
+          s_dirty.protect_fallback = true;
+          Log("snapshot protect tracker startup self-test failed; falling back to page hashing");
+          s_dirty.on = s_dirty.InitHash(system.GetMemory().GetRAM(), r.vmem);
+        }
+      }
+      else if (dirty == "hash")
+      {
+        s_dirty.on = s_dirty.InitHash(system.GetMemory().GetRAM(), r.vmem);
+      }
+      else if (dirty == "kernel")
+      {
         s_dirty.on = s_dirty.InitKernel();
-      if (!s_dirty.on && dirty != "kernel")
+      }
+      else
+      {
+#if defined(_WIN32) || defined(__APPLE__)
+        s_dirty.on = s_dirty.InitProtect(system.GetMemory(), system.GetMemory().GetRAM(), r.vmem);
+        if (!s_dirty.on)
+        {
+          s_dirty.protect_fallback = true;
+          Log("snapshot protect tracker startup self-test failed; falling back to page hashing");
+          s_dirty.on = s_dirty.InitHash(system.GetMemory().GetRAM(), r.vmem);
+        }
+#else
+        s_dirty.on = s_dirty.InitKernel();
+        if (!s_dirty.on)
+          s_dirty.on = s_dirty.InitHash(system.GetMemory().GetRAM(), r.vmem);
+#endif
+      }
+      if (!s_dirty.on && dirty != "kernel" && dirty != "protect" && dirty != "hash")
         s_dirty.on = s_dirty.InitHash(system.GetMemory().GetRAM(), r.vmem);
     }
     using Mode = DirtyTracker::Mode;
     Log("snapshot dirty-page tracking: {} ({} mappings of game memory, {} hashed pages); "
         "{} snapshot thread(s)",
         s_dirty.mode == Mode::Kernel ? "kernel" :
+        s_dirty.mode == Mode::Protect ? "write protection" :
         s_dirty.mode == Mode::Hash   ? "page hashing" :
                                        "off, full copies",
         s_dirty.views.size(), s_dirty.hash_pages.size(), s_workers.Threads());
@@ -4878,6 +5279,9 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     if (s_dirty.mode == DirtyTracker::Mode::Hash)
       Log("snapshot hash audit: {} pages compared, {} differed", s_dirty.audit_checked,
           s_dirty.audit_mismatches);
+    if (s_dirty.mode == DirtyTracker::Mode::Protect && s_dirty.exhaustive_audit)
+      Log("snapshot protect audit: {} pages hashed, {} tracker misses", s_dirty.protect_audit_checked,
+          s_dirty.protect_audit_misses);
     Log("tick {}: rollbacks {}, re-simulated {}, mismatched checks {}/{}; audio gate: "
         "recorded {}, replayed {}, mismatched {}; load barriers {} (clamped {}, in re-sim {}); "
         "io-idle skips {}; mispredictions {} (uncorrectable {}); net stalls {} sync waits {}",
@@ -7108,9 +7512,15 @@ void TelemetrySessionEnter()
   info.io_idle = r.io_idle_mode;
   info.audio_rollback = r.audio_rollback;
   info.dirty_tracking = s_dirty.on;
+  info.dirty_mode = static_cast<u32>(s_dirty.mode);
   info.frame_mode = r.frame_mode;
   info.vmem_bytes = r.vmem_bytes;
   NSRTelemetry::SessionEnter(info);
+  if (s_dirty.protect_fallback)
+  {
+    NSRTelemetry::Event(NSRTelemetry::EventKind::Note, r.vtime_from,
+                        {NSRTelemetry::Int("dirty_protect_fallback", 1)});
+  }
 }
 
 void TelemetrySessionLeave(const char* reason)
