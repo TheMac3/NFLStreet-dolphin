@@ -1750,6 +1750,11 @@ constexpr u32 PAGE_CHUNK = 32;  // pages per work item (128 KiB)
 struct DirtyTracker
 {
   static constexpr u32 PAGE = 0x1000;
+  // Opening one page per exception made the protection boundary itself cost
+  // several milliseconds on write-heavy frames. Conservatively dirtying a
+  // 32 KiB group amortizes signal/VEH and protection syscalls; false-positive
+  // pages only cause an extra snapshot copy and cannot hide a write.
+  static constexpr u32 PROTECT_GROUP_PAGES = 8;
   enum class Mode
   {
     Off,      // no tracking: full copies (possibly on worker threads)
@@ -2031,8 +2036,16 @@ struct DirtyTracker
       const u32 page = view.first + q;
       if (!IsTrackedPage(page))
         return false;
-      protect_dirty[page].store(1, std::memory_order_release);
-      if (!SetPageProtection(view.host + static_cast<uintptr_t>(q) * PAGE, 1, false))
+      const u32 group_first = q / PROTECT_GROUP_PAGES * PROTECT_GROUP_PAGES;
+      const u32 group_count = std::min(PROTECT_GROUP_PAGES, view.count - group_first);
+      for (u32 i = 0; i < group_count; ++i)
+      {
+        const u32 group_page = view.first + group_first + i;
+        if (IsTrackedPage(group_page))
+          protect_dirty[group_page].store(1, std::memory_order_release);
+      }
+      if (!SetPageProtection(view.host + static_cast<uintptr_t>(group_first) * PAGE, group_count,
+                             false))
       {
         protect_fault_failed.store(true, std::memory_order_release);
         return false;
