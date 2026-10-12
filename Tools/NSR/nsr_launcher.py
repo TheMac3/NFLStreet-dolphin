@@ -770,10 +770,9 @@ class WebApi:
     def browse_iso(self):
         import webview
         kind = getattr(getattr(webview, "FileDialog", None), "OPEN", None) or webview.OPEN_DIALOG
-        try:
-            picked = self._window.create_file_dialog(
-                kind, file_types=("NFL Street Reborn game (NSR.iso)", "Disc images (*.iso)"))
-        except Exception:  # noqa: BLE001  (older pywebview: no file_types support)
+        try:  # pywebview filters must be "Label (*.ext)"; NSR.iso sits in content\games
+            picked = self._window.create_file_dialog(kind, file_types=("Disc images (*.iso)",))
+        except Exception:  # noqa: BLE001  (a pywebview that rejects the filter)
             picked = self._window.create_file_dialog(kind)
         if picked:
             self._l.prepare(picked[0] if isinstance(picked, (list, tuple)) else picked)
