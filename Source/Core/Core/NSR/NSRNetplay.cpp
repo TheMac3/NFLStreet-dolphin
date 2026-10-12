@@ -4482,10 +4482,15 @@ void DigestExclusions(Core::System& system, const u8* ram, u32 mem1_size,
   // from the first menus on), so it does not depend on whether a transient
   // block exists right now.
   const auto t1 = std::chrono::steady_clock::now();
+  // Heap ranges come out of each walk in address order: keep them apart so
+  // the final merge is linear instead of sorting ~3,700 ranges every digest.
+  std::vector<RollbackLogic::Range> misc = std::move(ranges);
+  ranges.clear();
+  ranges.reserve(4096);
   auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
   for (const u32 heap : s_audio_heaps)
   {
-    add((heap & 0x01FFFFFF) + 0x24, 0x70 - 0x24);
+    misc.push_back({(heap & 0x01FFFFFF) + 0x24, (heap & 0x01FFFFFF) + 0x70});
     const u32 first = rd(heap + 0x14), last = rd(heap + 0x18);
     u32 h = first;
     for (int n = 0; n < 200000 && h >= first && h + 0x20 <= last && h < 0x817FFFF0; ++n)
@@ -4508,7 +4513,32 @@ void DigestExclusions(Core::System& system, const u8* ram, u32 mem1_size,
   const auto t2 = std::chrono::steady_clock::now();
   s_digest.per_machine_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
   s_digest.heap_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
-  *out = RollbackLogic::MergeRanges(std::move(ranges));
+  const auto by_lo = [](const RollbackLogic::Range& a, const RollbackLogic::Range& b) {
+    return a.lo < b.lo || (a.lo == b.lo && a.hi < b.hi);
+  };
+  std::sort(misc.begin(), misc.end(), by_lo);
+  if (!std::is_sorted(ranges.begin(), ranges.end(), by_lo))
+    std::sort(ranges.begin(), ranges.end(), by_lo);  // nested heaps interleave
+  std::vector<RollbackLogic::Range>& merged = *out;
+  merged.clear();
+  merged.reserve(misc.size() + ranges.size());
+  auto coalesce = [&merged](const RollbackLogic::Range& x) {
+    if (x.lo >= x.hi)
+      return;
+    if (!merged.empty() && x.lo <= merged.back().hi)
+      merged.back().hi = std::max(merged.back().hi, x.hi);
+    else
+      merged.push_back(x);
+  };
+  size_t i = 0, j = 0;
+  while (i < misc.size() || j < ranges.size())
+  {
+    if (j == ranges.size() || (i < misc.size() && by_lo(misc[i], ranges[j])))
+      coalesce(misc[i++]);
+    else
+      coalesce(ranges[j++]);
+  }
+  // Same result as RollbackLogic::MergeRanges over both lists.
 }
 }  // namespace
 
