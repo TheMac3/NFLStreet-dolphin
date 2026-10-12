@@ -57,6 +57,17 @@ struct LogicalMemoryView
 {
   void* mapped_pointer;
   u32 mapped_size;
+  u32 physical_address;
+};
+
+// One writable host alias of a contiguous physical-memory range. Rollback's
+// portable dirty tracker protects every alias so JIT, slowmem, and device
+// writers all cross the same first-write fault boundary.
+struct NSRMemoryView
+{
+  u8* host;
+  u32 physical_address;
+  u32 size;
 };
 
 class MemoryManager
@@ -91,6 +102,8 @@ public:
   u8*& GetEXRAM() { return m_exram; }
   u8* GetL1Cache() { return m_l1_cache; }
   u8*& GetFakeVMEM() { return m_fake_vmem; }
+
+  std::vector<NSRMemoryView> GetNSRMemoryViews() const;
 
   MMIO::Mapping* GetMMIOMapping() const { return m_mmio_mapping.get(); }
 

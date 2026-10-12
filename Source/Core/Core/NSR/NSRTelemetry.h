@@ -200,6 +200,7 @@ struct RollbackInfo
   bool io_idle = false;
   bool audio_rollback = false;
   bool dirty_tracking = false;
+  std::uint32_t dirty_mode = 0;  // NSRNetplay DirtyTracker::Mode wire value
   bool frame_mode = false;
   std::uint32_t vmem_bytes = 0;
 };
