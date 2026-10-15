@@ -1124,8 +1124,13 @@ static void TestPureRollbackHelpers()
   assert(RL::BusyPollCatchups(999, 1000) == 0);
   assert(RL::BusyPollCatchups(2001, 1000) == 2);
   assert(RL::Before(9, 10) && !RL::Before(10, 10));
+  assert(!RL::PausedFrame(0) && RL::PausedFrame(1) && RL::PausedFrame(2));
   const RL::SongTimeline song = RL::ScheduleSong(100, 380, 10800);
   assert(song.start == 480 && song.end == 11280);
+  const RL::SongTimeline held = RL::HoldSongOneFrame(song);
+  assert(held.start == 481 && held.end == 11281);
+  const RL::SongTimeline no_start = RL::HoldSongOneFrame({0, 7});
+  assert(no_start.start == 0 && no_start.end == 8);
 
   std::map<const void*, std::uint32_t> synced{{pages.data(), 7}};
   std::map<const void*, std::uint64_t> sequences{{pages.data(), 9}};
