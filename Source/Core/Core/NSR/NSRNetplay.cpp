@@ -1086,7 +1086,7 @@ constexpr u32 RB_GRANULE = 64;          // mismatch-report resolution
 //   - low memory: OS globals (time, arena, thread queue, current context).
 // Live OS objects elsewhere (game-created threads and their stacks, queued
 // alarms, the GX FIFO) are found at restore time; see RbLiveRanges.
-constexpr std::array<std::pair<u32, u32>, 22> RB_KEEP{{
+constexpr std::array<std::pair<u32, u32>, 21> RB_KEEP{{
     {0x003EE4C0, 0x003FE4C0},  // main-thread stack
     {0x00384C00, 0x00398E00},  // memory-card work areas
     {0x00411A00, 0x00412000},  // NFLStreet patch area (counters, scripts)
@@ -1099,8 +1099,13 @@ constexpr std::array<std::pair<u32, u32>, 22> RB_KEEP{{
     // held game/EA-engine data (restored) and audio-middleware data (moved to
     // AUDIO_KEEP); keeping those live leaked state set by later frames into
     // re-simulated ones (EA floats at 0x802FB45C changed at a play start).
+    // 0x802C7000..0x802C7200 used to be kept too ("no direct references" in
+    // the original main.dol), but Reborn's added code (0x80410xxx, the tail of
+    // its text) dereferences the pointer at 0x802C7014: once a later frame
+    // nulled it, a rollback across that frame resumed Reborn's code on the
+    // null pointer and looped on invalid reads (RC1 regress, frame 14,382).
+    // It is game state and is restored with the rest.
     {0x002B7240, 0x002B7260},
-    {0x002C7000, 0x002C7200},  // no direct references found; kept as before
     {0x002FB468, 0x002FE350},
     {0x002FE440, 0x002FE444},  // referenced by game and SDK code
     {0x002FE4C0, 0x002FF4A0},
@@ -5602,7 +5607,34 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
     return FailHandoff(fmt::format("transport is not connected at frame {}", frame));
 
   const RollbackNet::ConfigFingerprint config = LocalConfigFingerprint(guard.GetSystem());
-  const u64 semantic = RbStateDigest(guard.GetSystem(), nullptr, RbSemanticChecksum(guard), frame);
+  u64 semantic = RbStateDigest(guard.GetSystem(), nullptr, RbSemanticChecksum(guard), frame);
+  if (kind == RollbackNet::HandoffKind::EnterRollback && s_rb.session_generation > 0)
+  {
+    // Re-entry: memory freed by the previous match's teardown is still being
+    // reclaimed on each machine's own audio schedule (4-player regress: four
+    // distinct full digests at a re-entry 34 frames after a pause-menu quit).
+    // Agree the semantic words here; the full state digest resumes on every
+    // confirmed frame of the new session and stops it within a few frames if
+    // the game state really differs.
+    semantic = RbSemanticChecksum(guard);
+    Log("handoff re-entry agrees semantic state; full digest resumes per frame");
+  }
+  if (kind == RollbackNet::HandoffKind::LeaveRollback && s_rb_exchange)
+  {
+    // Leave: the teardown frame just freed audio/heap memory on each
+    // machine's own schedule, so a fresh RAM hash here differs between honest
+    // peers (4-player regress: three distinct values after a pause-menu
+    // quit, with no per-frame digest mismatch during the match).  Prove the
+    // last confirmed in-match state instead: ConfirmRollbackTail ensured no
+    // pending rollback, so this per-frame digest is final on every peer, and
+    // digest_every is part of the config fingerprint, so all peers pick the
+    // same frame.
+    if (const auto last = s_rb_exchange->LocalStateChecksumAtOrBefore(s_rb.tick_running))
+    {
+      semantic = last->second ^ (static_cast<u64>(last->first) * 0x9E3779B97F4A7C15ULL);
+      Log("handoff leave proves the in-match digest of frame {}", last->first);
+    }
+  }
   // Entry 0, leave 1, re-entry 2, ... is derived solely from the completed
   // session generation.  It prevents a late unsequenced packet from an old
   // match from poisoning a later barrier.
@@ -5682,6 +5714,14 @@ static Pads FromNetPads(const RollbackNet::Pads& pads)
 // Drain and resend while prediction is at its configured bound.  This is a
 // host wait: no guest frame, clock, audio query, or disc completion advances,
 // so all peers still simulate the same numbered frame once input arrives.
+// Set by RbStep for a live frame that starts with the pause menu open.  Such a
+// frame waits for every player's confirmed input instead of predicting: the
+// pause menu is where a match is quit, and the session-leave teardown frame
+// must never run on a guess (ConfirmRollbackTail refuses to re-simulate it;
+// a 4-player regress run aborted when a predicted A on "Quit Game" was later
+// corrected).  The menu is static, so the added input latency is invisible.
+static bool s_rb_confirm_live = false;
+
 static bool RbNetworkPreflight(u32 live)
 {
   Rollback& r = s_rb;
@@ -5764,6 +5804,22 @@ static bool RbNetworkPreflight(u32 live)
         std::chrono::steady_clock::now() - stall_start);
     if (!ok)
       return false;
+  }
+  if (s_rb_confirm_live)
+  {
+    const auto is_unconfirmed = [&] {
+      const u32 confirmed = s_rb_exchange->ConfirmedThrough();
+      return confirmed == RollbackNet::NO_FRAME || confirmed < live;
+    };
+    if (is_unconfirmed())
+    {
+      const auto confirm_start = std::chrono::steady_clock::now();
+      const bool ok = wait_until(is_unconfirmed, std::chrono::milliseconds(PEER_TIMEOUT_MS), true);
+      Core::System::GetInstance().GetCoreTiming().NSRDeferThrottle(
+          std::chrono::steady_clock::now() - confirm_start);
+      if (!ok)
+        return false;
+    }
   }
   // Check twice per second after compensating remote progress for one-way
   // latency.  Only the genuinely faster peer stretches this frame, by less
@@ -5940,6 +5996,8 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
   }
   const u32 slots = r.ring.empty() ? 1 : static_cast<u32>(r.ring.size());
   RbSampleIo(guard);
+  s_rb_confirm_live = r.net_enabled && r.cursor == r.live && !r.rolled &&
+                      RollbackLogic::PausedFrame(PowerPC::MMU::HostRead<u32>(guard, PAUSE_DEPTH));
   if (r.net_enabled && r.cursor == r.live && !r.rolled && !RbNetworkPreflight(r.live))
     return 0;
   if (r.disc_commands != r.disc_commands_seen)

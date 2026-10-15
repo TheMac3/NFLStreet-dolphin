@@ -275,6 +275,11 @@ public:
   // Record the digest of the state at the start of `frame`.  Re-simulation
   // calls it again for the same frame; the newest value wins.
   void SetStateChecksum(std::uint32_t frame, std::uint64_t checksum);
+  // The newest local state checksum at or before `frame` (frame, value).  The
+  // leave barrier compares this in-match digest instead of re-hashing RAM
+  // after the match teardown, which frees audio/heap memory per machine.
+  std::optional<std::pair<std::uint32_t, std::uint64_t>>
+  LocalStateChecksumAtOrBefore(std::uint32_t frame) const;
   // A rollback restored the state at the start of `frame`: every recorded
   // digest of a later frame start describes the abandoned timeline.  Without
   // this, finalization during re-simulation could advertise (and compare) a

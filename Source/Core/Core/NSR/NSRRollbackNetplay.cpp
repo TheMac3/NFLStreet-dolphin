@@ -619,6 +619,16 @@ void Exchange::BeginRollback()
   m_pending.reset();
 }
 
+std::optional<std::pair<std::uint32_t, std::uint64_t>>
+Exchange::LocalStateChecksumAtOrBefore(std::uint32_t frame) const
+{
+  auto it = m_local_checksums.upper_bound(frame);
+  if (it == m_local_checksums.begin())
+    return std::nullopt;
+  --it;
+  return std::make_pair(it->first, it->second);
+}
+
 void Exchange::SetStateChecksum(std::uint32_t frame, std::uint64_t checksum)
 {
   m_local_checksums[frame] = checksum;
