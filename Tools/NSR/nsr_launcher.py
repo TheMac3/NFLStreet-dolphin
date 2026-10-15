@@ -175,9 +175,14 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     if open_ui:
         return args, env
     players = start.players if start else 1
-    if reborn_install:
-        args += ["-C", f"Dolphin.General.LoadPath={os.path.join(reborn_install, 'content')}",
-                 "-C", "GFX.Settings.HiresTextures=True"]
+    load_path = controllers.reborn_load_path(reborn_install, os.environ) if reborn_install else None
+    if load_path:
+        # Reborn's composed texture tree (library + the player's mods), as its
+        # own Dolphin loads it; see controllers.reborn_load_path. Cached like
+        # Reborn's GFX.ini so textures don't stream in mid-match.
+        args += ["-C", f"Dolphin.General.LoadPath={load_path}",
+                 "-C", "GFX.Settings.HiresTextures=True",
+                 "-C", "GFX.Settings.CacheHiresTextures=True"]
     # Some Quick Play paths make Reborn's own code read through a null pointer
     # (harmless under Dolphin, which returns 0); keep those warnings out of
     # popup dialogs during a match. They still go to Dolphin's log.

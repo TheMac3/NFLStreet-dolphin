@@ -1,6 +1,6 @@
 # NSR Netplay launcher (vendored)
 
-Copied from the NFLStreet repo (`tools/`, commit 9f744c0) by
+Copied from the NFLStreet repo (`tools/`, commit 6ab1570) by
 `scripts/sync-launcher-to-fork.sh`. Don't edit here; edit in NFLStreet and
 re-sync. The Windows CI workflow (`.github/workflows/nsr-windows.yml`)
 builds `nsr_launcher.py` (with `nsr_controllers.py` and the bundled
