@@ -127,6 +127,27 @@ jobs:
           "NSR Netplay.exe: {0:N1} MB" -f ((Get-Item "pyi-dist/NSR Netplay.exe").Length / 1MB)
 
       - uses: microsoft/setup-msbuild@v2
+        if: ${{ runner.environment == 'github-hosted' }}
+
+      - name: Use the MSBuild that has the C++ toolset (self-hosted)
+        # A PC can have several Visual Studio instances (e.g. Build Tools
+        # without the C++ workload next to a full VS); setup-msbuild takes the
+        # newest, which may lack Microsoft.Cpp.Default.props. Ask vswhere for
+        # an instance with the x64 C++ tools and the v143 MSBuild support.
+        if: ${{ runner.environment != 'github-hosted' }}
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere not found: install Visual Studio 2022 with 'Desktop development with C++'" }
+          & $vswhere -products * -format text -property installationPath | ForEach-Object { Write-Host "VS instance: $_" }
+          $msbuild = & $vswhere -latest -products * -version "[17.0,18.0)" `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 Microsoft.Component.MSBuild `
+            -find "MSBuild\Current\Bin\amd64\MSBuild.exe" | Select-Object -First 1
+          if (-not $msbuild) {
+            throw "No Visual Studio 2022 instance with the C++ x64 tools. Install the 'Desktop development with C++' workload (Visual Studio Installer > Modify)."
+          }
+          Write-Host "MSBuild: $msbuild"
+          Add-Content $env:GITHUB_PATH (Split-Path $msbuild)
 
       - name: Build (Release x64)
         working-directory: Source
