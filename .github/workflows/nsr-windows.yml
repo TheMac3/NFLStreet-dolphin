@@ -73,22 +73,25 @@ jobs:
           }
           if (-not $exe) {
             # Not visible to the runner's service account (e.g. a per-user
-            # install): use the official portable Python NuGet package, cached
-            # in the runner's tool folder. No installer, no admin.
-            $root = Join-Path $env:RUNNER_TOOL_CACHE "nsr-python-3.12.7"
-            $exe = Join-Path $root "tools\python.exe"
+            # install): install python.org's full 3.12 (with tkinter, which the
+            # launcher's fallback window needs) quietly into the runner tool
+            # cache. Per-user, no admin, no PATH or registry launcher changes.
+            $root = Join-Path $env:RUNNER_TOOL_CACHE "nsr-python-3.12.7-full"
+            $exe = Join-Path $root "python.exe"
             if (-not (Test-Path $exe)) {
-              New-Item -ItemType Directory -Force $root | Out-Null
-              $pkg = Join-Path $env:RUNNER_TEMP "python.3.12.7.zip"
-              Invoke-WebRequest "https://www.nuget.org/api/v2/package/python/3.12.7" -OutFile $pkg
-              Expand-Archive $pkg -DestinationPath $root -Force
-              & $exe -m ensurepip --upgrade
+              $setup = Join-Path $env:RUNNER_TEMP "python-3.12.7-amd64.exe"
+              Invoke-WebRequest "https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe" -OutFile $setup
+              $p = Start-Process $setup -Wait -PassThru -ArgumentList @("/quiet", "InstallAllUsers=0",
+                "TargetDir=$root", "Include_launcher=0", "Include_test=0", "Include_tcltk=1",
+                "PrependPath=0", "Shortcuts=0", "AssociateFiles=0")
+              if ($p.ExitCode -ne 0 -or -not (Test-Path $exe)) { throw "Python install failed ($($p.ExitCode))" }
             }
           }
           $dir = Split-Path $exe
           Add-Content $env:GITHUB_PATH $dir
           Add-Content $env:GITHUB_PATH (Join-Path $dir "Scripts")
-          & $exe --version
+          & $exe -c "import sys, tkinter; print(sys.version, 'tk', tkinter.TkVersion)"
+          if ($LASTEXITCODE -ne 0) { throw "this Python lacks tkinter (the launcher fallback needs it)" }
 
       # Python first: these take a few minutes and fail fast, before the long
       # Dolphin build. pywebview pinned (6.2.1, 2026-04) so a new release
