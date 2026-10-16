@@ -29,8 +29,10 @@ constexpr std::uint32_t HANDOFF_MAGIC = 0x4E535248;  // 'NSRH'
 // carry the full ConfigFingerprint.  HANDOFF_VERSION 3 (rc1regress): proposals
 // also carry the sender's VI retrace counter (sync_clock).  Mixed builds
 // therefore fail to parse each other instead of comparing values that mean
-// different things.
-constexpr std::uint8_t VERSION = 5;
+// different things.  VERSION 6 keeps frame-driven time, DVD completion and
+// audio modeling active during post-match lockstep; an older peer would run
+// that transition with incompatible lifecycle semantics.
+constexpr std::uint8_t VERSION = 6;
 constexpr std::uint8_t HANDOFF_VERSION = 3;
 constexpr std::size_t MAX_PLAYERS = 4;
 constexpr std::size_t PAD_SIZE = 12;

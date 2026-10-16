@@ -1090,7 +1090,7 @@ constexpr std::array<std::pair<u32, u32>, 21> RB_KEEP{{
     {0x003EE4C0, 0x003FE4C0},  // main-thread stack
     {0x00384C00, 0x00398E00},  // memory-card work areas
     {0x00411A00, 0x00412000},  // NFLStreet patch area (counters, scripts)
-    {0x00416900, 0x00416A80},  // rollback patch area
+    {0x00416900, 0x00416B00},  // rollback patch area (including wait/music trampolines)
     {0x004132C0, 0x00413E00},  // trace ring
     {0x00000000, 0x00003100},  // low memory
     // SDK .data, only the words SDK code references (lis/addi pairs, see
@@ -1150,7 +1150,6 @@ constexpr u32 TICK_CLOCK_PTR = 0x803EC138;  // -0x6168(r13)
 // by rollback, identical on every peer), so TickCountHook may key on it.
 // Not the flag at -0x5CA0(r13): fn_80028918 also writes that from sim code.
 constexpr u32 PAUSE_DEPTH = 0x803EC5FC;  // -0x5CA4(r13)
-
 // The game's disc worker (GN7E69): thread, its semaphores (request queue at
 // 0x80381C10), descriptor and DVD staging buffer (Codex audit). In I/O-idle
 // mode (NSR_RB_IO_IDLE) they are restored with everything else, because
@@ -1395,6 +1394,18 @@ struct Rollback
 };
 
 Rollback s_rb;
+
+// A rollback epoch and its following frame-lockstep transition are one
+// deterministic lifecycle.  The transition does not snapshot or predict,
+// but it must keep the frame-derived clocks that asynchronous DVD/audio work
+// observes until the next epoch takes ownership.  Initial boot menus remain
+// on Dolphin's natural clocks because menu_frame_lockstep is armed only by a
+// completed rollback session.
+bool FrameDrivenLifecycleActive()
+{
+  return s_rb.vtime_on || s_rb.menu_frame_lockstep;
+}
+
 // Follow input is CPU-thread-owned; only the capture-suppression flag crosses threads.
 std::unique_ptr<ReplayFollow> s_follow;
 std::atomic<bool> s_follow_catchup{false};
@@ -3873,7 +3884,7 @@ void InstallSeedOnce(const Core::CPUThreadGuard& guard)
 
 long long DiscLatency(long long ticks)
 {
-  return ConfigForRollback().instant_disc && s_rb.vtime_on ? 0 : ticks;
+  return ConfigForRollback().instant_disc && FrameDrivenLifecycleActive() ? 0 : ticks;
 }
 
 void NoteDiscCommand()
@@ -4535,6 +4546,27 @@ static std::map<u32, u32> AudioDataBlocks(const u8* ram)
   return data;
 }
 
+// The frontend's UI command scratch buffer (GN7E69): fn_80189F68 computes
+// its size with fn_802188A0, allocates it, initializes its command arrays in
+// fn_802188D4, and stores the payload at r13-0x6C18.  Render traversal writes
+// transient clipping/primitive data here; at confirmed frame 8260 two honest
+// peers differed only at 0x80B8BD54..5C in this block while their heap maps,
+// RNG, semantic state, and later whole-RAM dumps agreed.  Classify the block
+// through its fixed root instead of its observed Quick Play address so a
+// later session may move it.  The range list itself is hashed, and sidecar v2
+// ownership compares its boundaries, so a real allocation-layout divergence
+// remains visible.
+constexpr u32 UI_RENDER_SCRATCH_ROOT = 0x803E9688;  // -0x6C18(r13)
+
+static std::map<u32, u32> UiRenderBlocks(const u8* ram)
+{
+  auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
+  std::map<u32, u32> blocks;
+  if (const auto block = EnclosingBlock(ram, rd(UI_RENDER_SCRATCH_ROOT)))
+    blocks[block->first] = block->second;
+  return blocks;
+}
+
 // One per-machine range of the classification below: virtual [lo, hi) and
 // its sidecar kind (a string literal).
 struct PerMachineRange
@@ -4549,7 +4581,8 @@ struct PerMachineRange
 // sidecar order: audio heap blocks, live OS objects (every thread, alarm, DVD
 // and ARQ request, audio callback node, tick accumulator, disc staging/stream
 // destinations, GX FIFO), boot-time disc/stream I/O objects, PathFinder audio
-// data blocks, then each audio-touched heap's counters and free blocks.
+// data blocks, the frontend UI render scratch, then each audio-touched heap's
+// counters and free blocks.
 // `io_blocks` / `audio_data` replace the I/O objects / audio data blocks found
 // from the current state, and `with_heaps` = false leaves out the heap
 // counters/free blocks (the state digest passes its fixed sets and applies a
@@ -4576,6 +4609,8 @@ static std::vector<PerMachineRange> PerMachineRanges(Core::System& system, const
     out.push_back({lo, hi, "io-object"});
   for (const auto& [lo, hi] : audio_data ? *audio_data : AudioDataBlocks(ram))
     out.push_back({lo, hi, "audio-data"});
+  for (const auto& [lo, hi] : UiRenderBlocks(ram))
+    out.push_back({lo, hi, "ui-render"});
   // Heaps that hold audio blocks also hold game blocks (e.g. the small heap
   // 0x804C4810 the audio allocator object fn_801E10F0 uses is shared with UI
   // text), and audio code allocates and frees there on audio time. Its effect
@@ -4645,6 +4680,8 @@ static void WritePerMachineSidecar(Core::System& system, const u8* ram, const st
     owner[lo] = "io-object";
   for (const auto& [lo, hi] : AudioDataBlocks(ram))
     owner[lo] = "audio-data";
+  for (const auto& [lo, hi] : UiRenderBlocks(ram))
+    owner[lo] = "ui-render";
   for (const auto& [p, recorded] : s_audio_blocks)
     owner[p - 0x10] = "audio-heap";
   size_t mapped = 0;
@@ -4824,7 +4861,7 @@ namespace
 {
 // Version of the exclusion rules; part of the config fingerprint, so peers
 // with different rules refuse to play instead of reporting false desyncs.
-constexpr u32 STATE_DIGEST_RANGES_VERSION = 2;  // 2: + ARAM gameplay ring
+constexpr u32 STATE_DIGEST_RANGES_VERSION = 3;  // 3: + frontend UI render scratch
 
 // tools/rbdiff.py PER_MACHINE entries below its STATIC_END (.data/.bss words
 // that follow audio/disc time in every mode; physical [lo, hi)).  Keep the
@@ -5608,17 +5645,6 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
 
   const RollbackNet::ConfigFingerprint config = LocalConfigFingerprint(guard.GetSystem());
   u64 semantic = RbStateDigest(guard.GetSystem(), nullptr, RbSemanticChecksum(guard), frame);
-  if (kind == RollbackNet::HandoffKind::EnterRollback && s_rb.session_generation > 0)
-  {
-    // Re-entry: memory freed by the previous match's teardown is still being
-    // reclaimed on each machine's own audio schedule (4-player regress: four
-    // distinct full digests at a re-entry 34 frames after a pause-menu quit).
-    // Agree the semantic words here; the full state digest resumes on every
-    // confirmed frame of the new session and stops it within a few frames if
-    // the game state really differs.
-    semantic = RbSemanticChecksum(guard);
-    Log("handoff re-entry agrees semantic state; full digest resumes per frame");
-  }
   if (kind == RollbackNet::HandoffKind::LeaveRollback && s_rb_exchange)
   {
     // Leave: the teardown frame just freed audio/heap memory on each
@@ -5985,9 +6011,13 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
       std::fflush(r.record);
     }
     RbWritePads(guard, buf, pass_pads);
-    r.in_unit = false;
+    // Post-match lockstep is frame-driven even though rollback ownership is
+    // off: game time/audio queries and instant DVD completion must observe
+    // the same frame on every peer while the next match is loading.
+    r.in_unit = r.menu_frame_lockstep;
     r.in_resim = false;
     r.frame_tick_done = false;
+    r.vtime_calls = 0;
     r.live = t + 1;
     r.cursor = r.live;
     r.rolled = false;
@@ -6793,7 +6823,7 @@ void RollbackFrameEndHook(const Core::CPUThreadGuard& guard)
   auto& ppc_state = guard.GetSystem().GetPPCState();
   ppc_state.npc = LR(ppc_state);
   Rollback& r = s_rb;
-  if (r.vtime_on && !r.config.async_present)
+  if (FrameDrivenLifecycleActive() && !r.config.async_present)
     PowerPC::MMU::HostWrite<u32>(guard, PowerPC::MMU::HostRead<u32>(guard, VI_POST_COUNTER) + 1,
                                  VI_POST_COUNTER);
   CostFrameEnd(guard);
@@ -6867,7 +6897,7 @@ void TickCountHook(const Core::CPUThreadGuard& guard)
 {
   Rollback& r = s_rb;
   auto& ppc = guard.GetSystem().GetPPCState();
-  if (!r.frame_mode || !r.vtime_on)
+  if (!r.frame_mode || !FrameDrivenLifecycleActive())
     return;  // run the original
   using PowerPC::MMU;
   const u32 outer = MMU::HostRead<u32>(guard, TICK_CLOCK_PTR);
@@ -6923,9 +6953,10 @@ void ViCallbackHook(const Core::CPUThreadGuard& guard)
   auto& ppc = guard.GetSystem().GetPPCState();
   const u32 lr = LR(ppc);
   const bool from_frame_routine = lr >= RB_FRAME_CODE && lr < RB_FRAME_CODE + 0x80;
-  if (lr == 0x80416AF4 && s_rb.vtime_on)  // SIM_WAIT_TRAMP: a retrace wait inside the sim
+  if (lr == 0x80416AF4 && FrameDrivenLifecycleActive())
+    // SIM_WAIT_TRAMP: a retrace wait inside deterministic game/menu work.
     return;
-  if (from_frame_routine != s_rb.vtime_on)
+  if (from_frame_routine != FrameDrivenLifecycleActive())
   {
     ppc.npc = lr;  // skip this call
     return;
@@ -6938,7 +6969,7 @@ void ViCallbackHook(const Core::CPUThreadGuard& guard)
 
 void PeekZHook(const Core::CPUThreadGuard& guard)
 {
-  if (!s_rb.vtime_on)
+  if (!FrameDrivenLifecycleActive())
     return;  // outside the session: run the real peek
   auto& ppc = guard.GetSystem().GetPPCState();
   ppc.gpr[3] = s_rb.config.peek_z;
@@ -7001,7 +7032,8 @@ void PresentHook(const Core::CPUThreadGuard& guard)
   Rollback& r = s_rb;
   auto& ppc = guard.GetSystem().GetPPCState();
   const bool async_present = r.config.async_present;  // old behavior
-  if (s_hook_pc == VI_WAIT_FOR_RETRACE && r.vtime_on && r.frame_mode && r.in_unit && !async_present &&
+  if (s_hook_pc == VI_WAIT_FOR_RETRACE && FrameDrivenLifecycleActive() && r.frame_mode && r.in_unit &&
+      !async_present &&
       LR(ppc) != PRESENT_BREAKPT_RETURN &&
       PowerPC::MMU::HostRead<u32>(guard, 0x800000E4) == 0x803A3F30)  // main thread
   {
@@ -7015,13 +7047,13 @@ void PresentHook(const Core::CPUThreadGuard& guard)
   }
   if (s_hook_pc == VI_POST_COUNTER_FN)
   {
-    if (!async_present && r.vtime_on)
+    if (!async_present && FrameDrivenLifecycleActive())
       ppc.npc = LR(ppc);  // counted per frame in RollbackFrameEndHook
     return;
   }
   if (s_hook_pc == GX_ENABLE_BREAKPT)
   {
-    if (!async_present && r.frame_mode && r.in_unit && r.vtime_on &&
+    if (!async_present && r.frame_mode && r.in_unit && FrameDrivenLifecycleActive() &&
         LR(ppc) == PRESENT_BREAKPT_RETURN)
       ppc.npc = r.in_resim ? LR(ppc) : VI_WAIT_FOR_RETRACE;
     return;
@@ -7058,7 +7090,8 @@ namespace
 std::optional<u64> VirtualTime(const Core::CPUThreadGuard& guard, const PowerPC::PowerPCState& ppc)
 {
   Rollback& r = s_rb;
-  if (!r.vtime_on || !r.in_unit || LR(ppc) >= 0x80230000)  // SDK callers: real time
+  if (!FrameDrivenLifecycleActive() || !r.in_unit || LR(ppc) >= 0x80230000)
+    // SDK callers remain on real time; only game decisions are frame-driven.
     return std::nullopt;
   // Spin-waits on ARQ (audio-shared DMA queue; fn_801C1D98..fn_801C1F54) read
   // the time once per iteration, a timing-dependent count: real time, and
@@ -7205,7 +7238,7 @@ void AcEnsureReturnStub(const Core::CPUThreadGuard& guard)
 bool AcGameCaller(const Core::CPUThreadGuard& guard, const PowerPC::PowerPCState& ppc)
 {
   const Rollback& r = s_rb;
-  return r.vtime_on && r.in_unit && LR(ppc) < 0x8025E000 &&
+  return FrameDrivenLifecycleActive() && r.in_unit && LR(ppc) < 0x8025E000 &&
          PowerPC::MMU::HostRead<u32>(guard, 0x800000E4) == 0x803A3F30;
 }
 }  // namespace
@@ -7254,7 +7287,7 @@ void AudioCallReturnHook(const Core::CPUThreadGuard& guard)
 void AudioClockFrameLog(const Core::CPUThreadGuard& guard)
 {
   FILE* f = AcLog();
-  if (!f || !s_rb.vtime_on)
+  if (!f || !FrameDrivenLifecycleActive())
     return;
   // NSR_AC_HASH=lo-hi,...: also a hash of each range (diagnostics: find the
   // first frame where some state differs between two runs).
@@ -7848,7 +7881,7 @@ void AudioClockEffectHook(const Core::CPUThreadGuard& guard)
       pc == R_SFX_START || std::find(R_SPEECH_QUEUE.begin(), R_SPEECH_QUEUE.end(), pc) != R_SPEECH_QUEUE.end() ||
       std::find(R_SFX_HANDLE.begin(), R_SFX_HANDLE.end(), pc) != R_SFX_HANDLE.end();
   const Rollback& r = s_rb;
-  if (AcModeNow() == AcMode::Off || !r.vtime_on || !r.in_unit ||
+  if (AcModeNow() == AcMode::Off || !FrameDrivenLifecycleActive() || !r.in_unit ||
       PowerPC::MMU::HostRead<u32>(guard, 0x800000E4) != 0x803A3F30 ||
       PowerPC::MMU::HostRead<u32>(guard, AC_BASE) != AC_MAGIC)
     return;
@@ -8048,7 +8081,7 @@ void MusicDispatchHook(const Core::CPUThreadGuard& guard)
   const Rollback& r = s_rb;
   if (AcModeNow() == AcMode::Off)
     return;
-  if (!r.vtime_on)
+  if (!FrameDrivenLifecycleActive())
   {
     // Before the session (one shared timeline in netplay: lockstep): note
     // when the current song started, for MusicSessionStart.
@@ -8068,7 +8101,7 @@ void MusicDispatchHook(const Core::CPUThreadGuard& guard)
 void MusicPickHook(const Core::CPUThreadGuard& guard)
 {
   const Rollback& r = s_rb;
-  if (AcModeNow() != AcMode::On || !r.vtime_on || !r.in_unit ||
+  if (AcModeNow() != AcMode::On || !FrameDrivenLifecycleActive() || !r.in_unit ||
       PowerPC::MMU::HostRead<u32>(guard, 0x800000E4) != 0x803A3F30)
     return;
   const AcMem m{guard};
@@ -8361,19 +8394,28 @@ void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason)
   if (r.force > 0)
     RbReport(40);
 
-  const AcMem model{guard};
-  for (u32 address = AC_BASE; address < AC_END; address += 4)
-    model.wr(address, 0);
-  s_ac_pending.clear();
-  s_ac_real.clear();
-  s_ac_sfx_start = {};
-  s_ac_queue = {};
-  s_ac_handle = {};
-  s_music_lr = 0;
-  s_music_r3 = 0;
-  s_sim_wait_lr = 0;
-  s_sim_wait_pass = false;
-  s_sim_waits = 0;
+  // Automatic stage 4 keeps the audio model and its virtual-to-real handle
+  // map alive through the post-match transition.  Clearing it here made
+  // loading/audio queries fall back to each peer's emulated-cycle schedule,
+  // so a quick Restart/Quit -> next match could allocate identical game
+  // objects in different orders.  Non-stage-4 sessions still tear it down.
+  const bool continue_frame_driven = r.auto_handoff && !s_session.failed;
+  if (!continue_frame_driven)
+  {
+    const AcMem model{guard};
+    for (u32 address = AC_BASE; address < AC_END; address += 4)
+      model.wr(address, 0);
+    s_ac_pending.clear();
+    s_ac_real.clear();
+    s_ac_sfx_start = {};
+    s_ac_queue = {};
+    s_ac_handle = {};
+    s_music_lr = 0;
+    s_music_r3 = 0;
+    s_sim_wait_lr = 0;
+    s_sim_wait_pass = false;
+    s_sim_waits = 0;
+  }
 
   r.vtime_on = false;
   s_rb_exchange.reset();
@@ -8404,7 +8446,7 @@ void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason)
   r.session_ended = true;
   r.in_game_seen = false;
   r.session_saw_in_game = false;
-  if (r.auto_handoff)
+  if (continue_frame_driven)
   {
     ResetLockstepStream();
     const u32 session = ConfigForRollback().seed.value_or(0x4E535200) ^ r.live ^ 0x4D454E55;
@@ -8412,8 +8454,9 @@ void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason)
         r.live, static_cast<u8>(s_session.players), static_cast<u8>(s_session.me),
         s_session.delay, 0, session);
     r.menu_frame_lockstep = true;
-    Log("post-match frame lockstep epoch {:08x} starts at frame {} with delay {}", session,
-        r.live, s_session.delay);
+    Log("post-match frame lockstep epoch {:08x} starts at frame {} with delay {}; "
+        "frame-driven time/disc/audio retained",
+        session, r.live, s_session.delay);
   }
   s_io_ranges.clear();
   for (auto& slot : r.ring)
