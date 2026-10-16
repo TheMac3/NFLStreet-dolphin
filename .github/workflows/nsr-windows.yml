@@ -28,6 +28,15 @@ jobs:
           submodules: recursive
           fetch-depth: 0   # Dolphin's ScmRevGen uses git describe for the version string
 
+      - name: Put PowerShell 7 on PATH (self-hosted)
+        # The runner service's PATH is fixed when the service starts, so a
+        # pwsh installed by setup-nsr-runner.ps1 may be invisible until a
+        # reboot. cmd is always available; later steps find pwsh after this.
+        if: ${{ runner.environment != 'github-hosted' }}
+        shell: cmd
+        run: |
+          if exist "%ProgramFiles%\PowerShell\7\pwsh.exe" (echo %ProgramFiles%\PowerShell\7>>"%GITHUB_PATH%") else (echo PowerShell 7 not found; rerun setup-nsr-runner.ps1 & exit /b 1)
+
       - uses: actions/setup-python@v5
         # Hosted runners only: on a self-hosted PC its installer runs a Windows
         # PowerShell 5.1 script, which the PC's execution policy may block.
