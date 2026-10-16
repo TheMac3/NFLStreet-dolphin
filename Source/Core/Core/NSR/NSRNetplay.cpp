@@ -4130,7 +4130,11 @@ void RollbackPollHook(const Core::CPUThreadGuard& guard)
     r.tick_mode = false;
   }
   r.ticks_since_poll = 0;
-  if (!r.tick_mode && r.cursor == r.live && !r.menu_frame_lockstep)
+  // fix/modal: in a frame-mode session only RbStep writes the buffer (agreed
+  // pads), so a long frame (Restart/Quit from the pause menu) never exposes
+  // this machine's local sample to the game. See PollFeedsPadBuffer.
+  if (RollbackLogic::PollFeedsPadBuffer(r.tick_mode, r.cursor == r.live, r.menu_frame_lockstep,
+                                        r.vtime_on && r.frame_mode))
     RbWritePads(guard, RB_PAD_BUF, r.latest);
 }
 
@@ -6886,6 +6890,13 @@ void TickCountHook(const Core::CPUThreadGuard& guard)
     // under the pause menu: the play clock kept counting while its display
     // was frozen, so after resume the CPU snapped on a clock that still
     // showed time. One drain call per frame either way: the loop stops on 0.
+    // Returning 0 also keeps the pause menu stock (fix/modal): with no tick,
+    // InGame runs its no-tick input flush (fn_801C601C/fn_801C60BC(-1)), as
+    // the stock pause menu and its Restart/Quit confirmation expect. Verified
+    // stock-equivalent single-machine and in 2-peer netplay (NFLStreet
+    // tests/scripts/*pause-restart*, *pause-quit*). Handing a paused frame a
+    // tick body instead (an experiment on fix/reentry) left the confirmation
+    // dialog stuck on Cancel in netplay.
     r.frame_tick_done = true;
     if ((inner >> 24) == 0x80)
       MMU::HostWrite<u32>(guard, 0, inner + 8);

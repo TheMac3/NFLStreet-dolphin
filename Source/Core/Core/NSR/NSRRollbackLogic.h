@@ -143,6 +143,23 @@ constexpr bool PausedFrame(std::uint32_t pause_depth)
   return pause_depth != 0;
 }
 
+// Whether the rollback pad poll (VI post-retrace interrupt) may copy this
+// machine's local sample into the game's PADStatus buffer (fix/modal).
+// Outside a session, in menus and loading, it does, as the unpatched poll.
+// In a frame-mode session the buffer belongs to RbStep, which installs the
+// agreed pads at the start of every frame, paused or not. A frame that spans
+// three or more retraces (the Restart reset, the Quit teardown/load, some
+// play transitions) ends poll "tick mode", and the poll used to overwrite
+// the agreed pads with local ones for the rest of that frame, at a
+// host-timing-dependent point that differs per peer. Never in a session.
+// Legacy tick-unit sessions (frame_mode off) keep the old behavior: there a
+// paused or loading frame runs no RbStep, so the poll is the pads' only path.
+constexpr bool PollFeedsPadBuffer(bool tick_mode, bool at_live, bool menu_frame_lockstep,
+                                  bool frame_session)
+{
+  return !tick_mode && at_live && !menu_frame_lockstep && !frame_session;
+}
+
 // Undo log for rollback-owned bytes that live outside the MEM1/VMEM snapshots
 // (final-review M1: the game's ARAM replay ring). Instead of copying the
 // window into every ring slot, each guest write into the window first records

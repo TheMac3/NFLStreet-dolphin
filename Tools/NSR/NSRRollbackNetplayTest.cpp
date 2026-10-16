@@ -1125,6 +1125,13 @@ static void TestPureRollbackHelpers()
   assert(RL::BusyPollCatchups(2001, 1000) == 2);
   assert(RL::Before(9, 10) && !RL::Before(10, 10));
   assert(!RL::PausedFrame(0) && RL::PausedFrame(1) && RL::PausedFrame(2));
+  // fix/modal: the poll feeds the game's pad buffer only outside a frame-mode
+  // session (menus/loading), never while RbStep owns it.
+  assert(RL::PollFeedsPadBuffer(false, true, false, false));
+  assert(!RL::PollFeedsPadBuffer(false, true, false, true));
+  assert(!RL::PollFeedsPadBuffer(true, true, false, false));
+  assert(!RL::PollFeedsPadBuffer(false, false, false, false));
+  assert(!RL::PollFeedsPadBuffer(false, true, true, false));
   const RL::SongTimeline song = RL::ScheduleSong(100, 380, 10800);
   assert(song.start == 480 && song.end == 11280);
   const RL::SongTimeline held = RL::HoldSongOneFrame(song);
