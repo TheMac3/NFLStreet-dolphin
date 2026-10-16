@@ -29,8 +29,44 @@ jobs:
           fetch-depth: 0   # Dolphin's ScmRevGen uses git describe for the version string
 
       - uses: actions/setup-python@v5
+        # Hosted runners only: on a self-hosted PC its installer runs a Windows
+        # PowerShell 5.1 script, which the PC's execution policy may block.
+        if: ${{ runner.environment == 'github-hosted' }}
         with:
           python-version: "3.12"
+
+      - name: Use the PC's Python 3.12 (self-hosted)
+        # setup-nsr-runner.ps1 installs Python 3.12 with winget. The runner
+        # service's PATH is fixed at service start, so locate it through the
+        # py launcher (C:\Windows\py.exe) or the default install folders.
+        if: ${{ runner.environment != 'github-hosted' }}
+        shell: pwsh
+        run: |
+          $exe = $null
+          try { $exe = (& py -3.12 -c "import sys; print(sys.executable)" 2>$null) } catch {}
+          if (-not $exe) {
+            $exe = @("$env:ProgramFiles\Python312\python.exe",
+                     "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe") |
+              Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $exe) {
+            # Not visible to the runner's service account (e.g. a per-user
+            # install): use the official portable Python NuGet package, cached
+            # in the runner's tool folder. No installer, no admin.
+            $root = Join-Path $env:RUNNER_TOOL_CACHE "nsr-python-3.12.7"
+            $exe = Join-Path $root "tools\python.exe"
+            if (-not (Test-Path $exe)) {
+              New-Item -ItemType Directory -Force $root | Out-Null
+              $pkg = Join-Path $env:RUNNER_TEMP "python.3.12.7.zip"
+              Invoke-WebRequest "https://www.nuget.org/api/v2/package/python/3.12.7" -OutFile $pkg
+              Expand-Archive $pkg -DestinationPath $root -Force
+              & $exe -m ensurepip --upgrade
+            }
+          }
+          $dir = Split-Path $exe
+          Add-Content $env:GITHUB_PATH $dir
+          Add-Content $env:GITHUB_PATH (Join-Path $dir "Scripts")
+          & $exe --version
 
       # Python first: these take a few minutes and fail fast, before the long
       # Dolphin build. pywebview pinned (6.2.1, 2026-04) so a new release
