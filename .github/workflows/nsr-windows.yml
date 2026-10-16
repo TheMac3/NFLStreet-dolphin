@@ -34,8 +34,21 @@ jobs:
         # reboot. cmd is always available; later steps find pwsh after this.
         if: ${{ runner.environment != 'github-hosted' }}
         shell: cmd
+        # If it is not installed at all, fetch the official portable zip once
+        # into the runner tool cache with Windows' built-in curl and tar.
         run: |
-          if exist "%ProgramFiles%\PowerShell\7\pwsh.exe" (echo %ProgramFiles%\PowerShell\7>>"%GITHUB_PATH%") else (echo PowerShell 7 not found; rerun setup-nsr-runner.ps1 & exit /b 1)
+          if exist "%ProgramFiles%\PowerShell\7\pwsh.exe" goto installed
+          set "PS7=%RUNNER_TOOL_CACHE%\nsr-pwsh-7.4.6"
+          if exist "%PS7%\pwsh.exe" goto portable
+          mkdir "%PS7%"
+          curl.exe -sSfL -o "%RUNNER_TEMP%\pwsh.zip" https://github.com/PowerShell/PowerShell/releases/download/v7.4.6/PowerShell-7.4.6-win-x64.zip || exit /b 1
+          tar.exe -xf "%RUNNER_TEMP%\pwsh.zip" -C "%PS7%" || exit /b 1
+          :portable
+          echo %PS7%>>"%GITHUB_PATH%"
+          "%PS7%\pwsh.exe" -NoProfile -Command "$PSVersionTable.PSVersion.ToString()"
+          exit /b %ERRORLEVEL%
+          :installed
+          echo %ProgramFiles%\PowerShell\7>>"%GITHUB_PATH%"
 
       - uses: actions/setup-python@v5
         # Hosted runners only: on a self-hosted PC its installer runs a Windows
