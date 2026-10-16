@@ -64,28 +64,24 @@ jobs:
         if: ${{ runner.environment != 'github-hosted' }}
         shell: pwsh
         run: |
-          $exe = $null
-          try { $exe = (& py -3.12 -c "import sys; print(sys.executable)" 2>$null) } catch {}
-          if (-not $exe) {
-            $exe = @("$env:ProgramFiles\Python312\python.exe",
-                     "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe") |
-              Where-Object { Test-Path $_ } | Select-Object -First 1
+          # Machine-wide installs are registered under HKLM (any folder);
+          # also try the py launcher and the default folders. The runner
+          # service (NETWORK SERVICE) cannot see per-user installs and cannot
+          # run the Python installer itself (MSI error 1601), so a machine-wide
+          # Python 3.12 must exist (setup-nsr-runner.ps1 installs one).
+          $cands = @()
+          foreach ($key in "HKLM:\SOFTWARE\Python\PythonCore\3.12\InstallPath",
+                           "HKLM:\SOFTWARE\WOW6432Node\Python\PythonCore\3.12\InstallPath") {
+            $ip = Get-ItemProperty $key -ErrorAction SilentlyContinue
+            if ($ip) { $cands += @($ip.ExecutablePath, (Join-Path ($ip.'(default)' + "") "python.exe")) }
           }
+          try { $cands += (& py -3.12 -c "import sys; print(sys.executable)" 2>$null) } catch {}
+          $cands += @("$env:ProgramFiles\Python312\python.exe", "C:\Python312\python.exe")
+          $cands += (Get-ChildItem "$env:ProgramFiles\Python3*\python.exe" -ErrorAction SilentlyContinue).FullName
+          $exe = $cands | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
           if (-not $exe) {
-            # Not visible to the runner's service account (e.g. a per-user
-            # install): install python.org's full 3.12 (with tkinter, which the
-            # launcher's fallback window needs) quietly into the runner tool
-            # cache. Per-user, no admin, no PATH or registry launcher changes.
-            $root = Join-Path $env:RUNNER_TOOL_CACHE "nsr-python-3.12.7-full"
-            $exe = Join-Path $root "python.exe"
-            if (-not (Test-Path $exe)) {
-              $setup = Join-Path $env:RUNNER_TEMP "python-3.12.7-amd64.exe"
-              Invoke-WebRequest "https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe" -OutFile $setup
-              $p = Start-Process $setup -Wait -PassThru -ArgumentList @("/quiet", "InstallAllUsers=0",
-                "TargetDir=$root", "Include_launcher=0", "Include_test=0", "Include_tcltk=1",
-                "PrependPath=0", "Shortcuts=0", "AssociateFiles=0")
-              if ($p.ExitCode -ne 0 -or -not (Test-Path $exe)) { throw "Python install failed ($($p.ExitCode))" }
-            }
+            Write-Host "Searched: $($cands -join '; ')"
+            throw "No machine-wide Python 3.12 visible to the runner. On the runner PC run (admin): winget install --id Python.Python.3.12 --scope machine --force"
           }
           $dir = Split-Path $exe
           Add-Content $env:GITHUB_PATH $dir
