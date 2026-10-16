@@ -76,12 +76,17 @@ jobs:
             if ($ip) { $cands += @($ip.ExecutablePath, (Join-Path ($ip.'(default)' + "") "python.exe")) }
           }
           try { $cands += (& py -3.12 -c "import sys; print(sys.executable)" 2>$null) } catch {}
-          $cands += @("$env:ProgramFiles\Python312\python.exe", "C:\Python312\python.exe")
+          # A private copy next to the runner (C:\nsr-runner\python312), for
+          # PCs where Windows Installer cannot install Python machine-wide:
+          # docs/self-hosted-runner.md.
+          $runnerRoot = Split-Path (Split-Path $env:RUNNER_WORKSPACE)
+          $cands += @((Join-Path $runnerRoot "python312\python.exe"),
+                      "$env:ProgramFiles\Python312\python.exe", "C:\Python312\python.exe")
           $cands += (Get-ChildItem "$env:ProgramFiles\Python3*\python.exe" -ErrorAction SilentlyContinue).FullName
           $exe = $cands | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
           if (-not $exe) {
             Write-Host "Searched: $($cands -join '; ')"
-            throw "No machine-wide Python 3.12 visible to the runner. On the runner PC run (admin): winget install --id Python.Python.3.12 --scope machine --force"
+            throw "No Python 3.12 visible to the runner. On the runner PC (admin): winget install --id Python.Python.3.12 --scope machine, or copy a Python 3.12 folder to $runnerRoot\\python312"
           }
           $dir = Split-Path $exe
           Add-Content $env:GITHUB_PATH $dir
