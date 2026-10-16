@@ -9,7 +9,10 @@ on:
 
 jobs:
   linux:
-    runs-on: ubuntu-24.04
+    # Off when NSR_LINUX_CI=off (the same suite runs locally on Linux before
+    # every merge); otherwise hosted Ubuntu or NSR_LINUX_RUNS_ON (JSON).
+    if: ${{ vars.NSR_LINUX_CI != 'off' }}
+    runs-on: ${{ fromJSON(vars.NSR_LINUX_RUNS_ON || '"ubuntu-24.04"') }}
     steps:
       - uses: actions/checkout@v4
       - name: Compile with warnings as errors
@@ -22,7 +25,7 @@ jobs:
         run: "$RUNNER_TEMP/nsr-rollback-tests"
 
   windows:
-    runs-on: windows-2022
+    runs-on: ${{ fromJSON(vars.NSR_WINDOWS_RUNS_ON || '"windows-2022"') }}
     steps:
       - uses: actions/checkout@v4
       - uses: ilammy/msvc-dev-cmd@v1

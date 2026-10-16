@@ -201,6 +201,45 @@ def candidate_user_dirs(install: str | None, env=os.environ) -> list[str]:
     return list(dict.fromkeys(os.path.normpath(c) for c in cands))
 
 
+GAME_ID = "GN7E69"
+
+
+def reborn_load_path(install: str | None, env=os.environ) -> str | None:
+    """Dolphin LoadPath with the textures Reborn's own Dolphin really shows.
+
+    Reborn's launcher composes its texture library (content/textures) plus the
+    player's enabled mods (button-prompt packs, footballs, ...) into the user
+    folder's Load/Textures/<gameid>; its Dolphin loads that composed tree. The
+    raw library alone has placeholder "MISSING TEXTURES" art where a mod is
+    expected to supply the real texture (menus with controller prompts), which
+    is what our netplay Dolphin showed when it pointed at content/. Prefer the
+    newest composed tree; fall back to the raw library. Read only: textures are
+    host-side and never affect netplay state.
+    """
+    best = None
+    for i, user_dir in enumerate(candidate_user_dirs(install, env)):
+        tex = os.path.join(user_dir, "Load", "Textures", GAME_ID)
+        try:
+            if not os.path.isdir(tex) or not os.listdir(tex):
+                continue
+            mtime = os.path.getmtime(tex)
+        except OSError:
+            continue
+        key = (mtime, -i)
+        if best is None or key > best[0]:
+            best = (key, os.path.join(user_dir, "Load"))
+    if best:
+        return best[1]
+    # No composed tree yet (Reborn never launched on this PC): Reborn's
+    # downloaded texture library, laid out as <root>/library/textures/<gameid>,
+    # still beats the installer's seed copy in content/textures.
+    for root in data_roots(install, env):
+        lib = os.path.join(root, "library")
+        if os.path.isdir(os.path.join(lib, "textures", GAME_ID)):
+            return lib
+    return os.path.join(install, "content") if install else None
+
+
 def find_reborn_source(install: str | None, env=os.environ) -> RebornSource | None:
     """The Reborn Dolphin user folder holding the player's mapping. Several can
     exist (the install's stock runtime/User and launcher-made copies); the

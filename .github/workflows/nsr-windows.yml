@@ -17,7 +17,10 @@ on:
 
 jobs:
   windows-x64:
-    runs-on: windows-2022
+    # Hosted windows-2022 by default; the repo variable NSR_WINDOWS_RUNS_ON
+    # (JSON) moves it to a self-hosted Windows runner, e.g.
+    # ["self-hosted","Windows","X64","nsr-windows"] (NFLStreet docs/self-hosted-runner.md).
+    runs-on: ${{ fromJSON(vars.NSR_WINDOWS_RUNS_ON || '"windows-2022"') }}
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
@@ -25,9 +28,71 @@ jobs:
           submodules: recursive
           fetch-depth: 0   # Dolphin's ScmRevGen uses git describe for the version string
 
+      - name: Put PowerShell 7 on PATH (self-hosted)
+        # The runner service's PATH is fixed when the service starts, so a
+        # pwsh installed by setup-nsr-runner.ps1 may be invisible until a
+        # reboot. cmd is always available; later steps find pwsh after this.
+        if: ${{ runner.environment != 'github-hosted' }}
+        shell: cmd
+        # If it is not installed at all, fetch the official portable zip once
+        # into the runner tool cache with Windows' built-in curl and tar.
+        run: |
+          if exist "%ProgramFiles%\PowerShell\7\pwsh.exe" goto installed
+          set "PS7=%RUNNER_TOOL_CACHE%\nsr-pwsh-7.4.6"
+          if exist "%PS7%\pwsh.exe" goto portable
+          mkdir "%PS7%"
+          curl.exe -sSfL -o "%RUNNER_TEMP%\pwsh.zip" https://github.com/PowerShell/PowerShell/releases/download/v7.4.6/PowerShell-7.4.6-win-x64.zip || exit /b 1
+          tar.exe -xf "%RUNNER_TEMP%\pwsh.zip" -C "%PS7%" || exit /b 1
+          :portable
+          echo %PS7%>>"%GITHUB_PATH%"
+          "%PS7%\pwsh.exe" -NoProfile -Command "$PSVersionTable.PSVersion.ToString()"
+          exit /b %ERRORLEVEL%
+          :installed
+          echo %ProgramFiles%\PowerShell\7>>"%GITHUB_PATH%"
+
       - uses: actions/setup-python@v5
+        # Hosted runners only: on a self-hosted PC its installer runs a Windows
+        # PowerShell 5.1 script, which the PC's execution policy may block.
+        if: ${{ runner.environment == 'github-hosted' }}
         with:
           python-version: "3.12"
+
+      - name: Use the PC's Python 3.12 (self-hosted)
+        # setup-nsr-runner.ps1 installs Python 3.12 with winget. The runner
+        # service's PATH is fixed at service start, so locate it through the
+        # py launcher (C:\Windows\py.exe) or the default install folders.
+        if: ${{ runner.environment != 'github-hosted' }}
+        shell: pwsh
+        run: |
+          # Machine-wide installs are registered under HKLM (any folder);
+          # also try the py launcher and the default folders. The runner
+          # service (NETWORK SERVICE) cannot see per-user installs and cannot
+          # run the Python installer itself (MSI error 1601), so a machine-wide
+          # Python 3.12 must exist (setup-nsr-runner.ps1 installs one).
+          $cands = @()
+          foreach ($key in "HKLM:\SOFTWARE\Python\PythonCore\3.12\InstallPath",
+                           "HKLM:\SOFTWARE\WOW6432Node\Python\PythonCore\3.12\InstallPath") {
+            $ip = Get-ItemProperty $key -ErrorAction SilentlyContinue
+            if ($ip) { $cands += @($ip.ExecutablePath, (Join-Path ($ip.'(default)' + "") "python.exe")) }
+          }
+          try { $cands += (& py -3.12 -c "import sys; print(sys.executable)" 2>$null) } catch {}
+          # A private copy next to the runner (C:\nsr-runner\python312), for
+          # PCs where Windows Installer cannot install Python machine-wide:
+          # docs/self-hosted-runner.md.
+          $runnerRoot = Split-Path (Split-Path $env:RUNNER_WORKSPACE)
+          $cands += @((Join-Path $runnerRoot "python312\python.exe"),
+                      "$env:ProgramFiles\Python312\python.exe", "C:\Python312\python.exe")
+          $cands += (Get-ChildItem "$env:ProgramFiles\Python3*\python.exe" -ErrorAction SilentlyContinue).FullName
+          $exe = $cands | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $exe) {
+            Write-Host "Searched: $($cands -join '; ')"
+            throw "No Python 3.12 visible to the runner. On the runner PC (admin): winget install --id Python.Python.3.12 --scope machine, or copy a Python 3.12 folder to $runnerRoot\\python312"
+          }
+          $dir = Split-Path $exe
+          Add-Content $env:GITHUB_PATH $dir
+          Add-Content $env:GITHUB_PATH (Join-Path $dir "Scripts")
+          & $exe -c "import sys, tkinter; print(sys.version, 'tk', tkinter.TkVersion)"
+          if ($LASTEXITCODE -ne 0) { throw "this Python lacks tkinter (the launcher fallback needs it)" }
 
       # Python first: these take a few minutes and fail fast, before the long
       # Dolphin build. pywebview pinned (6.2.1, 2026-04) so a new release
@@ -62,6 +127,27 @@ jobs:
           "NSR Netplay.exe: {0:N1} MB" -f ((Get-Item "pyi-dist/NSR Netplay.exe").Length / 1MB)
 
       - uses: microsoft/setup-msbuild@v2
+        if: ${{ runner.environment == 'github-hosted' }}
+
+      - name: Use the MSBuild that has the C++ toolset (self-hosted)
+        # A PC can have several Visual Studio instances (e.g. Build Tools
+        # without the C++ workload next to a full VS); setup-msbuild takes the
+        # newest, which may lack Microsoft.Cpp.Default.props. Ask vswhere for
+        # an instance with the x64 C++ tools and the v143 MSBuild support.
+        if: ${{ runner.environment != 'github-hosted' }}
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere not found: install Visual Studio 2022 with 'Desktop development with C++'" }
+          & $vswhere -products * -format text -property installationPath | ForEach-Object { Write-Host "VS instance: $_" }
+          $msbuild = & $vswhere -latest -products * -version "[17.0,18.0)" `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 Microsoft.Component.MSBuild `
+            -find "MSBuild\Current\Bin\amd64\MSBuild.exe" | Select-Object -First 1
+          if (-not $msbuild) {
+            throw "No Visual Studio 2022 instance with the C++ x64 tools. Install the 'Desktop development with C++' workload (Visual Studio Installer > Modify)."
+          }
+          Write-Host "MSBuild: $msbuild"
+          Add-Content $env:GITHUB_PATH (Split-Path $msbuild)
 
       - name: Build (Release x64)
         working-directory: Source
