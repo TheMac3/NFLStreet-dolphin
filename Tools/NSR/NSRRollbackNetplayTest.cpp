@@ -54,19 +54,23 @@ static void Deliver(const RN::Exchange& from, RN::Exchange* to, std::uint32_t fr
 static void TestHandoffAgreement()
 {
   RN::HandoffAgreement agreement(3, 0, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd, {},
-                                 100);
-  RN::HandoffPacket peer1{1, 3, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd, {}, 111};
-  RN::HandoffPacket peer2{2, 3, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd, {}, 122};
+                                 100, 1000);
+  RN::HandoffPacket peer1{1, 3, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd, {}, 111,
+                          1110};
+  RN::HandoffPacket peer2{2, 3, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd, {}, 122,
+                          1220};
   const auto bytes = RN::EncodeHandoff(peer1);
   const auto decoded = RN::DecodeHandoff(bytes);
   assert(decoded);
   assert(decoded->sync_clock == 111);
+  assert(decoded->sync_aux_clock == 1110);
   assert(agreement.Accept(*decoded));
   assert(agreement.Accept(*decoded));
   assert(!agreement.Complete());
   assert(agreement.Accept(peer2));
   assert(agreement.Complete());
   assert(agreement.HostClock() == 100);
+  assert(agreement.HostAuxClock() == 1000);
   // A retransmission may not change its sender's clock.
   RN::HandoffPacket moved = peer2;
   moved.sync_clock = 123;
@@ -74,9 +78,11 @@ static void TestHandoffAgreement()
   assert(agreement.Mismatched() && !agreement.Complete());
 
   RN::HandoffAgreement leaf(3, 2, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd, {},
-                            122);
-  assert(leaf.Accept({0, 3, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd, {}, 100}));
+                            122, 1220);
+  assert(leaf.Accept(
+      {0, 3, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd, {}, 100, 1000}));
   assert(leaf.HostClock() == 100);
+  assert(leaf.HostAuxClock() == 1000);
   assert(leaf.Accept(peer1));
   assert(leaf.Complete());
 

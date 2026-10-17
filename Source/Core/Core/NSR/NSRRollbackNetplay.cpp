@@ -16,7 +16,7 @@ namespace NSRNetplay::RollbackNet
 namespace
 {
 constexpr std::size_t HEADER_SIZE = 96;
-constexpr std::size_t HANDOFF_SIZE = 29 + 8 * CONFIG_FIELDS;
+constexpr std::size_t HANDOFF_SIZE = 33 + 8 * CONFIG_FIELDS;
 constexpr double FRAME_US = 16683.0;
 constexpr std::uint32_t MAX_TIMING_RTT_US = 2'000'000;
 constexpr std::size_t MIN_TIMING_SAMPLES = 6;
@@ -96,6 +96,7 @@ std::vector<std::uint8_t> EncodeHandoff(const HandoffPacket& packet)
   for (const std::uint64_t value : packet.config.fields)
     Put(out, value);
   Put(out, packet.sync_clock);
+  Put(out, packet.sync_aux_clock);
   return out;
 }
 
@@ -118,7 +119,8 @@ std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes)
       version != HANDOFF_VERSION || packet.players < 2 || packet.players > MAX_PLAYERS ||
       packet.sender >= packet.players ||
       (kind != static_cast<std::uint8_t>(HandoffKind::EnterRollback) &&
-       kind != static_cast<std::uint8_t>(HandoffKind::LeaveRollback)))
+       kind != static_cast<std::uint8_t>(HandoffKind::LeaveRollback) &&
+       kind != static_cast<std::uint8_t>(HandoffKind::SyncClocks)))
   {
     return std::nullopt;
   }
@@ -127,7 +129,7 @@ std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes)
     if (!Get(bytes, at, &value))
       return std::nullopt;
   }
-  if (!Get(bytes, at, &packet.sync_clock))
+  if (!Get(bytes, at, &packet.sync_clock) || !Get(bytes, at, &packet.sync_aux_clock))
     return std::nullopt;
   packet.kind = static_cast<HandoffKind>(kind);
   return packet;
@@ -136,13 +138,15 @@ std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes)
 HandoffAgreement::HandoffAgreement(std::uint8_t players, std::uint8_t me, HandoffKind kind,
                                    std::uint32_t transition, std::uint32_t frame,
                                    std::uint64_t semantic_hash, const ConfigFingerprint& config,
-                                   std::uint32_t sync_clock)
+                                   std::uint32_t sync_clock, std::uint32_t sync_aux_clock)
     : m_players(std::clamp<std::uint8_t>(players, 2, static_cast<std::uint8_t>(MAX_PLAYERS))),
       m_me(std::min<std::uint8_t>(me, m_players - 1)),
-      m_local{m_me, m_players, kind, transition, frame, semantic_hash, config, sync_clock}
+      m_local{m_me, m_players, kind, transition, frame, semantic_hash, config, sync_clock,
+              sync_aux_clock}
 {
   m_seen[m_me] = true;
   m_sync_clocks[m_me] = sync_clock;
+  m_sync_aux_clocks[m_me] = sync_aux_clock;
 }
 
 bool HandoffAgreement::Accept(const HandoffPacket& packet)
@@ -169,7 +173,9 @@ bool HandoffAgreement::Accept(const HandoffPacket& packet)
   // Different peers are expected to propose different clocks, but one
   // sender's retransmissions must be immutable so leaves cannot adopt
   // different player-0 baselines after reordering.
-  if (m_seen[packet.sender] && m_sync_clocks[packet.sender] != packet.sync_clock)
+  if (m_seen[packet.sender] &&
+      (m_sync_clocks[packet.sender] != packet.sync_clock ||
+       m_sync_aux_clocks[packet.sender] != packet.sync_aux_clock))
   {
     if (!m_mismatch)
       m_mismatch = packet;
@@ -177,6 +183,7 @@ bool HandoffAgreement::Accept(const HandoffPacket& packet)
   }
   m_seen[packet.sender] = true;
   m_sync_clocks[packet.sender] = packet.sync_clock;
+  m_sync_aux_clocks[packet.sender] = packet.sync_aux_clock;
   return true;
 }
 
@@ -191,6 +198,13 @@ std::optional<std::uint32_t> HandoffAgreement::HostClock() const
   if (!m_seen[0])
     return std::nullopt;
   return m_sync_clocks[0];
+}
+
+std::optional<std::uint32_t> HandoffAgreement::HostAuxClock() const
+{
+  if (!m_seen[0])
+    return std::nullopt;
+  return m_sync_aux_clocks[0];
 }
 
 std::vector<std::uint8_t> Encode(const Packet& packet)

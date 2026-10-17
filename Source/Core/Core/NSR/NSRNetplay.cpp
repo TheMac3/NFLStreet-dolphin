@@ -645,7 +645,11 @@ void HandlePacket(const ENetPacket* packet, u32 source)
     if (decoded->session != s_rb_exchange->Session())
     {
       NSRTelemetry::Count(NSRTelemetry::Counter::PacketsRejected, 1, decoded->sender);
-      if (!s_rb_bad_session_logged)
+      // One peer can complete the reliable entry barrier and emit its first
+      // new-epoch NSRB packet while this peer is still receiving that
+      // barrier's final proposal. Reject it as usual, but it is an expected
+      // transition race rather than a protocol/session diagnostic.
+      if (!s_rb_handoff && !s_rb_bad_session_logged)
       {
         s_rb_bad_session_logged = true;
         Log("rollback session mismatch from player {}: expected {:08x}, got {:08x}",
@@ -1150,6 +1154,10 @@ constexpr u32 TICK_CLOCK_PTR = 0x803EC138;  // -0x6168(r13)
 // by rollback, identical on every peer), so TickCountHook may key on it.
 // Not the flag at -0x5CA0(r13): fn_80028918 also writes that from sim code.
 constexpr u32 PAUSE_DEPTH = 0x803EC5FC;  // -0x5CA4(r13)
+// A retrace-derived game clock not covered by VI_POST_COUNTER. The two are
+// proposed independently at lifecycle barriers because teardown-frame audio
+// waits can advance them by different amounts.
+constexpr u32 TRANSITION_AUX_CLOCK = 0x8039B438;
 // The game's disc worker (GN7E69): thread, its semaphores (request queue at
 // 0x80381C10), descriptor and DVD staging buffer (Codex audit). In I/O-idle
 // mode (NSR_RB_IO_IDLE) they are restored with everything else, because
@@ -4865,16 +4873,17 @@ namespace
 {
 // Version of the exclusion rules; part of the config fingerprint, so peers
 // with different rules refuse to play instead of reporting false desyncs.
-constexpr u32 STATE_DIGEST_RANGES_VERSION = 3;  // 3: + frontend UI render scratch
+constexpr u32 STATE_DIGEST_RANGES_VERSION = 4;  // 4: + audio callback's transient stream pointer
 
 // tools/rbdiff.py PER_MACHINE entries below its STATIC_END (.data/.bss words
 // that follow audio/disc time in every mode; physical [lo, hi)).  Keep the
 // two lists in sync (and bump STATE_DIGEST_RANGES_VERSION) when either moves.
-constexpr std::array<std::pair<u32, u32>, 11> STATIC_PER_MACHINE{{
+constexpr std::array<std::pair<u32, u32>, 12> STATIC_PER_MACHINE{{
     {0x0037F8C0, 0x00381C20},  // disc worker thread/stack
     {0x0039B42C, 0x0039B430},  // disc worker owner word
     {0x003D51A0, 0x003D51A4},  // disc worker owner word
     {0x002C8840, 0x002C89E0},  // audio streaming I/O
+    {0x002C8A30, 0x002C8A34},  // audio callback's transient stream pointer
     {0x003EBC3C, 0x003EBC40},  // audio streaming I/O
     {0x003ECFA0, 0x003ECFA4},  // audio streaming I/O
     {0x002F481C, 0x002F4834},  // PathFinder music globals (audio thread)
@@ -5422,6 +5431,47 @@ static void RbDumpDesync(Core::System& system, u32 frame)
   Log("wrote {} (+ .vmem, .permachine, .excl, .pages) for the desync at frame {}", path, frame);
 }
 
+// A handoff mismatch happens outside the snapshot ring, so preserve the live
+// state that produced the barrier digest.  This is the lifecycle equivalent
+// of RbDumpDesync and is intentionally failure-only.
+static void RbDumpHandoffDesync(Core::System& system, u32 frame)
+{
+  const std::string prefix = Env("NSR_DUMP_PREFIX");
+  if (prefix.empty())
+    return;
+  const std::string path = fmt::format("{}-handoff-desync-{}.bin", prefix, frame);
+  const u8* ram = system.GetMemory().GetRAM();
+  if (FILE* f = std::fopen(path.c_str(), "wb"))
+  {
+    std::fwrite(ram, 1, system.GetMemory().GetRamSizeReal(), f);
+    std::fclose(f);
+  }
+  if (s_rb.vmem_bytes)
+  {
+    if (FILE* f = std::fopen((path + ".vmem").c_str(), "wb"))
+    {
+      std::fwrite(s_rb.vmem, 1, s_rb.vmem_bytes, f);
+      std::fclose(f);
+    }
+  }
+  WritePerMachineSidecar(system, ram, path);
+  WriteAramRingSidecar(system, path);
+  if (FILE* f = std::fopen((path + ".excl").c_str(), "w"))
+  {
+    for (const RollbackLogic::Range& x : s_digest.excluded)
+      std::fprintf(f, "%08x %08x\n", x.lo, x.hi);
+    std::fclose(f);
+  }
+  if (FILE* f = std::fopen((path + ".pages").c_str(), "w"))
+  {
+    for (size_t p = 0; p < s_digest.values.size(); ++p)
+      std::fprintf(f, "%zx %016llx\n", p,
+                   static_cast<unsigned long long>(s_digest.values[p]));
+    std::fclose(f);
+  }
+  Log("wrote {} (+ .vmem, .permachine, .aram, .excl, .pages) for handoff mismatch", path);
+}
+
 // Diagnostics: NSR_RB_DIGEST_DUMP_EVERY=n (with NSR_DUMP_PREFIX) writes the
 // digested state of every finalized frame start that is a multiple of n:
 // <prefix>-dfin-<frame>.bin (the ring slot's MEM1; RB_KEEP bytes in it are
@@ -5641,7 +5691,8 @@ static bool ConfirmRollbackTail(u32 completed_frame)
 // kind/frame/hash/config tuple.  A differing config is refused by name before
 // any rollback epoch starts (final review M2).
 static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::HandoffKind kind,
-                           u32 frame, u32* host_clock = nullptr)
+                           u32 frame, u32* host_clock = nullptr,
+                           u32* host_aux_clock = nullptr)
 {
   Session& s = s_session;
   if (!s.enabled || s.failed || (!AllConnected() && !WaitForConnection()))
@@ -5672,8 +5723,9 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
                              s_rb.session_generation * 2 :
                              s_rb.session_generation * 2 - 1;
   const u32 sync_clock = PowerPC::MMU::HostRead<u32>(guard, VI_POST_COUNTER);
+  const u32 sync_aux_clock = PowerPC::MMU::HostRead<u32>(guard, TRANSITION_AUX_CLOCK);
   s_rb_handoff.emplace(static_cast<u8>(s.players), static_cast<u8>(s.me), kind, transition, frame,
-                       semantic, config, sync_clock);
+                       semantic, config, sync_clock, sync_aux_clock);
   SendHandoff();
   const auto start = std::chrono::steady_clock::now();
   auto last_send = start;
@@ -5704,6 +5756,7 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
   if (s_rb_handoff->Mismatched())
   {
     const RollbackNet::HandoffPacket& other = *s_rb_handoff->Mismatch();
+    RbDumpHandoffDesync(guard.GetSystem(), frame);
     return FailHandoff(fmt::format(
         "state/frame mismatch from player {}: local kind {} frame {} state digest {:016x}, "
         "remote kind {} frame {} state digest {:016x}",
@@ -5713,15 +5766,84 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
   if (s.failed)
     return FailHandoff(fmt::format("transport failed at handoff frame {}", frame));
   const std::optional<u32> agreed_clock = s_rb_handoff->HostClock();
-  if (!agreed_clock)
+  const std::optional<u32> agreed_aux_clock = s_rb_handoff->HostAuxClock();
+  if (!agreed_clock || !agreed_aux_clock)
     return FailHandoff(fmt::format("handoff at frame {} completed without player 0", frame));
   if (host_clock)
     *host_clock = *agreed_clock;
+  if (host_aux_clock)
+    *host_aux_clock = *agreed_aux_clock;
   Log("handoff {} transition {} agreed at frame {} state digest {:016x} host clock {}",
       kind == RollbackNet::HandoffKind::EnterRollback ? "entry" : "leave", transition, frame,
       semantic, *agreed_clock);
   s_rb_handoff.reset();
   return true;
+}
+
+// Re-entry needs one small phase before its full-state barrier: real audio
+// completion may make the preceding presentation loop take a few different
+// virtual retraces on each peer. Exchange only the authenticated clock
+// baselines, adopt player 0's domain, then compute the full digest. A
+// high-bit transition id keeps delayed clock packets distinct from the
+// subsequent entry proposal.
+static bool HandoffClockBarrier(const Core::CPUThreadGuard& guard, u32 frame, u32* host_clock,
+                                u32* host_aux_clock)
+{
+  Session& s = s_session;
+  if (!s.enabled || s.failed || (!AllConnected() && !WaitForConnection()))
+    return FailHandoff(fmt::format("transport is not connected at clock sync frame {}", frame));
+  const RollbackNet::ConfigFingerprint config = LocalConfigFingerprint(guard.GetSystem());
+  const u32 transition = 0x80000000u | s_rb.session_generation;
+  const u32 sync_clock = PowerPC::MMU::HostRead<u32>(guard, VI_POST_COUNTER);
+  const u32 sync_aux_clock = PowerPC::MMU::HostRead<u32>(guard, TRANSITION_AUX_CLOCK);
+  s_rb_handoff.emplace(static_cast<u8>(s.players), static_cast<u8>(s.me),
+                       RollbackNet::HandoffKind::SyncClocks, transition, frame, 0, config,
+                       sync_clock, sync_aux_clock);
+  SendHandoff();
+  const auto start = std::chrono::steady_clock::now();
+  auto last_send = start;
+  while (!s_rb_handoff->Complete() && !s_rb_handoff->Mismatched() && !s.failed)
+  {
+    Service(1);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_send >= std::chrono::milliseconds(8))
+    {
+      SendHandoff();
+      last_send = now;
+    }
+    if (now - start >= std::chrono::milliseconds(PEER_TIMEOUT_MS))
+      return FailHandoff(fmt::format("timeout synchronizing re-entry clocks at frame {}", frame));
+  }
+  if (const auto& other = s_rb_handoff->ConfigMismatch())
+  {
+    const RollbackNet::ConfigFingerprint remote = other->config;
+    const u32 player = other->sender;
+    s_rb_handoff.reset();
+    FailConfigMismatch(player, &config, &remote, RollbackNet::ConfigDigest(config),
+                       RollbackNet::ConfigDigest(remote));
+    return false;
+  }
+  if (s_rb_handoff->Mismatched() || s.failed)
+    return FailHandoff(fmt::format("clock synchronization mismatch at frame {}", frame));
+  const std::optional<u32> agreed_clock = s_rb_handoff->HostClock();
+  const std::optional<u32> agreed_aux_clock = s_rb_handoff->HostAuxClock();
+  if (!agreed_clock || !agreed_aux_clock)
+    return FailHandoff(fmt::format("clock sync at frame {} completed without player 0", frame));
+  *host_clock = *agreed_clock;
+  *host_aux_clock = *agreed_aux_clock;
+  Log("handoff clock sync transition {} agreed at frame {} host clocks {}/{}", transition, frame,
+      *agreed_clock, *agreed_aux_clock);
+  s_rb_handoff.reset();
+  return true;
+}
+
+// Adopt player 0's retrace-derived clock domain at a lifecycle barrier.
+// Defined beside the affected model below; the declaration keeps handoff
+// transport independent from the game's clock layout.
+namespace
+{
+void NormalizeTransitionClocks(const Core::CPUThreadGuard& guard, u32 host_clock,
+                               u32 host_aux_clock);
 }
 
 // Convert the transport-neutral input arrays without coupling that component
@@ -5974,16 +6096,25 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     // A failed session (e.g. a refused config) is already stopping: don't
     // retry the barrier every frame until the core stops.
     u32 host_clock = 0;
+    u32 host_aux_clock = 0;
+    bool clocks_ready = true;
+    if (automatic_entry && r.session_generation > 0)
+    {
+      clocks_ready = HandoffClockBarrier(guard, t, &host_clock, &host_aux_clock);
+      if (clocks_ready)
+        NormalizeTransitionClocks(guard, host_clock, host_aux_clock);
+    }
     if (!automatic_entry ||
-        (!s_session.failed &&
-         HandoffBarrier(guard, RollbackNet::HandoffKind::EnterRollback, t, &host_clock)))
+        (clocks_ready && !s_session.failed &&
+         HandoffBarrier(guard, RollbackNet::HandoffKind::EnterRollback, t, &host_clock,
+                        &host_aux_clock)))
     {
       // Lockstep proves the semantic state, but VI retrace callbacks are
       // scheduled independently on each host. The game reads this counter
       // for timers and sound rate limiting, so every peer adopts player 0's
       // natural baseline before the rollback epoch starts.
       if (automatic_entry)
-        PowerPC::MMU::HostWrite<u32>(guard, host_clock, VI_POST_COUNTER);
+        NormalizeTransitionClocks(guard, host_clock, host_aux_clock);
       EnterRollbackSession(guard, t);
     }
   }
@@ -6868,10 +6999,15 @@ void RollbackFrameEndHook(const Core::CPUThreadGuard& guard)
     // The next absolute frame is the lockstep fallback boundary.  Confirm
     // the just-completed transition input first, then prove equal semantic
     // state before disabling rollback and resetting the poll stream.
+    u32 host_clock = 0;
+    u32 host_aux_clock = 0;
     if (!r.auto_handoff ||
         (ConfirmRollbackTail(r.tick_running) &&
-         HandoffBarrier(guard, RollbackNet::HandoffKind::LeaveRollback, r.live)))
+         HandoffBarrier(guard, RollbackNet::HandoffKind::LeaveRollback, r.live, &host_clock,
+                        &host_aux_clock)))
     {
+      if (r.auto_handoff)
+        NormalizeTransitionClocks(guard, host_clock, host_aux_clock);
       LeaveRollbackSession(guard, "InGame group inactive");
     }
   }
@@ -7013,7 +7149,14 @@ void SimWaitBegin(const Core::CPUThreadGuard& guard)
   using PowerPC::MMU;
   auto& ppc = guard.GetSystem().GetPPCState();
   MMU::HostWrite<u32>(guard, MMU::HostRead<u32>(guard, VI_POST_COUNTER) + 1, VI_POST_COUNTER);
-  AudioClockSimWait(guard);
+  // The presenter's teardown wait (fn_801CE82C, call at 0x801CE7DC) is
+  // host/GX pacing. It needs a virtual VI callback to make progress, but it
+  // is not elapsed game-audio time: the number of waits depends on each
+  // peer's rollback-history cycle phase. Advancing AcNow here made otherwise
+  // identical peers expire model deadlines on different transition frames.
+  const u32 caller = LR(ppc) - 4;
+  if (caller < 0x801CE000 || caller >= 0x801CE900)
+    AudioClockSimWait(guard);
   if (MMU::HostRead<u32>(guard, SIM_WAIT_TRAMP) != 0x4E800020)
     MMU::HostWrite<u32>(guard, 0x4E800020, SIM_WAIT_TRAMP);
   if (++s_sim_waits % 600 == 1)
@@ -8046,6 +8189,33 @@ constexpr u32 MUSIC_TRAMP = 0x80416AF8;      // injected dispatcher calls return
 constexpr u32 AC_MUSIC = 0x80416FC0;         // +0 song end frame, +4 song start frame (+8/+C: AcCountPoll)
 constexpr u32 AC_MUSIC_LAST_START = 0x80416FFC;  // last real start before the session (kept)
 static_assert(AC_SFX + AC_SFX_SLOTS * 12 <= AC_MUSIC);
+
+void NormalizeTransitionClocks(const Core::CPUThreadGuard& guard, u32 host_clock,
+                               u32 host_aux_clock)
+{
+  using PowerPC::MMU;
+  const u32 local_clock = MMU::HostRead<u32>(guard, VI_POST_COUNTER);
+  const u32 delta = local_clock - host_clock;
+  MMU::HostWrite<u32>(guard, host_clock, VI_POST_COUNTER);
+  MMU::HostWrite<u32>(guard, host_aux_clock, TRANSITION_AUX_CLOCK);
+
+  // These GN7E69 words are advanced by the same VI callbacks as the post
+  // counter. Preserve their established offsets while moving the clock
+  // domain to player 0. The pre-retrace object's counter is reached through
+  // its game-owned root so this remains valid if that object moves.
+  const auto shift = [&](u32 address) {
+    MMU::HostWrite<u32>(guard, MMU::HostRead<u32>(guard, address) - delta, address);
+  };
+  shift(0x802D55BC);
+  shift(0x803EBE58);
+  const u32 pre_retrace = MMU::HostRead<u32>(guard, 0x803EBE44);
+  if (pre_retrace >= 0x80003100 && pre_retrace < 0x817FFFE0)
+    shift(pre_retrace + 0x20);
+
+  Log("handoff clocks normalized: VI {} -> {}, aux -> {}, delta {}", local_clock, host_clock,
+      host_aux_clock, delta);
+}
+
 constexpr u32 MUSIC_EVENT = 0x11000000;  // track event flags as PathFinder sends them
 constexpr u32 MUSIC_START_ID = 0x7C, MUSIC_END_ID = 0x75;
 u32 s_music_lr = 0, s_music_r3 = 0;  // the frame routine's VI_PRE_CB call being resumed

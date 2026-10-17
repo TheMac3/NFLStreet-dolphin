@@ -27,13 +27,15 @@ constexpr std::uint32_t HANDOFF_MAGIC = 0x4E535248;  // 'NSRH'
 // NSRNetplay's StateDigest) instead of the nine-word semantic hash, and every
 // datagram carries the sender's ConfigDigest.  HANDOFF_VERSION 2: proposals
 // carry the full ConfigFingerprint.  HANDOFF_VERSION 3 (rc1regress): proposals
-// also carry the sender's VI retrace counter (sync_clock).  Mixed builds
+// also carry the sender's VI retrace counter (sync_clock). HANDOFF_VERSION 4
+// adds the second retrace-derived clock needed to normalize a completed
+// match's teardown state before the next entry digest. Mixed builds
 // therefore fail to parse each other instead of comparing values that mean
 // different things.  VERSION 6 keeps frame-driven time, DVD completion and
 // audio modeling active during post-match lockstep; an older peer would run
 // that transition with incompatible lifecycle semantics.
 constexpr std::uint8_t VERSION = 6;
-constexpr std::uint8_t HANDOFF_VERSION = 3;
+constexpr std::uint8_t HANDOFF_VERSION = 4;
 constexpr std::size_t MAX_PLAYERS = 4;
 constexpr std::size_t PAD_SIZE = 12;
 constexpr std::size_t MAX_HISTORY = 64;
@@ -147,6 +149,7 @@ enum class HandoffKind : std::uint8_t
 {
   EnterRollback = 1,
   LeaveRollback = 2,
+  SyncClocks = 3,
 };
 
 struct HandoffPacket
@@ -162,6 +165,7 @@ struct HandoffPacket
   // This field is deliberately not part of agreement equality: peers reach
   // the same lockstep frame with host-scheduling-dependent counter values.
   std::uint32_t sync_clock = 0;
+  std::uint32_t sync_aux_clock = 0;
 };
 
 std::vector<std::uint8_t> EncodeHandoff(const HandoffPacket& packet);
@@ -181,7 +185,7 @@ public:
   HandoffAgreement(std::uint8_t players, std::uint8_t me, HandoffKind kind,
                    std::uint32_t transition, std::uint32_t frame,
                    std::uint64_t semantic_hash, const ConfigFingerprint& config = {},
-                   std::uint32_t sync_clock = 0);
+                   std::uint32_t sync_clock = 0, std::uint32_t sync_aux_clock = 0);
 
   bool Accept(const HandoffPacket& packet);
   bool Complete() const;
@@ -190,6 +194,7 @@ public:
   const std::optional<HandoffPacket>& Mismatch() const { return m_mismatch; }
   const std::optional<HandoffPacket>& ConfigMismatch() const { return m_config_mismatch; }
   std::optional<std::uint32_t> HostClock() const;
+  std::optional<std::uint32_t> HostAuxClock() const;
 
 private:
   std::uint8_t m_players;
@@ -197,6 +202,7 @@ private:
   HandoffPacket m_local;
   std::array<bool, MAX_PLAYERS> m_seen{};
   std::array<std::uint32_t, MAX_PLAYERS> m_sync_clocks{};
+  std::array<std::uint32_t, MAX_PLAYERS> m_sync_aux_clocks{};
   std::optional<HandoffPacket> m_mismatch;
   std::optional<HandoffPacket> m_config_mismatch;
 };
