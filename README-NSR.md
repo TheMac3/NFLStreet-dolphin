@@ -7,6 +7,9 @@ patched by the NFL Street Reborn mod. Base: Dolphin tag `2512`. Work branch:
 
 Changes from upstream:
 
+- Passive per-game stats/MVP export to the Dolphin user `GameStats/` folder;
+  see [capture format and evidence](docs/nsr-game-stats.md).
+
 - `Source/Core/Core/NSR/NSRNetplay.{h,cpp}`: HLE hook for the NFLStreet
   in-game netplay stub (milestone 1: delay-based lockstep over ENet, 2-4
   players, star topology with host relay, room-code hole punching through the
@@ -21,7 +24,9 @@ Changes from upstream:
 
 Design, the game-side patch, and test tooling live in the NFLStreet repo
 (`docs/poc-milestone1.md`, `tools/isopatch.py`, `tools/detrun.py`).
-Without `NSR_NETPLAY` set, this build behaves like stock Dolphin.
+Without `NSR_NETPLAY` set, the transport stays inactive. Rollback-patched
+GN7E69 revision-0 images still enable fixed game hooks, including passive
+results capture.
 
 Room codes: set the repository Actions variable `NSR_RENDEZVOUS` to the room
 server's `host:port` and CI ships it as `nsr-rendezvous.txt` in the download.

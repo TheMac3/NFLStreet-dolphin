@@ -19,6 +19,8 @@
 #include "Core/NSR/NSRRollbackNetplay.h"
 #include "Core/NSR/NSRRollbackLogic.h"
 #include "Core/NSR/NSRTelemetryLogic.h"
+#include "Core/NSR/NSRGameStatsRead.h"
+#include "Core/NSR/NSRGameStatsIdentity.h"
 
 #include <algorithm>
 #include <array>
@@ -1361,8 +1363,130 @@ static void TestWindowUndoLog()
   assert(log.Record(mem, lo, hi, 60, 16) == 0);  // past the backing store
 }
 
+// Synthetic memory only: packed fields cross bytes, signed counters preserve
+// their sign, deleted rows are omitted, and hostile descriptors fail closed.
+static void TestGameStatsMemoryReader()
+{
+  namespace GS = NSRGameStats;
+  std::vector<std::uint8_t> ram(0x400000), vmem(0x1000);
+  const auto put = [](std::vector<std::uint8_t>& bytes, std::uint32_t offset,
+                      std::uint32_t value, unsigned size = 4) {
+    for (unsigned i = 0; i < size; ++i)
+      bytes[offset + i] = static_cast<std::uint8_t>(value >> ((size - i - 1) * 8));
+  };
+  const auto tag = [](std::vector<std::uint8_t>& bytes, std::uint32_t offset,
+                      std::string_view name) {
+    std::copy(name.begin(), name.end(), bytes.begin() + offset);
+  };
+  put(ram, 0x3ebe88, 0x7e000100);
+  put(vmem, 0x104, 0x7e000200);
+  tag(vmem, 0x108, "EMAG");
+  tag(vmem, 0x21c, "TEST");
+  put(vmem, 0x214, 0x7e000400);
+  put(vmem, 0x220, 8);
+  put(vmem, 0x224, 63);
+  put(vmem, 0x240, 3, 2);
+  put(vmem, 0x242, 3, 2);
+  put(vmem, 0x244, 3, 2);
+  put(vmem, 0x24a, 3, 1);
+  put(vmem, 0x24c, 3);
+  put(vmem, 0x250, 3);
+  tag(vmem, 0x254, "DIGP");
+  put(vmem, 0x258, 8);
+  put(vmem, 0x25c, 2);
+  put(vmem, 0x260, 11);
+  tag(vmem, 0x264, "SIGN");
+  put(vmem, 0x268, 5);
+  put(vmem, 0x26c, 0);
+  put(vmem, 0x270, 16);
+  tag(vmem, 0x274, "NAME");
+  put(vmem, 0x278, 32);
+  // 8-bit value 0x91 starting at bit 3; 5-bit -4 starting at bit 11.
+  vmem[0x400] = 0x12;
+  vmem[0x401] = 0x3c;
+  tag(vmem, 0x402, "Name");
+  vmem[0x40f] = 1;  // deleted row 1
+  tag(vmem, 0x412, "Zero");
+  const GS::Memory memory{ram, vmem};
+  const auto rows = GS::ReadTable(memory, "EMAG", "TEST");
+  assert(rows && rows->size() == 2);
+  assert(GS::Integer((*rows)[0], "DIGP") == 0x91);
+  assert(GS::Integer((*rows)[0], "SIGN") == -4);
+  assert(GS::String((*rows)[0], "NAME") == "Name");
+  assert(GS::Integer((*rows)[1], "DIGP") == 0);
+  assert(GS::UniqueIntegerKeys(*rows, "DIGP"));
+  assert(!GS::UniqueIntegerKeys(*rows, "NAME"));
+  auto duplicate_rows = *rows;
+  duplicate_rows.push_back((*rows)[0]);
+  assert(!GS::UniqueIntegerKeys(duplicate_rows, "DIGP"));
+  assert(!GS::Integer((*rows)[0], "NAME"));
+  assert(!GS::String((*rows)[0], "DIGP"));
+  assert(!memory.Bytes(0xfffffffc, 8));
+  assert(!memory.Bytes(0x7dffffff, 4));
+  assert(!memory.Bytes(0x80000000, 0xffffffff));
+  assert(!GS::ReadTable(memory, "NONE", "TEST"));
+  const std::array<std::string_view, 1> missing{"NONE"};
+  assert(!GS::ReadTable(memory, "EMAG", "TEST", missing));
+  const std::array<std::string_view, 1> wrong_type{"NAME"};
+  assert(!GS::ReadTable(memory, "EMAG", "TEST", wrong_type));
+  put(vmem, 0x270, 8);  // overlapping fields
+  assert(!GS::ReadTable(memory, "EMAG", "TEST"));
+  put(vmem, 0x270, 16);
+  put(vmem, 0x244, 4, 2);  // high-water exceeds allocation
+  assert(!GS::ReadTable(memory, "EMAG", "TEST"));
+  put(vmem, 0x244, 3, 2);
+  put(vmem, 0x214, 0x7e000ffc);  // record buffer overrun
+  assert(!GS::ReadTable(memory, "EMAG", "TEST"));
+  put(vmem, 0x100, 0x7e000100);  // cycle must terminate
+  assert(!GS::FindTable(memory, "NONE", "TEST"));
+  assert(ram[0x3ebe88] == 0x7e);  // all reads preserve synthetic guest memory
+}
+
+// Identity validation is independent of sockets; attribution to the established
+// connection remains the adapter's existing PacketSenderMatchesPeer contract.
+static void TestGameStatsIdentity()
+{
+  namespace GS = NSRGameStats;
+  const GS::PeerIdentity identity{0, 2, 1700000000, "Synthetic \xc3\xa9"};
+  const auto bytes = GS::EncodeIdentity(identity);
+  const auto decoded = GS::DecodeIdentity(bytes);
+  assert(decoded && decoded->pad == 0 && decoded->players == 2);
+  assert(decoded->started_at == identity.started_at && decoded->name == identity.name);
+  for (std::size_t length = 0; length < bytes.size(); ++length)
+    assert(!GS::DecodeIdentity(std::span(bytes).first(length)));
+  auto bad = bytes;
+  bad.push_back(0);
+  assert(!GS::DecodeIdentity(bad));
+  bad = bytes;
+  bad[5] = 2;
+  assert(!GS::DecodeIdentity(bad));
+  bad[5] = 1;  // a leaf cannot set the shared timestamp
+  assert(!GS::DecodeIdentity(bad));
+  assert(!GS::ValidIdentityName("bad\nname"));
+  assert(!GS::ValidIdentityName("\xc0\xaf"));
+  assert(!GS::ValidIdentityName("\xed\xa0\x80"));
+  assert(!GS::ValidIdentityName("\xf4\x90\x80\x80"));
+  assert(!GS::ValidIdentityName(std::string(65, 'x')));
+  assert(GS::EncodeIdentity({1, 2, 0, "Second"}).size() == 18);
+  const auto anchor = GS::EncodeCaptureAnchor({2, 7, 0x12345678});
+  const auto decoded_anchor = GS::DecodeCaptureAnchor(anchor);
+  assert(decoded_anchor && decoded_anchor->players == 2 && decoded_anchor->ordinal == 7 &&
+         decoded_anchor->frame == 0x12345678);
+  for (std::size_t length = 0; length < anchor.size(); ++length)
+    assert(!GS::DecodeCaptureAnchor(std::span(anchor).first(length)));
+  auto bad_anchor = anchor;
+  bad_anchor[6] = 1;
+  assert(!GS::DecodeCaptureAnchor(bad_anchor));
+  bad_anchor = anchor;
+  bad_anchor[4] = 2;
+  assert(!GS::DecodeCaptureAnchor(bad_anchor));
+  assert(GS::EncodeCaptureAnchor({2, 0, 7}).empty());
+}
+
 int main()
 {
+  TestGameStatsMemoryReader();
+  TestGameStatsIdentity();
   TestHandoffAgreement();
   TestPredictionAndCorrection();
   TestPredictionWindowAndAcks();
