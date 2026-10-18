@@ -628,6 +628,21 @@ std::optional<std::uint32_t> Exchange::PendingRollback() const
   return m_pending;
 }
 
+std::uint8_t Exchange::MispredictedPlayers(std::uint32_t frame) const
+{
+  const auto ran = m_ran.find(frame);
+  if (ran == m_ran.end())
+    return 0;
+  std::uint8_t mask = 0;
+  for (std::uint32_t p = 0; p < m_players && p < MAX_PLAYERS; ++p)
+  {
+    const auto it = m_confirmed[p].find(frame);
+    if (it != m_confirmed[p].end() && it->second != ran->second[p])
+      mask = static_cast<std::uint8_t>(mask | (1U << p));
+  }
+  return mask;
+}
+
 void Exchange::BeginRollback()
 {
   m_pending.reset();

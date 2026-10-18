@@ -278,6 +278,9 @@ public:
   bool ShouldStall(std::uint32_t frame) const;
   std::uint32_t ConfirmedThrough() const;
   std::optional<std::uint32_t> PendingRollback() const;
+  // Diagnostics: bit p set when player p's confirmed input for `frame`
+  // differs from the input that frame last ran with (0 if unknown).
+  std::uint8_t MispredictedPlayers(std::uint32_t frame) const;
   void BeginRollback();
 
   // Record the digest of the state at the start of `frame`.  Re-simulation

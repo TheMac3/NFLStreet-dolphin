@@ -143,6 +143,57 @@ constexpr bool PausedFrame(std::uint32_t pause_depth)
   return pause_depth != 0;
 }
 
+// Lifecycle transitions (fix/lifecycle). The session leaves at the end of
+// the first frame InGame no longer runs; that teardown frame frees audio,
+// heap and disc resources and must never run on a predicted input
+// (re-simulating it is unsafe, so a later correction cannot be applied). The
+// match end is always requested one frame earlier: fn_800282DC clears
+// InGame's keep-running byte, the update returns it, and the module manager
+// tears InGame down in the next frame. Requests seen in testing: the pause
+// menu's Quit confirmation (pause depth != 0); a tutorial drill's modal
+// results dialog ("|^Retry|Quit", then "|^No|Yes"; 4-player regress seed
+// 3918529284: dialog open from frame 6890, A at 6960 requests the end, 6961
+// tears down); and a real match's post-game flow (fn_800AB3B0 at 0x800AB550,
+// no modal UI; CPU match: request in 101554, teardown 101555). The input
+// driven ones come from modal UI, so a live frame waits for every player's
+// confirmed input when it starts
+//  - with the pause menu open,
+//  - with a modal dialog on top of the in-game UI stack,
+//  - after the end was requested (the teardown frame itself), or
+//  - within `grace` frames after one of the above, which covers screens
+//    that close a few frames before the request takes effect.
+// The wait is host-side only (no guest state depends on it), so peers may
+// disagree on it without affecting determinism. The menus are static, so
+// the added input latency is invisible; normal play never waits (but a
+// confirmed frame is lockstep: ~one network hop per frame while it lasts).
+// Deferred: if a non-modal request turns out to be input-driven (the
+// post-game flow above has not been traced for that), a correction could
+// move the request into a re-simulated frame; RbStep logs "re-simulated
+// frame ... starts after a match-end request" then. Revisit on that log line.
+struct LifecycleSignals
+{
+  std::uint32_t pause_depth = 0;
+  bool in_game_running = true;  // InGame's keep-running byte != 0
+  bool modal_dialog = false;    // in-game UI stack top is the modal dialog
+};
+
+constexpr bool LifecycleTransition(const LifecycleSignals& s)
+{
+  return PausedFrame(s.pause_depth) || !s.in_game_running || s.modal_dialog;
+}
+
+// `hold_until` (exclusive end of the grace window, 0 = none) is updated.
+constexpr bool LifecycleConfirmFrame(std::uint32_t frame, const LifecycleSignals& s,
+                                     std::uint32_t grace, std::uint32_t& hold_until)
+{
+  if (LifecycleTransition(s))
+  {
+    hold_until = frame + 1 + grace;
+    return true;
+  }
+  return hold_until != 0 && Before(frame, hold_until);
+}
+
 // Whether the rollback pad poll (VI post-retrace interrupt) may copy this
 // machine's local sample into the game's PADStatus buffer (fix/modal).
 // Outside a session, in menus and loading, it does, as the unpatched poll.

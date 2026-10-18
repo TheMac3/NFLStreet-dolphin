@@ -105,6 +105,47 @@ static void TestHandoffAgreement()
 
 // A changed remote input arrives after its frame ran predicted, selecting the
 // earliest affected frame and then disappearing once rollback begins.
+// fix/lifecycle: transition states hold confirmed-input mode for a grace
+// window; normal play never waits.
+static void TestLifecycleConfirmFrames()
+{
+  std::uint32_t hold = 0;
+  const RL::LifecycleSignals play{};
+  assert(!RL::LifecycleConfirmFrame(100, play, 8, hold) && hold == 0);
+  RL::LifecycleSignals paused{};
+  paused.pause_depth = 1;
+  assert(RL::LifecycleConfirmFrame(101, paused, 8, hold) && hold == 110);
+  assert(RL::LifecycleConfirmFrame(109, play, 8, hold));
+  assert(!RL::LifecycleConfirmFrame(110, play, 8, hold));
+  RL::LifecycleSignals ending{};
+  ending.in_game_running = false;  // the teardown frame itself
+  assert(RL::LifecycleConfirmFrame(500, ending, 0, hold));
+  assert(!RL::LifecycleConfirmFrame(501, play, 0, hold));
+  RL::LifecycleSignals dialog{};
+  dialog.modal_dialog = true;
+  assert(RL::LifecycleConfirmFrame(0xFFFFFFFE, dialog, 8, hold));
+  assert(RL::LifecycleConfirmFrame(3, play, 8, hold));  // window crosses wrap
+  assert(!RL::LifecycleConfirmFrame(7, play, 8, hold));
+}
+
+// MispredictedPlayers names the player whose late input differs from the
+// one the frame ran with (handoff diagnostics).
+static void TestMispredictedPlayers()
+{
+  RN::Exchange a(100, 2, 0, 1, 3, 0x1234);
+  RN::Exchange b(100, 2, 1, 1, 3, 0x1234);
+  RN::Pad neutral{};
+  RN::Pad right{};
+  right[0] = 1;
+  a.SubmitLocal(100, neutral);
+  b.SubmitLocal(100, right);
+  a.Assemble(101);
+  assert(a.MispredictedPlayers(101) == 0);
+  Deliver(b, &a, 101);
+  assert(a.PendingRollback() == 101 && a.MispredictedPlayers(101) == 0x2);
+  assert(a.MispredictedPlayers(5) == 0);
+}
+
 static void TestPredictionAndCorrection()
 {
   RN::Exchange a(100, 2, 0, 1, 3, 0x1234);
@@ -1338,6 +1379,8 @@ int main()
   TestExchangeConfigMismatch();
   TestDigestComparedOnlyWhenFinal();
   TestPureRollbackHelpers();
+  TestLifecycleConfirmFrames();
+  TestMispredictedPlayers();
   TestWindowUndoLog();
   TestTelemetryFinalFlushIsBounded();
   std::puts("NSR rollback exchange tests passed");
