@@ -8051,6 +8051,78 @@ bool AcBankReady(const AcMem& m, u32 record, u32 f)
   m.wr(a + 4, f);
   return wait == 0;
 }
+
+// --- bank uploads: hold the commit until this machine's upload is done -----
+// (fix/k7loop) The model's "ready" is only the sim-visible half of a bank
+// load. On ready, the bank service commits the bank: fn_801F3544 ->
+// fn_801F5034 asks the middleware for the bank's resident size
+// (fn_8026A9F4), allocates a right-sized block, moves the bank there
+// (fn_8026A980) and frees the load buffer. That commit is only valid once the
+// middleware's upload has finished (its busy byte, read by fn_8026A96C, is
+// clear). Committing while the upload is still in flight leaves the
+// middleware's bank table pointing at moved/freed data; a later sound start
+// from that bank parses a garbage event stream in fn_8027823C, forever
+// (regress forced-k7 and RC1 forced-k2: live frame 14,382; NSR_RB_FORCE=7
+// first committed early at frame 12,064, bank 1, in re-simulation).
+//
+// Live, real uploads finish in <= 4 polls, inside the model's
+// NSR_AC_BANK_FRAMES = 6. After a restore, though, the upload resumes from the
+// snapshot and re-simulated frames give the audio engine only about half a
+// live frame of emulated time each, so a rollback across a bank load (any
+// depth that reaches back to within a few frames of the first poll) can reach
+// the model's ready frame with the upload still running. A busy-polling loop
+// (AC_EXTRA_TICKS) can do the same within one frame.
+//
+// So when the model says ready while the real upload is busy, the main
+// thread waits right here: the hook re-runs the real fn_8026A96C (5
+// instructions; it returns to this call site, so the hook sees the poll
+// again) until the busy byte clears, then answers ready. Emulated time
+// passes, the upload's DMA and interrupt work completes, and nothing the sim
+// can observe changes: the model state was already updated by the one
+// AcBankReady/AcCountPoll of this poll, and in-frame time is virtual. The
+// wait is per machine and costs host time only when an upload is late.
+// Bounded by AC_BANK_HOLD_MAX_TICKS of emulated time (an upload that never
+// completes, e.g. a load the middleware rejected): then it logs and answers
+// ready as before. Revisit if that log line ever appears in a session.
+constexpr u32 MW_BANK_BUSY = 0x803A6C10;      // byte: an upload is in flight
+constexpr u32 MW_BANK_READY_FN = 0x8026A96C;  // returns !busy
+constexpr u64 AC_BANK_HOLD_MAX_TICKS = 486'000'000;  // ~1 s of emulated CPU time
+struct AcBankHold
+{
+  bool active = false;
+  u32 record = 0, frame = 0;
+  u64 start = 0;
+};
+AcBankHold s_ac_bank_hold;
+u64 s_ac_bank_holds = 0;  // holds this session (diagnostics)
+
+// Returns true when this poll is held (npc/LR set to run the real check).
+bool AcBankHoldStep(const Core::CPUThreadGuard& guard, PowerPC::PowerPCState& ppc, const AcMem& m,
+                    u32 record)
+{
+  const u64 now = guard.GetSystem().GetCoreTiming().GetTicks();
+  AcBankHold& h = s_ac_bank_hold;
+  if (!h.active)
+  {
+    h = {true, record, s_rb.tick_running, now};
+    ++s_ac_bank_holds;
+    if (s_ac_bank_holds <= 16 || s_ac_bank_holds % 256 == 0)
+      Log("audio clock: bank {:08x} ready at frame {} but its upload is still running{}; "
+          "waiting (hold {})",
+          record, s_rb.tick_running, s_rb.in_resim ? " (re-sim)" : "", s_ac_bank_holds);
+  }
+  if ((m.rd8(MW_BANK_BUSY) != 0) && now - h.start < AC_BANK_HOLD_MAX_TICKS)
+  {
+    LR(ppc) = C_BANK_READY;  // the real check returns to this poll
+    ppc.npc = MW_BANK_READY_FN;
+    return true;
+  }
+  if (m.rd8(MW_BANK_BUSY) != 0)
+    Log("audio clock: bank {:08x} upload still busy after {} ticks at frame {}; committing anyway",
+        h.record, now - h.start, h.frame);
+  h.active = false;
+  return false;
+}
 }  // namespace
 
 void AudioClockSimWait(const Core::CPUThreadGuard& guard)
@@ -8069,6 +8141,8 @@ void AudioClockSessionStart(const Core::CPUThreadGuard& guard)
     m.wr(a, 0);
   m.wr(AC_BASE, AC_MAGIC);
   s_ac_real.clear();
+  s_ac_bank_hold = {};
+  s_ac_bank_holds = 0;
   MusicSessionStart(guard, s_rb.tick_running);
   Log("audio clock: model at {:08x}..{:08x} ({})", AC_BASE, AC_END,
       AcModeNow() == AcMode::Shadow ? "shadow" : "on");
@@ -8111,6 +8185,19 @@ void AudioClockQueryHook(const Core::CPUThreadGuard& guard)
   if (!AcActive(guard, ppc))
     return;
   const AcMem m{guard};
+  // A held bank poll (see AcBankHoldStep) re-enters here after each real
+  // check: it must not count as another query or ask the model again.
+  if (pc == C_BANK_READY && s_ac_bank_hold.active && s_ac_bank_hold.frame != s_rb.tick_running)
+    s_ac_bank_hold.active = false;  // (defensive: a hold always ends inside its frame)
+  if (pc == C_BANK_READY && s_ac_bank_hold.active)
+  {
+    if (AcBankHoldStep(guard, ppc, m, s_ac_bank_hold.record))
+      return;
+    LR(ppc) = C_BANK_READY + 4;  // what the poll's own `bl` leaves
+    ppc.gpr[3] = 1;
+    ppc.npc = C_BANK_READY + 4;
+    return;
+  }
   AcCountPoll(m);
   const u32 f = AcNow(m);
   const bool shadow = AcModeNow() == AcMode::Shadow;
@@ -8123,6 +8210,8 @@ void AudioClockQueryHook(const Core::CPUThreadGuard& guard)
       AcLogLine(fmt::format("V {} bank {:08x} {}", f, record, ready ? 1 : 0));
       return;
     }
+    if (ready && m.rd8(MW_BANK_BUSY) != 0 && AcBankHoldStep(guard, ppc, m, record))
+      return;  // ready for the sim; this machine's upload finishes first
     ppc.gpr[3] = ready ? 1 : 0;
     ppc.npc = C_BANK_READY + 4;
     return;
