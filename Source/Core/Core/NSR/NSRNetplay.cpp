@@ -205,6 +205,10 @@ Session s_session;
 // remains a thin datagram adapter and the CPU thread is its sole owner.
 std::unique_ptr<RollbackNet::Exchange> s_rb_exchange;
 std::optional<RollbackNet::HandoffAgreement> s_rb_handoff;
+// fix/lifecycle: the session id of the exchange most recently replaced.
+// Barrier waits keep re-sending the old epoch's input history, so peers that
+// already moved on receive it; that is expected, not a session diagnostic.
+std::optional<u32> s_rb_retired_session;
 // fix/lifecycle: transition proposals that arrived before this peer opened
 // the matching barrier (raw datagram, for the star relay, plus its decoding).
 // Proposals are sent reliably but only while the sender's own barrier is
@@ -628,6 +632,8 @@ void OpenHandoffBarrier(const RollbackNet::HandoffAgreement& agreement)
   {
     if (it->packet.transition == transition)
     {
+      Log("handoff transition {}: replaying an early proposal from player {}", transition,
+          it->packet.sender);
       AcceptHandoff(it->packet, it->bytes);
       it = s_rb_early_handoffs.erase(it);
     }
@@ -703,7 +709,7 @@ void HandlePacket(const ENetPacket* packet, u32 source)
       // new-epoch NSRB packet while this peer is still receiving that
       // barrier's final proposal. Reject it as usual, but it is an expected
       // transition race rather than a protocol/session diagnostic.
-      if (!s_rb_handoff && !s_rb_bad_session_logged)
+      if (!s_rb_handoff && !s_rb_bad_session_logged && s_rb_retired_session != decoded->session)
       {
         s_rb_bad_session_logged = true;
         Log("rollback session mismatch from player {}: expected {:08x}, got {:08x}",
@@ -5869,13 +5875,20 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
     if (now - last_send >= std::chrono::milliseconds(8))
     {
       SendHandoff();
+      // fix/lifecycle: keep re-sending the input history too.  A peer still
+      // one frame short of this barrier needs the last inputs; they travel
+      // unreliably, and a barrier host wait used to stop their redundancy
+      // (4-player regress: "rollback input timeout at frame 7238" on one
+      // peer while the others waited in the re-entry clock barrier).
+      if (s_rb_exchange)
+        SendRollbackLatest(s_rb.live);
       last_send = now;
     }
     if (now - start >= std::chrono::milliseconds(PEER_TIMEOUT_MS))
       return FailHandoff(fmt::format(
-          "timeout at {} frame {} state digest {:016x}",
+          "timeout at {} frame {} state digest {:016x} (heard from {:#x}, {} early queued)",
           kind == RollbackNet::HandoffKind::EnterRollback ? "entry" : "leave", frame,
-          semantic));
+          semantic, s_rb_handoff->SeenMask(), s_rb_early_handoffs.size()));
   }
   if (const auto& other = s_rb_handoff->ConfigMismatch())
   {
@@ -5942,10 +5955,19 @@ static bool HandoffClockBarrier(const Core::CPUThreadGuard& guard, u32 frame, u3
     if (now - last_send >= std::chrono::milliseconds(8))
     {
       SendHandoff();
+      // fix/lifecycle: keep re-sending the input history too.  A peer still
+      // one frame short of this barrier needs the last inputs; they travel
+      // unreliably, and a barrier host wait used to stop their redundancy
+      // (4-player regress: "rollback input timeout at frame 7238" on one
+      // peer while the others waited in the re-entry clock barrier).
+      if (s_rb_exchange)
+        SendRollbackLatest(s_rb.live);
       last_send = now;
     }
     if (now - start >= std::chrono::milliseconds(PEER_TIMEOUT_MS))
-      return FailHandoff(fmt::format("timeout synchronizing re-entry clocks at frame {}", frame));
+      return FailHandoff(fmt::format(
+          "timeout synchronizing re-entry clocks at frame {} (heard from {:#x}, {} early queued)",
+          frame, s_rb_handoff->SeenMask(), s_rb_early_handoffs.size()));
   }
   if (const auto& other = s_rb_handoff->ConfigMismatch())
   {
@@ -8784,6 +8806,8 @@ void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
     const RollbackNet::ConfigFingerprint config = LocalConfigFingerprint(guard.GetSystem());
     Log("config fingerprint {:016x}: {}", RollbackNet::ConfigDigest(config),
         DescribeConfig(config));
+    if (s_rb_exchange)
+      s_rb_retired_session = s_rb_exchange->Session();
     s_rb_exchange = std::make_unique<RollbackNet::Exchange>(
         frame, static_cast<u8>(s_session.players), static_cast<u8>(s_session.me), r.net_delay,
         r.max_prediction, session, RollbackNet::ConfigDigest(config));
@@ -8911,6 +8935,8 @@ void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason)
   }
 
   r.vtime_on = false;
+  if (s_rb_exchange)
+    s_rb_retired_session = s_rb_exchange->Session();
   s_rb_exchange.reset();
   s_rb_handoff.reset();
   s_rb_logged_desync.reset();
@@ -8943,6 +8969,8 @@ void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason)
   {
     ResetLockstepStream();
     const u32 session = ConfigForRollback().seed.value_or(0x4E535200) ^ r.live ^ 0x4D454E55;
+    if (s_rb_exchange)
+      s_rb_retired_session = s_rb_exchange->Session();
     s_rb_exchange = std::make_unique<RollbackNet::Exchange>(
         r.live, static_cast<u8>(s_session.players), static_cast<u8>(s_session.me),
         s_session.delay, 0, session);
@@ -9043,6 +9071,7 @@ void Shutdown(const Core::CPUThreadGuard& guard)
   s_rb_exchange.reset();
   s_rb_handoff.reset();
   s_rb_early_handoffs.clear();
+  s_rb_retired_session.reset();
   s_rb_logged_desync.reset();
   s_rb_bad_session_logged = false;
   s_rb_violation_logged = false;
