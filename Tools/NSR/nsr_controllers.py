@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""nsr_controllers.py: use the player's NFL Street Reborn controller setup in NSR Netplay.
+"""nsr_controllers.py: use the player's NFL Street Reborn controller setup in NFLStreetRollback.
 
 Reborn ships its own Dolphin ("NFL Street Reborn Dolphin.exe" in <install>/runtime)
 and its launcher's Controllers page writes the player's real mapping into that
@@ -152,13 +152,15 @@ def data_roots(install: str | None, env=os.environ) -> list[str]:
     """Folders where Reborn's launcher may keep per-user data. reborn-launcher.exe
     (3.0, Tauri app id com.nflstreetreborn.launcher) names a data root with
     config/settings.json and dolphin-users/, plus a legacy %APPDATA%\\NFL Street
-    Reborn; we check every plausible spelling and keep the ones that exist."""
+    Reborn (Mason reports game stats under %APPDATA%\\nflstreetreborn); we
+    check every plausible spelling and keep the ones that exist."""
     roots = [install] if install else []
     for var in ("LOCALAPPDATA", "APPDATA"):
         base = env.get(var)
         if base:
             roots += [os.path.join(base, name) for name in
-                      ("NFL Street Reborn", "com.nflstreetreborn.launcher", "nfl-street-reborn")]
+                      ("NFL Street Reborn", "com.nflstreetreborn.launcher", "nfl-street-reborn",
+                       "nflstreetreborn")]
     return [r for r in dict.fromkeys(roots) if r and os.path.isdir(r)]
 
 
@@ -385,7 +387,7 @@ def sync_controllers(our_user_dir: str, source: RebornSource | None, record: dic
         action = "first-import"
     elif ours is not None and ours_hash != record["written"]:
         return SyncResult("kept-yours", record,
-                          "Using the mapping you made in NSR Netplay's controller setup.")
+                          "Using the mapping you made in NFLStreetRollback's controller setup.")
     elif ours_hash == wanted_hash:
         return SyncResult("up-to-date", record, "Using your Reborn controller settings.")
     else:

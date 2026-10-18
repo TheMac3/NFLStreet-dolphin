@@ -1,6 +1,6 @@
 <!doctype html>
 <!--
-  nsr_launcher_ui.html: the "NSR Netplay" window (pywebview / Edge WebView2).
+  nsr_launcher_ui.html: the "NFLStreetRollback" window (pywebview / Edge WebView2).
 
   A view only: every action calls the Python Launcher (tools/nsr_launcher.py)
   through window.pywebview.api, and the page re-renders from api.snapshot()
@@ -20,7 +20,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NSR Netplay</title>
+<title>NFLStreetRollback</title>
 <style>
 :root {
   --bg: #0b0b0e; --side: #0f0f13; --line: #1f1f26; --panel: #15151a; --panel2: #1b1b21;
@@ -42,7 +42,7 @@ button, input { font: inherit; color: inherit; }
 .brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px 22px; }
 .mark { width: 42px; height: 42px; border-radius: 11px; display: grid; place-items: center;
   background: linear-gradient(135deg, var(--red), #7d0f15); font-weight: 900; font-style: italic;
-  letter-spacing: -1px; font-size: 17px; box-shadow: 0 6px 18px rgba(227,38,47,.35); }
+  letter-spacing: -1px; font-size: 13px; box-shadow: 0 6px 18px rgba(227,38,47,.35); }
 .brand b { display: block; font-size: 15px; letter-spacing: .2px; }
 .brand span { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1.4px; }
 .nav { display: flex; flex-direction: column; gap: 4px; }
@@ -97,7 +97,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
   border: 2px solid rgba(255,255,255,.05); box-shadow: inset 0 0 0 60px rgba(255,255,255,.015); }
 .hero .user { position: absolute; top: 22px; right: 26px; }
 .logo { position: relative; z-index: 1; margin: auto 0 34px; padding-top: 40px; }
-.logo .nsr { font-size: 120px; line-height: .9; font-weight: 900; font-style: italic; letter-spacing: -6px;
+.logo .nsr { font-size: 96px; line-height: .9; font-weight: 900; font-style: italic; letter-spacing: -6px;
   background: linear-gradient(180deg, #ffffff 30%, #c9c9d6); -webkit-background-clip: text; background-clip: text; color: transparent;
   filter: drop-shadow(0 6px 0 rgba(227,38,47,.9)) drop-shadow(0 18px 30px rgba(0,0,0,.6)); }
 .logo .np { display: inline-block; margin-top: 10px; padding: 5px 16px 5px 14px; background: var(--red); transform: skewX(-12deg);
@@ -184,7 +184,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
 <body>
 <div class="app">
   <aside class="side">
-    <div class="brand"><div class="mark">NSR</div><div><b>NSR Netplay</b><span>Rollback</span></div></div>
+    <div class="brand"><div class="mark">NSRB</div><div><b>NFLStreetRollback</b><span>Netplay</span></div></div>
     <nav class="nav" id="nav">
       <button data-page="play" class="on"><svg viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg>Play</button>
       <button data-page="host"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="2.5"/><path d="M7.8 7.8a6 6 0 0 0 0 8.4M16.2 7.8a6 6 0 0 1 0 8.4M4.9 4.9a10 10 0 0 0 0 14.2M19.1 4.9a10 10 0 0 1 0 14.2"/></svg>Host</button>
@@ -204,8 +204,8 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
       <div class="hero">
         <div class="user pill"><span class="dot" id="userDot"></span><span id="userName">Player</span><span class="faint">· Port 1</span></div>
         <div class="logo">
-          <div class="nsr">NSR</div>
-          <div class="np"><span>NETPLAY</span></div>
+          <div class="nsr">NFLSTREET</div>
+          <div class="np"><span>ROLLBACK</span></div>
           <div class="tagline">Play NFL Street Reborn online with friends: 2 to 4 players, rollback netcode, room codes. Your Reborn install is never changed.</div>
         </div>
         <div class="cta">
@@ -231,7 +231,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
             <div class="mode red sel" id="modeRoom">
               <span class="corner pill" id="hostCount"><span class="dot"></span><span>0 joined</span></span>
               <div class="label" style="color:#ffb3b6">Room code</div>
-              <div class="code empty" id="roomCode">NSR-·····</div>
+              <div class="code empty" id="roomCode">NSRB-·····</div>
               <h2 id="roomTitle">Create a room</h2>
               <p id="roomHint">No router setup needed. Up to 4 players.</p>
               <div class="row" style="margin-top:16px">
@@ -261,7 +261,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
       <div class="grid">
         <div class="card" style="padding:26px">
           <div class="label" style="margin-bottom:8px">Room code (or host IP address)</div>
-          <input class="field code-in" id="joinCode" placeholder="NSR-XXXXX" maxlength="64" spellcheck="false" autocomplete="off">
+          <input class="field code-in" id="joinCode" placeholder="NSRB-XXXXX" maxlength="64" spellcheck="false" autocomplete="off">
           <div class="row" style="margin-top:16px">
             <button class="btn red big" id="btnJoin">Join room</button>
             <button class="btn" id="btnLeave" disabled>Leave</button>
@@ -274,7 +274,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
 
     <!-- CONTROLLERS -->
     <section class="page" id="page-controllers">
-      <div class="head"><div class="grow"><h1>Controllers</h1><div class="sub">Your controller is always Port 1. NSR Netplay uses the setup from NFL Street Reborn's Controllers page.</div></div>
+      <div class="head"><div class="grow"><h1>Controllers</h1><div class="sub">Your controller is always Port 1. NFLStreetRollback uses the setup from NFL Street Reborn's Controllers page.</div></div>
         <span class="pill"><span class="dot" id="ctlDot"></span><span id="ctlState">Checking…</span></span></div>
       <div class="cgrid">
         <div class="card">
@@ -289,7 +289,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
           <div class="path" id="ctlSource"></div>
         </div>
         <div class="card"><div class="label">Port 1 buttons</div><div class="binds" id="binds"></div>
-          <div class="note">Change these in Reborn's Controllers page, then click “Use my Reborn controller settings”. Or use “Set up controllers…” to map them in NSR Netplay's own Dolphin; that mapping is then kept until you re-import.</div></div>
+          <div class="note">Change these in Reborn's Controllers page, then click “Use my Reborn controller settings”. Or use “Set up controllers…” to map them in NFLStreetRollback's own Dolphin; that mapping is then kept until you re-import.</div></div>
       </div>
     </section>
 
@@ -304,6 +304,10 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
           <div style="height:22px"></div>
           <div class="toggle" id="telemetry"><div class="switch"></div><div><b>Send lag/rollback stats to Mason's server</b>
             <div class="note" style="margin-top:4px">Connection and rollback counters, your name and the room code, to help fix netplay. Never your button presses, files, or game data. Off: nothing is sent or kept.</div></div></div>
+          <div style="height:14px"></div>
+          <div class="toggle" id="gameStats"><div class="switch"></div><div><b>Upload game results to Mason's server</b>
+            <div class="note" style="margin-top:4px">For the shared Stats page: final scores and box-score stats of the games you finish in NFL Street Reborn (the files its Dolphin saves after the Game Stats/MVP screens), your name and a random ID for this install. Never other files, folder paths, or your PC's name. Off: nothing is uploaded.</div>
+            <div class="note" id="gameStatsText" style="margin-top:4px"></div></div></div>
         </div>
         <div class="card">
           <div class="label">Game copy</div>
@@ -326,7 +330,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
         <div class="card"><h3>Playing</h3><ol>
           <li>Settings: type your name. The game copy is built once from your Reborn install (about a minute).</li>
           <li>Controllers: your Reborn controller setup is used automatically. Port 1 is you.</li>
-          <li>Host: Create room, send friends the NSR-XXXXX code, Start when everyone is listed.</li>
+          <li>Host: Create room, send friends the NSRB-XXXXX code, Start when everyone is listed.</li>
           <li>Join: type the code, click Join, wait for the host to start.</li>
         </ol></div>
         <div class="card"><h3>If something's wrong</h3><ol>
@@ -412,7 +416,7 @@ function render(s) {
   setText("roomsText", s.rooms ? "Room codes on" : "Room codes off in this download");
   const open = h.state === "open" || h.state === "starting";
   const roomCode = h.mode === "room" ? h.code : (h.mode === "ip" ? "BY IP" : "");
-  setText("roomCode", roomCode || "NSR-·····"); $("roomCode").classList.toggle("empty", !roomCode);
+  setText("roomCode", roomCode || "NSRB-·····"); $("roomCode").classList.toggle("empty", !roomCode);
   setText("roomTitle", open ? (h.mode === "ip" ? "Lobby open (by IP)" : "Room open") : h.state === "opening" ? "Creating…" : "Create a room");
   setText("roomHint", open ? "Send the code, then Start when everyone's listed." : "No router setup needed. Up to 4 players.");
   show("btnOpen", !open); enable("btnOpen", s.rooms && h.state === "idle");
@@ -460,6 +464,9 @@ function render(s) {
   // settings
   setValue("nameIn", s.name || "");
   $("telemetry").classList.toggle("on", !!s.telemetry);
+  const gs = s.game_stats || {};
+  $("gameStats").classList.toggle("on", !!gs.enabled);
+  setText("gameStatsText", gs.enabled ? (gs.text || "") : "");
   setText("gameFp", g.fingerprint || "–");
   setText("gameText", (g.text || "") + (g.note ? "\n" + g.note : ""));
   show("gameBar", g.progress != null); $("gameProg").style.width = (g.progress || 0) + "%";
@@ -497,6 +504,7 @@ function wire() {
   $("btnSetup").onclick = () => call("setup_controllers");
   $("nameIn").onchange = () => call("set_name", $("nameIn").value.trim());
   $("telemetry").onclick = () => call("set_telemetry", !(S.snap && S.snap.telemetry));
+  $("gameStats").onclick = () => call("set_game_stats", !(S.snap && S.snap.game_stats && S.snap.game_stats.enabled));
   $("btnFind").onclick = () => call("find_game");
   $("btnBrowse").onclick = () => call("browse_iso");
   document.addEventListener("contextmenu", (e) => { if (!(e.target instanceof HTMLInputElement)) e.preventDefault(); });
@@ -517,8 +525,9 @@ async function start() {
 // --- demo mode (design/screenshots only; see header comment) ---
 function demoApi(page) {
   const names = { host: ["Mason", "Tuna", "wolfspeedy"], join: ["Marcus", "Mason"] };
-  const base = { rev: 1, name: "Mason", telemetry: true, delay: 1, max_delay: 4, last_host: "", rooms: true,
-    folder: "C:\\Users\\mason\\Desktop\\NFLStreet-Rollback",
+  const base = { rev: 1, name: "Mason", telemetry: true, delay: 1,
+    game_stats: { enabled: true, state: "ok", text: "14 game result files sent.", sent: 14, pending: 0 }, max_delay: 4, last_host: "", rooms: true,
+    folder: "C:\\Users\\mason\\Desktop\\NFLStreetRollback",
     game: { state: "ready", text: "Ready for rollback netplay.", fingerprint: "7F3A-29C4", note: "", progress: null, busy: false },
     host: { state: "idle", mode: "", code: "", info: "", players: [], can_start: false },
     join: { state: "idle", info: "", players: [] },
@@ -530,10 +539,10 @@ function demoApi(page) {
           ["C up","Axis Zr-"],["C down","Axis Zr+"],["C left","Axis Z-"],["C right","Axis Z+"],["D-pad up","Hat 0 N"],["D-pad down","Hat 0 S"],
           ["D-pad left","Hat 0 W"],["D-pad right","Hat 0 E"]].map(([control, input]) => ({ control, input })) } },
     notice: null };
-  if (page === "host") Object.assign(base.host, { state: "open", mode: "room", code: "NSR-4K7QX", players: names.host, can_start: true,
+  if (page === "host") Object.assign(base.host, { state: "open", mode: "room", code: "NSRB-4K7QX", players: names.host, can_start: true,
     info: "Room open. Give your friends this code; click Start when everyone's listed." });
-  if (page === "join") base.last_host = "NSR-4K7QX";
-  if (page === "join") Object.assign(base.join, { state: "waiting", players: names.join, info: "Joined NSR-4K7QX… waiting for the host to start." });
+  if (page === "join") base.last_host = "NSRB-4K7QX";
+  if (page === "join") Object.assign(base.join, { state: "waiting", players: names.join, info: "Joined NSRB-4K7QX… waiting for the host to start." });
   if (page === "settings") Object.assign(base.game, { state: "building", text: "Building the netplay copy…", fingerprint: "", progress: 62, busy: true });
   return new Proxy({ snapshot: async (since) => since === base.rev ? null : base }, { get: (t, k) => t[k] || (async () => null) });
 }

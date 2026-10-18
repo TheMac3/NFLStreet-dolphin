@@ -4,7 +4,7 @@
 Two ways to meet:
   - Room codes (default): through the rendezvous server
     (services/rendezvous/nsr_rendezvous.py). The host gets a code like
-    NSR-4K7QX, friends type it in, and Dolphin hole-punches the game traffic,
+    NSRB-4K7QX, friends type it in, and Dolphin hole-punches the game traffic,
     so usually nobody forwards ports. See RoomHost / join_room below.
   - Direct (advanced fallback): the host's PC runs the lobby itself and
     friends join by IP address; the host forwards TCP+UDP 51515. LobbyHost /
@@ -74,7 +74,7 @@ def _agreed_mode(msg: dict, expected: str, who: str) -> str:
         raise ConnectionError(f"{who} selected an unknown netplay mode.")
     if mode != expected:
         raise ConnectionError(f"{who} started a {mode} game, but this launcher plays {expected}. "
-                              "Everyone needs the same NSR Netplay download.")
+                              "Everyone needs the same NFLStreetRollback download.")
     return mode
 
 
@@ -90,7 +90,7 @@ class StartInfo:
     key: str = ""         # our per-player secret for UDP registration
     seed: int = 0x13579BDF  # per-match RNG seed, identical for every player
     mode: str = RELEASE_MODE  # "rollback": stage-4 lockstep menus + rollback matches
-    room_code: str = ""   # "NSR-4K7QX" (display only; telemetry header)
+    room_code: str = ""   # "NSRB-4K7QX" (display only; telemetry header)
     telemetry_url: str = ""    # ingest endpoint granted by the room server
     telemetry_token: str = ""  # per-session/per-player token (docs/telemetry.md)
 
@@ -179,10 +179,10 @@ class LobbyHost:
         reason = None
         if hello.get("type") != "hello" or hello.get("version") != PROTOCOL_VERSION:
             reason = ("Your launcher is a different version from the host's. "
-                      "Everyone needs the same NSR Netplay download.")
+                      "Everyone needs the same NFLStreetRollback download.")
         elif hello.get("mode", "lockstep") != self.mode:
             reason = (f"Your launcher plays {hello.get('mode', 'lockstep')} netplay; this lobby is "
-                      f"{self.mode}. Everyone needs the same NSR Netplay download.")
+                      f"{self.mode}. Everyone needs the same NFLStreetRollback download.")
         elif hello.get("fingerprint") != self.fingerprint:
             reason = (f"Game image mismatch: yours is {hello.get('fingerprint')}, the host's is "
                       f"{self.fingerprint}. Everyone needs the same Reborn version and patches.")

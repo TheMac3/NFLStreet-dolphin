@@ -1,8 +1,10 @@
-# NFLStreet-dolphin
+# NFLStreet-dolphin (NFLStreetRollback)
 
 Private fork of [Dolphin](https://github.com/dolphin-emu/dolphin) (GPL-2.0-or-later)
-for the NFLStreet POC: Slippi-style netplay for NFL Street 2 (GN7E69) as
-patched by the NFL Street Reborn mod. Base: Dolphin tag `2512`. Work branch:
+for **NFLStreetRollback** (short form NSRB), the NFLStreet POC: Slippi-style netplay for NFL Street 2 (GN7E69) as
+patched by the NFL Street Reborn mod. NFLStreetRollback uses a player's own
+Reborn install; it is not part of Reborn. Internal names (`NSR*` sources,
+`NSR_*` variables, `Tools/NSR`, `nsr-*` files) keep the older prefix. Base: Dolphin tag `2512`. Work branch:
 `nsr-netplay`.
 
 Changes from upstream:
@@ -14,9 +16,9 @@ Changes from upstream:
 - `Source/Core/Core/HLE/HLE.cpp`: registers the hook when `NSR_NETPLAY` is set.
 - `Source/Core/Core/CMakeLists.txt`, `Source/Core/DolphinLib.props`: build lists.
 - `.github/workflows/nsr-windows.yml`: the Windows x64 friends zip: Dolphin,
-  the **NSR Netplay** launcher and **NSR-Patcher** (`Tools/NSR`, vendored from
+  the **NFLStreetRollback.exe** launcher and **NFLStreetRollback-Patcher.exe** (`Tools/NSR`, vendored from
   NFLStreet), README-FIRST.txt, VERSION.txt, SOURCE.txt and licences. The
-  launcher plays rollback netplay only (stage 4); `nsr-netplay-debug.bat` is a
+  launcher plays rollback netplay only (stage 4); `NFLStreetRollback-debug.bat` is a
   direct-IP debug helper with the same rollback settings.
 
 Design, the game-side patch, and test tooling live in the NFLStreet repo
@@ -28,5 +30,6 @@ server's `host:port` and CI ships it as `nsr-rendezvous.txt` in the download.
 
 CI: `.github/workflows/nsr-windows.yml` builds Release x64 on every push to
 `nsr-netplay` (or on demand: `gh workflow run nsr-windows.yml --ref <branch>`);
-download the `NFLStreet-rollback-windows-x64` artifact from the run. It
-unzips to one `NFLStreet-Rollback/` folder.
+download the `NFLStreetRollback-windows-x64` artifact from the run. It
+unzips to one `NFLStreetRollback/` folder (was `NFLStreet-rollback-windows-x64` /
+`NFLStreet-Rollback/` before the rename).
