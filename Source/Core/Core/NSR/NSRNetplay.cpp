@@ -2752,8 +2752,11 @@ void RbInit(Core::System& system)
   r.perturb_at = ParseU32(Env("NSR_RB_PERTURB_AT")).value_or(0);
   r.vtime_from = ParseU32(Env("NSR_RB_VTIME_FROM")).value_or(0);
   // Diagnostics: NSR_RB_MEMWATCH=addr logs every write to that word
-  // (Dolphin's MEMMAP log; run with -C Logger.Logs.MEMMAP=True
-  // -C Logger.Options.WriteToConsole=True -C Logger.Options.Verbosity=3).
+  // (NSR_RB_MEMWATCH_LEN=n bytes, default 4) to the NSR log as "MBP" lines
+  // with live/cursor/rolled, pc, lr, r1 and the running thread; armed at the
+  // NSR_RB_WATCH window's start.  Dolphin's MEMMAP log gets them too (run
+  // with -C Logger.Logs.MEMMAP=True -C Logger.Options.WriteToConsole=True
+  // -C Logger.Options.Verbosity=3).
   if (const auto w = Split(Env("NSR_RB_WATCH"), ':'); w.size() == 3)
   {
     r.watch = ParseU32(w[0]).value_or(0);
@@ -3904,8 +3907,10 @@ void LogMemHit(u32 pc, u32 lr, bool write, size_t size, u64 value, u32 addr)
 {
   if (!s_session.log)
     return;
-  Log("MBP live {} cursor {} rolled {}: pc {:08x} lr {:08x} {}{} {:x} at {:08x}", s_rb.live,
-      s_rb.cursor, s_rb.rolled, pc, lr, write ? "write" : "read", size * 8, value, addr);
+  Log("MBP live {} cursor {} rolled {}: pc {:08x} lr {:08x} {}{} {:x} at {:08x} r1 {:08x} thr {:08x}",
+      s_rb.live, s_rb.cursor, s_rb.rolled, pc, lr, write ? "write" : "read", size * 8, value, addr,
+      Core::System::GetInstance().GetPPCState().gpr[1],
+      Core::System::GetInstance().GetMemory().Read_U32(0x800000E4));
 }
 
 bool IsEnabled()
@@ -4558,25 +4563,53 @@ static std::map<u32, u32> AudioDataBlocks(const u8* ram)
   return data;
 }
 
-// The frontend's UI command scratch buffer (GN7E69): fn_80189F68 computes
-// its size with fn_802188A0, allocates it, initializes its command arrays in
-// fn_802188D4, and stores the payload at r13-0x6C18.  Render traversal writes
-// transient clipping/primitive data here; at confirmed frame 8260 two honest
-// peers differed only at 0x80B8BD54..5C in this block while their heap maps,
-// RNG, semantic state, and later whole-RAM dumps agreed.  Classify the block
-// through its fixed root instead of its observed Quick Play address so a
-// later session may move it.  The range list itself is hashed, and sidecar v2
-// ownership compares its boundaries, so a real allocation-layout divergence
-// remains visible.
-constexpr u32 UI_RENDER_SCRATCH_ROOT = 0x803E9688;  // -0x6C18(r13)
+// The UI system's scratch block (GN7E69, "UIS_"): fn_80189F68 sizes it with
+// fn_802188A0, allocates it, lays it out in fn_802188D4 and stores the
+// payload at r13-0x6C18 = 0x803EB688 (r13 = 0x803F22A0, set at 0x801ABBA4).
+// It holds the UI's element arrays (hashed) and a downward-growing command
+// stack [payload+0x74, payload+0x7C) whose next-free pointer is payload+0xBC.
+// During the frame's UI pass, on the main thread, fn_8021D904 calls
+// fn_8021D888 to push a record that copies 16 bytes through a pointer its
+// callers build on their own stack frame (addi r7, r1, N), often to a struct
+// that does not initialize all 16 bytes.  The main-thread stack is RB_KEEP
+// (never restored, not hashed), so its dead bytes follow each machine's own
+// rollback/re-simulation history and interrupt timing, and those copies carry
+// them into game memory.  Evidence (NSR_RB_MEMWATCH, 4-player smoke): every
+// write to the disputed 0x80B8BD54..5C is fn_8021D888 (pc 8021D8B8/8021D8C4,
+// lr 8021D950, r1 in 803FE1xx); at frames 3214..3231 one honest peer held
+// 0011c66c 0000000b where the other three held 3f400000 3f4eaaab (the 4993
+// false positive: 00070007 0f070007 vs 3f400000 3f4eaaab; also 4875, 8260),
+// while over 4,194 finalized frames x 4 peers the rest of the block, the
+// stack pointer word, RNG and later whole-RAM dumps always agreed.  The
+// stack is empty at every frame start (pointer = top - 4): its contents are
+// dead scratch, re-pushed before they are read.  Exclude the command stack,
+// found from the block's own header, and keep the rest of the block, the
+// header and its stack pointer hashed, so a disagreement in stack depth or
+// UI state at a frame start still fails the digest.
+//
+// History: until digest-range version 5 the root was given as 0x803E9688
+// (r13 taken as 0x803F02A0), so the whole-block "ui-render" rule added for
+// the frame-8260 report never matched anything.
+//
+// Deferred: other game code may copy uninitialized stack words into heap
+// memory the same way.  Such a case shows as a short run of digest mismatches
+// on a few bytes whose values look like stale stack data (saved LRs, main
+// stack pointers 0x803Fxxxx).  Revisit with NSR_RB_MEMWATCH(_LEN) on the
+// address (writer pc/lr and r1 in the log) and classify that writer here.
+constexpr u32 UI_SCRATCH_ROOT = 0x803EB688;  // -0x6C18(r13)
+constexpr u32 UI_SCRATCH_MAGIC = 0x5549535F;  // "UIS_"
 
-static std::map<u32, u32> UiRenderBlocks(const u8* ram)
+static std::optional<std::pair<u32, u32>> UiCommandStack(const u8* ram)
 {
   auto rd = [&](u32 a) { return Common::swap32(ram + (a & 0x01FFFFFF)); };
-  std::map<u32, u32> blocks;
-  if (const auto block = EnclosingBlock(ram, rd(UI_RENDER_SCRATCH_ROOT)))
-    blocks[block->first] = block->second;
-  return blocks;
+  const u32 payload = rd(UI_SCRATCH_ROOT);
+  const auto block = EnclosingBlock(ram, payload);
+  if (!block || payload + 0xC0 > block->second || rd(payload) != UI_SCRATCH_MAGIC)
+    return std::nullopt;
+  const u32 lo = rd(payload + 0x74), hi = rd(payload + 0x7C);
+  if (lo < payload + 0xC0 || hi <= lo || hi > block->second || (lo & 3) || (hi & 3))
+    return std::nullopt;
+  return std::pair<u32, u32>{lo, hi};
 }
 
 // One per-machine range of the classification below: virtual [lo, hi) and
@@ -4593,7 +4626,7 @@ struct PerMachineRange
 // sidecar order: audio heap blocks, live OS objects (every thread, alarm, DVD
 // and ARQ request, audio callback node, tick accumulator, disc staging/stream
 // destinations, GX FIFO), boot-time disc/stream I/O objects, PathFinder audio
-// data blocks, the frontend UI render scratch, then each audio-touched heap's
+// data blocks, the UI command stack, then each audio-touched heap's
 // counters and free blocks.
 // `io_blocks` / `audio_data` replace the I/O objects / audio data blocks found
 // from the current state, and `with_heaps` = false leaves out the heap
@@ -4621,8 +4654,8 @@ static std::vector<PerMachineRange> PerMachineRanges(Core::System& system, const
     out.push_back({lo, hi, "io-object"});
   for (const auto& [lo, hi] : audio_data ? *audio_data : AudioDataBlocks(ram))
     out.push_back({lo, hi, "audio-data"});
-  for (const auto& [lo, hi] : UiRenderBlocks(ram))
-    out.push_back({lo, hi, "ui-render"});
+  if (const auto stack = UiCommandStack(ram))
+    out.push_back({stack->first, stack->second, "ui-cmdstack"});
   // Heaps that hold audio blocks also hold game blocks (e.g. the small heap
   // 0x804C4810 the audio allocator object fn_801E10F0 uses is shared with UI
   // text), and audio code allocates and frees there on audio time. Its effect
@@ -4692,8 +4725,6 @@ static void WritePerMachineSidecar(Core::System& system, const u8* ram, const st
     owner[lo] = "io-object";
   for (const auto& [lo, hi] : AudioDataBlocks(ram))
     owner[lo] = "audio-data";
-  for (const auto& [lo, hi] : UiRenderBlocks(ram))
-    owner[lo] = "ui-render";
   for (const auto& [p, recorded] : s_audio_blocks)
     owner[p - 0x10] = "audio-heap";
   size_t mapped = 0;
@@ -4873,7 +4904,7 @@ namespace
 {
 // Version of the exclusion rules; part of the config fingerprint, so peers
 // with different rules refuse to play instead of reporting false desyncs.
-constexpr u32 STATE_DIGEST_RANGES_VERSION = 4;  // 4: + audio callback's transient stream pointer
+constexpr u32 STATE_DIGEST_RANGES_VERSION = 5;  // 5: UI command stack (UiCommandStack) replaces the dead ui-render rule
 
 // tools/rbdiff.py PER_MACHINE entries below its STATIC_END (.data/.bss words
 // that follow audio/disc time in every mode; physical [lo, hi)).  Keep the
@@ -6178,16 +6209,25 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
   if (!r.memwatch_armed && r.watch && r.live >= r.watch_from)
   {
     r.memwatch_armed = true;
-    if (const auto addr = ParseU32(Env("NSR_RB_MEMWATCH")))
+    const auto addr = ParseU32(Env("NSR_RB_MEMWATCH"));
+    const u32 mwlen = std::max<u32>(1, ParseU32(Env("NSR_RB_MEMWATCH_LEN")).value_or(4));
+    if (addr)
     {
-      TMemCheck mc;
-      mc.start_address = *addr;
-      mc.end_address = *addr + 3;
-      mc.is_ranged = true;
-      mc.is_break_on_write = true;
-      mc.log_on_hit = true;
-      system.GetPowerPC().GetMemChecks().Add(std::move(mc));
-      Log("watching writes to {:08x} from tick {}", *addr, r.live);
+      // Adding a memcheck clears the JIT cache (MemChecks::Update); doing
+      // that inside this HLE hook freed the running block (SIGTRAP on
+      // return), so arm it from the host thread, which pauses the CPU at a
+      // safe point first.
+      const u32 a0 = *addr;
+      Core::QueueHostJob([a0, mwlen](Core::System& sys) {
+        TMemCheck mc;
+        mc.start_address = a0;
+        mc.end_address = a0 + mwlen - 1;
+        mc.is_ranged = true;
+        mc.is_break_on_write = true;
+        mc.log_on_hit = true;
+        sys.GetPowerPC().GetMemChecks().Add(std::move(mc));
+      });
+      Log("watching writes to {:08x}+{} from tick {}", *addr, mwlen, r.live);
     }
   }
   if (r.watch && r.live >= r.watch_from && r.live <= r.watch_to)
