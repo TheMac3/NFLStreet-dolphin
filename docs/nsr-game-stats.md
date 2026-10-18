@@ -60,11 +60,13 @@ the game's Windows-1252 bytes to UTF-8. Player entries cover the seven final
 field slots per team; DIGP is native roster identity, not a user identifier.
 
 The fifteen exact native displayed totals are `score`, `style`, `total_td`,
-`rush_td`, `pass_td`, `def_td`, `sacks`, `safeties`, `int`, `forced_fumbles`,
+`rush_td`, `pass_td`, `def_td`, `sacks`, `safeties`, `int`, `ff`,
 `first_downs`, `gamebreakers`, `gb_2pt`, `hot_spots`, `credits`. Team rows also
 provide `fumble_rec` and `thrown_int`. Player counters are `pass_td`, `rush_td`,
 `rec_td`, `thrown_int`, `fumbles`, `pick_six`, `fum_td`, `interceptions`,
-`forced_fumbles`, `fumble_rec`, `tackles`, `sacks`. Absent event rows mean zero;
+`forced_fumbles`, `fumble_rec`, `tackles`, `sacks`. Reborn's short team key is
+`ff`; only player lines use `forced_fumbles` (`strings -n 2` reveals the short
+key). Absent event rows mean zero;
 missing schemas, invalid fields, duplicate event IDs or unmatched identities
 suppress the export. Unsupported hidden/non-numeric scores suppress export
 rather than turning a negative native formatter sentinel into a huge score.

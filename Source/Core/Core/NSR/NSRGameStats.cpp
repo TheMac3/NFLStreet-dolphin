@@ -234,7 +234,7 @@ std::optional<Object> Capture(const Memory& memory, std::uint32_t frame)
     style_json.emplace_back(double(points));
     static constexpr std::array<const char*, 15> keys{
         "score", "style", "total_td", "rush_td", "pass_td", "def_td", "sacks", "safeties",
-        "int", "forced_fumbles", "first_downs", "gamebreakers", "gb_2pt", "hot_spots", "credits"};
+        "int", "ff", "first_downs", "gamebreakers", "gb_2pt", "hot_spots", "credits"};
     Object stats;
     for (std::uint32_t index = 0; index < keys.size(); ++index)
       stats.emplace(keys[index], Json(double(*memory.UInt(s.totals_arrays[side] + index * 4))));
