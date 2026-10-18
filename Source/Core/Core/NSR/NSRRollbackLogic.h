@@ -93,6 +93,58 @@ struct Range
   constexpr bool operator==(const Range&) const = default;
 };
 
+// GN7E69 rev 0: Crush the Carrier's six score records have stride 0x38,
+// with a byte at +8 followed by three padding bytes. The insertion sort
+// fn_8014D024 copies that byte with lbz/stb into a main-stack temporary,
+// then copies the whole record back (write PC 8014D1A8). Those padding bytes
+// therefore inherit each machine's uninitialized stack history. Find only
+// that padding through the active mode's pointers, rejecting incomplete or
+// differently typed tables; IDs, scores, flags, ordering and vtables remain
+// checked. Return physical ranges for both the digest and dump sidecar.
+// Revisit for another revision/event only after proving its layout/writers;
+// do not infer padding by looking for unequal bytes in arbitrary objects.
+inline std::vector<Range> StreetEventRankingPadding(std::span<const std::uint8_t> ram)
+{
+  constexpr std::uint32_t BASE = 0x80000000;
+  constexpr std::uint32_t ACTIVE_MODE = 0x803EB2AC;  // fn_801486A0, r13-0x6FF4
+  constexpr std::uint32_t MODE_TABLE = 0x8031BDBC;   // fn_80148A58
+  constexpr std::uint32_t STRIDE = 0x38;
+  constexpr std::uint32_t COUNT = 6;
+  constexpr std::uint32_t VTABLE = 0x802A1F78;
+  // Validate full extents before any read, including the fixed roots when
+  // tests or a failed boot supply a short backing store.
+  auto valid = [&](std::uint32_t address, std::uint32_t size) {
+    if (address < BASE + 0x3100 || (address & 3) != 0)
+      return false;
+    const std::size_t offset = address - BASE;
+    return offset <= ram.size() && size <= ram.size() - offset;
+  };
+  auto read = [&](std::uint32_t address) {
+    const std::size_t offset = address - BASE;
+    return (std::uint32_t{ram[offset]} << 24) | (std::uint32_t{ram[offset + 1]} << 16) |
+           (std::uint32_t{ram[offset + 2]} << 8) | ram[offset + 3];
+  };
+  if (!valid(ACTIVE_MODE, 4) || !valid(MODE_TABLE, 4) || read(ACTIVE_MODE) != 0)
+    return {};
+  const std::uint32_t mode = read(MODE_TABLE);
+  if (!valid(mode, 0x20))
+    return {};
+  const std::uint32_t state = read(mode + 0x1C);  // fn_8014F104
+  if (!valid(state, 0x38))
+    return {};
+  const std::uint32_t records = read(state + 0x34);
+  if (!valid(records, COUNT * STRIDE))
+    return {};
+  for (std::uint32_t i = 0; i < COUNT; ++i)
+    if (read(records + i * STRIDE + 0x34) != VTABLE)
+      return {};
+  std::vector<Range> ranges;
+  ranges.reserve(COUNT);
+  for (std::uint32_t i = 0; i < COUNT; ++i)
+    ranges.push_back({records - BASE + i * STRIDE + 9, records - BASE + i * STRIDE + 12});
+  return ranges;
+}
+
 // Normalize half-open sidecar ranges. Invalid/empty entries are ignored and
 // touching ranges merge because they describe one exclusion interval.
 inline std::vector<Range> MergeRanges(std::vector<Range> ranges)

@@ -4656,6 +4656,12 @@ static std::vector<PerMachineRange> PerMachineRanges(Core::System& system, const
     out.push_back({lo, hi, "audio-data"});
   if (const auto stack = UiCommandStack(ram))
     out.push_back({stack->first, stack->second, "ui-cmdstack"});
+  // Event ranking padding follows main-stack history, not the simulation.
+  // The shared helper validates the mode, complete table and every record's
+  // type; never exclude an entire scoreboard or its meaningful byte field.
+  for (const auto& range : RollbackLogic::StreetEventRankingPadding(
+           {ram, system.GetMemory().GetRamSizeReal()}))
+    out.push_back({0x80000000 | range.lo, 0x80000000 | range.hi, "event-rank-padding"});
   // Heaps that hold audio blocks also hold game blocks (e.g. the small heap
   // 0x804C4810 the audio allocator object fn_801E10F0 uses is shared with UI
   // text), and audio code allocates and frees there on audio time. Its effect
@@ -4904,7 +4910,7 @@ namespace
 {
 // Version of the exclusion rules; part of the config fingerprint, so peers
 // with different rules refuse to play instead of reporting false desyncs.
-constexpr u32 STATE_DIGEST_RANGES_VERSION = 5;  // 5: UI command stack (UiCommandStack) replaces the dead ui-render rule
+constexpr u32 STATE_DIGEST_RANGES_VERSION = 7;  // 6: Crush padding; 7: stable small audio-heap metadata
 
 // tools/rbdiff.py PER_MACHINE entries below its STATIC_END (.data/.bss words
 // that follow audio/disc time in every mode; physical [lo, hi)).  Keep the
@@ -5026,6 +5032,18 @@ constexpr std::array<std::pair<u32, u32>, 3> DIGEST_PER_MACHINE{{
 void DigestExclusions(Core::System& system, const u8* ram, u32 mem1_size,
                       std::vector<RollbackLogic::Range>* out)
 {
+  // GN7E69 rev 0: fn_801E10F0's small shared heap is audio-capable even
+  // before this host has observed its first audio allocation. Jump Ball's
+  // frame-1718 probe had identical game bytes but only one peer had already
+  // touched this heap on audio time: one excluded allocator metadata/free
+  // space while the other hashed it, producing different page digests.
+  // Seed this known descriptor after validating it, rather than keying the
+  // mask on that asynchronous first allocation. This applies the existing
+  // metadata/free-space rule; every used game payload remains hashed. Do not
+  // add arbitrary heaps here without allocation-owner and layout evidence.
+  constexpr u32 SMALL_AUDIO_HEAP = 0x804C4810;
+  if (HeapDescriptor(ram, SMALL_AUDIO_HEAP))
+    s_audio_heaps.insert(SMALL_AUDIO_HEAP);
   if (!s_digest.io_blocks)
     s_digest.io_blocks = IoObjectBlocks(ram);
   if (!s_digest.audio_data)

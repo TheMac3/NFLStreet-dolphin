@@ -1090,6 +1090,56 @@ static void TestDigestComparedOnlyWhenFinal()
          c.FirstDesyncInfo()->remote == 0xD && c.FirstDesyncInfo()->player == 1);
 }
 
+// Synthetic MEM1 verifies that the Crush rule hides exactly its 18 padding
+// bytes and fails closed for another mode, stale type tags or damaged roots.
+// No game data is needed; meaningful score/ID/flag bytes stay observable.
+static void TestStreetEventRankingPadding()
+{
+  constexpr std::uint32_t BASE = 0x80000000;
+  constexpr std::uint32_t MODE = 0x80010000;
+  constexpr std::uint32_t STATE = 0x80011000;
+  constexpr std::uint32_t RECORDS = 0x80012000;
+  std::vector<std::uint8_t> ram(0x400000);
+  // Write big-endian synthetic roots/fields without a Dolphin dependency.
+  auto write = [&](std::uint32_t address, std::uint32_t value) {
+    for (std::uint32_t i = 0; i < 4; ++i)
+      ram[address - BASE + i] = static_cast<std::uint8_t>(value >> (24 - 8 * i));
+  };
+  write(0x8031BDBC, MODE);
+  write(MODE + 0x1C, STATE);
+  write(STATE + 0x34, RECORDS);
+  for (std::uint32_t i = 0; i < 6; ++i)
+    write(RECORDS + i * 0x38 + 0x34, 0x802A1F78);
+  const auto ranges = RL::StreetEventRankingPadding(ram);
+  assert(ranges.size() == 6);
+  for (std::uint32_t i = 0; i < 6; ++i)
+  {
+    const std::uint32_t record = RECORDS - BASE + i * 0x38;
+    assert((ranges[i] == RL::Range{record + 9, record + 12}));
+    for (std::uint32_t offset = 0; offset < 0x38; ++offset)
+      assert((record + offset >= ranges[i].lo && record + offset < ranges[i].hi) ==
+             (offset >= 9 && offset < 12));
+  }
+  write(0x803EB2AC, 1);
+  assert(RL::StreetEventRankingPadding(ram).empty());
+  write(0x803EB2AC, 0);
+  write(RECORDS + 5 * 0x38 + 0x34, 0x802A1F90);
+  assert(RL::StreetEventRankingPadding(ram).empty());
+  write(RECORDS + 5 * 0x38 + 0x34, 0x802A1F78);
+  for (const std::uint32_t root : {0x8031BDBCu, MODE + 0x1C, STATE + 0x34})
+  {
+    const std::uint32_t good = root == 0x8031BDBC ? MODE : root == MODE + 0x1C ? STATE : RECORDS;
+    for (const std::uint32_t bad : {0u, 0x80000000u, 0x803FFFFCu, 0xFFFFFFFCu, good + 1})
+    {
+      write(root, bad);
+      assert(RL::StreetEventRankingPadding(ram).empty());
+    }
+    write(root, good);
+  }
+  assert(RL::StreetEventRankingPadding({}).empty());
+  assert(RL::StreetEventRankingPadding(std::span<const std::uint8_t>(ram).first(0x3100)).empty());
+}
+
 // Production helper decisions cover the non-I/O portions of snapshotting,
 // target selection, sidecar normalization, and audio virtual time.
 static void TestPureRollbackHelpers()
@@ -1338,6 +1388,7 @@ int main()
   TestExchangeConfigMismatch();
   TestDigestComparedOnlyWhenFinal();
   TestPureRollbackHelpers();
+  TestStreetEventRankingPadding();
   TestWindowUndoLog();
   TestTelemetryFinalFlushIsBounded();
   std::puts("NSR rollback exchange tests passed");
