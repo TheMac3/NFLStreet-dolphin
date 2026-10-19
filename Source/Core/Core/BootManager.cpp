@@ -44,6 +44,8 @@
 #include "Core/HW/WiimoteReal/WiimoteReal.h"
 #include "Core/Movie.h"
 #include "Core/NetPlayProto.h"
+#include "Core/NSR/NSRNetplay.h"
+#include "Core/NSR/NSRBootSync.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 #include "Core/WiiRoot.h"
@@ -144,6 +146,9 @@ bool BootCore(Core::System& system, std::unique_ptr<BootParameters> boot,
   if (!boot->riivolution_patches.empty())
     Config::SetCurrent(Config::MAIN_FAST_DISC_SPEED, true);
 
+  if (NSRBootSync::Enabled() && !NSRNetplay::PrepareBoot())
+    return false;
+
   system.Initialize();
 
   Core::UpdateWantDeterminism(system, /*initial*/ true);
@@ -214,6 +219,7 @@ static void RestoreSYSCONF()
 
 void RestoreConfig()
 {
+  NSRBootSync::Cleanup();
   Core::ShutdownWiiRoot();
 
   if (!Core::WiiRootIsTemporary())
