@@ -8518,6 +8518,74 @@ constexpr u32 AC_MUSIC = 0x80416FC0;         // +0 song end frame, +4 song start
 constexpr u32 AC_MUSIC_LAST_START = 0x80416FFC;  // last real start before the session (kept)
 static_assert(AC_SFX + AC_SFX_SLOTS * 12 <= AC_MUSIC);
 
+// fix/lifecycle: the game's software real-time clock (VI callback
+// fn_801F8574, read by fn_801F81F4 under interrupts disabled) is
+//   0x803EBE58  retraces into the current second (0..59 at 60 Hz),
+//   0x803EBE5C  seconds counter,
+//   0x8039B430  {sec, min, hour, day, month, -, year16} calendar bytes,
+//   0x8039B438  centiseconds = (retraces * 1000 / 60) / 10 (TRANSITION_AUX_CLOCK).
+// Moving the domain by `delta` retraces used to shift only the retrace
+// count, so it went out of range (-1, -15, 62) without borrowing from the
+// seconds: honest peers re-entered after pause-Quit with seconds 0x27 vs
+// 0x28 and retraces 0x3B vs 0xFFFFFFFF at 0x803EBE58 (re-entry full-digest
+// abort at frame 8633 on base and on this branch, ~1 run in 4).  Carry/
+// borrow through seconds, minutes and hours exactly like the callback;
+// a day change (the clock crossing midnight between peers) is not modeled
+// and is logged instead (the full digest then fails closed).
+constexpr u32 SOFT_RTC_RETRACES = 0x803EBE58;  // -0x6448(r13)
+constexpr u32 SOFT_RTC_SECONDS = 0x803EBE5C;   // -0x6444(r13)
+constexpr u32 SOFT_RTC_CALENDAR = 0x8039B430;
+constexpr s32 SOFT_RTC_RATE = 60;  // GN7E69 is NTSC: fn_801CE1E8 != 1, ms = n * 1000 / 60
+
+void ShiftSoftRtc(const Core::CPUThreadGuard& guard, u32 delta)
+{
+  using PowerPC::MMU;
+  s32 retraces = static_cast<s32>(MMU::HostRead<u32>(guard, SOFT_RTC_RETRACES)) -
+                 static_cast<s32>(delta);
+  u32 seconds = MMU::HostRead<u32>(guard, SOFT_RTC_SECONDS);
+  u8 sec = MMU::HostRead<u8>(guard, SOFT_RTC_CALENDAR);
+  u8 min = MMU::HostRead<u8>(guard, SOFT_RTC_CALENDAR + 1);
+  u8 hour = MMU::HostRead<u8>(guard, SOFT_RTC_CALENDAR + 2);
+  bool day_change = false;
+  while (retraces < 0)
+  {
+    retraces += SOFT_RTC_RATE;
+    --seconds;
+    if (sec-- != 0)
+      continue;
+    sec = 59;
+    if (min-- != 0)
+      continue;
+    min = 59;
+    if (hour-- != 0)
+      continue;
+    hour = 23;
+    day_change = true;
+  }
+  while (retraces >= SOFT_RTC_RATE)
+  {
+    retraces -= SOFT_RTC_RATE;
+    ++seconds;
+    if (++sec <= 59)
+      continue;
+    sec = 0;
+    if (++min <= 59)
+      continue;
+    min = 0;
+    if (++hour <= 23)
+      continue;
+    hour = 0;
+    day_change = true;
+  }
+  MMU::HostWrite<u32>(guard, static_cast<u32>(retraces), SOFT_RTC_RETRACES);
+  MMU::HostWrite<u32>(guard, seconds, SOFT_RTC_SECONDS);
+  MMU::HostWrite<u8>(guard, sec, SOFT_RTC_CALENDAR);
+  MMU::HostWrite<u8>(guard, min, SOFT_RTC_CALENDAR + 1);
+  MMU::HostWrite<u8>(guard, hour, SOFT_RTC_CALENDAR + 2);
+  if (day_change)
+    Log("WARNING: clock normalization crossed midnight; the calendar day is not adjusted");
+}
+
 void NormalizeTransitionClocks(const Core::CPUThreadGuard& guard, u32 host_clock,
                                u32 host_aux_clock)
 {
@@ -8535,11 +8603,17 @@ void NormalizeTransitionClocks(const Core::CPUThreadGuard& guard, u32 host_clock
     MMU::HostWrite<u32>(guard, MMU::HostRead<u32>(guard, address) - delta, address);
   };
   shift(0x802D55BC);
-  shift(0x803EBE58);
+  ShiftSoftRtc(guard, delta);
   const u32 pre_retrace = MMU::HostRead<u32>(guard, 0x803EBE44);
   if (pre_retrace >= 0x80003100 && pre_retrace < 0x817FFFE0)
     shift(pre_retrace + 0x20);
 
+  // The adopted centiseconds are derived from player 0's retrace count; the
+  // shifted local count must give the same value.
+  const u32 retraces = MMU::HostRead<u32>(guard, SOFT_RTC_RETRACES);
+  if (retraces * 1000 / 60 / 10 != host_aux_clock)
+    Log("WARNING: normalized clock retraces {} disagree with player 0's centiseconds {}",
+        retraces, host_aux_clock);
   Log("handoff clocks normalized: VI {} -> {}, aux -> {}, delta {}", local_clock, host_clock,
       host_aux_clock, delta);
 }
