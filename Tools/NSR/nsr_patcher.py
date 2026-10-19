@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """nsr_patcher.py: one-click builder of the NFLStreet rollback netplay game image.
 
-For friends testing the POC. Double-click NSR-Patcher.exe (built from this file
+For friends testing the POC. Double-click NFLStreetRollback-Patcher.exe (built from this file
 with PyInstaller) inside the NFLStreet netplay Dolphin folder, and it:
 
   1. finds the NFL Street Reborn game image (<Reborn install>/content/games/
@@ -27,7 +27,7 @@ rebuild.
 Nothing is downloaded or uploaded; Reborn's own file is only read. The
 patched image is each player's own copy, made from their own install.
 
-Usage: NSR-Patcher.exe [path\\to\\NSR.iso]      (no argument: search, then ask)
+Usage: NFLStreetRollback-Patcher.exe [path\\to\\NSR.iso]      (no argument: search, then ask)
        python3 tools/nsr_patcher.py [NSR.iso] [--out DIR] [--no-pause]
 """
 from __future__ import annotations
@@ -179,7 +179,7 @@ def reborn_install_of(iso: str) -> str | None:
 def saved_reborn_install(out_dir: str) -> str | None:
     """The Reborn install recorded next to nsr-net.iso by the last build
     (REBORN_PATH_NAME), if it still exists. Lets the launcher use Reborn's HD
-    textures when the image was built by NSR-Patcher.exe rather than by the
+    textures when the image was built by NFLStreetRollback-Patcher.exe rather than by the
     launcher itself."""
     try:
         with open(os.path.join(out_dir, REBORN_PATH_NAME)) as f:
@@ -295,13 +295,13 @@ def image_fingerprint(out_dir: str, progress=None) -> str | None:
 
 
 def run(iso: str | None, out_dir: str) -> int:
-    print("NFLStreet rollback netplay image builder\n")
+    print("NFLStreetRollback netplay image builder\n")
     if not iso:
         print("Looking for NFL Street Reborn...")
         iso = find_reborn_iso() or ask_for_iso()
     if not iso or not os.path.isfile(iso):
         print("Couldn't find Reborn's NSR.iso. Run this again with its path, e.g.\n"
-              '  NSR-Patcher.exe "C:\\...\\NFL Street Reborn\\content\\games\\NSR.iso"')
+              '  NFLStreetRollback-Patcher.exe "C:\\...\\NFL Street Reborn\\content\\games\\NSR.iso"')
         return 1
     print(f"Reborn image: {iso}\n")
     started = time.time()
@@ -323,7 +323,7 @@ def run(iso: str | None, out_dir: str) -> int:
     if r.reborn_install:
         print(f"Reborn textures will be used read-only from: {os.path.join(r.reborn_install, 'content', 'textures')}")
     print("\nYour Reborn install was only read, never changed.")
-    print(f"Next: start a game with the NSR Netplay launcher (it uses {OUTPUT_NAME} from this folder).")
+    print(f"Next: start a game with the NFLStreetRollback launcher (it uses {OUTPUT_NAME} from this folder).")
     return 0
 
 

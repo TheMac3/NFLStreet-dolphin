@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""nsr_launcher.py: "NSR Netplay", the friend-facing launcher for NFLStreet netplay.
+"""nsr_launcher.py: "NFLStreetRollback", the friend-facing launcher for NFLStreet netplay
+("NFLStreetRollback.exe"; short form "NSRB"; the module, NSR_* variables and
+nsr-*.json/.txt file names keep their old internal names on purpose).
 
 A window that replaces command lines and .bat files. It lives in the
 NFLStreet-dolphin folder (next to Dolphin.exe) and does four things:
@@ -8,7 +10,7 @@ NFLStreet-dolphin folder (next to Dolphin.exe) and does four things:
      rollback netplay image (nsr_patcher.prepare_image), and show its
      fingerprint. An image from an older (lockstep) download is detected and
      must be rebuilt.
-  2. Play: Host (Create room: shows a code like NSR-4K7QX, lists who joined,
+  2. Play: Host (Create room: shows a code like NSRB-4K7QX, lists who joined,
      Start) or Join (type the code, wait for Start), via the rendezvous server
      (room codes + hole punching, so usually no router setup). "Host by IP
      address" / typing an IP is the advanced fallback. Then it starts the
@@ -20,6 +22,10 @@ NFLStreet-dolphin folder (next to Dolphin.exe) and does four things:
   4. Controllers: the player's NFL Street Reborn controller setup is copied
      into this Dolphin automatically (nsr_controllers.py), so a pad mapped in
      Reborn's launcher works here without mapping it twice.
+  5. Game results: new per-game stats files that Reborn's own Dolphin writes
+     (GameStats/, stats/queue/) are uploaded in the background to Mason's
+     server for the shared Stats page (nsr_gamestats.py, docs/stats.md),
+     unless the player unticks "Upload game results".
 
 Reborn is never modified: its files are only read, this Dolphin runs in
 portable mode with its own settings and saves (User/ next to it), and
@@ -59,10 +65,11 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import isopatch  # noqa: E402
 import nsr_controllers as controllers  # noqa: E402
+import nsr_gamestats as gamestats  # noqa: E402
 import nsr_lobby as lobby  # noqa: E402
 import nsr_patcher as patcher  # noqa: E402
 
-APP_TITLE = "NSR Netplay"
+APP_TITLE = "NFLStreetRollback"  # window title; user-facing product name
 CONFIG_NAME = "nsr-launcher.json"
 # Rollback input delay in frames, the same for every player (the host's
 # choice is sent to all). 1 is the tested release value (release plan 2.3:
@@ -115,6 +122,10 @@ def app_dir() -> str:
     return os.getcwd()
 
 
+GAME_STATS_NOTE = ("Final scores and box-score stats of the games you finish in NFL Street Reborn (the "
+                   "files its Dolphin saves after the Game Stats/MVP screens), your name above and a random "
+                   "ID for this install. Never other files, folder paths, or your PC's name. Untick to upload "
+                   "nothing.")
 TELEMETRY_FILE = "nsr-telemetry.txt"  # shipped next to the launcher: url=..., key=... (POC)
 
 
@@ -369,7 +380,7 @@ class Launcher:
     """
 
     def __init__(self, folder: str | None = None, spawn=None, popen=None, lobby_mod=None,
-                 patcher_mod=None, env=os.environ):
+                 patcher_mod=None, env=os.environ, loop_spawn=None, stats_post=None):
         self.folder = folder or app_dir()
         self.cfg = load_config(self.folder)
         self._spawn = spawn or (lambda fn: threading.Thread(target=fn, daemon=True).start())
@@ -380,6 +391,12 @@ class Launcher:
         self._lock = threading.RLock()
         self._host = None
         self._join_cancel = None
+        # Background game-results uploader: its own long-lived thread (tests pass
+        # loop_spawn=lambda fn: None and call upload_stats_now directly).
+        self._loop_spawn = loop_spawn or (lambda fn: threading.Thread(target=fn, daemon=True).start())
+        self._stop = threading.Event()
+        self._stats_wake = threading.Event()
+        self.uploader = gamestats.Uploader(self.folder, **({"post": stats_post} if stats_post else {}))
         self.rv_server = rendezvous_server(self.folder)
         self.rev = 0
         self._notice_id = 0
@@ -388,6 +405,8 @@ class Launcher:
             "app": APP_TITLE, "folder": self.folder,
             "name": str(cfg.get("name", env.get("USERNAME", "Player")))[:24],
             "telemetry": bool(cfg.get("telemetry", True)),
+            "game_stats": {"enabled": bool(cfg.get("game_stats", True)), "state": "idle",
+                           "text": "", "sent": 0, "pending": 0},
             # "rb_delay", not the lockstep-era "delay" (2 by default), so an old
             # config doesn't carry a lockstep value into rollback.
             "delay": self._clamp_delay(cfg.get("rb_delay", DEFAULT_DELAY)),
@@ -450,6 +469,13 @@ class Launcher:
         self.cfg["telemetry"] = bool(on)
         self._save()
         self._set(telemetry=bool(on))
+
+    def set_game_stats(self, on: bool) -> None:
+        self.cfg["game_stats"] = bool(on)
+        self._save()
+        self._set("game_stats", enabled=bool(on))
+        if on:
+            self._stats_wake.set()
 
     def set_delay(self, delay) -> None:
         self._set(delay=self._clamp_delay(delay))
@@ -529,7 +555,7 @@ class Launcher:
     # -- controllers --
     def reborn_install(self, search: bool = False) -> str | None:
         """Reborn's install folder: from the last image build, else (search=True)
-        found on disk like NSR-Patcher does."""
+        found on disk like NFLStreetRollback-Patcher does."""
         install = self.cfg.get("reborn_install") or self._patcher.saved_reborn_install(self.folder)
         if not install and self.cfg.get("reborn_iso"):
             install = self._patcher.reborn_install_of(self.cfg["reborn_iso"])
@@ -575,6 +601,11 @@ class Launcher:
             self.sync_controllers_now()
         except Exception as e:  # noqa: BLE001
             log(self.folder, f"controller sync failed: {e!r}")
+        if start is not None and getattr(start, "telemetry_url", ""):
+            # Remember the server (and this room's token as registration proof)
+            # so Reborn-only games can be uploaded later too.
+            self.uploader.remember_server(start.telemetry_url, start.telemetry_token)
+            self._stats_wake.set()
         args, env = dolphin_command(self.folder, start, self.reborn_install(), open_ui=open_ui,
                                     name=self.state["name"], fingerprint=self.state["game"]["fingerprint"],
                                     telemetry=self.state["telemetry"])
@@ -716,11 +747,51 @@ class Launcher:
         if self._join_cancel:
             self._join_cancel.set()
 
+    # -- game results upload --
+    def upload_stats_now(self, force: bool = False) -> dict:
+        """One upload pass (the background loop calls this every few minutes)."""
+        if not self.state["game_stats"]["enabled"]:
+            self._set("game_stats", state="off", text="Off: nothing is uploaded.")
+            return {"state": "off"}
+        fallback = telemetry_config(self.folder)
+        url = gamestats.games_url(self._env.get("NSR_GAMES_URL", "") or fallback["url"])
+        dirs = gamestats.stats_dirs(self.reborn_install(), self._env)
+        try:
+            res = self.uploader.run_once(dirs, self.state["name"], url=url, shared_key=fallback["key"],
+                                         force=force)
+        except Exception as e:  # noqa: BLE001  (never let uploads break the launcher)
+            log(self.folder, f"game stats upload failed: {e!r}")
+            return {"state": "error"}
+        text = {"ok": f"{res['total_sent']} game result files sent"
+                      + (f", {res['pending']} waiting" if res["pending"] else "") + ".",
+                "no-server": "Waiting for the server address: it arrives with your first room "
+                             "(or nsr-telemetry.txt).",
+                "no-token": "The server hasn't accepted this PC yet; play one room through "
+                            "room codes and it will.",
+                "unauthorized": "The server refused the upload key; it will ask for a new one.",
+                "offline": "Server unreachable; will retry.", "waiting": "Will retry shortly.",
+                }.get(res["state"], f"Upload problem ({res['state']}); will retry.")
+        if not dirs:
+            text = "No Reborn game results folder found yet. " + text
+        self._set("game_stats", state=res["state"], text=text, sent=res["total_sent"], pending=res["pending"])
+        if res.get("sent"):
+            log(self.folder, f"game stats: sent {res['sent']}, {res['pending']} pending")
+        return res
+
+    def _stats_loop(self) -> None:
+        while not self._stop.is_set():
+            self.upload_stats_now()
+            self._stats_wake.wait(gamestats.INTERVAL_S)
+            self._stats_wake.clear()
+
     def startup(self) -> None:
         self.check_game()
         self.sync_controllers()
+        self._loop_spawn(self._stats_loop)
 
     def shutdown(self) -> None:
+        self._stop.set()
+        self._stats_wake.set()
         if self._host:
             self._host.close()
             self._host = None
@@ -758,6 +829,7 @@ class WebApi:
 
     def set_name(self, name): self._l.set_name(name)
     def set_telemetry(self, on): self._l.set_telemetry(bool(on))
+    def set_game_stats(self, on): self._l.set_game_stats(bool(on))
     def set_delay(self, delay): self._l.set_delay(delay)
     def find_game(self): self._l.find_game()
     def host_room(self): self._l.host_room()
@@ -843,7 +915,7 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
 
     outer = ttk.Frame(root, padding=16)
     outer.pack(fill="both", expand=True)
-    ttk.Label(outer, text="NSR NETPLAY", style="Title.TLabel").pack(anchor="w")
+    ttk.Label(outer, text="NFLSTREET ROLLBACK", style="Title.TLabel").pack(anchor="w")
     status = ttk.Label(outer, text="", foreground=muted)
     status.pack(anchor="w", pady=(0, 8))
 
@@ -917,12 +989,19 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     ttk.Label(sp, text="Connection and rollback counters, your name and the room code. Never your button "
                        "presses, files, or game data. Untick to send nothing.", style="Muted.TLabel",
               wraplength=560, justify="left").grid(row=2, column=0, columnspan=4, sticky="w")
-    game_text = label(sp, 3, pady=(14, 4))
+    stats_var = tk.BooleanVar(value=launcher.state["game_stats"]["enabled"])
+    ttk.Checkbutton(sp, text="Upload game results to Mason's server for the Stats page",
+                    variable=stats_var, command=lambda: launcher.set_game_stats(stats_var.get())) \
+        .grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
+    ttk.Label(sp, text=GAME_STATS_NOTE, style="Muted.TLabel", wraplength=560, justify="left") \
+        .grid(row=4, column=0, columnspan=4, sticky="w")
+    stats_text = label(sp, 5, style="Muted.TLabel")
+    game_text = label(sp, 6, pady=(14, 4))
     progress = ttk.Progressbar(sp, length=300, mode="determinate")
     b_find = ttk.Button(sp, text="Find Reborn automatically", command=launcher.find_game)
     b_browse = ttk.Button(sp, text="Browse for NSR.iso…")
-    b_find.grid(row=5, column=0, sticky="w")
-    b_browse.grid(row=5, column=1, sticky="w", padx=6)
+    b_find.grid(row=8, column=0, sticky="w")
+    b_browse.grid(row=8, column=1, sticky="w", padx=6)
 
     def browse():
         iso = filedialog.askopenfilename(title="Pick NFL Street Reborn's NSR.iso (content\\games)",
@@ -966,9 +1045,10 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
             if g["progress"] is None:
                 progress.grid_forget()
             else:
-                progress.grid(row=4, column=0, columnspan=3, sticky="w", pady=4)
+                progress.grid(row=7, column=0, columnspan=3, sticky="w", pady=4)
                 progress.configure(value=g["progress"])
             enable(b_find, not g["busy"]); enable(b_browse, not g["busy"])
+            stats_text.configure(text=s["game_stats"]["text"])
             n = s["notice"]
             if n and n["id"] != seen["notice"]:
                 seen["notice"] = n["id"]

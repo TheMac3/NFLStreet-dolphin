@@ -168,6 +168,8 @@ void RollbackFrameEndHook(const Core::CPUThreadGuard& guard);
 // completed live frame no longer makes it (match/results transition).
 constexpr unsigned int IN_GAME_FN = 0x8002854C;
 void InGameHook(const Core::CPUThreadGuard& guard);  // HookType::Start
+void GameStatsMvpHook(const Core::CPUThreadGuard& guard);  // HookType::Start, read-only
+void GameStatsTotalsHook(const Core::CPUThreadGuard& guard);  // HookType::Start, read-only
 void TickCountHook(const Core::CPUThreadGuard& guard);  // HookType::Gate
 std::vector<unsigned int> ResimSkipList();
 std::vector<unsigned int> EffectGateList();  // NSR_RB_EFFECT_GATE

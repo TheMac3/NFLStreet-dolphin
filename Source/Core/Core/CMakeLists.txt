@@ -138,6 +138,10 @@ add_library(core
   NSR/NSRTelemetry.h
   NSR/NSRTelemetryLogic.h
   NSR/NSRNetplay.cpp
+  NSR/NSRGameStats.cpp
+  NSR/NSRGameStats.h
+  NSR/NSRGameStatsRead.h
+  NSR/NSRGameStatsIdentity.h
   NSR/NSRNetplay.h
   NSR/NSRRollbackNetplay.cpp
   NSR/NSRRollbackNetplay.h

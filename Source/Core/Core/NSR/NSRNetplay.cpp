@@ -10,6 +10,7 @@
 //   - periodic whole-MEM1 hashes, compared with every peer, to detect desyncs.
 
 #include "Core/NSR/NSRNetplay.h"
+#include "Core/NSR/NSRGameStats.h"
 #include "Core/NSR/NSRRollbackLogic.h"
 #include "Core/NSR/NSRRollbackNetplay.h"
 #include "Core/NSR/ReplayFollow.h"
@@ -470,6 +471,7 @@ bool Setup()
   std::vector<std::string> lower_peers;
   if (!ReadConfig(s, &lower_peers))
     return false;
+  NSRGameStats::Configure(s.me, s.players, true);
   if (enet_initialize() != 0)
   {
     Log("enet_initialize failed");
@@ -647,6 +649,33 @@ void OpenHandoffBarrier(const RollbackNet::HandoffAgreement& agreement)
 void HandlePacket(const ENetPacket* packet, u32 source)
 {
   Session& s = s_session;
+  // Optional stats identities use reliable, sender-bound metadata only. They
+  // neither enter the input exchange nor make simulation wait for a response.
+  const std::span<const u8> bytes{packet->data, packet->dataLength};
+  if (packet->dataLength >= 4 && std::memcmp(packet->data, "NSRG", 4) == 0)
+  {
+    if (PacketSenderMatchesPeer(0, source))
+      NSRGameStats::AcceptCaptureAnchor(bytes);
+    return;
+  }
+  if (packet->dataLength >= 4 && std::memcmp(packet->data, "NSRI", 4) == 0)
+  {
+    const auto sender = NSRGameStats::IdentitySender(bytes);
+    if (!sender || !PacketSenderMatchesPeer(*sender, source) ||
+        !NSRGameStats::AcceptIdentity(bytes))
+      return;
+    if (s.star && s.me == 0)
+    {
+      for (u32 i = 1; i < s.players; ++i)
+      {
+        if (i != *sender && Linked(i))
+          enet_peer_send(s.peers[i], 0,
+                         enet_packet_create(packet->data, packet->dataLength,
+                                            ENET_PACKET_FLAG_RELIABLE));
+      }
+    }
+    return;
+  }
   u32 magic = 0;
   if (packet->dataLength >= sizeof(magic))
     std::memcpy(&magic, packet->data, sizeof(magic));
@@ -857,6 +886,15 @@ void Service(int timeout_ms)
       {
         s.peers[index] = event.peer;
         Log("connected to player {}", index);
+        // A star host replays already-known leaf identities to a new leaf;
+        // mesh peers send only their own connection-bound identity.
+        for (const auto& identity : NSRGameStats::Identities())
+        {
+          if ((s.star && s.me == 0) || NSRGameStats::IdentitySender(identity) == s.me)
+            enet_peer_send(event.peer, 0,
+                           enet_packet_create(identity.data(), identity.size(),
+                                              ENET_PACKET_FLAG_RELIABLE));
+        }
       }
       break;
     }
@@ -886,6 +924,18 @@ void Service(int timeout_ms)
     default:
       break;
     }
+  }
+  // One small host-only results announcement per completed stats snapshot.
+  // It never stalls simulation; only file publication waits for this metadata.
+  if (const auto anchor = NSRGameStats::TakeCaptureAnchor(); !anchor.empty())
+  {
+    for (u32 i = 0; i < s.players; ++i)
+    {
+      if (i != s.me && Linked(i))
+        enet_peer_send(s.peers[i], 0,
+                       enet_packet_create(anchor.data(), anchor.size(), ENET_PACKET_FLAG_RELIABLE));
+    }
+    enet_host_flush(s.host);
   }
 }
 
@@ -6473,6 +6523,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
       else if (quiet)
       {
         RbSave(ram, r.ring[r.live % slots]);
+        NSRGameStats::RollbackFrom(target);
         RbRestore(system, ram, r.ring[target % slots]);
         r.cursor = target;
         r.rolled = true;
@@ -6533,6 +6584,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
           // No save of the state before frame `now` here: nothing reads it (the
           // re-simulation check is off in this mode) and the live frame `now`
           // saves its slot again when re-simulation reaches it.
+          NSRGameStats::RollbackFrom(target);
           RbRestore(system, ram, r.ring[target % slots]);
           r.cursor = target;
           r.rolled = true;
@@ -6574,6 +6626,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
         if (target != r.live - depth)
           ++r.clamped;
         RbSave(ram, r.ring[r.live % slots]);
+        NSRGameStats::RollbackFrom(target);
         RbRestore(system, ram, r.ring[target % slots]);
         r.cursor = target;
         r.rolled = true;
@@ -7200,6 +7253,19 @@ void RollbackFrameEndHook(const Core::CPUThreadGuard& guard)
   if (FrameDrivenLifecycleActive() && !r.config.async_present)
     PowerPC::MMU::HostWrite<u32>(guard, PowerPC::MMU::HostRead<u32>(guard, VI_POST_COUNTER) + 1,
                                  VI_POST_COUNTER);
+  // Passive stats observation must never see re-simulation as a new match or
+  // publish a result based on predicted input. Post-match frame lockstep is
+  // confirmed by RbNetworkPreflight before the guest frame runs.
+  if (!r.in_resim)
+  {
+    std::optional<u32> confirmed_through;
+    if (!r.net_enabled || r.menu_frame_lockstep)
+      confirmed_through = r.tick_running;
+    else if (s_rb_exchange && !s_rb_exchange->PendingRollback() &&
+             s_rb_exchange->ConfirmedThrough() != RollbackNet::NO_FRAME)
+      confirmed_through = s_rb_exchange->ConfirmedThrough();
+    NSRGameStats::ObserveFrame(guard, r.tick_running, r.in_game_seen, confirmed_through);
+  }
   CostFrameEnd(guard);
   TelemetryUnitEnd(guard);  // NSR telemetry
   s_hp_phase = 0;
@@ -7263,6 +7329,22 @@ void InGameHook(const Core::CPUThreadGuard& guard)
   r.in_game_seen = true;
   if (r.vtime_on)
     r.session_saw_in_game = true;
+}
+
+// Observational HLE Start hook at GN7E69 rev-0 MVP calculation completion.
+// It preserves the original instruction, PPC registers and all guest state.
+void GameStatsMvpHook(const Core::CPUThreadGuard& guard)
+{
+  if (!s_rb.in_resim)
+    NSRGameStats::ObserveMvp(guard);
+}
+
+// Remember the native formatter's output buffers; no game reads/writes occur
+// until the live frame's result capture, and re-simulation cannot update them.
+void GameStatsTotalsHook(const Core::CPUThreadGuard& guard)
+{
+  if (!s_rb.in_resim)
+    NSRGameStats::ObserveTotals(guard);
 }
 
 // Frame mode, during the session: exactly one tick per unpaused frame.
@@ -9085,6 +9167,7 @@ bool IsReplayCatchingUp()
 
 void Shutdown(const Core::CPUThreadGuard& guard)
 {
+  NSRGameStats::Reset();
   if (s_rb_watchdog.joinable())
   {
     s_rb_watchdog.request_stop();
