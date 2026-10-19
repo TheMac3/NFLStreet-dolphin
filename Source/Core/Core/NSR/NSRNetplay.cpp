@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // See NSRNetplay.h for the design. This file holds:
+//   - canonical boot settings/cards and an all-peer agreement before guest boot,
 //   - session setup over ENet for 2-4 players in a full mesh (each player
 //     binds a port, connects to every lower-numbered player, and accepts the
 //     higher-numbered ones),
@@ -10,6 +11,8 @@
 //   - periodic whole-MEM1 hashes, compared with every peer, to detect desyncs.
 
 #include "Core/NSR/NSRNetplay.h"
+#include "Core/NSR/NSRBootSync.h"
+#include "Core/NSR/NSRBootAgreement.h"
 #include "Core/NSR/NSRGameStats.h"
 #include "Core/NSR/NSRRollbackLogic.h"
 #include "Core/NSR/NSRRollbackNetplay.h"
@@ -152,6 +155,14 @@ struct Packet
 
 struct Session
 {
+  // Preboot all-peer manifest + ready + host release barrier. No guest frame is
+  // allowed before every participant has compared every named field.
+  bool boot_pending = false;
+  bool boot_go = false;
+  bool boot_ready_sent = false;
+  NSRBootSync::Manifest boot_manifest;
+  std::array<std::vector<u8>, MAX_PLAYERS> boot_manifests{};
+  std::array<bool, MAX_PLAYERS> boot_ready{};
   bool initialized = false;
   bool enabled = false;
   // Star (default): everyone connects only to player 0, who relays every
@@ -180,6 +191,7 @@ struct Session
   u32 delay = 2;
   FILE* log = stderr;
   ENetHost* host = nullptr;
+  bool enet_initialized = false;
   std::array<ENetPeer*, MAX_PLAYERS> peers{};  // by player index (ours unused)
   bool failed = false;
 
@@ -460,6 +472,8 @@ bool Setup()
     return false;
   }
 
+  s.enet_initialized = true;
+
   if (s.punch.enabled)
     return SetupPunch();
 
@@ -578,13 +592,85 @@ void StopForRollbackTransportFailure()
   // Milestone-1 lockstep historically falls back offline.  Rollback cannot:
   // returning from a failed preflight would let the guest advance without a
   // prepared frame, so a configured rollback session always fails closed.
-  if (!Env("NSR_RB_NET").empty())
+  if (!s_session.boot_pending && !Env("NSR_RB_NET").empty())
     Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+}
+
+// Send a boot-control message only over established, identity-bound links.
+void SendBootBytes(const std::vector<u8>& bytes, u32 except = MAX_PLAYERS)
+{
+  Session& s = s_session;
+  for (u32 i = 0; i < s.players; ++i)
+    if (i != s.me && i != except && Linked(i))
+      enet_peer_send(s.peers[i], 0,
+                     enet_packet_create(bytes.data(), bytes.size(), ENET_PACKET_FLAG_RELIABLE));
+  enet_host_flush(s.host);
+}
+
+// Every manifest is compared before the hub relays it. A leaf then needs all
+// peer manifests, not just the host's; the host releases only after all Ready.
+void HandleBootPacket(const ENetPacket* packet, u32 source)
+{
+  Session& s = s_session;
+  const auto message = NSRBootSync::DecodeBoot({packet->data, packet->dataLength});
+  if (!message || message->players != s.players || message->sender == s.me ||
+      !PacketSenderMatchesPeer(message->sender, source))
+  {
+    Log("boot sync rejected: invalid preboot protocol or player identity");
+    s.failed = true;
+    return;
+  }
+  const u32 sender = message->sender;
+  if (message->kind == NSRBootSync::BootKind::Settings)
+  {
+    const auto differences = NSRBootSync::BootDifferences(s.boot_manifest, message->fields);
+    if (!differences.empty())
+    {
+      std::string names;
+      for (const auto& name : differences)
+        names += (names.empty() ? "" : ", ") + name;
+      Log("boot sync mismatch from player {} BEFORE boot: {}. Use the same NFLStreetRollback build "
+          "and session settings on every PC.", sender, names);
+      s.failed = true;
+      return;
+    }
+    s.boot_manifests[sender].assign(packet->data, packet->data + packet->dataLength);
+  }
+  else if (message->kind == NSRBootSync::BootKind::Ready)
+  {
+    if (s.boot_manifests[sender].empty())
+    {
+      s.failed = true;
+      Log("boot sync rejected: ready before manifest from player {}", sender);
+      return;
+    }
+    s.boot_ready[sender] = true;
+  }
+  else
+  {
+    if (sender != 0 || !s.boot_ready_sent)
+    {
+      s.failed = true;
+      Log("boot sync rejected: premature or non-host boot release");
+      return;
+    }
+    s.boot_go = true;
+  }
+  if (s.star && s.me == 0 && message->kind != NSRBootSync::BootKind::Go)
+    SendBootBytes({packet->data, packet->data + packet->dataLength}, sender);
 }
 
 void HandlePacket(const ENetPacket* packet, u32 source)
 {
   Session& s = s_session;
+  if (packet->dataLength >= 4 && std::memcmp(packet->data, "NSRC", 4) == 0)
+  {
+    HandleBootPacket(packet, source);
+    return;
+  }
+  // No pad/handoff packet may get ahead of the connection agreement.
+  if (s.boot_pending)
+    return;
   // Optional stats identities use reliable, sender-bound metadata only. They
   // neither enter the input exchange nor make simulation wait for a response.
   const std::span<const u8> bytes{packet->data, packet->dataLength};
@@ -826,6 +912,14 @@ void Service(int timeout_ms)
       {
         s.peers[index] = event.peer;
         Log("connected to player {}", index);
+        if (s.boot_pending)
+        {
+          for (u32 i = 0; i < s.players; ++i)
+            if (!s.boot_manifests[i].empty() && (i == s.me || (s.star && s.me == 0)))
+              enet_peer_send(event.peer, 0,
+                             enet_packet_create(s.boot_manifests[i].data(),
+                                                s.boot_manifests[i].size(), ENET_PACKET_FLAG_RELIABLE));
+        }
         // A star host replays already-known leaf identities to a new leaf;
         // mesh peers send only their own connection-bound identity.
         for (const auto& identity : NSRGameStats::Identities())
@@ -4134,6 +4228,83 @@ static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 fra
   if (frame % 600 == 0)
     Log("frame {} ok (desyncs so far: {})", frame, s.desyncs);
   return true;
+}
+
+// BootManager calls this on the host thread before Core::Init. The same ENet
+// session is handed to the CPU thread after agreement, with no concurrent use.
+bool PrepareBoot()
+{
+  Session& s = s_session;
+  s.boot_pending = true;
+  if (const auto manifest = NSRBootSync::Prepare())
+  {
+    s.boot_manifest = *manifest;
+    s.enabled = Setup();
+    if (s.enabled)
+    {
+      const auto own = NSRBootSync::EncodeBoot({NSRBootSync::BootKind::Settings,
+          static_cast<u8>(s.me), static_cast<u8>(s.players), s.boot_manifest});
+      s.boot_manifests[s.me] = own;
+      SendBootBytes(own);
+      Log("boot sync manifest {:016x}: {} settings, fresh empty disposable GCI cards, canonical SRAM",
+          XXH3_64bits(own.data() + 8, own.size() - 8), s.boot_manifest.size());
+      const auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(CONNECT_TIMEOUT_MS);
+      while (s.enabled && !s.failed && !s.boot_go && std::chrono::steady_clock::now() < deadline)
+      {
+        Service(10);
+        bool all_seen = AllConnected();
+        for (u32 i = 0; i < s.players; ++i)
+          all_seen = all_seen && !s.boot_manifests[i].empty();
+        if (all_seen && !s.boot_ready_sent)
+        {
+          s.boot_ready_sent = true;
+          s.boot_ready[s.me] = true;
+          SendBootBytes(NSRBootSync::EncodeBoot({NSRBootSync::BootKind::Ready,
+              static_cast<u8>(s.me), static_cast<u8>(s.players), {}}));
+        }
+        bool all_ready = all_seen;
+        for (u32 i = 0; i < s.players; ++i)
+          all_ready = all_ready && s.boot_ready[i];
+        if (s.me == 0 && all_ready && !s.failed)
+        {
+          SendBootBytes(NSRBootSync::EncodeBoot({NSRBootSync::BootKind::Go,
+              0, static_cast<u8>(s.players), {}}));
+          s.boot_go = true;
+        }
+        if (s.punch.enabled)
+          SendPunches();
+      }
+    }
+  }
+  else
+  {
+    Log("boot sync failed BEFORE boot: could not create disposable cards");
+    s.failed = true;
+  }
+  if (s.boot_go && !s.failed)
+  {
+    s.boot_pending = false;
+    Log("boot sync PASSED: all {} peers agreed BEFORE boot", s.players);
+    return true;
+  }
+  Log("boot sync failed BEFORE boot (incompatible peer, disconnected peer or timeout). "
+      "All players must use the same NFLStreetRollback build; inspect the named mismatch above.");
+  if (s.host)
+  {
+    for (u32 i = 0; i < s.players; ++i)
+      if (s.peers[i])
+        enet_peer_disconnect_now(s.peers[i], 0);
+    enet_host_destroy(s.host);
+  }
+  if (s.enet_initialized)
+    enet_deinitialize();
+  if (s.log != stderr)
+    std::fclose(s.log);
+  s = Session{};
+  NSRBootSync::Cleanup();
+  Config::RemoveLayer(Config::LayerType::Netplay);
+  return false;
 }
 
 void Hook(const Core::CPUThreadGuard& guard)
@@ -8934,6 +9105,8 @@ void Shutdown(const Core::CPUThreadGuard& guard)
     }
     enet_host_destroy(s.host);
   }
+  if (s.enet_initialized)
+    enet_deinitialize();
   s_dirty.Reset();
   s_digest = StateDigest{};
   s_workers.Stop();

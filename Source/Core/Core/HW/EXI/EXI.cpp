@@ -19,6 +19,7 @@
 #include "Core/HW/MMIO.h"
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/HW/Sram.h"
+#include "Core/NSR/NSRBootSync.h"
 #include "Core/HW/SystemTimers.h"
 #include "Core/Movie.h"
 #include "Core/System.h"
@@ -117,6 +118,8 @@ u8 SlotToEXIDevice(Slot slot)
 void ExpansionInterfaceManager::Init(const Sram* override_sram)
 {
   auto& sram = m_system.GetSRAM();
+  if (NSRBootSync::Enabled())
+    override_sram = &GetDefaultSRAM();  // Disposable NSR cards never use or persist local SRAM.
   if (override_sram)
   {
     sram = *override_sram;
@@ -142,7 +145,8 @@ void ExpansionInterfaceManager::Init(const Sram* override_sram)
     const u32 rtc_bias = sram.settings.rtc_bias;
     const u32 sram_language = static_cast<u32>(sram.settings.language);
     const u64 format_time =
-        Common::Timer::GetLocalTimeSinceJan1970() - ExpansionInterface::CEXIIPL::GC_EPOCH;
+        NSRBootSync::Enabled() ? NSRBootSync::CARD_FORMAT_TIME :
+            Common::Timer::GetLocalTimeSinceJan1970() - ExpansionInterface::CEXIIPL::GC_EPOCH;
 
     for (u32 i = 0; i < MAX_EXI_CHANNELS; i++)
     {

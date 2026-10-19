@@ -134,6 +134,9 @@ static_assert(sizeof(Sram) == 0x44);
 
 #pragma pack(pop)
 
+// Canonical built-in SRAM for deterministic sessions; no persistent file access.
+const Sram& GetDefaultSRAM();
+
 void InitSRAM(Sram* sram, const std::string& filename);
 void SetCardFlashID(Sram* sram, const u8* buffer, ExpansionInterface::Slot card_slot);
 void FixSRAMChecksums(Sram* sram);

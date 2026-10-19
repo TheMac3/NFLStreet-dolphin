@@ -17,6 +17,7 @@
 //     -o nsr-rollback-netplay-test && ./nsr-rollback-netplay-test
 
 #include "Core/NSR/NSRRollbackNetplay.h"
+#include "Core/NSR/NSRBootAgreement.h"
 #include "Core/NSR/NSRRollbackLogic.h"
 #include "Core/NSR/NSRTelemetryLogic.h"
 #include "Core/NSR/NSRGameStatsRead.h"
@@ -1483,8 +1484,49 @@ static void TestGameStatsIdentity()
   assert(GS::EncodeCaptureAnchor({2, 0, 7}).empty());
 }
 
+// The boot protocol must reject malformed messages and report actual card or
+// emulation-setting differences, including missing fields from older builds.
+static void TestBootAgreementWire()
+{
+  using namespace NSRBootSync;
+  const BootMessage local{BootKind::Settings, 0, 3,
+      {{"Dolphin.Core.CPUThread", "False"}, {"MemoryCard.A.contents", "empty-v1"}}};
+  const auto bytes = EncodeBoot(local);
+  const auto decoded = DecodeBoot(bytes);
+  assert(decoded && decoded->fields == local.fields);
+  for (std::size_t n = 0; n < 8; ++n)
+    assert(!DecodeBoot(std::span(bytes).first(n)));
+  auto bad = bytes;
+  bad[4] = 2;
+  assert(!DecodeBoot(bad));
+  bad = bytes;
+  bad[6] = 3;
+  assert(!DecodeBoot(bad));
+  bad = bytes;
+  bad.pop_back();
+  assert(!DecodeBoot(bad));
+  bad = bytes;
+  bad.insert(bad.end(), bytes.begin() + 8, bytes.end());
+  assert(!DecodeBoot(bad));
+  bad.assign(MAX_BOOT_PACKET + 1, 0);
+  assert(!DecodeBoot(bad));
+  auto other = local.fields;
+  other["MemoryCard.A.contents"] = "different-save";
+  assert(BootDifferences(local.fields, other) ==
+         std::vector<std::string>{"MemoryCard.A.contents"});
+  other = local.fields;
+  other.erase("Dolphin.Core.CPUThread");
+  assert(BootDifferences(local.fields, other) ==
+         std::vector<std::string>{"Dolphin.Core.CPUThread"});
+  assert(DecodeBoot(EncodeBoot({BootKind::Ready, 1, 3, {}})));
+  assert(DecodeBoot(EncodeBoot({BootKind::Go, 0, 3, {}})));
+  assert(!DecodeBoot(EncodeBoot({BootKind::Ready, 1, 3, local.fields})));
+  assert(!DecodeBoot(EncodeBoot({BootKind::Settings, 1, 3, {}})));
+}
+
 int main()
 {
+  TestBootAgreementWire();
   TestGameStatsMemoryReader();
   TestGameStatsIdentity();
   TestHandoffAgreement();
