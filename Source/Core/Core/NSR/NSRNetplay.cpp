@@ -798,7 +798,8 @@ void HandlePacket(const ENetPacket* packet, u32 source)
     {
       return;
     }
-    const std::span<const u8> bytes(static_cast<const u8*>(packet->data), packet->dataLength);
+    const std::span<const u8> handoff_bytes(
+        static_cast<const u8*>(packet->data), packet->dataLength);
     if (!s_rb_handoff || s_rb_handoff->Local().transition != decoded->transition)
     {
       // Not (yet) this peer's barrier: keep the newest copy per sender and
@@ -808,10 +809,11 @@ void HandlePacket(const ENetPacket* packet, u32 source)
       });
       if (s_rb_early_handoffs.size() >= MAX_EARLY_HANDOFFS)
         s_rb_early_handoffs.pop_front();
-      s_rb_early_handoffs.push_back({std::vector<u8>(bytes.begin(), bytes.end()), *decoded});
+      s_rb_early_handoffs.push_back(
+          {std::vector<u8>(handoff_bytes.begin(), handoff_bytes.end()), *decoded});
       return;
     }
-    AcceptHandoff(*decoded, bytes);
+    AcceptHandoff(*decoded, handoff_bytes);
     return;
   }
   if (magic == RollbackNet::MAGIC)
