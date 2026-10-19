@@ -415,6 +415,13 @@ bool ReadConfig(Session& s, std::vector<std::string>* lower_peers)
       *lower_peers = Split(Env("NSR_PEERS"), ',');
   }
   s.players = std::clamp<u32>(s.players, 2, MAX_PLAYERS);
+  // Validate before the rendezvous branch too: preboot indexes the per-player
+  // manifest table after either transport path has completed setup.
+  if (s.me >= s.players)
+  {
+    Log("bad config: player {} of {}", s.me, s.players);
+    return false;
+  }
   s.star = Env("NSR_TOPOLOGY", "star") != "mesh";
   if (const std::string rv = Env("NSR_RENDEZVOUS"); !rv.empty())
   {
@@ -439,7 +446,7 @@ bool ReadConfig(Session& s, std::vector<std::string>* lower_peers)
   if (s.star && lower_peers->size() > 1)
     lower_peers->resize(1);  // star: only player 0's address is needed
   const size_t needed = s.star ? (s.me > 0 ? 1 : 0) : s.me;
-  if (s.me >= s.players || lower_peers->size() != needed)
+  if (lower_peers->size() != needed)
   {
     Log("bad config: player {} of {} with {} lower-player addresses", s.me, s.players,
         lower_peers->size());
