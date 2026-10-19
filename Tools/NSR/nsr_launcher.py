@@ -28,7 +28,8 @@ NFLStreet-dolphin folder (next to Dolphin.exe) and does four things:
      unless the player unticks "Upload game results".
 
 Reborn is never modified: its files are only read, this Dolphin runs in
-portable mode with its own settings and saves (User/ next to it), and
+portable mode with its own settings (User/ next to it). Offline saves persist;
+netplay uses fresh disposable cards and canonical SRAM owned by the fork, and
 Reborn's HD textures are loaded read-only from its install.
 
 Structure: pure helpers (dolphin_command & co., unit-tested), then Launcher,
@@ -172,8 +173,10 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     """Command line and environment for the netplay Dolphin.
 
     start=None: practice offline. open_ui=True: just open Dolphin's window
-    (controller setup), no game. Every setting that affects determinism is
-    passed explicitly so all machines match regardless of local Dolphin config.
+    (controller setup), no game. The fork installs its canonical Netplay config
+    layer and disposable empty cards for NSR_NETPLAY, then agrees the effective
+    settings with every peer before guest boot. These flags also document the
+    launcher profile; local UI/game config cannot override the fork layer.
     """
     exe = os.environ.get("NSR_DOLPHIN") or os.path.join(folder, "Dolphin.exe")
     args = [exe, "-u", os.path.join(folder, "User")]
@@ -209,6 +212,8 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     if start:
         env.update({
             "NSR_NETPLAY": "1",
+            # Compatibility is independent of the optional telemetry upload.
+            "NSR_FINGERPRINT": fingerprint or "",
             "NSR_PLAYER": str(start.player),
             "NSR_PLAYERS": str(start.players),
             "NSR_PORT": str(lobby.PORT),
@@ -610,11 +615,41 @@ class Launcher:
                                     name=self.state["name"], fingerprint=self.state["game"]["fingerprint"],
                                     telemetry=self.state["telemetry"])
         try:
-            self._popen(args, env=env, cwd=self.folder)
+            # The fork truncates this per-player log at connection setup. Clear
+            # it here too so a failed launch cannot surface an older mismatch.
+            if start is not None and not open_ui:
+                with open(env["NSR_LOG"], "w", encoding="utf-8"):
+                    pass
+            process = self._popen(args, env=env, cwd=self.folder)
         except OSError as e:
             self.notify(f"Couldn't start Dolphin ({args[0]}): {e}", "error")
             return False
+        if start is not None and not open_ui and hasattr(process, "poll"):
+            self._spawn(lambda: self._watch_boot_sync(process, env["NSR_LOG"]))
         return True
+
+    def _watch_boot_sync(self, process, path: str) -> None:
+        """Surface the fork's named preboot failure without exposing wire internals.
+
+        Stop watching as soon as the boot barrier passes. Gameplay and Dolphin's
+        later exit status belong to its normal UI, not this connection watcher.
+        """
+        deadline = time.monotonic() + 130  # rendezvous + peer-connect windows
+        while time.monotonic() < deadline:
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    lines = f.read(65536).splitlines()
+            except OSError:
+                lines = []
+            for line in lines:
+                if "boot sync mismatch" in line or "boot sync failed BEFORE boot" in line:
+                    self.notify(line.removeprefix("[NSR] "), "error")
+                    return
+                if "boot sync PASSED" in line:
+                    return
+            if process.poll() is not None:
+                return
+            time.sleep(0.2)
 
     def play_offline(self) -> None:
         self.launch(None)

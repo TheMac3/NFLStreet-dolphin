@@ -118,6 +118,10 @@ class System;
 
 namespace NSRNetplay
 {
+// Install canonical settings/cards and agree all peers before Core::Init executes
+// any guest boot code. Returns false with a named diagnostic on incompatibility.
+bool PrepareBoot();
+
 // Address of the in-game stub the hook replaces. Must match isopatch.py's
 // NETPLAY_STUB.
 constexpr unsigned int STUB_ADDRESS = 0x804119AC;

@@ -30,6 +30,12 @@ const Sram sram_dump = {Common::BigEndianValue<u32>{0},
                          {}}};
 // clang-format on
 
+// Reuse Dolphin's built-in template rather than duplicating its packed layout.
+const Sram& GetDefaultSRAM()
+{
+  return sram_dump;
+}
+
 void InitSRAM(Sram* sram, const std::string& filename)
 {
   File::IOFile file(filename, "rb");
