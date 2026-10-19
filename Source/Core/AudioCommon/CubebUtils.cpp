@@ -71,6 +71,16 @@ std::shared_ptr<cubeb> GetContext()
   if (cubeb_init(&ctx, "Dolphin Emulator", nullptr) != CUBEB_OK)
   {
     ERROR_LOG_FMT(AUDIO, "Error initializing cubeb library");
+    // NFLStreet fork (fix/lifecycle): cubeb_set_log_callback above started
+    // cubeb's async logger thread, and only DestroyContext stops it. Without
+    // a context nothing ever did, so the process died in std::terminate at
+    // exit (the static logger's std::thread destroyed while joinable) whenever
+    // no audio backend was available: a crash dialog on every self-initiated
+    // quit, e.g. after a netplay abort.
+    if (cubeb_set_log_callback(CUBEB_LOG_DISABLED, nullptr) != CUBEB_OK)
+    {
+      ERROR_LOG_FMT(AUDIO, "Error removing cubeb log callback");
+    }
     return nullptr;
   }
   INFO_LOG_FMT(AUDIO, "Cubeb initialized using {} backend", cubeb_get_backend_id(ctx));

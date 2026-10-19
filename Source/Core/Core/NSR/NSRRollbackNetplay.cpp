@@ -193,6 +193,17 @@ bool HandoffAgreement::Complete() const
          std::all_of(m_seen.begin(), m_seen.begin() + m_players, [](bool seen) { return seen; });
 }
 
+std::uint8_t HandoffAgreement::SeenMask() const
+{
+  std::uint8_t mask = static_cast<std::uint8_t>(1U << m_me);
+  for (std::uint32_t p = 0; p < m_players && p < MAX_PLAYERS; ++p)
+  {
+    if (m_seen[p])
+      mask = static_cast<std::uint8_t>(mask | (1U << p));
+  }
+  return mask;
+}
+
 std::optional<std::uint32_t> HandoffAgreement::HostClock() const
 {
   if (!m_seen[0])
@@ -626,6 +637,21 @@ bool Exchange::ShouldStall(std::uint32_t frame) const
 std::optional<std::uint32_t> Exchange::PendingRollback() const
 {
   return m_pending;
+}
+
+std::uint8_t Exchange::MispredictedPlayers(std::uint32_t frame) const
+{
+  const auto ran = m_ran.find(frame);
+  if (ran == m_ran.end())
+    return 0;
+  std::uint8_t mask = 0;
+  for (std::uint32_t p = 0; p < m_players && p < MAX_PLAYERS; ++p)
+  {
+    const auto it = m_confirmed[p].find(frame);
+    if (it != m_confirmed[p].end() && it->second != ran->second[p])
+      mask = static_cast<std::uint8_t>(mask | (1U << p));
+  }
+  return mask;
 }
 
 void Exchange::BeginRollback()

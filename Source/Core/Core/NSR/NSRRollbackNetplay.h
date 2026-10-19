@@ -189,6 +189,8 @@ public:
 
   bool Accept(const HandoffPacket& packet);
   bool Complete() const;
+  // Diagnostics: bit p set once player p's matching proposal was accepted.
+  std::uint8_t SeenMask() const;
   bool Mismatched() const { return m_mismatch.has_value() || m_config_mismatch.has_value(); }
   const HandoffPacket& Local() const { return m_local; }
   const std::optional<HandoffPacket>& Mismatch() const { return m_mismatch; }
@@ -278,6 +280,9 @@ public:
   bool ShouldStall(std::uint32_t frame) const;
   std::uint32_t ConfirmedThrough() const;
   std::optional<std::uint32_t> PendingRollback() const;
+  // Diagnostics: bit p set when player p's confirmed input for `frame`
+  // differs from the input that frame last ran with (0 if unknown).
+  std::uint8_t MispredictedPlayers(std::uint32_t frame) const;
   void BeginRollback();
 
   // Record the digest of the state at the start of `frame`.  Re-simulation
