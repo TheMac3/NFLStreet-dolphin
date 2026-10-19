@@ -4725,6 +4725,13 @@ static std::vector<PerMachineRange> PerMachineRanges(Core::System& system, const
   if (!with_heaps)
     return out;
   std::set<u32> heaps;
+  // GN7E69 rev 0: match DigestExclusions' validated known-heap seed even
+  // when no audio allocation is currently live. Pickup's cocky draft probe
+  // exposed counter/stale-free-space differences after the last audio block
+  // was freed. Keep used game payloads and the both-dumps-free oracle intact.
+  constexpr u32 SMALL_AUDIO_HEAP = 0x804C4810;
+  if (HeapDescriptor(ram, SMALL_AUDIO_HEAP))
+    heaps.insert(SMALL_AUDIO_HEAP);
   for (const auto& [p, recorded] : s_audio_blocks)
   {
     const u32 heap = rd(p - 8);

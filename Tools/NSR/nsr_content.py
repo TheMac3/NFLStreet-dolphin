@@ -532,15 +532,20 @@ class Cache:
             return None
         return self.load(verify_manifest(raw, self.keys))
 
-    def runtime_env(self, content: Content) -> dict[str, str]:
-        """Write an immutable, content-addressed edits-only file for Dolphin.
+    def runtime_env(self, content: Content | None, draft_order="alternating", draft_first="stock") -> dict[str, str]:
+        """Write an immutable ratings/settings bundle for Dolphin.
         Dolphin re-hashes these bytes once before accepting the native load."""
-        raw = content.runtime_bytes()
+        import draftmodes
+        raw = draftmodes.runtime_bytes(content, draft_order, draft_first)
+        if raw is None:
+            return {}
+        if len(raw) > 4 * 1024 * 1024:
+            raise ContentError("Combined runtime settings exceed the bundle size limit.")
         sha = hashlib.sha256(raw).hexdigest()
         path = os.path.abspath(os.path.join(self.root, "runtime", sha + ".json"))
         _atomic_write(path, raw)
         return {"NSR_CONTENT_PACK": path, "NSR_CONTENT_SHA256": sha,
-                "NSR_CONTENT_VERSION": str(content.version)}
+                "NSR_CONTENT_VERSION": str(content.version if content else 0)}
 
     def clear_runtime(self) -> None:
         """Retire our active pointer only after a fallback image build succeeds."""

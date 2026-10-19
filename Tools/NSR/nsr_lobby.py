@@ -220,8 +220,8 @@ class LobbyHost:
         elif content:
             reason, action = content
         elif hello.get("fingerprint") != self.fingerprint:
-            reason = (f"Game image mismatch: yours is {hello.get('fingerprint')}, the host's is "
-                      f"{self.fingerprint}. Everyone needs the same Reborn version and patches.")
+            reason = (f"Game setup mismatch: yours is {hello.get('fingerprint')}, the host's is "
+                      f"{self.fingerprint}. Everyone needs the same Reborn version, patches and Pickup draft settings.")
         with self._lock:
             if reason is None and len(self._joiners) + 1 >= MAX_PLAYERS:
                 reason = "The lobby is full (4 players)."

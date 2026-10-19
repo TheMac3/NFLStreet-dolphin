@@ -94,6 +94,11 @@ Patches (GN7E69 rev 0, Reborn 3.0 main.dol `6dccf385…`):
           time stub (0x8041690C) instead, so Dolphin can return tick-based
           time during ticks (re-simulation must see the same time).
 
+  draft-snake / draft-cocky  Pickup-only accepted-pick order; requires rollback.
+          Optional draft-first-team-one / draft-first-team-two selects the
+          native first side. No draft flags means stock alternating/order.
+          See tools/draftmodes.py and docs/draftmodes.md.
+
 Usage: tools/isopatch.py SRC.iso DST.iso freeze [seed | seedlog] [input [netplay] | rollback] [profile | stress] [trace]
 """
 from __future__ import annotations
@@ -591,7 +596,7 @@ def write_words(iso, va: int, words: list[int], expect: list[int] | None = None)
 
 
 PATCHES = {"freeze", "seed", "seedlog", "input", "profile", "stress", "netplay", "trace",
-           "rollback"}
+           "rollback", "draft-snake", "draft-cocky", "draft-first-team-one", "draft-first-team-two"}
 # Milestone-1 delay-based lockstep image (superseded for friends; kept so the
 # lockstep path and its tests stay reproducible).
 LOCKSTEP_SET = ("freeze", "seed", "input", "netplay")
@@ -603,8 +608,12 @@ NETPLAY_SET = ROLLBACK_SET  # what friends' netplay images use (nsr_patcher)
 
 
 def check_patch_set(patches: set[str]) -> None:
+    """Reject unknown/conflicting patches before copying or mutating an image."""
     if not patches or not patches <= PATCHES:
         raise PatchError(f"unknown patches: {sorted(patches - PATCHES)}")
+    # Draft choices are baked into the rollback image, never host-only runtime state.
+    import draftmodes
+    draftmodes.validate_patches(patches)
     for a, b_ in (("seed", "seedlog"), ("profile", "stress"), ("rollback", "input"),
                   ("rollback", "profile"), ("rollback", "stress")):
         if {a, b_} <= patches:
@@ -686,6 +695,11 @@ def apply_patches(iso, patches: set[str]) -> None:
         write_words(iso, NETPLAY_CODE, words, expect=[0] * len(words))
         write_words(iso, POLL_CALL, [b(POLL_CALL, NETPLAY_CODE, link=True)],
                     expect=[b(POLL_CALL, INPUT_CODE, link=True)])
+
+    # Apply only after the base recipe; original-instruction guards reject a
+    # second application or a different game revision without publishing it.
+    import draftmodes
+    draftmodes.apply(iso, patches)
 
 
 def build(src: str, dst: str, patches: set[str], progress=None) -> None:

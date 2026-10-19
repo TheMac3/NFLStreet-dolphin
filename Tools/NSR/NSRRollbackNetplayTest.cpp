@@ -21,6 +21,7 @@
 #include "Core/NSR/NSRTelemetryLogic.h"
 #include "Core/NSR/NSRGameStatsRead.h"
 #include "Core/NSR/NSRContentRead.h"
+#include "Core/NSR/NSRDraft.h"
 #include "Core/NSR/NSRGameStatsIdentity.h"
 
 #include <algorithm>
@@ -1564,9 +1565,44 @@ static void TestGameStatsIdentity()
   assert(GS::EncodeCaptureAnchor({2, 0, 7}).empty());
 }
 
+// Runtime draft plans use synthetic MEM1 only: validate the full fixed recipe
+// before writes, reject changed native instructions and tolerate exact reloads.
+static void TestRuntimeDraft()
+{
+  std::vector<std::uint8_t> ram(0x420000);
+  std::copy_n("GN7E69", 6, ram.begin());
+  const auto put = [&](std::uint32_t address, std::uint32_t value) {
+    for (std::uint32_t i = 0; i < 4; ++i)
+      ram[address - 0x80000000 + i] = static_cast<std::uint8_t>(value >> (24 - 8 * i));
+  };
+  put(0x8001abac, 0x816d9768);
+  put(0x80018fc0, 0x48063bad);
+  const NSRGameStats::Memory memory{ram, {}};
+  std::string error;
+  for (std::uint32_t order = 0; order < 3; ++order)
+    for (std::uint32_t first = 0; first < 3; ++first)
+    {
+      const auto before = ram;
+      const auto plan = NSRContent::PlanDraft(memory, order, first, &error);
+      assert(plan && ram == before);
+    }
+  auto plan = NSRContent::PlanDraft(memory, 1, 2, &error);
+  assert(plan && !plan->empty());
+  for (const auto& [address, value] : *plan)
+    put(address, value);
+  assert(NSRContent::PlanDraft(memory, 1, 2, &error) == plan);
+  assert(!NSRContent::PlanDraft(memory, 2, 2, &error));
+  put(0x80411604, 0xdeadbeef);
+  assert(!NSRContent::PlanDraft(memory, 1, 2, &error));
+  assert(!NSRContent::PlanDraft(memory, 3, 0, &error));
+  ram[7] = 1;
+  assert(!NSRContent::PlanDraft(memory, 0, 0, &error));
+}
+
 int main()
 {
   TestRuntimeContent();
+  TestRuntimeDraft();
   TestGameStatsMemoryReader();
   TestGameStatsIdentity();
   TestHandoffAgreement();

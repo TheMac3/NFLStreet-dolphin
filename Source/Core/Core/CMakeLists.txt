@@ -138,6 +138,7 @@ add_library(core
   NSR/NSRTelemetry.h
   NSR/NSRTelemetryLogic.h
   NSR/NSRContent.cpp
+  NSR/NSRDraft.h
   NSR/NSRContent.h
   NSR/NSRContentRead.h
   NSR/NSRNetplay.cpp

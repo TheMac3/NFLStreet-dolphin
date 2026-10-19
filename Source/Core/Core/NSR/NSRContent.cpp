@@ -20,6 +20,8 @@
 #include "Core/Core.h"
 #include "Core/HW/Memmap.h"
 #include "Core/NSR/NSRContentRead.h"
+#include "Core/NSR/NSRDraft.h"
+#include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
@@ -33,6 +35,8 @@ struct State
   std::string sha;
   std::array<std::uint64_t, 6> fingerprint{};
   std::vector<Edit> edits;
+  std::uint32_t draft_order = 0, draft_first = 0;
+  bool draft = false;
 };
 State s;
 
@@ -118,14 +122,36 @@ std::string Load(const std::string& path, const std::string& expected)
   if (s.sha != expected)
     return "content SHA-256 mismatch";
   picojson::value root;
-  if (!picojson::parse(root, raw).empty() || !Keys(root, {"format", "version", "packs"}))
-    return "invalid content JSON or object shape";
+  if (!picojson::parse(root, raw).empty())
+    return "invalid content JSON";
+  const bool draft = Keys(root, {"format", "version", "packs", "draft"});
+  if (!draft && !Keys(root, {"format", "version", "packs"}))
+    return "invalid content object shape";
   bool valid = true;
-  if (Text(root.get("format"), 64, valid) != "nsrb.runtime-content.v1" ||
+  if (Text(root.get("format"), 64, valid) !=
+          (draft ? "nsrb.runtime-content.v2" : "nsrb.runtime-content.v1") ||
       !root.get("packs").is<picojson::array>())
     return "unsupported content format";
   s.fingerprint[4] = Number(root.get("version"), 0x7fffffff, valid);
-  s.fingerprint[5] = 1;  // DB-load hook and packed-field application policy
+  s.fingerprint[5] = draft ? 2 : 1;  // exact hook/application policy is part of M2
+  if (draft)
+  {
+    const auto& settings = root.get("draft");
+    if (!Keys(settings, {"order", "first", "policy"}) ||
+        Number(settings.get("policy"), 1, valid) != 1)
+      return "unsupported draft policy";
+    constexpr std::array<const char*, 3> ORDERS{{"alternating", "snake", "cocky"}};
+    constexpr std::array<const char*, 3> FIRSTS{{"stock", "team-one", "team-two"}};
+    const auto order = Text(settings.get("order"), 16, valid);
+    const auto first = Text(settings.get("first"), 16, valid);
+    const auto o = std::find(ORDERS.begin(), ORDERS.end(), order);
+    const auto f = std::find(FIRSTS.begin(), FIRSTS.end(), first);
+    if (o == ORDERS.end() || f == FIRSTS.end())
+      return "unsupported draft setting";
+    s.draft_order = static_cast<std::uint32_t>(o - ORDERS.begin());
+    s.draft_first = static_cast<std::uint32_t>(f - FIRSTS.begin());
+    s.draft = true;
+  }
   const auto& packs = root.get("packs").get<picojson::array>();
   if (packs.size() > 8)
     return "too many content packs";
@@ -226,10 +252,16 @@ void DatabaseLoaded(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t
     return;
   std::string error;
   std::optional<std::map<std::uint32_t, std::uint8_t>> writes;
+  std::optional<std::map<std::uint32_t, std::uint32_t>> draft_words;
   if (s.failed || ppc.gpr[3] != 0)
     error = "invalid content or failed native database load";
   else
-    writes = Plan(view, s.edits, &error);
+  {
+    if (s.draft)
+      draft_words = PlanDraft(view, s.draft_order, s.draft_first, &error);
+    if (error.empty())
+      writes = Plan(view, s.edits, &error);
+  }
   if (!error.empty() || !writes)
   {
     s.failed = true;
@@ -239,6 +271,19 @@ void DatabaseLoaded(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t
   }
   for (const auto& [address, value] : *writes)
     memory.GetFakeVMEM()[address - 0x7e000000] = value;
+  if (draft_words && !draft_words->empty())
+  {
+    // All words were checked before either plan committed. This hook runs
+    // before draft consumers, outside rollback. Clear both instruction caches
+    // once, so precompiled native blocks cannot execute displaced code.
+    for (const auto& [address, value] : *draft_words)
+      for (std::uint32_t byte = 0; byte < 4; ++byte)
+        memory.GetRAM()[address - 0x80000000 + byte] =
+            static_cast<std::uint8_t>(value >> (24 - byte * 8));
+    system.GetPPCState().iCache.Reset(system.GetJitInterface());
+    std::fprintf(stderr, "[NSR] draft applied: order %u first %u policy 1 words %zu frame %u\n",
+                 s.draft_order, s.draft_first, draft_words->size(), frame);
+  }
   s.applied = true;
   const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::steady_clock::now() - started).count();

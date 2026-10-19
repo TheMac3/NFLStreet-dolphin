@@ -45,6 +45,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import isopatch  # noqa: E402
+import draftmodes  # noqa: E402
 import nsr_content  # noqa: E402  (content updates: our ratings packs, docs/content-updates.md)
 
 OUTPUT_NAME = "nsr-net.iso"
@@ -167,14 +168,18 @@ class Prepared:
 
     def __init__(self, image: str, fingerprint: str, reborn_label: str | None,
                  matches_reference: bool | None, reborn_install: str | None,
-                 content: "nsr_content.Content | None" = None, source_sha256: str = ""):
+                 content: "nsr_content.Content | None" = None, source_sha256: str = "",
+                 base_content_known: bool = False):
         self.image = image
         self.fingerprint = fingerprint
         self.reborn_label = reborn_label            # e.g. "Reborn 2026.09.12" (None: unknown version)
-        self.matches_reference = matches_reference  # None when the Reborn version is unknown
+        self.matches_reference = matches_reference  # None for unknown inputs or composed draft images
         self.reborn_install = reborn_install        # for read-only textures, if found
         self.content = content                      # the applied content update, if any
         self.source_sha256 = source_sha256
+        # A known base with our authored draft code can still receive ratings
+        # updates automatically; unrelated custom images keep the opt-in policy.
+        self.base_content_known = base_content_known
 
 
 def reborn_install_of(iso: str) -> str | None:
@@ -198,18 +203,22 @@ def saved_reborn_install(out_dir: str) -> str | None:
 
 
 def write_manifest(out_dir: str, digest_in: str, label: str | None, digest_out: str,
-                   content: "nsr_content.Content | None" = None) -> None:
+                   content: "nsr_content.Content | None" = None,
+                   draft_order: str = "alternating", draft_first: str = "stock") -> None:
     """nsr-image.json: what nsr-net.iso is. Digests and labels only; no paths
     or Reborn content (release plan 3.1). "content" records the applied
     content update (version, manifest serial, pack digests) or is null."""
     packs = [p["sha256"] for p in content.release["packs"]] if content else []
     manifest = {"recipe": ROLLBACK_RECIPE, "mode": NETPLAY_MODE,
-                "patches": list(isopatch.NETPLAY_SET),
+                "patches": sorted(set(isopatch.NETPLAY_SET) | draftmodes.patch_names(draft_order, draft_first)),
+                "draft_order": draft_order, "draft_first": draft_first,
+                "draft_recipe": "gn7e69-r0-draft-v1",
                 "source_label": label, "source_sha256": digest_in,
                 "output_sha256": digest_out, "fingerprint": fingerprint(digest_out),
                 "ratings_pack_sha256": packs[0] if len(packs) == 1 else None,
                 "content": ({"version": content.version, "serial": content.serial, "packs": packs}
-                            if content else None),
+                            if content else {"version": 0, "serial": 0, "packs": []}
+                            if digest_in in KNOWN_INPUTS and draftmodes.patch_names(draft_order, draft_first) else None),
                 "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     tmp = os.path.join(out_dir, MANIFEST_NAME + ".tmp")
     with open(tmp, "w") as f:
@@ -248,8 +257,11 @@ def apply_content(image: str, build: dict, content: "nsr_content.Content") -> No
 
 
 def prepare_image(iso: str, out_dir: str, progress=None, content: "nsr_content.Content | None" = None,
-                  content_strict: bool = True) -> Prepared:
+                  content_strict: bool = True, *,
+                  draft_order: str = "alternating", draft_first: str = "stock") -> Prepared:
     """Check Reborn's image, build nsr-net.iso in out_dir, fingerprint it.
+    Draft choices are applied after validating a signed content output, and
+    the final fingerprint covers both.
     progress(stage, done, total) with stage in {"check", "build", "verify"}.
     Raises isopatch.PatchError if the patches don't fit this Reborn version.
     The build goes to a temporary file that replaces nsr-net.iso only when
@@ -261,6 +273,7 @@ def prepare_image(iso: str, out_dir: str, progress=None, content: "nsr_content.C
     without content), the edits are applied to the fresh copy, and the result
     must equal the release's output_sha256 exactly (ContentError otherwise,
     and the previous nsr-net.iso is kept)."""
+    choices = draftmodes.patch_names(draft_order, draft_first)
     step = (lambda st: (lambda d, t: progress(st, d, t))) if progress else (lambda st: None)
     digest_in = sha256(iso, progress=step("check")) if progress else sha256(iso, "checking Reborn image")
     known = KNOWN_INPUTS.get(digest_in)
@@ -278,7 +291,7 @@ def prepare_image(iso: str, out_dir: str, progress=None, content: "nsr_content.C
     if os.path.abspath(iso) in (os.path.abspath(out), os.path.abspath(tmp)):
         raise isopatch.PatchError("the Reborn image and the output are the same file")
     try:
-        isopatch.build(iso, tmp, set(isopatch.NETPLAY_SET),
+        isopatch.build(iso, tmp, set(isopatch.NETPLAY_SET) | (choices if not build else set()),
                        progress=step("build") if progress else (lambda d, t: _bar("copying + patching", d, t)))
         if not progress:
             print()
@@ -289,6 +302,15 @@ def prepare_image(iso: str, out_dir: str, progress=None, content: "nsr_content.C
             raise nsr_content.ContentError(
                 f"the updated game copy came out as {fingerprint(digest_out)}, not the expected "
                 f"{fingerprint(build['output_sha256'])}; your current copy was kept")
+        # The signed release authenticates the complete ratings/base image.
+        # Verify that exact digest first, then layer bundled authored draft
+        # code over the verified copy. The final image fingerprint agrees both
+        # content and draft configuration across peers, without weakening the
+        # signed digest check or changing the ratings-only pack format.
+        if build and choices:
+            with open(tmp, "r+b") as draft_image:
+                draftmodes.apply(draft_image, set(isopatch.NETPLAY_SET) | choices)
+            digest_out = sha256(tmp, progress=step("verify"))
         os.replace(tmp, out)
     except BaseException:
         try:
@@ -297,16 +319,16 @@ def prepare_image(iso: str, out_dir: str, progress=None, content: "nsr_content.C
             pass
         raise
     label = known[0] if known else (build["label"] if build else None)
-    write_manifest(out_dir, digest_in, label, digest_out, content if build else None)
+    write_manifest(out_dir, digest_in, label, digest_out, content if build else None, draft_order, draft_first)
     install = reborn_install_of(iso)
     if install:
         with open(os.path.join(out_dir, REBORN_PATH_NAME), "w") as f:
             f.write(install)
-    # With content the reference is the release's predicted output, not the
-    # unedited KNOWN_INPUTS image (equality was enforced above).
-    matches = True if build else ((digest_out == known[1]) if known else None)
+    # A signed ratings image was checked above before optional draft code.
+    # A composed image is custom; do not claim its final digest was signed.
+    matches = None if choices else (True if build else ((digest_out == known[1]) if known else None))
     return Prepared(out, fingerprint(digest_out), label, matches, install,
-                    content if build else None, digest_in)
+                    content if build else None, digest_in, bool(known or build))
 
 
 class ImageStatus:
@@ -349,11 +371,14 @@ def image_status(out_dir: str, progress=None) -> ImageStatus | None:
     applied = nsr_content.parse_descriptor(
         {k: (manifest.get("content") or {}).get(k) for k in ("version", "serial")}
         if isinstance(manifest.get("content"), dict) else None)
+    order, first = manifest.get("draft_order", "alternating"), manifest.get("draft_first", "stock")
+    draft_note = (f"Pickup draft: {order}; first: {first}" if order in draftmodes.ORDERS and first in draftmodes.FIRSTS
+                  else "Custom game copy; draft setup unknown")
     # Checked before the release table: a content release without packs
     # (e.g. "back to the stock ratings") builds the unedited release bytes
     # but still counts as that content version.
     if ours and applied and applied["version"] > 0:
-        return ImageStatus(fp, "content", f"game content v{applied['version']}", content=applied,
+        return ImageStatus(fp, "content", f"game content v{applied['version']}; {draft_note}", content=applied,
                            source_sha256=source)
     if digest in {out for _, out in KNOWN_INPUTS.values()}:
         source = source or next(k for k, (_, out) in KNOWN_INPUTS.items() if out == digest)
@@ -361,7 +386,7 @@ def image_status(out_dir: str, progress=None) -> ImageStatus | None:
     if digest in LEGACY_OUTPUTS:
         return ImageStatus(fp, "legacy", f"an older {LEGACY_OUTPUTS[digest]} build")
     if ours:
-        return ImageStatus(fp, "custom", "unrecognized Reborn version", source_sha256=source)
+        return ImageStatus(fp, "custom", draft_note, content=applied, source_sha256=source)
     return ImageStatus(fp, "unknown", "not built by this version")
 
 
@@ -373,7 +398,8 @@ def image_fingerprint(out_dir: str, progress=None) -> str | None:
     return fingerprint(sha256(path, progress=progress or (lambda d, t: None)))
 
 
-def run(iso: str | None, out_dir: str) -> int:
+def run(iso: str | None, out_dir: str, draft_order="alternating", draft_first="stock") -> int:
+    """Build the chosen image recipe and show its room compatibility fingerprint."""
     print("NFLStreetRollback netplay image builder\n")
     if not iso:
         print("Looking for NFL Street Reborn...")
@@ -385,13 +411,14 @@ def run(iso: str | None, out_dir: str) -> int:
     print(f"Reborn image: {iso}\n")
     started = time.time()
     try:
-        r = prepare_image(iso, out_dir)
+        r = prepare_image(iso, out_dir, draft_order=draft_order, draft_first=draft_first)
     except isopatch.PatchError as e:
         print(f"\n\nFAILED: {e}\nThis Reborn version needs updated patches. Nothing was written.")
         return 1
     print(f"  {r.reborn_label or 'unknown Reborn version (patches applied cleanly)'}; "
           f"done in {time.time() - started:.0f}s")
     print(f"\nRecipe: {ROLLBACK_RECIPE}")
+    print(f"Pickup draft: {draft_order}; first: {draft_first}")
     print(f"Your netplay image fingerprint:  {r.fingerprint}")
     if r.matches_reference:
         print("Matches the reference build. Everyone with this fingerprint can play together.")
@@ -407,15 +434,19 @@ def run(iso: str | None, out_dir: str) -> int:
 
 
 def main(argv=None) -> int:
+    """Accept explicit image setup choices for CLI and packaged patcher users."""
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("iso", nargs="?", help="path to Reborn's NSR.iso (default: find it)")
     default_out = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False)
                                                   else __file__))
     ap.add_argument("--out", default=default_out, help="folder for nsr-net.iso (default: next to this program)")
     ap.add_argument("--no-pause", action="store_true", help="don't wait for Enter at the end")
+    ap.add_argument("--draft-order", choices=draftmodes.ORDERS, default="alternating")
+    ap.add_argument("--draft-first", choices=draftmodes.FIRSTS, default="stock",
+                    help="native first side, or an explicit in-game team (not host identity)")
     a = ap.parse_args(argv)
     try:
-        rc = run(a.iso, a.out)
+        rc = run(a.iso, a.out, a.draft_order, a.draft_first)
     except KeyboardInterrupt:
         rc = 1
     if getattr(sys, "frozen", False) and not a.no_pause:

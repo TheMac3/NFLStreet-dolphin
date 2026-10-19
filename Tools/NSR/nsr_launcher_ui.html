@@ -172,6 +172,11 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
 .bar { height: 8px; border-radius: 4px; background: #24242b; overflow: hidden; margin-top: 12px; }
 .bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--red), #ff6a5c); transition: width .2s; }
 .fp { font-size: 22px; font-weight: 800; letter-spacing: 1px; margin: 4px 0 2px; }
+/* Image setup choices use native keyboard-accessible selects, sized like the other controls. */
+.draft-settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-top: 12px; }
+.draft-settings label { display: flex; flex-direction: column; gap: 6px; }
+.draft-settings select { width: 100%; font: inherit; color: var(--text); background: #0e0e12; border: 1px solid #2a2a32; border-radius: 8px; padding: 8px; }
+.draft-settings select:disabled { opacity: .45; }
 .help ol { padding-left: 20px; margin: 0; } .help li { margin: 0 0 10px; color: #d2d2db; }
 .help h3 { margin: 0 0 10px; font-size: 16px; }
 
@@ -311,6 +316,12 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
         </div>
         <div class="card">
           <div class="label">Game copy</div>
+          <!-- Draft choices are applied by the existing image rebuild buttons. -->
+          <div class="draft-settings">
+            <label>Pickup draft <select id="draftOrder"><option value="alternating">Alternating (stock)</option><option value="snake">Snake (A,B,B,A…)</option><option value="cocky">Cocky (7 picks each)</option></select></label>
+            <label>First team <select id="draftFirst"><option value="stock">Stock first team</option><option value="team-one">Team One</option><option value="team-two">Team Two</option></select></label>
+          </div>
+          <p class="muted">Team One/Two are in-game sides. Applied at game load; everyone in the room must select the same setup.</p>
           <div class="fp mono" id="gameFp">–</div>
           <div class="info" id="gameText" style="margin-top:6px"></div>
           <div class="bar" id="gameBar" hidden><i id="gameProg"></i></div>
@@ -348,7 +359,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
         </ol></div>
         <div class="card"><h3>If something's wrong</h3><ol>
           <li>Windows Firewall asks about Dolphin the first time: tick Private (and Public) networks and allow it.</li>
-          <li>“Fingerprints differ”: everyone needs the same download and the same Reborn version.</li>
+          <li>“Fingerprints differ”: everyone needs the same download, Reborn version and Pickup draft settings.</li>
           <li>Controller not responding: plug it in before starting, then Controllers → Use my Reborn controller settings.</li>
           <li>Send Mason the nsr-p*.log files from this folder if he asks.</li>
         </ol><div class="path" id="folderPath"></div></div>
@@ -482,10 +493,14 @@ function render(s) {
   const gs = s.game_stats || {};
   $("gameStats").classList.toggle("on", !!gs.enabled);
   setText("gameStatsText", gs.enabled ? (gs.text || "") : "");
-  setText("gameFp", g.fingerprint || "–");
+  setText("gameFp", g.room_fingerprint || g.fingerprint || "–");
   setText("gameText", (g.text || "") + (g.note ? "\n" + g.note : ""));
   show("gameBar", g.progress != null); $("gameProg").style.width = (g.progress || 0) + "%";
-  enable("btnFind", !g.busy); enable("btnBrowse", !g.busy);
+  const setupIdle = !g.busy && !(s.content && s.content.busy) && h.state === "idle" && j.state === "idle";
+  enable("btnFind", setupIdle); enable("btnBrowse", setupIdle);
+  $("draftOrder").value = g.draft_order || "alternating";
+  $("draftFirst").value = g.draft_first || "stock";
+  enable("draftOrder", setupIdle); enable("draftFirst", setupIdle);
   const ct = s.content || {};
   $("runtimeContent").classList.toggle("on", !!ct.runtime);
   setText("contentText", ct.text || (ct.version ? "Game content v" + ct.version : "No game updates installed."));
@@ -527,6 +542,8 @@ function wire() {
   $("nameIn").onchange = () => call("set_name", $("nameIn").value.trim());
   $("telemetry").onclick = () => call("set_telemetry", !(S.snap && S.snap.telemetry));
   $("gameStats").onclick = () => call("set_game_stats", !(S.snap && S.snap.game_stats && S.snap.game_stats.enabled));
+  // Stage both choices together; the backend clears readiness until rebuilt.
+  $("draftOrder").onchange = $("draftFirst").onchange = () => call("set_draft", $("draftOrder").value, $("draftFirst").value);
   $("btnFind").onclick = () => call("find_game");
   $("btnUpdates").onclick = () => call("check_updates");
   $("runtimeContent").onclick = () => call("set_content_runtime", !(S.snap && S.snap.content && S.snap.content.runtime));
