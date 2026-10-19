@@ -4001,6 +4001,28 @@ bool ValidateRollbackImage(Core::System& system)
   return true;
 }
 
+// QS-TRACE (temporary exploration)
+static void QsTrace(const Core::CPUThreadGuard& guard, u32 frame)
+{
+  static bool on = std::getenv("NSR_QS_TRACE") != nullptr;
+  static u32 last = 0xFFFFFFFF;
+  if (!on) return;
+  auto& memory = guard.GetSystem().GetMemory();
+  const u8* ram = memory.GetRAM();
+  const u32 size = memory.GetRamSizeReal();
+  auto rd = [&](u32 a, u32& out) {
+    if ((a & 0xFE000000) != 0x80000000) return false;
+    const u32 o = a & 0x01FFFFFF;
+    if (o + 4 > size) return false;
+    out = Common::swap32(ram + o);
+    return true;
+  };
+  u32 root = 0, index = 0, array = 0, gs = 0xFFFFFFFF;
+  if (rd(0x803EB688, root) && rd(root + 0x3C, index) && rd(root + 0x48, array) && index < 128 &&
+      rd(array + index * 0x14 + 4, gs)) {}
+  if (gs != last) { Log("QS screen {}/{} at frame {} (idx {})", gs >> 16, gs & 0xFFFF, frame, index); last = gs; }
+}
+
 // Run milestone-1 raw-pad lockstep for one poll.  Keeping this independent
 // from either game-side stub lets the rollback image use the same proven
 // ordering in menus: PADRead -> agreement -> Reborn remap/PADClamp.
@@ -4095,6 +4117,7 @@ static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 fra
   std::array<Pad, MAX_PLAYERS> pads{};
   for (u32 i = 0; i < s.players; ++i)
     pads[i] = i == s.me ? s.local_pads.at(frame) : s.remote_pads[i].at(frame);
+  QsTrace(guard, frame);
   s.applied.emplace(frame, pads);
   WritePads(guard, buf, pads);
 
@@ -4169,6 +4192,7 @@ void RollbackPollHook(const Core::CPUThreadGuard& guard)
       LockstepExchange(guard, scratch, retrace);
       return;
     }
+    QsTrace(guard, retrace);
     // Raw pads, before Reborn's remap: the test script replaces port 0.
     if (auto scripted = ScriptPad(guard, retrace))
     {
