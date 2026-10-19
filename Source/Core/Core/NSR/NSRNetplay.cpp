@@ -10,6 +10,7 @@
 //   - periodic whole-MEM1 hashes, compared with every peer, to detect desyncs.
 
 #include "Core/NSR/NSRNetplay.h"
+#include "Core/NSR/NSRContent.h"
 #include "Core/NSR/NSRGameStats.h"
 #include "Core/NSR/NSRRollbackLogic.h"
 #include "Core/NSR/NSRRollbackNetplay.h"
@@ -5638,6 +5639,9 @@ static RollbackNet::ConfigFingerprint LocalConfigFingerprint(Core::System& syste
       text += fmt::format("{:08x},", value);
     return text;
   };
+  const auto content = NSRContent::Fingerprint();
+  for (std::size_t i = 0; i < content.size(); ++i)
+    fp.fields[static_cast<std::size_t>(ConfigField::ContentSha0) + i] = content[i];
   fp[ConfigField::Protocol] = (u64{RollbackNet::VERSION} << 8) | RollbackNet::HANDOFF_VERSION;
   fp[ConfigField::StateDigest] = (u64{c.digest_every} << 16) |
                                  (u64{STATE_DIGEST_RANGES_VERSION} << 8) |
@@ -7148,6 +7152,12 @@ void InGameHook(const Core::CPUThreadGuard& guard)
   r.in_game_seen = true;
   if (r.vtime_on)
     r.session_saw_in_game = true;
+}
+
+// Native load completion, outside frame-dependent caches and rollback history.
+void ContentDatabaseHook(const Core::CPUThreadGuard& guard)
+{
+  NSRContent::DatabaseLoaded(guard, s_rb.in_resim, s_rb.live);
 }
 
 // Observational HLE Start hook at GN7E69 rev-0 MVP calculation completion.
@@ -8687,7 +8697,12 @@ namespace
 // no correction can cross a prior match or menu transition.
 void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
 {
-  (void)guard;
+  if (!NSRContent::Ready())
+  {
+    Log("content was not applied: refusing rollback session");
+    Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+    return;
+  }
   Rollback& r = s_rb;
   if (r.net_enabled)
   {
@@ -8900,6 +8915,7 @@ bool IsReplayCatchingUp()
 
 void Shutdown(const Core::CPUThreadGuard& guard)
 {
+  NSRContent::Reset();
   NSRGameStats::Reset();
   if (s_rb_watchdog.joinable())
   {

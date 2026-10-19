@@ -4,7 +4,7 @@
 nsr-*.json/.txt file names keep their old internal names on purpose).
 
 A window that replaces command lines and .bat files. It lives in the
-NFLStreet-dolphin folder (next to Dolphin.exe) and does four things:
+NFLStreet-dolphin folder (next to Dolphin.exe) and handles these workflows:
 
   1. Game: find NFL Street Reborn's NSR.iso (or browse to it), build the
      rollback netplay image (nsr_patcher.prepare_image), and show its
@@ -26,6 +26,13 @@ NFLStreet-dolphin folder (next to Dolphin.exe) and does four things:
      (GameStats/, stats/queue/) are uploaded in the background to Mason's
      server for the shared Stats page (nsr_gamestats.py, docs/stats.md),
      unless the player unticks "Upload game results".
+  6. Content updates (docs/content-updates.md): on start, before hosting or
+     joining, and on "Check for updates", fetch Mason's signed content
+     manifest, verify it (nsr_content), download the ratings packs it names
+     (our own edit lists, never game data), and stage them for boot-time
+     injection by the matching fork. The unedited image stays unchanged.
+     A setting preserves the image-rebuild fallback. Offline practice re-verifies
+     the installed signed release and applies the same edits.
 
 Reborn is never modified: its files are only read, this Dolphin runs in
 portable mode with its own settings and saves (User/ next to it), and
@@ -66,6 +73,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import isopatch  # noqa: E402
 import nsr_controllers as controllers  # noqa: E402
 import nsr_gamestats as gamestats  # noqa: E402
+import nsr_content  # noqa: E402
 import nsr_lobby as lobby  # noqa: E402
 import nsr_patcher as patcher  # noqa: E402
 
@@ -240,6 +248,34 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
 
 
 RENDEZVOUS_FILE = "nsr-rendezvous.txt"
+CONTENT_FILE = "nsr-content.txt"  # optional, shipped next to the launcher: content base URL
+# A start/Join re-checks for content updates only if the last check is older
+# than this, so joining doesn't wait on the network every time.
+CONTENT_RECHECK_S = 300
+
+
+def content_url(folder: str, env=os.environ, games_url: str = "") -> str:
+    """Base URL for content updates (".../v1/content"): NSR_CONTENT_URL, else
+    nsr-content.txt next to the launcher, else the telemetry service a room
+    told us about (games_url) or nsr-telemetry.txt's url, whose /v1/telemetry
+    or /v1/games suffix becomes /v1/content (same service, same host).
+    https only (loopback http for development); "" when none is known."""
+    candidates = [env.get("NSR_CONTENT_URL", "")]
+    try:
+        with open(os.path.join(folder, CONTENT_FILE)) as f:
+            candidates.append(f.readline())
+    except OSError:
+        pass
+    candidates += [games_url, telemetry_config(folder)["url"]]
+    for c in candidates:
+        c = (c or "").strip().rstrip("/")
+        for suffix in ("/v1/telemetry", "/v1/games"):
+            if c.endswith(suffix):
+                c = c[: -len(suffix)] + "/v1/content"
+        url = nsr_content.check_base_url(c)
+        if url:
+            return url
+    return ""
 
 
 def rendezvous_server(folder: str) -> str | None:
@@ -380,7 +416,8 @@ class Launcher:
     """
 
     def __init__(self, folder: str | None = None, spawn=None, popen=None, lobby_mod=None,
-                 patcher_mod=None, env=os.environ, loop_spawn=None, stats_post=None):
+                 patcher_mod=None, env=os.environ, loop_spawn=None, stats_post=None,
+                 content_fetch=None, content_keys=None, clock=time.monotonic):
         self.folder = folder or app_dir()
         self.cfg = load_config(self.folder)
         self._spawn = spawn or (lambda fn: threading.Thread(target=fn, daemon=True).start())
@@ -398,6 +435,16 @@ class Launcher:
         self._stats_wake = threading.Event()
         self.uploader = gamestats.Uploader(self.folder, **({"post": stats_post} if stats_post else {}))
         self.rv_server = rendezvous_server(self.folder)
+        # Content updates: fetch(url, limit) -> bytes and the trusted keys are
+        # injectable so tests run the whole flow against a fake server.
+        self._content_fetch = content_fetch or nsr_content.http_get
+        self._content_keys = content_keys
+        self._content_cache = nsr_content.Cache(self.folder, content_keys)
+        self._clock = clock
+        self._checked_at = None   # clock() of the last successful manifest check
+        self._runtime_content = None  # installed, signed runtime release (also used offline)
+        self._source_sha = ""     # SHA-256 of the Reborn image nsr-net.iso was built from
+        self._proc = None         # the Dolphin we started, to avoid rebuilding under it
         self.rev = 0
         self._notice_id = 0
         cfg = self.cfg
@@ -413,7 +460,13 @@ class Launcher:
             "max_delay": MAX_DELAY, "last_host": str(cfg.get("last_host", "")),
             "rooms": bool(self.rv_server),
             "game": {"state": "checking", "text": "Checking your game copy…", "fingerprint": "",
-                     "note": "", "progress": None, "busy": False},
+                     "note": "", "progress": None, "busy": False, "content": None},
+            # Content updates. state: idle|off|checking|downloading|updating|current|
+            # available|offline|blocked|error. version: installed (0 = none applied),
+            # latest: newest verified on the server.
+            "content": {"state": "idle", "text": "", "version": None, "latest": None, "changelog": "",
+                        "auto": bool(cfg.get("content_auto", True)), "busy": False,
+                        "runtime": bool(cfg.get("content_runtime", True))},
             "host": {"state": "idle", "mode": "", "code": "", "players": [], "can_start": False,
                      "info": "" if self.rv_server else "Room codes aren't set up in this download "
                              "(no room server). Use “Host by IP”."},
@@ -487,26 +540,39 @@ class Launcher:
         return False
 
     # -- game image --
-    def _ready(self, fp: str, note: str = "") -> None:
-        self._set("game", state="ready", fingerprint=fp, note=note.strip(), progress=None,
+    def _ready(self, fp: str, note: str = "", content: dict | None = None) -> None:
+        self._set("game", state="ready", fingerprint=fp, note=note.strip(), progress=None, content=content,
                   text="Ready for rollback netplay. Everyone you play with must have the same fingerprint.")
+        self._set("content", version=content["version"] if content else None)
+
+    def _check_game_now(self) -> None:
+        st = self._patcher.image_status(self.folder)
+        if st is None:
+            self._set("game", state="missing", fingerprint="", content=None,
+                      text="Not set up yet. Click “Find Reborn automatically”.")
+        elif st.playable:
+            self._source_sha = getattr(st, "source_sha256", "") or ""
+            self._ready(st.fingerprint, {"release": "", "content": "", "custom": "Unrecognized Reborn version: "
+                                         "compare fingerprints with friends."}.get(
+                st.kind, "Custom game copy (e.g. a ratings pack): everyone needs the identical copy."),
+                getattr(st, "content", None))
+            try:
+                self._runtime_content = self._installed_runtime()
+                if self._runtime_content:
+                    self._validate_runtime(self._runtime_content)
+                    self._ready(st.fingerprint, "Ratings are applied when the game starts.",
+                                self._runtime_content.descriptor())
+            except (OSError, nsr_content.ContentError) as exc:
+                self._set("game", state="stale", fingerprint="", content=None,
+                          text=f"Installed runtime content could not be verified: {exc}")
+        else:
+            self._set("game", state="stale", fingerprint="", content=None,
+                      text=f"Your game copy ({st.fingerprint}) is {st.note} and can't play this "
+                           "version's rollback netplay. Click “Find Reborn automatically” to "
+                           "rebuild it (about a minute).")
 
     def check_game(self) -> None:
-        def work():
-            st = self._patcher.image_status(self.folder)
-            if st is None:
-                self._set("game", state="missing", fingerprint="",
-                          text="Not set up yet. Click “Find Reborn automatically”.")
-            elif st.playable:
-                self._ready(st.fingerprint, {"release": "", "custom": "Unrecognized Reborn version: "
-                                             "compare fingerprints with friends."}.get(
-                    st.kind, "Custom game copy (e.g. a ratings pack): everyone needs the identical copy."))
-            else:
-                self._set("game", state="stale", fingerprint="",
-                          text=f"Your game copy ({st.fingerprint}) is {st.note} and can't play this "
-                               "version's rollback netplay. Click “Find Reborn automatically” to "
-                               "rebuild it (about a minute).")
-        self._spawn(work)
+        self._spawn(self._check_game_now)
 
     def find_game(self) -> None:
         if self.state["game"]["busy"]:
@@ -522,35 +588,91 @@ class Launcher:
                                        "NSR.iso…” and pick content\\games\\NSR.iso in your Reborn folder.")
         self._spawn(work)
 
-    def prepare(self, iso: str) -> None:
+    def _claim_build(self, text: str) -> dict | None:
+        """Mark the game copy busy (one build at a time). Returns the previous
+        game state to restore if a content update fails, or None if busy."""
         with self._lock:
             if self.state["game"]["busy"]:
-                return
-            self._set("game", busy=True, state="building", progress=0, text="Checking Reborn's game file…")
-        labels = {"check": "Checking Reborn's game file…", "build": "Building the netplay copy…",
-                  "verify": "Fingerprinting…"}
+                return None
+            before = dict(self.state["game"])
+            self._set("game", busy=True, state="building", progress=0, text=text)
+            return before
 
-        def work():
-            try:
-                r = self._patcher.prepare_image(iso, self.folder, progress=lambda st, d, t: self._set(
-                    "game", text=labels.get(st, st), progress=round(d * 100 / max(t, 1))))
-                self.cfg["reborn_iso"] = iso
-                self.cfg["reborn_install"] = r.reborn_install
+    def _run_build(self, iso: str, content=None, strict: bool = False, restore: dict | None = None) -> bool:
+        """Build nsr-net.iso (with a content update if given) after _claim_build.
+        On failure the previous nsr-net.iso is untouched (prepare_image builds
+        into a temporary file); with restore, the game state goes back to it
+        too, because that copy is still playable."""
+        labels = {"check": "Checking Reborn's game file…",
+                  "build": "Building the netplay copy…" if not content else
+                           f"Building the netplay copy with game content v{content.version}…",
+                  "verify": "Fingerprinting…"}
+        built = False
+        runtime = content if self.state["content"]["runtime"] else None
+        extra = {"content": content, "content_strict": strict} if content and not runtime else {}
+        try:
+            r = self._patcher.prepare_image(iso, self.folder, progress=lambda st, d, t: self._set(
+                "game", text=labels.get(st, st), progress=round(d * 100 / max(t, 1))), **extra)
+            built = True
+            self.cfg["reborn_iso"] = iso
+            self.cfg["reborn_install"] = r.reborn_install
+            self._save()
+            self._source_sha = getattr(r, "source_sha256", "") or self._source_sha
+            applied = getattr(r, "content", None)
+            descriptor = applied.descriptor() if applied else (
+                nsr_content.content_descriptor(0, 0) if r.matches_reference else None)
+            note = "" if r.matches_reference else (
+                "Unrecognized Reborn version: compare fingerprints with friends."
+                if r.matches_reference is None else
+                "WARNING: doesn't match the reference build; ask Mason before playing.")
+            if runtime:
+                self._validate_runtime(runtime, r.fingerprint)
+                self._activate_runtime(runtime)
+                descriptor = runtime.descriptor()
+                note = "Ratings are applied when the game starts."
+            else:
+                self._content_cache.clear_runtime()
+                self.cfg.pop("runtime_installed", None)
                 self._save()
-                self._ready(r.fingerprint, "" if r.matches_reference else (
-                    "Unrecognized Reborn version: compare fingerprints with friends."
-                    if r.matches_reference is None else
-                    "WARNING: doesn't match the reference build; ask Mason before playing."))
-                self.sync_controllers()  # the install may be new to us: pick up its pad setup
-            except isopatch.PatchError:
-                self._set("game", state="error", progress=None,
-                          text="This Reborn version isn't supported yet (the game code changed). "
-                               "Nothing was written. Ask Mason for an updated launcher.")
-            except OSError as e:
-                self._set("game", state="error", progress=None, text=f"Couldn't build the game copy: {e}")
-            finally:
-                self._set("game", busy=False)
-        self._spawn(work)
+                self._runtime_content = None
+            if content and not applied and not runtime:
+                note = (note + f"\nGame content v{content.version} doesn't support this Reborn version yet; "
+                               "built without it.").strip()
+            self._ready(r.fingerprint, note, descriptor)
+            self.sync_controllers()  # the install may be new to us: pick up its pad setup
+            return True
+        except isopatch.PatchError:
+            self._fail_build(restore, "This Reborn version isn't supported yet (the game code changed). "
+                                      "Nothing was written. Ask Mason for an updated launcher.")
+        except nsr_content.ContentError as e:
+            log(self.folder, f"content build failed: {e}")
+            self._fail_build(restore, f"The game content update didn't apply: {e}", recheck=built)
+        except (OSError, ValueError) as e:
+            self._fail_build(restore, f"Couldn't build the game copy: {e}"
+                             + (" (Is the game still running?)" if isinstance(e, PermissionError) else ""), recheck=built)
+        finally:
+            self._set("game", busy=False)
+        return False
+
+    def _fail_build(self, restore: dict | None, text: str, recheck: bool = False) -> None:
+        """Restore UI only while prepare_image kept the prior image. If a later
+        runtime activation fails, re-read actual disk state before allowing play."""
+        if recheck:
+            self._check_game_now()
+            self.notify(text + " The base image was rebuilt; check Game copy before playing.", "error")
+        elif restore:
+            restore = {k: v for k, v in restore.items() if k != "busy"}
+            self._set("game", **{**restore, "progress": None})
+            self.notify(text + " Your previous game copy was kept.", "error")
+        else:
+            self._set("game", state="error", progress=None, text=text)
+
+    def prepare(self, iso: str) -> None:
+        """Build the game copy from a Reborn image the player picked/found,
+        with the newest verified content update when one is known."""
+        if self._claim_build("Checking Reborn's game file…") is None:
+            return
+        self._spawn(lambda: self._run_build(iso, self._known_content(), strict=False))
 
     # -- controllers --
     def reborn_install(self, search: bool = False) -> str | None:
@@ -593,6 +715,215 @@ class Launcher:
     def refresh_controllers(self) -> None:
         self.sync_controllers(force=False)
 
+    # -- content updates --
+    def content_base(self) -> str:
+        return content_url(self.folder, self._env, self.uploader.state.get("url", ""))
+
+    def set_content_runtime(self, on: bool) -> None:
+        """Choose the delivery path for the next update; the installed release
+        stays active until Check for updates completes the switch safely."""
+        self.cfg["content_runtime"] = bool(on)
+        self._save()
+        self._set("content", runtime=bool(on), text="Click Check for updates to apply this setting.")
+
+    def _installed_runtime(self):
+        """A separately persisted identity detects deletion or replacement of the
+        signed installed pointer, including between room entry and launch."""
+        active = self._content_cache.runtime_content()
+        expected = self.cfg.get("runtime_installed")
+        if expected:
+            if active is None or expected != self._runtime_identity(active):
+                raise nsr_content.ContentError("Installed runtime content is missing or changed. Check for updates or rebuild the base.")
+        return active
+
+    @staticmethod
+    def _runtime_identity(content) -> dict:
+        """Only metadata is duplicated; trust still comes from the signed file."""
+        import hashlib
+        return {"version": content.version, "sha256": hashlib.sha256(content.runtime_bytes()).hexdigest()}
+
+    def _activate_runtime(self, content) -> None:
+        """Publish the signed pointer first, then its expected identity. A crash
+        between them blocks launch rather than silently selecting other ratings."""
+        self._content_cache.activate_runtime(content)
+        self.cfg["runtime_installed"] = self._runtime_identity(content)
+        # Installation metadata must not use the legacy best-effort settings
+        # writer: a failed save must be visible, so missing packs cannot later
+        # be mistaken for an intentional stock installation.
+        nsr_content._atomic_write(os.path.join(self.folder, CONFIG_NAME),
+                                  json.dumps(self.cfg, indent=1).encode("utf-8"))
+        self._runtime_content = content
+
+    def _validate_runtime(self, content, fingerprint=None) -> None:
+        """Pin the signed release to the known unedited image before activation."""
+        build = content.build_for(self._source_sha)
+        if not build or (fingerprint or self.state["game"]["fingerprint"]) != patcher.fingerprint(build["base_sha256"]):
+            raise nsr_content.ContentError("Runtime ratings need the stock rollback image. Find Reborn once to rebuild it.")
+        content.validate_runtime_image(os.path.join(self.folder, patcher.OUTPUT_NAME), self._source_sha)
+
+    def set_auto_updates(self, on: bool) -> None:
+        self.cfg["content_auto"] = bool(on)
+        self._save()
+        self._set("content", auto=bool(on))
+        if on:
+            self._spawn(lambda: self.update_content_now(user=False))
+
+    def check_updates(self) -> None:
+        """The "Check for updates" button: check and install (explicit request)."""
+        self._spawn(lambda: self.update_content_now(user=True))
+
+    def _dolphin_running(self) -> bool:
+        p = self._proc
+        return p is not None and hasattr(p, "poll") and p.poll() is None
+
+    def _reborn_iso(self) -> str | None:
+        iso = self.cfg.get("reborn_iso")
+        if iso and os.path.isfile(iso):
+            return iso
+        return self._patcher.find_reborn_iso()
+
+    def _usable(self, payload: dict) -> bool:
+        rel = payload["release"]
+        return (rel["min_launcher"] <= nsr_content.LAUNCHER_CONTENT_FORMAT
+                and rel["recipe"] == self._patcher.ROLLBACK_RECIPE)
+
+    def _known_content(self):
+        """Newest verified content for a rebuild: the cached manifest with its
+        packs (downloaded now if missing and online), else None (plain build)."""
+        payload = self._content_cache.manifest()
+        if not payload or not self._usable(payload):
+            return None
+        try:
+            return self._content_cache.load(payload, self._content_fetch, self.content_base())
+        except (OSError, nsr_content.ContentError) as e:
+            log(self.folder, f"content for rebuild unavailable: {e}")
+            return None
+
+    def _content(self, state: str, text: str, **kw) -> str:
+        self._set("content", state=state, text=text, **kw)
+        return state
+
+    def _installed_text(self) -> str:
+        c = self.state["game"].get("content")
+        return f"game content v{c['version']}" if c and c["version"] else "your current game copy"
+
+    def update_content_now(self, user: bool = False, before_play: bool = False) -> str:
+        """One update check, installing when allowed (user=True: the button, or
+        auto updates on). Returns the resulting content state. Never removes a
+        working image: every failure keeps the current nsr-net.iso."""
+        with self._lock:
+            if self.state["content"]["busy"]:
+                return "busy"
+            self._set("content", busy=True)
+        try:
+            return self._update(user, before_play)
+        except Exception as e:  # noqa: BLE001  (updates must never break the launcher)
+            log(self.folder, f"content update crashed: {e!r}")
+            return self._content("error", "Update check failed; keeping your current game copy.")
+        finally:
+            self._set("content", busy=False)
+
+    def _update(self, user: bool, before_play: bool) -> str:
+        base = self.content_base()
+        if not base or not nsr_content.trusted_keys(self._content_keys):
+            return self._content("off", "Automatic game updates aren't set up in this download.")
+        self._content("checking", "Checking for game updates…")
+        try:
+            raw = self._content_fetch(base + "/manifest", nsr_content.MAX_MANIFEST_BYTES)
+            payload = nsr_content.verify_manifest(raw, self._content_keys)
+        except OSError as e:
+            log(self.folder, f"content check offline: {e}")
+            return self._content("offline", f"Couldn't check for updates (offline?). Using {self._installed_text()}.")
+        except nsr_content.ContentError as e:
+            log(self.folder, f"content manifest rejected: {e}")
+            return self._content("error", "An update list was found but couldn't be verified, so it was "
+                                          f"ignored. Using {self._installed_text()}.")
+        seen = int(self.cfg.get("content_serial", 0) or 0)
+        if payload["serial"] < seen:  # an old, validly signed manifest replayed
+            log(self.folder, f"content manifest serial {payload['serial']} < {seen}: ignored")
+            return self._content("error", "The server sent an older update list than one already seen; "
+                                          f"ignored it. Using {self._installed_text()}.")
+        if payload["serial"] > seen:
+            self.cfg["content_serial"] = payload["serial"]
+            self._save()
+        self._content_cache.save_manifest(raw)
+        self._checked_at = self._clock()
+        release = payload["release"]
+        what = nsr_content.describe(release)
+        self._set("content", latest=release["version"], changelog=release["changelog"])
+        installed = self.state["game"].get("content")
+        if (installed and installed["version"] == release["version"]
+                and bool(self._runtime_content) == self.state["content"]["runtime"]):
+            return self._content("current", f"Up to date: {what}")
+        if not self._usable(payload):
+            return self._content("blocked", f"Game content v{release['version']} needs a newer "
+                                            "NFLStreetRollback download. Ask Mason for it.")
+        if not user and not self.state["content"]["auto"]:
+            return self._content("available", f"Update available: {what}. Click “Check for updates” to install it.")
+        if not user and installed is None and self.state["game"]["state"] == "ready":
+            # A custom copy (e.g. a hand-built ratings image) is only replaced on request.
+            return self._content("available", f"Update available: {what}. Click “Check for updates” to "
+                                              "replace your custom game copy with it.")
+        if self.state["game"]["state"] not in ("ready",):
+            return self._content("available", f"Update available: {what}. Set up your game copy first "
+                                              "(Find Reborn automatically); it will include the update.")
+        blocker = ("Wait for the current build to finish." if self.state["game"]["busy"] else
+                   "Close the game first, then click “Check for updates”." if self._dolphin_running() else
+                   "Leave the room first, then click “Check for updates”."
+                   if not before_play and (self.state["host"]["state"] != "idle"
+                                           or self.state["join"]["state"] != "idle") else "")
+        if blocker:
+            return self._content("available", f"Update available: {what}. {blocker}")
+        iso = self._reborn_iso()
+        if not iso and not self.state["content"]["runtime"]:
+            return self._content("blocked", f"Update available: {what}. It's built from your Reborn install: "
+                                            "click “Find Reborn automatically” in Settings.")
+        if self._source_sha and self._source_sha not in release["builds"]:
+            return self._content("blocked", f"Game content v{release['version']} doesn't support your Reborn "
+                                            "version yet. Ask Mason.")
+        self._content("downloading", f"Downloading {what}…")
+        try:
+            content = self._content_cache.load(payload, self._content_fetch, base)
+        except OSError as e:
+            log(self.folder, f"content download failed: {e}")
+            return self._content("offline", f"Couldn't download the update; using {self._installed_text()}. "
+                                            "Try “Check for updates” later.")
+        except nsr_content.ContentError as e:
+            log(self.folder, f"content pack rejected: {e}")
+            return self._content("error", "The update's files didn't verify, so nothing was changed.")
+        if self.state["content"]["runtime"]:
+            try:
+                self._validate_runtime(content)
+                self._activate_runtime(content)
+                self._ready(self.state["game"]["fingerprint"], "Ratings are applied when the game starts.",
+                            content.descriptor())
+                self.notify(f"Game updated: {what}")
+                return self._content("current", f"Up to date: {what}")
+            except (OSError, nsr_content.ContentError) as exc:
+                self._check_game_now()
+                return self._content("blocked", f"Runtime update could not finish: {exc}")
+        restore = self._claim_build(f"Updating to game content v{content.version}…")
+        if restore is None:
+            return self._content("available", f"Update available: {what}. Wait for the current build to finish.")
+        self._content("updating", f"Installing {what}…")
+        if self._run_build(iso, content, strict=True, restore=restore):
+            log(self.folder, f"content: installed v{content.version} (serial {content.serial})")
+            self.notify(f"Game updated: {what}")
+            return self._content("current", f"Up to date: {what}")
+        return self._content("error", f"Couldn't install {what}; your previous game copy was kept.")
+
+    def _preflight_update(self) -> None:
+        """Before hosting/joining with auto updates on: catch an update published
+        since the last check, so the room doesn't have to reject us."""
+        if not self.state["content"]["auto"] or not self.content_base():
+            return
+        if self._checked_at is not None and self._clock() - self._checked_at < CONTENT_RECHECK_S:
+            return
+        self.update_content_now(user=False, before_play=True)
+
+    def _content_descriptor(self) -> dict | None:
+        return self.state["game"].get("content")
+
     # -- launching --
     def launch(self, start, open_ui: bool = False) -> bool:
         if not open_ui and self.need_game():
@@ -610,8 +941,14 @@ class Launcher:
                                     name=self.state["name"], fingerprint=self.state["game"]["fingerprint"],
                                     telemetry=self.state["telemetry"])
         try:
-            self._popen(args, env=env, cwd=self.folder)
-        except OSError as e:
+            if not open_ui:
+                active = self._installed_runtime()
+                if active:
+                    self._validate_runtime(active)
+                    env.update(self._content_cache.runtime_env(active))
+                    args += ["--nsr-runtime-content=1"]
+            self._proc = self._popen(args, env=env, cwd=self.folder)
+        except (OSError, nsr_content.ContentError) as e:
             self.notify(f"Couldn't start Dolphin ({args[0]}): {e}", "error")
             return False
         return True
@@ -633,10 +970,12 @@ class Launcher:
             self.notify("Room codes aren't set up in this download. Use “Host by IP”.", "error")
             return
         self._set("host", state="opening", mode="room", info="Creating a room…")
-        h = self._lobby.RoomHost(self.rv_server, self.state["name"], self.state["game"]["fingerprint"],
-                                 on_change=self._roster, on_error=lambda why: self._set("host", info=why))
 
         def work():
+            self._preflight_update()
+            h = self._lobby.RoomHost(self.rv_server, self.state["name"], self.state["game"]["fingerprint"],
+                                     on_change=self._roster, on_error=lambda why: self._set("host", info=why),
+                                     content=self._content_descriptor())
             try:
                 code = h.open()
             except ConnectionError as e:
@@ -653,7 +992,8 @@ class Launcher:
         try:
             h = self._lobby.LobbyHost(self.state["name"], self.state["game"]["fingerprint"],
                                       on_change=self._roster,
-                                      on_reject=lambda who, why: self._set("host", info=f"Refused {who}: {why}"))
+                                      on_reject=lambda who, why: self._set("host", info=f"Refused {who}: {why}"),
+                                      content=self._content_descriptor())
             h.open()
         except OSError as e:
             self.notify(f"Couldn't open the lobby on port {self._lobby.PORT}: {e}", "error")
@@ -726,17 +1066,36 @@ class Launcher:
         self._set("join", state="waiting", players=[], info=f"Joining {target}… waiting for the host to start.")
         on_lobby = lambda names: self._set("join", players=list(names))  # noqa: E731
 
+        def attempt():
+            kw = {"on_lobby": on_lobby, "cancel": cancel, "content": self._content_descriptor()}
+            if direct:
+                return self._lobby.join(target, self.state["name"], self.state["game"]["fingerprint"], **kw)
+            return self._lobby.join_room(self.rv_server, target, self.state["name"],
+                                         self.state["game"]["fingerprint"], **kw)
+
         def work():
-            try:
-                if direct:
-                    start = self._lobby.join(target, self.state["name"], self.state["game"]["fingerprint"],
-                                             on_lobby=on_lobby, cancel=cancel)
-                else:
-                    start = self._lobby.join_room(self.rv_server, target, self.state["name"],
-                                                  self.state["game"]["fingerprint"],
-                                                  on_lobby=on_lobby, cancel=cancel)
-            except ConnectionError as e:
-                self._set("join", state="idle", info=str(e))
+            self._preflight_update()
+            start = None
+            for retry in (False, True):
+                try:
+                    start = attempt()
+                    break
+                except ConnectionError as e:
+                    # The room says our game content is older: with auto updates on,
+                    # update now and try once more; else say what to click.
+                    if getattr(e, "action", "") != nsr_content.UPDATE_ACTION or retry:
+                        self._set("join", state="idle", info=str(e))
+                        return
+                    if not self.state["content"]["auto"]:
+                        self._set("join", state="idle", info=str(e))
+                        return
+                    self._set("join", info="Your game content is older than the room's. Updating first…")
+                    if self.update_content_now(user=True, before_play=True) != "current":
+                        self._set("join", state="idle",
+                                  info=f"{e}\n{self.state['content']['text']}")
+                        return
+                    self._set("join", info=f"Updated. Joining {target} again…")
+            if start is None:
                 return
             self._set("join", state="idle",
                       info=f"Starting! You're player {start.player + 1} of {start.players}.")
@@ -784,8 +1143,12 @@ class Launcher:
             self._stats_wake.wait(gamestats.INTERVAL_S)
             self._stats_wake.clear()
 
+    def _startup_checks(self) -> None:
+        self._check_game_now()
+        self.update_content_now(user=False)  # auto: install; manual: just report
+
     def startup(self) -> None:
-        self.check_game()
+        self._spawn(self._startup_checks)
         self.sync_controllers()
         self._loop_spawn(self._stats_loop)
 
@@ -830,6 +1193,9 @@ class WebApi:
     def set_name(self, name): self._l.set_name(name)
     def set_telemetry(self, on): self._l.set_telemetry(bool(on))
     def set_game_stats(self, on): self._l.set_game_stats(bool(on))
+    def set_auto_updates(self, on): self._l.set_auto_updates(bool(on))
+    def set_content_runtime(self, on): self._l.set_content_runtime(bool(on))
+    def check_updates(self): self._l.check_updates()
     def set_delay(self, delay): self._l.set_delay(delay)
     def find_game(self): self._l.find_game()
     def host_room(self): self._l.host_room()
@@ -1002,6 +1368,18 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     b_browse = ttk.Button(sp, text="Browse for NSR.iso…")
     b_find.grid(row=8, column=0, sticky="w")
     b_browse.grid(row=8, column=1, sticky="w", padx=6)
+    content_text = label(sp, 9, pady=(14, 4))
+    b_updates = ttk.Button(sp, text="Check for updates", command=launcher.check_updates)
+    b_updates.grid(row=10, column=0, sticky="w")
+    auto_var = tk.BooleanVar(value=launcher.state["content"]["auto"])
+    ttk.Checkbutton(sp, text="Install game updates automatically (roster/rating edits from Mason)",
+                    variable=auto_var, command=lambda: launcher.set_auto_updates(auto_var.get())) \
+        .grid(row=11, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+    runtime_var = tk.BooleanVar(value=launcher.state["content"]["runtime"])
+    ttk.Checkbutton(sp, text="Apply ratings at game start (off: rebuild the image)",
+                    variable=runtime_var, command=lambda: launcher.set_content_runtime(runtime_var.get())) \
+        .grid(row=12, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
     def browse():
         iso = filedialog.askopenfilename(title="Pick NFL Street Reborn's NSR.iso (content\\games)",
@@ -1048,6 +1426,11 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
                 progress.grid(row=7, column=0, columnspan=3, sticky="w", pady=4)
                 progress.configure(value=g["progress"])
             enable(b_find, not g["busy"]); enable(b_browse, not g["busy"])
+            ct = s["content"]
+            content_text.configure(text=(ct["text"] or "No game updates installed.")
+                                   + (f"\nv{ct['latest']}: {ct['changelog']}" if ct["latest"] and ct["changelog"]
+                                      and ct["state"] != "off" else ""))
+            enable(b_updates, not ct["busy"] and not g["busy"])
             stats_text.configure(text=s["game_stats"]["text"])
             n = s["notice"]
             if n and n["id"] != seen["notice"]:

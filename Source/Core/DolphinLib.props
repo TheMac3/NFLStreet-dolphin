@@ -257,6 +257,8 @@
     <ClInclude Include="Core\GeckoCodeConfig.h" />
     <ClInclude Include="Core\HLE\HLE_Misc.h" />
     <ClInclude Include="Core\HLE\HLE_OS.h" />
+    <ClInclude Include="Core\NSR\NSRContent.h" />
+    <ClInclude Include="Core\NSR\NSRContentRead.h" />
     <ClInclude Include="Core\NSR\NSRNetplay.h" />
     <ClInclude Include="Core\NSR\NSRGameStats.h" />
     <ClInclude Include="Core\NSR\NSRGameStatsRead.h" />
@@ -951,6 +953,7 @@
     <ClCompile Include="Core\GeckoCodeConfig.cpp" />
     <ClCompile Include="Core\HLE\HLE_Misc.cpp" />
     <ClCompile Include="Core\HLE\HLE_OS.cpp" />
+    <ClCompile Include="Core\NSR\NSRContent.cpp" />
     <ClCompile Include="Core\NSR\NSRNetplay.cpp" />
     <ClCompile Include="Core\NSR\NSRGameStats.cpp" />
     <ClCompile Include="Core\NSR\NSRTelemetry.cpp" />

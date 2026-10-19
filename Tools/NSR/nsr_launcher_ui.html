@@ -320,6 +320,19 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
           </div>
           <div class="note">Everyone you play with must have the same fingerprint.</div>
         </div>
+        <div class="card">
+          <div class="label">Game updates</div>
+          <div class="info" id="contentText" style="margin-top:6px">–</div>
+          <div class="note" id="contentLog" style="margin-top:4px;white-space:pre-line"></div>
+          <div class="row" style="margin-top:16px">
+            <button class="btn" id="btnUpdates">Check for updates</button>
+          </div>
+          <div style="height:14px"></div>
+          <div class="toggle" id="autoUpdates"><div class="switch"></div><div><b>Install game updates automatically</b>
+            <div class="note" style="margin-top:4px">Roster and rating updates from Mason. Only his edit lists are downloaded (signed, checked); ratings apply when the game starts. Your game image stays the same. Off: updates are only shown here.</div></div></div>
+          <div class="toggle" id="runtimeContent"><div class="switch"></div><div><b>Apply ratings at game start</b>
+            <div class="note" style="margin-top:4px">Off: rebuild the game image for each update. Click Check for updates after changing this setting.</div></div></div>
+        </div>
       </div>
     </section>
 
@@ -395,6 +408,8 @@ function statusOf(s) {
   const g = s.game;
   if (g.state === "ready") return ["", "Ready to play"];
   if (g.state === "building" || g.state === "checking") return ["busy", g.text || "Working…"];
+  const ct = s.content || {};
+  if (g.state === "ready" && ct.state === "available") return ["warn", "Game update available (Settings)"];
   if (g.state === "stale" || g.state === "missing") return ["warn", "Set up your game copy in Settings"];
   return ["err", g.text || "Game copy problem"];
 }
@@ -471,6 +486,13 @@ function render(s) {
   setText("gameText", (g.text || "") + (g.note ? "\n" + g.note : ""));
   show("gameBar", g.progress != null); $("gameProg").style.width = (g.progress || 0) + "%";
   enable("btnFind", !g.busy); enable("btnBrowse", !g.busy);
+  const ct = s.content || {};
+  $("runtimeContent").classList.toggle("on", !!ct.runtime);
+  setText("contentText", ct.text || (ct.version ? "Game content v" + ct.version : "No game updates installed."));
+  setText("contentLog", ct.latest && ct.changelog && ct.state !== "off" ? "v" + ct.latest + ": " + ct.changelog : "");
+  $("autoUpdates").classList.toggle("on", !!ct.auto);
+  enable("btnUpdates", !ct.busy && !g.busy);
+  setText("btnUpdates", ct.busy ? "Checking…" : "Check for updates");
   setText("folderPath", "This folder: " + (s.folder || ""));
 
   if (s.notice && s.notice.id !== S.noticeId) { S.noticeId = s.notice.id; toast(s.notice.text, s.notice.kind); }
@@ -506,6 +528,9 @@ function wire() {
   $("telemetry").onclick = () => call("set_telemetry", !(S.snap && S.snap.telemetry));
   $("gameStats").onclick = () => call("set_game_stats", !(S.snap && S.snap.game_stats && S.snap.game_stats.enabled));
   $("btnFind").onclick = () => call("find_game");
+  $("btnUpdates").onclick = () => call("check_updates");
+  $("runtimeContent").onclick = () => call("set_content_runtime", !(S.snap && S.snap.content && S.snap.content.runtime));
+  $("autoUpdates").onclick = () => call("set_auto_updates", !(S.snap && S.snap.content && S.snap.content.auto));
   $("btnBrowse").onclick = () => call("browse_iso");
   document.addEventListener("contextmenu", (e) => { if (!(e.target instanceof HTMLInputElement)) e.preventDefault(); });
 }
@@ -528,7 +553,9 @@ function demoApi(page) {
   const base = { rev: 1, name: "Mason", telemetry: true, delay: 1,
     game_stats: { enabled: true, state: "ok", text: "14 game result files sent.", sent: 14, pending: 0 }, max_delay: 4, last_host: "", rooms: true,
     folder: "C:\\Users\\mason\\Desktop\\NFLStreetRollback",
-    game: { state: "ready", text: "Ready for rollback netplay.", fingerprint: "7F3A-29C4", note: "", progress: null, busy: false },
+    game: { state: "ready", text: "Ready for rollback netplay.", fingerprint: "7F3A-29C4", note: "", progress: null, busy: false, content: { version: 3, serial: 4 } },
+    content: { state: "current", text: "Up to date: content v3 — Week 6 speed tweaks", version: 3, latest: 3,
+      changelog: "Week 6 speed tweaks", auto: true, busy: false },
     host: { state: "idle", mode: "", code: "", info: "", players: [], can_start: false },
     join: { state: "idle", info: "", players: [] },
     controllers: { state: "synced", message: "Using your Reborn controller settings.",

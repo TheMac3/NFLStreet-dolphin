@@ -13,8 +13,8 @@ with PyInstaller) inside the NFLStreet netplay Dolphin folder, and it:
      rollback, see docs/release-plan.md section 3). It builds into a
      temporary file and only replaces nsr-net.iso once the new copy is
      complete, so a failed build never destroys a working image,
-  4. writes nsr-image.json (recipe, source/output digests, fingerprint; no
-     paths) and shows the result's fingerprint. Netplay needs byte-identical
+  4. writes nsr-image.json (recipe, source/output digests, fingerprint,
+     content version if any; no paths) and shows the result's fingerprint. Netplay needs byte-identical
      images on every machine, so the lobby compares fingerprints (and this
      says whether the image matches the reference build).
 
@@ -24,7 +24,11 @@ milestone-1 lockstep, so the netplay mode is a property of the image. An old
 lockstep nsr-net.iso is recognized (LEGACY_OUTPUTS) and reported as needing a
 rebuild.
 
-Nothing is downloaded or uploaded; Reborn's own file is only read. The
+Nothing is downloaded or uploaded here; Reborn's own file is only read. The
+launcher can pass a verified content update (nsr_content.Content: our own
+ratings-pack edits, never game bytes) to prepare_image, which then also
+rewrites the roster file inside the fresh copy and requires the result to
+match the fingerprint the signed manifest predicts for this Reborn input. The
 patched image is each player's own copy, made from their own install.
 
 Usage: NFLStreetRollback-Patcher.exe [path\\to\\NSR.iso]      (no argument: search, then ask)
@@ -41,6 +45,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import isopatch  # noqa: E402
+import nsr_content  # noqa: E402  (content updates: our ratings packs, docs/content-updates.md)
 
 OUTPUT_NAME = "nsr-net.iso"
 MANIFEST_NAME = "nsr-image.json"  # sidecar describing nsr-net.iso (no paths)
@@ -161,12 +166,15 @@ class Prepared:
     """Result of prepare_image()."""
 
     def __init__(self, image: str, fingerprint: str, reborn_label: str | None,
-                 matches_reference: bool | None, reborn_install: str | None):
+                 matches_reference: bool | None, reborn_install: str | None,
+                 content: "nsr_content.Content | None" = None, source_sha256: str = ""):
         self.image = image
         self.fingerprint = fingerprint
         self.reborn_label = reborn_label            # e.g. "Reborn 2026.09.12" (None: unknown version)
         self.matches_reference = matches_reference  # None when the Reborn version is unknown
         self.reborn_install = reborn_install        # for read-only textures, if found
+        self.content = content                      # the applied content update, if any
+        self.source_sha256 = source_sha256
 
 
 def reborn_install_of(iso: str) -> str | None:
@@ -189,14 +197,19 @@ def saved_reborn_install(out_dir: str) -> str | None:
     return path if path and os.path.isdir(os.path.join(path, "content", "textures")) else None
 
 
-def write_manifest(out_dir: str, digest_in: str, label: str | None, digest_out: str) -> None:
+def write_manifest(out_dir: str, digest_in: str, label: str | None, digest_out: str,
+                   content: "nsr_content.Content | None" = None) -> None:
     """nsr-image.json: what nsr-net.iso is. Digests and labels only; no paths
-    or Reborn content (release plan 3.1)."""
+    or Reborn content (release plan 3.1). "content" records the applied
+    content update (version, manifest serial, pack digests) or is null."""
+    packs = [p["sha256"] for p in content.release["packs"]] if content else []
     manifest = {"recipe": ROLLBACK_RECIPE, "mode": NETPLAY_MODE,
                 "patches": list(isopatch.NETPLAY_SET),
                 "source_label": label, "source_sha256": digest_in,
                 "output_sha256": digest_out, "fingerprint": fingerprint(digest_out),
-                "ratings_pack_sha256": None,
+                "ratings_pack_sha256": packs[0] if len(packs) == 1 else None,
+                "content": ({"version": content.version, "serial": content.serial, "packs": packs}
+                            if content else None),
                 "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     tmp = os.path.join(out_dir, MANIFEST_NAME + ".tmp")
     with open(tmp, "w") as f:
@@ -213,16 +226,53 @@ def read_manifest(out_dir: str) -> dict:
         return {}
 
 
-def prepare_image(iso: str, out_dir: str, progress=None) -> Prepared:
+def apply_content(image: str, build: dict, content: "nsr_content.Content") -> None:
+    """Write a content update's ratings edits into the roster file of a fresh,
+    unpublished build (the .partial file). The roster file must hash to the
+    release's template_sha256 first; eadb validates every edit (player
+    present, original values as expected, per-field storage range) before any
+    byte changes. CRC words are preserved exactly as the editor does
+    (docs/roster-editing.md), so this matches the publisher's prediction."""
+    import discpatch  # noqa: PLC0415  (only content builds need the FST/DB tooling)
+    import eadb  # noqa: PLC0415
+    template = discpatch.read_file(image, build["roster_file"])
+    if hashlib.sha256(template).hexdigest() != build["template_sha256"]:
+        raise nsr_content.ContentError("the roster file in this build differs from the one the update "
+                                       "was made for")
+    try:
+        replacement, _ = eadb.apply_edits(template, content.edits)
+    except ValueError as exc:
+        raise nsr_content.ContentError(f"the update's ratings don't fit this game copy: {exc}") from None
+    discpatch.replace_in_place(image, build["roster_file"], replacement,
+                               expect_sha256=build["template_sha256"])
+
+
+def prepare_image(iso: str, out_dir: str, progress=None, content: "nsr_content.Content | None" = None,
+                  content_strict: bool = True) -> Prepared:
     """Check Reborn's image, build nsr-net.iso in out_dir, fingerprint it.
     progress(stage, done, total) with stage in {"check", "build", "verify"}.
     Raises isopatch.PatchError if the patches don't fit this Reborn version.
     The build goes to a temporary file that replaces nsr-net.iso only when
     complete, so a failure leaves any previous image untouched and no partial
-    file behind. Reborn's files are only read."""
+    file behind. Reborn's files are only read.
+
+    content: a verified content update. Its release must list this Reborn
+    input (else ContentError, or with content_strict=False a plain build
+    without content), the edits are applied to the fresh copy, and the result
+    must equal the release's output_sha256 exactly (ContentError otherwise,
+    and the previous nsr-net.iso is kept)."""
     step = (lambda st: (lambda d, t: progress(st, d, t))) if progress else (lambda st: None)
     digest_in = sha256(iso, progress=step("check")) if progress else sha256(iso, "checking Reborn image")
     known = KNOWN_INPUTS.get(digest_in)
+    build = content.build_for(digest_in) if content else None
+    if content and build is None:
+        if content_strict:
+            raise nsr_content.ContentError(f"content v{content.version} doesn't support this Reborn version")
+        content = None
+    if build and content.release["recipe"] != ROLLBACK_RECIPE:
+        raise nsr_content.ContentError("this update is for a different NFLStreetRollback version")
+    if build and known and known[1] != build["base_sha256"]:
+        raise nsr_content.ContentError("this update was made for a different patch build")
     out = os.path.join(out_dir, OUTPUT_NAME)
     tmp = out + ".partial"
     if os.path.abspath(iso) in (os.path.abspath(out), os.path.abspath(tmp)):
@@ -232,7 +282,13 @@ def prepare_image(iso: str, out_dir: str, progress=None) -> Prepared:
                        progress=step("build") if progress else (lambda d, t: _bar("copying + patching", d, t)))
         if not progress:
             print()
+        if build:
+            apply_content(tmp, build, content)
         digest_out = sha256(tmp, progress=step("verify")) if progress else sha256(tmp, "fingerprinting result")
+        if build and digest_out != build["output_sha256"]:
+            raise nsr_content.ContentError(
+                f"the updated game copy came out as {fingerprint(digest_out)}, not the expected "
+                f"{fingerprint(build['output_sha256'])}; your current copy was kept")
         os.replace(tmp, out)
     except BaseException:
         try:
@@ -240,27 +296,38 @@ def prepare_image(iso: str, out_dir: str, progress=None) -> Prepared:
         except OSError:
             pass
         raise
-    write_manifest(out_dir, digest_in, known[0] if known else None, digest_out)
+    label = known[0] if known else (build["label"] if build else None)
+    write_manifest(out_dir, digest_in, label, digest_out, content if build else None)
     install = reborn_install_of(iso)
     if install:
         with open(os.path.join(out_dir, REBORN_PATH_NAME), "w") as f:
             f.write(install)
-    return Prepared(out, fingerprint(digest_out), known[0] if known else None,
-                    (digest_out == known[1]) if known else None, install)
+    # With content the reference is the release's predicted output, not the
+    # unedited KNOWN_INPUTS image (equality was enforced above).
+    matches = True if build else ((digest_out == known[1]) if known else None)
+    return Prepared(out, fingerprint(digest_out), label, matches, install,
+                    content if build else None, digest_in)
 
 
 class ImageStatus:
     """What an existing nsr-net.iso is: kind "release" (a known rollback
-    output), "custom" (current recipe from an unrecognized Reborn, per its
+    output), "content" (built by the launcher with a content update, per its
+    manifest), "custom" (current recipe from an unrecognized Reborn, per its
     manifest), "legacy" (an older launcher's lockstep image: rebuild), or
     "unknown" (e.g. a ratings-pack build, docs/roster-editing.md). Only
     "legacy" is refused: the lobby's fingerprint check keeps any other
-    mismatch out of a room, and refusing "unknown" would block ratings packs."""
+    mismatch out of a room, and refusing "unknown" would block ratings packs.
 
-    def __init__(self, fingerprint: str, kind: str, note: str = ""):
+    content: {"version", "serial"} of the installed content (version 0 for an
+    unedited release image), None when unknown (custom/unknown builds)."""
+
+    def __init__(self, fingerprint: str, kind: str, note: str = "", content: dict | None = None,
+                 source_sha256: str = ""):
         self.fingerprint = fingerprint
         self.kind = kind
         self.note = note
+        self.content = content
+        self.source_sha256 = source_sha256
 
     @property
     def playable(self) -> bool:
@@ -276,13 +343,25 @@ def image_status(out_dir: str, progress=None) -> ImageStatus | None:
         return None
     digest = sha256(path, progress=progress or (lambda d, t: None))
     fp = fingerprint(digest)
+    manifest = read_manifest(out_dir)
+    source = manifest.get("source_sha256") if isinstance(manifest.get("source_sha256"), str) else ""
+    ours = manifest.get("recipe") == ROLLBACK_RECIPE and manifest.get("output_sha256") == digest
+    applied = nsr_content.parse_descriptor(
+        {k: (manifest.get("content") or {}).get(k) for k in ("version", "serial")}
+        if isinstance(manifest.get("content"), dict) else None)
+    # Checked before the release table: a content release without packs
+    # (e.g. "back to the stock ratings") builds the unedited release bytes
+    # but still counts as that content version.
+    if ours and applied and applied["version"] > 0:
+        return ImageStatus(fp, "content", f"game content v{applied['version']}", content=applied,
+                           source_sha256=source)
     if digest in {out for _, out in KNOWN_INPUTS.values()}:
-        return ImageStatus(fp, "release")
+        source = source or next(k for k, (_, out) in KNOWN_INPUTS.items() if out == digest)
+        return ImageStatus(fp, "release", content=nsr_content.content_descriptor(0, 0), source_sha256=source)
     if digest in LEGACY_OUTPUTS:
         return ImageStatus(fp, "legacy", f"an older {LEGACY_OUTPUTS[digest]} build")
-    manifest = read_manifest(out_dir)
-    if manifest.get("recipe") == ROLLBACK_RECIPE and manifest.get("output_sha256") == digest:
-        return ImageStatus(fp, "custom", "unrecognized Reborn version")
+    if ours:
+        return ImageStatus(fp, "custom", "unrecognized Reborn version", source_sha256=source)
     return ImageStatus(fp, "unknown", "not built by this version")
 
 
