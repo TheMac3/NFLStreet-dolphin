@@ -218,6 +218,17 @@ std::optional<std::uint32_t> HandoffAgreement::HostAuxClock() const
   return m_sync_aux_clocks[0];
 }
 
+std::optional<HandoffPacket> HandoffAgreement::Proposal(std::uint8_t player) const
+{
+  if (Mismatched() || player >= m_players || !m_seen[player])
+    return std::nullopt;
+  HandoffPacket packet = m_local;
+  packet.sender = player;
+  packet.sync_clock = m_sync_clocks[player];
+  packet.sync_aux_clock = m_sync_aux_clocks[player];
+  return packet;
+}
+
 std::vector<std::uint8_t> Encode(const Packet& packet)
 {
   const std::size_t count = std::min(packet.pads.size(), MAX_HISTORY);

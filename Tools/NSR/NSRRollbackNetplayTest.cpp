@@ -49,6 +49,38 @@ static void Deliver(const RN::Exchange& from, RN::Exchange* to, std::uint32_t fr
   assert(to->Accept(*packet));
 }
 
+// The hub can complete a phase before a leaf receives every relayed
+// participant's proposal. Retained, validated proposals repair that leaf
+// while the hub is already waiting in the next phase. Clocks stay authored
+// per participant; unknown/rejected proposals must never be reconstructed.
+static void TestHandoffPhaseRelay()
+{
+  RN::HandoffAgreement host(4, 0, RN::HandoffKind::SyncClocks, 0x80000001, 7239, 0, {}, 7875, 28);
+  RN::HandoffAgreement leaf(4, 3, RN::HandoffKind::SyncClocks, 0x80000001, 7239, 0, {}, 7905, 58);
+  assert(!host.Proposal(1) && !host.Proposal(4));
+  assert(leaf.Accept(*host.Proposal(0)));
+  for (std::uint8_t p = 1; p < 4; ++p)
+  {
+    assert(host.Accept({p, 4, RN::HandoffKind::SyncClocks, 0x80000001, 7239, 0, {},
+                        7875U + 10U * p, 28U + 10U * p}));
+  }
+  assert(host.Complete() && !leaf.Complete());
+  const auto previous = host;
+  RN::HandoffAgreement next(4, 0, RN::HandoffKind::EnterRollback, 2, 7239, 0x1234);
+  for (std::uint8_t p = 0; p < 3; ++p)
+  {
+    const auto wire = RN::EncodeHandoff(*previous.Proposal(p));
+    const auto packet = RN::DecodeHandoff(wire);
+    assert(packet && packet->sender == p && packet->sync_clock == 7875U + 10U * p);
+    assert(leaf.Accept(*packet));
+    assert(!next.Accept(*packet) && !next.Mismatched());
+  }
+  assert(leaf.Complete() && leaf.HostClock() == 7875);
+  auto invalid = *previous.Proposal(1);
+  invalid.sync_clock++;
+  assert(!host.Accept(invalid) && !host.Proposal(1));
+}
+
 // Match entry/leave proposals are independently encoded and require the same
 // transition kind, absolute lockstep frame, and deterministic-state hash from
 // every peer. Per-peer clocks may differ, player 0's survives wire encoding,
@@ -1133,6 +1165,55 @@ static void TestDigestComparedOnlyWhenFinal()
          c.FirstDesyncInfo()->remote == 0xD && c.FirstDesyncInfo()->player == 1);
 }
 
+// The name-tail rule must follow the validated descriptor/string identity,
+// never infer padding from the contents of the disputed word itself.
+static void TestInGameHeapNamePadding()
+{
+  constexpr std::uint32_t DESC = 0x00390000;
+  constexpr std::uint32_t ENTRY = 0x00384C20;
+  std::vector<std::uint8_t> ram(0x400000);
+  const auto write = [&](std::uint32_t offset, std::uint32_t value) {
+    for (std::uint32_t i = 0; i < 4; ++i)
+      ram[offset + i] = static_cast<std::uint8_t>(value >> (24 - 8 * i));
+  };
+  write(ENTRY, 0x8038F000);
+  write(ENTRY + 4, 0x803F0000);
+  write(ENTRY + 8, 1);
+  write(ENTRY + 12, 0x80000000 + DESC);
+  write(DESC, 1);
+  write(DESC + 4, 0x80000000 + DESC);
+  write(DESC + 0x14, 0x8038F000);
+  write(DESC + 0x18, 0x803F0000);
+  write(DESC + 0xB0, 0x496E4761);
+  write(DESC + 0xB4, 0x6D650008);  // InGame, NUL, stale byte
+  write(DESC + 0xBC, 0x0024A700);  // invented prior transfer length
+  assert((RL::InGameHeapNamePadding(ram) == RL::Range{DESC + 0xBC, DESC + 0xC0}));
+  write(DESC + 0xBC, 0x004F4A00);
+  assert((RL::InGameHeapNamePadding(ram) == RL::Range{DESC + 0xBC, DESC + 0xC0}));
+  // Malformed identity, ownership, bounds, name and terminator fail closed.
+  for (const auto offset : {ENTRY + 8, ENTRY + 12, DESC, DESC + 4, DESC + 0x14,
+                            DESC + 0x18, DESC + 0xB0, DESC + 0xB6})
+  {
+    ram[offset] ^= 0x40;
+    assert(!RL::InGameHeapNamePadding(ram));
+    ram[offset] ^= 0x40;
+  }
+  assert(!RL::InGameHeapNamePadding({}));
+  assert(!RL::InGameHeapNamePadding(std::span<const std::uint8_t>(ram).first(DESC + 0xFF)));
+}
+
+// Lifecycle canonicalization drops only an expired busy-poll generation;
+// it must retain same-frame progress that controls audio-loader catch-up.
+static void TestAudioPollFrame()
+{
+  assert((RL::BeginAudioPollFrame({7238, 43}, 7239) == RL::AudioPollState{7239, 0}));
+  assert((RL::BeginAudioPollFrame({7238, 193}, 7239) == RL::AudioPollState{7239, 0}));
+  assert((RL::BeginAudioPollFrame({7239, 999}, 7239) == RL::AudioPollState{7239, 999}));
+  assert((RL::BeginAudioPollFrame({0xFFFFFFFF, 999}, 0) == RL::AudioPollState{0, 0}));
+  assert((RL::BeginAudioPollFrame({0, 999}, 0xFFFFFFFF) ==
+          RL::AudioPollState{0xFFFFFFFF, 0}));
+}
+
 // Synthetic MEM1 verifies that the Crush rule hides exactly its 18 padding
 // bytes and fails closed for another mode, stale type tags or damaged roots.
 // No game data is needed; meaningful score/ID/flag bytes stay observable.
@@ -1529,6 +1610,7 @@ int main()
   TestGameStatsMemoryReader();
   TestGameStatsIdentity();
   TestHandoffAgreement();
+  TestHandoffPhaseRelay();
   TestPredictionAndCorrection();
   TestPredictionWindowAndAcks();
   TestLongLossRecovery();
@@ -1556,6 +1638,8 @@ int main()
   TestLifecycleConfirmFrames();
   TestMispredictedPlayers();
   TestStreetEventRankingPadding();
+  TestInGameHeapNamePadding();
+  TestAudioPollFrame();
   TestWindowUndoLog();
   TestTelemetryFinalFlushIsBounded();
   std::puts("NSR rollback exchange tests passed");

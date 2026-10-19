@@ -197,6 +197,10 @@ public:
   const std::optional<HandoffPacket>& ConfigMismatch() const { return m_config_mismatch; }
   std::optional<std::uint32_t> HostClock() const;
   std::optional<std::uint32_t> HostAuxClock() const;
+  // Reconstruct only a validated participant's immutable proposal. A relay
+  // may retain a completed agreement to repair delivery to a lagging leaf
+  // while the relay itself waits in the following barrier.
+  std::optional<HandoffPacket> Proposal(std::uint8_t player) const;
 
 private:
   std::uint8_t m_players;

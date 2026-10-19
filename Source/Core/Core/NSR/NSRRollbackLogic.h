@@ -93,6 +93,57 @@ struct Range
   constexpr bool operator==(const Range&) const = default;
 };
 
+// Audio busy-poll progress belongs to one frame only. A new frame starts
+// at zero; stale loading-presenter polls must not survive into a lifecycle
+// digest. Preserve progress within the current frame so its catch-up guard
+// continues to advance long audio-loading loops deterministically.
+struct AudioPollState
+{
+  std::uint32_t frame;
+  std::uint32_t polls;
+  constexpr bool operator==(const AudioPollState&) const = default;
+};
+
+constexpr AudioPollState BeginAudioPollFrame(AudioPollState state, std::uint32_t frame)
+{
+  return state.frame == frame ? state : AudioPollState{frame, 0};
+}
+
+// GN7E69 rev 0's heap-1 descriptor contains six 16-byte allocation-name
+// slots at +0x90. fn_801D3318 writes through the terminating NUL, and
+// fn_801D339C pushes with strcpy; fn_801D28A8 passes the current slot to
+// debug allocation bookkeeping as a C string. Bytes after its NUL are never
+// consumed. Only mask the observed final word of slot 2 ("InGame"), after
+// validating the heap-table entry and descriptor. Keep the string, NUL,
+// depth (+0x8C), allocator fields and every other slot hashed. Revisit for
+// another slot/revision only with writer/reader evidence.
+inline std::optional<Range> InGameHeapNamePadding(std::span<const std::uint8_t> ram)
+{
+  constexpr std::uint32_t BASE = 0x80000000;
+  constexpr std::uint32_t ENTRY = 0x00384C20;
+  const auto fits = [&](std::uint32_t offset, std::uint32_t size) {
+    return offset <= ram.size() && size <= ram.size() - offset;
+  };
+  const auto read = [&](std::uint32_t offset) {
+    return (std::uint32_t{ram[offset]} << 24) | (std::uint32_t{ram[offset + 1]} << 16) |
+           (std::uint32_t{ram[offset + 2]} << 8) | ram[offset + 3];
+  };
+  if (!fits(ENTRY, 16) || read(ENTRY + 8) != 1)
+    return std::nullopt;
+  const std::uint32_t desc = read(ENTRY + 12);
+  if (desc < BASE + 0x3100 || (desc & 15) != 0 || !fits(desc - BASE, 0x100))
+    return std::nullopt;
+  const std::uint32_t off = desc - BASE;
+  if (read(off) != 1 || read(off + 4) != desc || read(off + 0x14) != read(ENTRY) ||
+      read(off + 0x18) != read(ENTRY + 4) || read(ENTRY) < BASE + 0x3100 ||
+      read(ENTRY) > desc ||
+      read(ENTRY + 4) <= desc + 0x100 || read(ENTRY + 4) > BASE + ram.size() ||
+      read(off + 0xB0) != 0x496E4761 ||  // "InGa"
+      ram[off + 0xB4] != 'm' || ram[off + 0xB5] != 'e' || ram[off + 0xB6] != 0)
+    return std::nullopt;
+  return Range{off + 0xBC, off + 0xC0};
+}
+
 // GN7E69 rev 0: Crush the Carrier's six score records have stride 0x38,
 // with a byte at +8 followed by three padding bytes. The insertion sort
 // fn_8014D024 copies that byte with lbz/stb into a main-stack temporary,

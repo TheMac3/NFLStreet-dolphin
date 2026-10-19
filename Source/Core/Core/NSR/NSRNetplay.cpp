@@ -206,6 +206,10 @@ Session s_session;
 // remains a thin datagram adapter and the CPU thread is its sole owner.
 std::unique_ptr<RollbackNet::Exchange> s_rb_exchange;
 std::optional<RollbackNet::HandoffAgreement> s_rb_handoff;
+// One completed phase is enough: a peer cannot propose the following phase
+// until it completes this one. Retain its validated proposals for a star
+// leaf still awaiting a relayed copy after the host moved to the next phase.
+std::optional<RollbackNet::HandoffAgreement> s_rb_previous_handoff;
 // fix/lifecycle: the session id of the exchange most recently replaced.
 // Barrier waits keep re-sending the old epoch's input history, so peers that
 // already moved on receive it; that is expected, not a session diagnostic.
@@ -1057,21 +1061,40 @@ void SendRollbackLatest(u32 live_frame)
   enet_host_flush(s.host);
 }
 
-// Broadcast the current transition proposal.  Unlike continuously repeated
-// input history, a peer stops announcing this proposal as soon as its local
-// barrier completes. ENet reliability therefore closes the window where one
-// leaf misses a relayed proposal after the other peers have already left.
+// Broadcast the current transition and the one completed phase retained for
+// lagging peers. Reliable delivery plus application retransmission lets a
+// star leaf recover relayed proposals while the hub waits in the next phase.
 void SendHandoff()
 {
   Session& s = s_session;
   if (!s_rb_handoff || !s.host)
     return;
-  const std::vector<u8> bytes = RollbackNet::EncodeHandoff(s_rb_handoff->Local());
-  for (u32 i = 0; i < s.players; ++i)
+  const auto send = [&](const RollbackNet::HandoffPacket& proposal) {
+    const std::vector<u8> bytes = RollbackNet::EncodeHandoff(proposal);
+    for (u32 i = 0; i < s.players; ++i)
+    {
+      if (i != s.me && i != proposal.sender && Linked(i))
+        enet_peer_send(s.peers[i], 0,
+                       enet_packet_create(bytes.data(), bytes.size(), ENET_PACKET_FLAG_RELIABLE));
+    }
+  };
+  send(s_rb_handoff->Local());
+  if (s_rb_previous_handoff)
   {
-    if (i != s.me && Linked(i))
-      enet_peer_send(s.peers[i], 0,
-                     enet_packet_create(bytes.data(), bytes.size(), ENET_PACKET_FLAG_RELIABLE));
+    // A star host must keep forwarding *all* accepted previous proposals,
+    // not just its own. Otherwise a leaf can remain in SyncClocks while
+    // everyone else waits for its entry proposal (seed 3918529284).
+    // Mesh participants and star leaves may send only their own identity.
+    if (s.star && s.me == 0)
+    {
+      for (u8 player = 0; player < s.players; ++player)
+        if (const auto proposal = s_rb_previous_handoff->Proposal(player))
+          send(*proposal);
+    }
+    else
+    {
+      send(s_rb_previous_handoff->Local());
+    }
   }
   enet_host_flush(s.host);
 }
@@ -2868,6 +2891,7 @@ void RbInit(Core::System& system)
   r.perturb_at = ParseU32(Env("NSR_RB_PERTURB_AT")).value_or(0);
   r.vtime_from = ParseU32(Env("NSR_RB_VTIME_FROM")).value_or(0);
   // Diagnostics: NSR_RB_MEMWATCH=addr logs every write to that word
+  // (and reads with NSR_RB_MEMWATCH_READ=1),
   // (NSR_RB_MEMWATCH_LEN=n bytes, default 4) to the NSR log as "MBP" lines
   // with live/cursor/rolled, pc, lr, r1 and the running thread; armed at the
   // NSR_RB_WATCH window's start.  Dolphin's MEMMAP log gets them too (run
@@ -4772,6 +4796,10 @@ static std::vector<PerMachineRange> PerMachineRanges(Core::System& system, const
     out.push_back({lo, hi, "audio-data"});
   if (const auto stack = UiCommandStack(ram))
     out.push_back({stack->first, stack->second, "ui-cmdstack"});
+  // Heap-name C-string padding, independently validated by the shared helper.
+  if (const auto padding = RollbackLogic::InGameHeapNamePadding(
+          {ram, system.GetMemory().GetRamSizeReal()}))
+    out.push_back({0x80000000 | padding->lo, 0x80000000 | padding->hi, "heap-name-padding"});
   // Event ranking padding follows main-stack history, not the simulation.
   // The shared helper validates the mode, complete table and every record's
   // type; never exclude an entire scoreboard or its meaningful byte field.
@@ -5026,8 +5054,9 @@ namespace
 {
 // Version of the exclusion rules; part of the config fingerprint, so peers
 // with different rules refuse to play instead of reporting false desyncs.
-constexpr u32 STATE_DIGEST_RANGES_VERSION = 8;  // 6: Crush padding; 7: stable small audio-heap metadata
+constexpr u32 STATE_DIGEST_RANGES_VERSION = 9;  // 6: Crush padding; 7: stable small audio-heap metadata
 // 8 (fix/lifecycle): the loading-screen icon (fn_80194060) position/velocity.
+// 9 (fix/lifecycle): heap-1's InGame allocation-name padding (four bytes).
 
 // tools/rbdiff.py PER_MACHINE entries below its STATIC_END (.data/.bss words
 // that follow audio/disc time in every mode; physical [lo, hi)).  Keep the
@@ -5873,6 +5902,20 @@ static bool ConfirmRollbackTail(u32 completed_frame)
   return true;
 }
 
+// A barrier freezes guest execution, but a peer one poll/frame behind still
+// needs the unreliable input tail to reach it. Before the first epoch there
+// is no rollback exchange: resend the latest stored legacy-menu packet in
+// that case. Four-player seed 3918529284 exposed the missing first-entry
+// branch (three peers at barrier 2803, one waiting at menu poll 3367).
+// This sends only previously recorded inputs and never samples a new pad.
+static void ResendHandoffInputs()
+{
+  if (s_rb_exchange)
+    SendRollbackLatest(s_rb.live);
+  else if (!s_session.local_pads.empty())
+    SendLatest(s_session.local_pads.rbegin()->first);
+}
+
 // Exchange and compare the canonical state digest (RbStateDigest, a full
 // one-off hash of RAM here) and the config fingerprint at an agreed absolute
 // frame.  This is a host-side barrier: no guest time advances while waiting,
@@ -5930,8 +5973,7 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
       // unreliably, and a barrier host wait used to stop their redundancy
       // (4-player regress: "rollback input timeout at frame 7238" on one
       // peer while the others waited in the re-entry clock barrier).
-      if (s_rb_exchange)
-        SendRollbackLatest(s_rb.live);
+      ResendHandoffInputs();
       last_send = now;
     }
     if (now - start >= std::chrono::milliseconds(PEER_TIMEOUT_MS))
@@ -5972,6 +6014,7 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
   Log("handoff {} transition {} agreed at frame {} state digest {:016x} host clock {}",
       kind == RollbackNet::HandoffKind::EnterRollback ? "entry" : "leave", transition, frame,
       semantic, *agreed_clock);
+  s_rb_previous_handoff = s_rb_handoff;
   s_rb_handoff.reset();
   return true;
 }
@@ -6010,8 +6053,7 @@ static bool HandoffClockBarrier(const Core::CPUThreadGuard& guard, u32 frame, u3
       // unreliably, and a barrier host wait used to stop their redundancy
       // (4-player regress: "rollback input timeout at frame 7238" on one
       // peer while the others waited in the re-entry clock barrier).
-      if (s_rb_exchange)
-        SendRollbackLatest(s_rb.live);
+      ResendHandoffInputs();
       last_send = now;
     }
     if (now - start >= std::chrono::milliseconds(PEER_TIMEOUT_MS))
@@ -6038,6 +6080,7 @@ static bool HandoffClockBarrier(const Core::CPUThreadGuard& guard, u32 frame, u3
   *host_aux_clock = *agreed_aux_clock;
   Log("handoff clock sync transition {} agreed at frame {} host clocks {}/{}", transition, frame,
       *agreed_clock, *agreed_aux_clock);
+  s_rb_previous_handoff = s_rb_handoff;
   s_rb_handoff.reset();
   return true;
 }
@@ -6457,16 +6500,19 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
       // return), so arm it from the host thread, which pauses the CPU at a
       // safe point first.
       const u32 a0 = *addr;
-      Core::QueueHostJob([a0, mwlen](Core::System& sys) {
+      const bool reads = Env("NSR_RB_MEMWATCH_READ") == "1";
+      Core::QueueHostJob([a0, mwlen, reads](Core::System& sys) {
         TMemCheck mc;
         mc.start_address = a0;
         mc.end_address = a0 + mwlen - 1;
         mc.is_ranged = true;
         mc.is_break_on_write = true;
+        mc.is_break_on_read = reads;
         mc.log_on_hit = true;
         sys.GetPowerPC().GetMemChecks().Add(std::move(mc));
       });
-      Log("watching writes to {:08x}+{} from tick {}", *addr, mwlen, r.live);
+      Log("watching {} to {:08x}+{} from tick {}", reads ? "reads/writes" : "writes", *addr,
+          mwlen, r.live);
     }
   }
   if (r.watch && r.live >= r.watch_from && r.live <= r.watch_to)
@@ -8287,7 +8333,8 @@ void AcCountPoll(const AcMem& m)
 {
   const u32 per_tick = s_rb.config.ac_polls_per_tick;
   const u32 frame = s_rb.tick_running;
-  u32 polls = m.rd(AC_POLL_FRAME) == frame ? m.rd(AC_POLLS) : 0;
+  u32 polls = RollbackLogic::BeginAudioPollFrame(
+                  {m.rd(AC_POLL_FRAME), m.rd(AC_POLLS)}, frame).polls;
   ++polls;
   m.wr(AC_POLL_FRAME, frame);
   m.wr(AC_POLLS, polls);
@@ -8686,6 +8733,21 @@ void NormalizeTransitionClocks(const Core::CPUThreadGuard& guard, u32 host_clock
   };
   shift(0x802D55BC);
   ShiftSoftRtc(guard, delta);
+  // Loading presenters can make different numbers of audio queries while
+  // retaining identical model time. Their last-frame poll count is dead:
+  // AcCountPoll discards it on the next query anyway. Canonicalize that
+  // expired state before the entry digest (seed 3918529284: 43 vs 193 at
+  // 0x80416FC8, both tagged frame 7238, entering frame 7239). Do not clear
+  // progress if normalization occurs within the same frame, nor exclude
+  // this counter from in-match digests.
+  if (MMU::HostRead<u32>(guard, AC_BASE) == AC_MAGIC)
+  {
+    const auto polls = RollbackLogic::BeginAudioPollFrame(
+        {MMU::HostRead<u32>(guard, AC_POLL_FRAME), MMU::HostRead<u32>(guard, AC_POLLS)},
+        s_rb.tick_running);
+    MMU::HostWrite<u32>(guard, polls.frame, AC_POLL_FRAME);
+    MMU::HostWrite<u32>(guard, polls.polls, AC_POLLS);
+  }
   const u32 pre_retrace = MMU::HostRead<u32>(guard, 0x803EBE44);
   if (pre_retrace >= 0x80003100 && pre_retrace < 0x817FFFE0)
     shift(pre_retrace + 0x20);
@@ -9228,6 +9290,7 @@ void Shutdown(const Core::CPUThreadGuard& guard)
   s_rb_exchange.reset();
   s_rb_handoff.reset();
   s_rb_early_handoffs.clear();
+  s_rb_previous_handoff.reset();
   s_rb_retired_session.reset();
   s_rb_logged_desync.reset();
   s_rb_bad_session_logged = false;
