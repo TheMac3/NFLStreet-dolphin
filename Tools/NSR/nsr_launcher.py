@@ -110,6 +110,7 @@ ROLLBACK_ENV = {
 # the mixer room to absorb those stalls for ~48 ms more audio latency, which
 # is not felt in a football game. Offline practice keeps Dolphin's defaults.
 NETPLAY_AUDIO_BUFFER_MS = 128
+NETPLAY_INPUT_ARGS = ["-C", "Dolphin.Input.BackgroundInput=True"]
 NETPLAY_AUDIO_ARGS = ["-C", "Dolphin.Core.AudioFillGaps=True",
                       "-C", f"Dolphin.Core.AudioBufferSize={NETPLAY_AUDIO_BUFFER_MS}"]
 
@@ -230,6 +231,11 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
             env["NSR_DELAY"] = str(MENU_LOCKSTEP_DELAY)
             args += ["-C", "Dolphin.Core.FastDiscSpeed=True"]
         args += NETPLAY_AUDIO_ARGS
+        # A joiner's Dolphin is started by a network message, not a click, so
+        # Windows' foreground lock keeps its window behind the launcher; with
+        # Dolphin's default (BackgroundInput off) that player's controller is
+        # then ignored. Host-side input policy only: pads are still exchanged.
+        args += NETPLAY_INPUT_ARGS
         if start.rendezvous:
             # Room code: hole punching through the rendezvous server.
             env.update({"NSR_RENDEZVOUS": start.rendezvous, "NSR_ROOM": start.room,
