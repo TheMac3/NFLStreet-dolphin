@@ -796,7 +796,7 @@ class Launcher:
             return {"state": "off"}
         fallback = telemetry_config(self.folder)
         url = gamestats.games_url(self._env.get("NSR_GAMES_URL", "") or fallback["url"])
-        dirs = gamestats.stats_dirs(self.reborn_install(), self._env)
+        dirs = gamestats.stats_dirs(self.reborn_install(), self._env, own_user_dir=self.user_dir)
         try:
             res = self.uploader.run_once(dirs, self.state["name"], url=url, shared_key=fallback["key"],
                                          force=force)

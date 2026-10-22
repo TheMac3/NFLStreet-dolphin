@@ -39,9 +39,15 @@ RETRY_BACKOFF_S = (60, 300, 900, 3600)
 
 
 # --- where captures live ----------------------------------------------------------
-def stats_dirs(install: str | None, env=os.environ) -> list[str]:
-    """Existing folders that may hold captures (see module doc); nothing is created."""
-    found = [os.path.join(u, "GameStats") for u in controllers.candidate_user_dirs(install, env)]
+def stats_dirs(install: str | None, env=os.environ, own_user_dir: str | None = None) -> list[str]:
+    """Existing folders that may hold captures (see module doc); nothing is created.
+
+    `own_user_dir` is the launcher's own Dolphin user folder: our netplay fork
+    writes source "nsr-netplay" captures (with the Pickup `draft` block) to its
+    GameStats/, which no Reborn path covers. It is listed first.
+    """
+    found = [os.path.join(own_user_dir, "GameStats")] if own_user_dir else []
+    found += [os.path.join(u, "GameStats") for u in controllers.candidate_user_dirs(install, env)]
     for root in controllers.data_roots(install, env):
         found += [os.path.join(root, "stats", "queue"), os.path.join(root, "GameStats")]
     return [f for f in dict.fromkeys(os.path.normpath(f) for f in found) if os.path.isdir(f)]
