@@ -145,6 +145,7 @@ add_library(core
   NSR/NSRGameStats.h
   NSR/NSRGameStatsRead.h
   NSR/NSRGameStatsIdentity.h
+  NSR/NSRDraftLog.h
   NSR/NSRNetplay.h
   NSR/NSRRollbackNetplay.cpp
   NSR/NSRRollbackNetplay.h

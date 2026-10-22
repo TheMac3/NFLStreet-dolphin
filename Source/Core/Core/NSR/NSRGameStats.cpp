@@ -25,6 +25,7 @@
 #include "Common/Version.h"
 #include "Core/Core.h"
 #include "Core/HW/Memmap.h"
+#include "Core/NSR/NSRDraftLog.h"
 #include "Core/NSR/NSRGameStatsIdentity.h"
 #include "Core/NSR/NSRGameStatsRead.h"
 #include "Core/PowerPC/PowerPC.h"
@@ -64,6 +65,9 @@ struct State
   std::optional<ReadyResult> ready;
   bool mvp_screen_visible = false;
   std::optional<std::pair<std::uint32_t, std::uint32_t>> last_screen;
+  // Pickup draft history (NSRDraftLog.h). Kept across "play again" rematches,
+  // which reuse the drafted rosters; a new draft restarts it at zero picks.
+  DraftLog draft;
 };
 State s;
 
@@ -179,6 +183,89 @@ Object PlayerStats(const Row* offense, const Row* defense)
   return result;
 }
 
+// --- Pickup draft export (docs/nsr-game-stats.md "Pickup draft") ---------------
+// Attach the observed draft only when it provably produced this match's rosters:
+// every pick must resolve through the roster PLAY table to exactly one exported
+// player on the drafting side. A stale draft from an earlier Pickup session, a
+// different mode or an unresolvable table therefore omits the field instead of
+// mislabelling players. The pad is exported only when the final controller
+// registry confirms that pad belongs to the drafting team.
+std::optional<Object> DraftJson(const Memory& memory, const Array& players)
+{
+  const auto& picks = s.draft.Picks();
+  if (picks.empty())
+    return std::nullopt;
+  // Runtime tags keep the on-disc reversed spelling: YALP = PLAY, DIGP = PGID,
+  // ANFP/ANLP = PFNA/PLNA (first/last name), as in the match AGLP table.
+  static constexpr std::array<std::string_view, 1> pgid_field{"DIGP"};
+  std::optional<std::vector<Row>> roster;
+  for (const auto& database : DatabasesWithTable(memory, "YALP"))
+  {
+    auto rows = ReadTable(memory, database, "YALP", pgid_field);
+    if (!rows)
+      continue;
+    bool resolved = true;
+    for (const auto& pick : picks)
+      resolved = resolved && Find(*rows, "DIGP", pick.pgid) != nullptr;
+    if (resolved)
+    {
+      roster = std::move(rows);
+      break;
+    }
+  }
+  if (!roster)
+  {
+    if (s.trace)
+      std::fprintf(stderr, "[NSR stats] draft omitted: drafted PGIDs not in a roster table\n");
+    return std::nullopt;
+  }
+  Array result;
+  std::set<std::size_t> used;
+  for (const auto& pick : picks)
+  {
+    const auto* row = Find(*roster, "DIGP", pick.pgid);
+    const auto first = String(*row, "ANFP");
+    const auto last = String(*row, "ANLP");
+    if (!first || !last)
+      return std::nullopt;
+    const auto name = CP1252ToUTF8(*first + " " + *last);
+    std::optional<std::size_t> match;
+    for (std::size_t index = 0; index < players.size(); ++index)
+    {
+      if (players[index].get("name").get<std::string>() == name &&
+          players[index].get("side").get<double>() == pick.team)
+      {
+        if (match)
+          return std::nullopt;
+        match = index;
+      }
+    }
+    if (!match || !used.insert(*match).second)
+    {
+      if (s.trace)
+        std::fprintf(stderr, "[NSR stats] draft omitted: pick %u is not in this match\n", pick.pick);
+      return std::nullopt;
+    }
+    const bool pad_known = pick.pad >= 0 && static_cast<std::uint32_t>(pick.pad) < s.players &&
+                           s.pad_teams[static_cast<std::size_t>(pick.pad)] == pick.team;
+    result.emplace_back(Object{
+        {"pick", pick.pick ? Json(double(pick.pick)) : Json()},
+        {"round", Json(double(pick.round))},
+        {"side", Json(double(pick.team))},
+        {"team_index", Json(double(pick.team))},
+        {"drafter", Json(double(pick.drafter))},
+        {"controller", Json(double(pick.controller))},
+        {"pad", pad_known ? Json(double(pick.pad)) : Json()},
+        {"pgid", Json(double(pick.pgid))},
+        {"name", Json(name)},
+        {"digp", players[*match].get("digp")}});
+  }
+  return Object{{"schema", Json(std::string("nsr.draft.v1"))},
+                {"mode", Json(std::string("pickup"))},
+                {"complete", Json(s.draft.Complete())},
+                {"picks", Json(std::move(result))}};
+}
+
 // Snapshot stable match data only after a native results screen. Empty offense
 // or defense tables legitimately mean no events; unavailable tables fail closed.
 std::optional<Object> Capture(const Memory& memory, std::uint32_t frame)
@@ -282,12 +369,16 @@ std::optional<Object> Capture(const Memory& memory, std::uint32_t frame)
                   {"seed", Json(Environment("NSR_SEED"))},
                   {"match_frame", Json(double(s.match_frame))}, {"capture_frame", Json(double(frame))},
                   {"match_ordinal", Json(double(s.ordinal))}, {"pads", Json(std::move(pads))}};
-  return Object{{"schema", Json(std::string("nsr.game.v1"))},
+  auto draft = DraftJson(memory, player_json);
+  Object result{{"schema", Json(std::string("nsr.game.v1"))},
                 {"source", Json(std::string("nsr-netplay"))}, {"teams", Json(std::move(team_json))},
                 {"style", Json(std::move(style_json))}, {"team_totals", Json(std::move(total_json))},
                 {"sides_verified", Json(true)}, {"per_player_matched", Json(true)},
                 {"reborn_match", Json(std::move(reborn))}, {"players", Json(std::move(player_json))},
                 {"nsr_netplay", Json(std::move(metadata))}};
+  if (draft)
+    result.emplace("draft", Json(std::move(*draft)));
+  return result;
 }
 
 // UTC comes from the host's shared session timestamp plus the agreed frame
@@ -502,6 +593,22 @@ void ObserveFrame(const Core::CPUThreadGuard& guard, std::uint32_t frame, bool i
                  screen ? screen->first : 0xffff, screen ? screen->second : 0xffff,
                  in_game, confirmed);
     s.last_screen = screen;
+  }
+  // Pickup draft picks happen in pre-match menus: no rollback epoch exists
+  // there, so a live frame end is final. Reads only; see NSRDraftLog.h.
+  if (!in_game)
+  {
+    if (const auto view = ReadDraft(memory))
+    {
+      const auto before = s.draft.Picks().size();
+      s.draft.Observe(*view);
+      if (s.trace && s.draft.Picks().size() > before)
+      {
+        const auto& pick = s.draft.Picks().back();
+        std::fprintf(stderr, "[NSR stats] draft pick %u round %u team %u drafter %u controller %u pgid %u\n",
+                     pick.pick, pick.round, pick.team, pick.drafter, pick.controller, pick.pgid);
+      }
+    }
   }
   if (in_game)
   {
