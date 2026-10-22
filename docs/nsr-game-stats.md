@@ -102,6 +102,63 @@ history. Identical builds/settings/session environment produce identical JSON
 contents. NSR_ROOM/NSR_TELEMETRY_SESSION must describe the same session on all
 peers, as the launcher already arranges.
 
+## Pickup draft
+
+`players[].slot` and `players[].digp` do not describe the draft. DIGP is the
+match roster key: the native lineup orders each team's seven players by the
+role the game assigned after the draft (the quarterback, or whoever plays it,
+is first), not by pick. The slot is the player's index in the active-player
+array at Game Stats, i.e. their spot in the **final** play's formation. The
+draft pool that knows the pick order is freed before the match starts.
+
+`NSRDraftLog.h` therefore watches the native Pickup draft passively. At every
+live frame end outside a match it reads the draft table and pool (no rollback
+epoch exists in those menus, so each observation is final). A frame that adds
+exactly one picked record is one ordered pick. CPU picks are separate frames
+too. Gaps (several picks between observations), a shrinking pool or a new draft
+are handled by restarting or marking the draft incomplete; nothing is guessed.
+
+At Game Stats the observed draft is attached only if every pick resolves
+through the roster `PLAY` table (runtime tags keep the reversed on-disc
+spelling: `YALP`, `DIGP` = PGID -> `ANFP`/`ANLP`) to exactly one
+exported player on the drafting side, so a stale draft from an earlier
+Pickup session or another mode never mislabels players. Rematches ("play
+again") reuse the drafted rosters and keep the draft.
+
+```json
+"draft": {"schema": "nsr.draft.v1", "mode": "pickup", "complete": true,
+          "picks": [{"pick": 1, "round": 1, "side": 0, "team_index": 0,
+                     "drafter": 0, "controller": 1, "pad": 1, "pgid": 116,
+                     "name": "...", "digp": 1}]}
+```
+
+- `pick`: overall pick 1-14 in observed order (null only in an incomplete
+  draft). `round`: the drafting team's n-th pick (1-7), for every draft order.
+- `side`/`team_index`: native side, which is also the index into `teams`.
+- `drafter`: native drafter slot; `controller`: its raw controller handle
+  (`0xFF` = CPU drafter); `pad`: GameCube port index (0 = port 1) of the human
+  who picked, exported only when the final controller registry places that
+  pad on the drafting side, otherwise null.
+- `pgid`: native roster id; `name`/`digp`: the exported player line it maps to.
+
+Evidence (GN7E69 revision 0, r13 = `0x803F22A0`): `fn_8001AA8C(id, slot_out)`
+commits a pick. It finds the pool record through `fn_800172C4` (base
+`*0x803EBA0C`, count `*0x803EBA10`, stride 0x18, +0 id) and stores +4 = the
+active team's pick count before the increment, +0x14 = active team (table
++0x19), +0x15 = active drafter (table +0x15); unpicked records keep -1 at +4.
+Draft table `*0x803EBA08`: +4 drafter counts, +8 controller handles
+(`fn_80018F9C` fills them from `fn_8007B090(team)`), +0x0C/+0x0D team counts,
++0x14 drafter count (2), +0x16 capacity (7). `0x803EB2AC == 15` is Pickup.
+A scripted two-human Pickup draft on both peers recorded all fourteen picks in
+the same order and with the same ids as an independent RAM observer
+(NFLStreet `local/work/draftlog/`, private). Handles are treated as controller
+registry slots mapped through `0x802EACAC`; in every observed run the mapping
+was the identity, so the registry cross-check is what keeps `pad` honest.
+
+Revisit: drafts with more than one drafter per team (none observed), CPU
+auto-pick bursts within one frame (would export `complete: false`), and any
+other disc revision.
+
 ## Reverse-engineering evidence
 
 All addresses below are **GN7E69 revision 0**, obtained from the game DOL using
@@ -135,6 +192,7 @@ authority for displayed team counters, including credits/GameBreakers.
 ## Validation and deferred coverage
 
 Socket-free tests in `Tools/NSR/NSRRollbackNetplayTest.cpp` exercise synthetic
+Pickup draft tables (ordered picks, rejected torn/stale views, restarts and gaps),
 MSB-packed fields, signed values, deletion, cycles, bounds, overlapping columns,
 required schemas, duplicate event IDs, NSRI bounds/version/UTF-8/timestamps,
 and NSRG framing/endianness/version/ordinal validation.

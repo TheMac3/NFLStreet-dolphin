@@ -263,6 +263,7 @@
     <ClInclude Include="Core\NSR\NSRGameStats.h" />
     <ClInclude Include="Core\NSR\NSRGameStatsRead.h" />
     <ClInclude Include="Core\NSR\NSRGameStatsIdentity.h" />
+    <ClInclude Include="Core\NSR\NSRDraftLog.h" />
     <ClInclude Include="Core\NSR\NSRTelemetry.h" />
     <ClInclude Include="Core\NSR\NSRTelemetryLogic.h" />
     <ClInclude Include="Core\NSR\NSRRollbackNetplay.h" />

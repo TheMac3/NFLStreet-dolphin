@@ -21,6 +21,7 @@
 #include "Core/NSR/NSRRollbackLogic.h"
 #include "Core/NSR/NSRTelemetryLogic.h"
 #include "Core/NSR/NSRGameStatsRead.h"
+#include "Core/NSR/NSRDraftLog.h"
 #include "Core/NSR/NSRGameStatsIdentity.h"
 
 #include <algorithm>
@@ -1565,8 +1566,103 @@ static void TestBootAgreementWire()
   assert(!DecodeBoot(EncodeBoot({BootKind::Settings, 1, 3, {}})));
 }
 
+// Pickup draft recorder (NSRDraftLog.h): synthetic GN7E69 rev-0 draft table and
+// pool exercise the live reader, ordered pick capture, gaps and restarts.
+static void TestDraftLog()
+{
+  namespace GS = NSRGameStats;
+  std::vector<std::uint8_t> ram(0x500000), vmem(0x100);
+  const auto put = [&ram](std::uint32_t address, std::uint32_t value, unsigned size = 4) {
+    for (unsigned i = 0; i < size; ++i)
+      ram[(address & 0x1ffffff) + i] = static_cast<std::uint8_t>(value >> ((size - i - 1) * 8));
+  };
+  const std::uint32_t table = 0x80400000, counts = 0x80400100, handles = 0x80400110,
+                      pool = 0x80401000, pool_size = 20;
+  put(GS::DRAFT_MODE_ADDRESS, GS::DRAFT_MODE_PICKUP);
+  put(GS::DRAFT_TABLE_ADDRESS, table);
+  put(table + 4, counts);
+  put(table + 8, handles);
+  put(table + 0x14, 2, 1);
+  put(table + 0x16, 7, 1);
+  put(handles, 1, 1);  // drafter 0 uses registry slot 1, drafter 1 slot 0
+  put(handles + 1, 0, 1);
+  put(GS::PAD_MAP_ADDRESS, 0);
+  put(GS::PAD_MAP_ADDRESS + 4, 1);
+  put(GS::DRAFT_POOL_ADDRESS, pool);
+  put(GS::DRAFT_POOL_COUNT_ADDRESS, pool_size);
+  for (std::uint32_t i = 0; i < pool_size; ++i)
+  {
+    put(pool + i * 0x18, 100 + i);
+    put(pool + i * 0x18 + 4, 0xffffffff);
+  }
+  std::array<std::uint32_t, 2> team_count{}, drafter_count{};
+  // Commit like fn_8001AA8C: team pick index, team and drafter into the record.
+  const auto commit = [&](std::uint32_t index, std::uint32_t team, std::uint32_t drafter) {
+    put(pool + index * 0x18 + 4, team_count[team]);
+    put(pool + index * 0x18 + 0x14, team, 1);
+    put(pool + index * 0x18 + 0x15, drafter, 1);
+    ++team_count[team];
+    ++drafter_count[drafter];
+    put(table + 0x0c + team, team_count[team], 1);
+    put(counts + drafter, drafter_count[drafter], 1);
+  };
+  const GS::Memory memory{ram, vmem};
+  GS::DraftLog log;
+  auto view = GS::ReadDraft(memory);
+  assert(view && view->total == 0 && view->picked.empty());
+  log.Observe(*view);
+  // Snake from team 1: B, A, A, B, B, ... with drafter == team here.
+  const std::array<std::uint32_t, 14> teams{1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0};
+  for (std::uint32_t n = 0; n < 14; ++n)
+  {
+    commit(19 - n, teams[n], teams[n]);
+    view = GS::ReadDraft(memory);
+    assert(view && view->total == n + 1);
+    log.Observe(*view);
+    log.Observe(*view);  // an unchanged frame adds nothing
+  }
+  assert(log.Complete() && log.Picks().size() == 14);
+  for (std::uint32_t n = 0; n < 14; ++n)
+  {
+    const auto& pick = log.Picks()[n];
+    assert(pick.pick == n + 1 && pick.pgid == 119 - n && pick.team == teams[n]);
+    assert(pick.controller == (teams[n] == 0 ? 1 : 0));
+    assert(pick.pad == static_cast<std::int32_t>(teams[n] == 0 ? 1 : 0));
+  }
+  assert(log.Picks()[0].round == 1 && log.Picks()[2].round == 2 && log.Picks()[13].round == 7);
+
+  // Torn/stale states are rejected: other mode, count mismatch, duplicate ids.
+  put(GS::DRAFT_MODE_ADDRESS, 3);
+  assert(!GS::ReadDraft(memory));
+  put(GS::DRAFT_MODE_ADDRESS, GS::DRAFT_MODE_PICKUP);
+  put(table + 0x0c, 6, 1);
+  assert(!GS::ReadDraft(memory));
+  put(table + 0x0c, 7, 1);
+  put(pool + 6 * 0x18, 119);  // pool id 119 now twice
+  assert(!GS::ReadDraft(memory));
+  put(pool + 6 * 0x18, 106);
+  put(GS::DRAFT_TABLE_ADDRESS, 0x81fffff0);  // outside MEM1 view
+  assert(!GS::ReadDraft(memory));
+  put(GS::DRAFT_TABLE_ADDRESS, table);
+
+  // A new draft (zero picks) restarts; two picks in one frame are a gap.
+  for (std::uint32_t i = 0; i < pool_size; ++i)
+    put(pool + i * 0x18 + 4, 0xffffffff);
+  team_count = {};
+  drafter_count = {};
+  put(table + 0x0c, 0, 2);
+  put(counts, 0, 2);
+  log.Observe(*GS::ReadDraft(memory));
+  assert(log.Picks().empty() && !log.Complete());
+  commit(0, 0, 0);
+  commit(1, 1, 1);
+  log.Observe(*GS::ReadDraft(memory));
+  assert(log.Picks().size() == 2 && log.Picks()[0].pick == 0 && !log.Complete());
+}
+
 int main()
 {
+  TestDraftLog();
   TestBootAgreementWire();
   TestGameStatsMemoryReader();
   TestGameStatsIdentity();
