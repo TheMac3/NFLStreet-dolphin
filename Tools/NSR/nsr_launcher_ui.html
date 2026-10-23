@@ -80,6 +80,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
 .btn svg { width: 16px; height: 16px; fill: currentColor; }
 
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; }
+.card.advanced > summary { cursor: pointer; list-style: revert; }
 .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1.3px; font-weight: 600; }
 .muted { color: var(--muted); } .faint { color: var(--faint); }
 .mono { font-family: "Cascadia Mono", Consolas, "SF Mono", monospace; }
@@ -215,7 +216,6 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
         <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Checking…</span></div>
         <div class="tiles">
           <button class="tile" data-go="controllers"><div class="grow"><div class="label">Controllers</div><b id="tileCtl">…</b></div><span class="chev">›</span></button>
-          <button class="tile" data-go="settings"><div class="grow"><div class="label">Game copy</div><b id="tileGame">…</b></div><span class="chev">›</span></button>
           <button class="tile" id="tilePractice"><div class="grow"><div class="label">Practice</div><b>Play offline</b></div><span class="chev">›</span></button>
         </div>
       </div>
@@ -295,7 +295,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
 
     <!-- SETTINGS -->
     <section class="page" id="page-settings">
-      <div class="head"><div class="grow"><h1>Settings</h1><div class="sub">Your name, your game copy and what gets shared.</div></div></div>
+      <div class="head"><div class="grow"><h1>Settings</h1><div class="sub">Your name and what gets shared.</div></div></div>
       <div class="sgrid">
         <div class="card">
           <div class="label" style="margin-bottom:8px">Your name</div>
@@ -309,17 +309,18 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
             <div class="note" style="margin-top:4px">For the shared Stats page: final scores and box-score stats of the games you finish in NFL Street Reborn (the files its Dolphin saves after the Game Stats/MVP screens), your name and a random ID for this install. Never other files, folder paths, or your PC's name. Off: nothing is uploaded.</div>
             <div class="note" id="gameStatsText" style="margin-top:4px"></div></div></div>
         </div>
-        <div class="card">
-          <div class="label">Game copy</div>
+        <details class="card advanced">
+          <summary class="label">Advanced: game files</summary>
           <div class="fp mono" id="gameFp">–</div>
           <div class="info" id="gameText" style="margin-top:6px"></div>
           <div class="bar" id="gameBar" hidden><i id="gameProg"></i></div>
           <div class="row" style="margin-top:16px">
-            <button class="btn red" id="btnFind">Find Reborn automatically</button>
+            <button class="btn red" id="btnFind">Locate Reborn automatically</button>
             <button class="btn" id="btnBrowse">Browse for NSR.iso…</button>
           </div>
-          <div class="note">Everyone you play with must have the same fingerprint.</div>
-        </div>
+          <div class="note">Built automatically from your NFL Street Reborn install. Only needed if Reborn
+            wasn't found or moved. Everyone you play with must show the same fingerprint.</div>
+        </details>
       </div>
     </section>
 
@@ -328,14 +329,14 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
       <div class="head"><div class="grow"><h1>Help</h1><div class="sub">Getting a game going, and what to do when it doesn't.</div></div></div>
       <div class="sgrid help">
         <div class="card"><h3>Playing</h3><ol>
-          <li>Settings: type your name. The game copy is built once from your Reborn install (about a minute).</li>
+          <li>Settings: type your name. The first start gets the game ready from your Reborn install by itself (about a minute).</li>
           <li>Controllers: your Reborn controller setup is used automatically. Port 1 is you.</li>
           <li>Host: Create room, send friends the NSRB-XXXXX code, Start when everyone is listed.</li>
           <li>Join: type the code, click Join, wait for the host to start.</li>
         </ol></div>
         <div class="card"><h3>If something's wrong</h3><ol>
           <li>Windows Firewall asks about Dolphin the first time: tick Private (and Public) networks and allow it.</li>
-          <li>“Fingerprints differ”: everyone needs the same download and the same Reborn version.</li>
+          <li>“Game versions differ”: everyone needs the same NFLStreetRollback download and the same Reborn version.</li>
           <li>Controller not responding: plug it in before starting, then Controllers → Use my Reborn controller settings.</li>
           <li>Send Mason the nsr-p*.log files from this folder if he asks.</li>
         </ol><div class="path" id="folderPath"></div></div>
@@ -394,8 +395,12 @@ function renderPlayers(listId, slotsId, players, max) {
 function statusOf(s) {
   const g = s.game;
   if (g.state === "ready") return ["", "Ready to play"];
-  if (g.state === "building" || g.state === "checking") return ["busy", g.text || "Working…"];
-  if (g.state === "stale" || g.state === "missing") return ["warn", "Set up your game copy in Settings"];
+  // The game copy is built behind the scenes (launcher startup); players only
+  // ever see that the game is getting ready, never patching/fingerprint details.
+  if (g.state === "building" || g.state === "checking" || g.busy)
+    return ["busy", "Getting the game ready…" + (g.progress != null ? " " + Math.round(g.progress) + "%" : "") +
+            " (first start only, about a minute)"];
+  if (g.state === "stale" || g.state === "missing") return ["warn", "Couldn't find NFL Street Reborn. Settings → Advanced → Locate Reborn"];
   return ["err", g.text || "Game copy problem"];
 }
 
@@ -407,7 +412,6 @@ function render(s) {
   $("statusDot").className = "dot " + lvl; $("userDot").className = "dot " + lvl;
   setText("statusText", text);
   setText("tileCtl", c.port1 && c.port1.mapped ? c.port1.family : "Set up a controller");
-  setText("tileGame", g.fingerprint ? g.fingerprint : (g.state === "ready" ? "Ready" : "Not set up"));
   show("gameBadge", g.state !== "ready" && g.state !== "checking");
   show("ctlBadge", !(c.port1 && c.port1.mapped));
 
