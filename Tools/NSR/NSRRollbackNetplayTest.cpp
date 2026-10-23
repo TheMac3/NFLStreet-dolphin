@@ -1248,6 +1248,41 @@ static void TestPureRollbackHelpers()
   assert(RL::PageNeedsCopy(7, std::nullopt));
 }
 
+// Whole-session telemetry must preserve the legacy wire hash with collection
+// on or off, while a changed region must be visible in the diagnostic list.
+static void TestTelemetryLockstepEvidence()
+{
+  namespace TL = NSRTelemetry::Logic;
+  std::array<unsigned char, 96> ram{};
+  for (size_t i = 0; i < ram.size(); ++i)
+    ram[i] = static_cast<unsigned char>(i);
+  const auto skip = [](std::uint32_t off) { return off >= 32 && off < 48; };
+  std::uint64_t original = 1469598103934665603ULL;
+  for (std::uint32_t off = 0; off + 8 <= ram.size(); off += 8)
+  {
+    if (skip(off))
+      continue;
+    std::uint64_t word;
+    std::memcpy(&word, ram.data() + off, 8);
+    original = (original ^ word) * 1099511628211ULL;
+  }
+  std::vector<std::uint64_t> regions;
+  assert(TL::LockstepMem1Hash(ram.data(), 96, skip) == original);
+  assert(TL::LockstepMem1Hash(ram.data(), 96, skip, &regions, 32) == original);
+  const auto before = TL::FoldUnits(regions, 1);
+  assert(before.size() == 3);
+  ram[80] ^= 1;
+  assert(TL::LockstepMem1Hash(ram.data(), 96, skip, &regions, 32) != original);
+  const auto after = TL::FoldUnits(regions, 1);
+  assert(before[0] == after[0] && before[1] == after[1] && before[2] != after[2]);
+  const auto changed = regions;
+  ram[40] ^= 1;  // An excluded word changes neither wire nor region hashes.
+  TL::LockstepMem1Hash(ram.data(), 96, skip, &regions, 32);
+  assert(regions == changed);
+  assert(TL::FoldUnits({}, 16).empty());
+  assert(TL::FoldUnits(regions, 2).size() == 2);  // Keep the short final unit.
+}
+
 // Telemetry shutdown (final review L1): every pending batch shares ONE
 // deadline. Fake clock in milliseconds; the fake server takes `latency` per
 // request and, like the sender's curl progress-callback abort, gives up with
@@ -1755,6 +1790,7 @@ int main()
   TestMispredictedPlayers();
   TestStreetEventRankingPadding();
   TestWindowUndoLog();
+  TestTelemetryLockstepEvidence();
   TestTelemetryFinalFlushIsBounded();
   std::puts("NSR rollback exchange tests passed");
   return 0;
