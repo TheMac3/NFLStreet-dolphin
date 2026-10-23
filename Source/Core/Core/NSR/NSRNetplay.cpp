@@ -5498,9 +5498,11 @@ namespace
 {
 // Version of the exclusion rules; part of the config fingerprint, so peers
 // with different rules refuse to play instead of reporting false desyncs.
-constexpr u32 STATE_DIGEST_RANGES_VERSION = 9;  // 6: Crush padding; 7: stable small audio-heap metadata
+constexpr u32 STATE_DIGEST_RANGES_VERSION = 10;  // 6: Crush padding; 7: stable small audio-heap metadata
 // 8 (fix/lifecycle): the loading-screen icon (fn_80194060) position/velocity.
 // 9 (fix/lifecycle): heap-1's InGame allocation-name padding (four bytes).
+// 10 (lifecycle3): no new exclusion; the hash state is initialized (XXH3_INITSTATE)
+// and barrier clock normalization changed, so older builds must refuse to pair.
 
 // tools/rbdiff.py PER_MACHINE entries below its STATIC_END (.data/.bss words
 // that follow audio/disc time in every mode; physical [lo, hi)).  Keep the
