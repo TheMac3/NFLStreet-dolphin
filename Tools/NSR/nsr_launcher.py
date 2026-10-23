@@ -1331,9 +1331,9 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     mode_picker.grid(row=6, column=1, columnspan=3, sticky="w")
     mode_picker.bind("<<ComboboxSelected>>", lambda e: launcher.set_quickstart(
         next(k for k, v in lobby.QUICKSTARTS.items() if v == mode_var.get())))
-    ttk.Label(hp, text="Quickstart: host vs joiners; pick teams or draft when menus finish.\n"
+    ttk.Label(hp, text="Quick Play or Pickup Game goes straight to Select Controller (pick sides, first pick / ball first).\n"
                        "Practice uses this choice too. Manual keeps offline saves.",
-              style="Muted.TLabel").grid(row=7, column=0, columnspan=4, sticky="w", pady=6)
+              style="Muted.TLabel", wraplength=650).grid(row=7, column=0, columnspan=4, sticky="w", pady=6)
 
     # Join
     jp = pages["Join"]
