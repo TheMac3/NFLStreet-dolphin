@@ -13,14 +13,18 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <mutex>
 #include <optional>
+#include <string>
 
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
 #include <libusb.h>
 #elif GCADAPTER_USE_ANDROID_IMPLEMENTATION
 #include <jni.h>
 #endif
+
+#include <fmt/format.h>
 
 #include "Common/BitUtils.h"
 #include "Common/Config/Config.h"
@@ -34,6 +38,7 @@
 #include "Core/HW/SI/SI.h"
 #include "Core/HW/SI/SI_Device.h"
 #include "Core/HW/SystemTimers.h"
+#include "Core/NSR/NSRPadSource.h"
 #include "Core/System.h"
 #include "InputCommon/GCPadStatus.h"
 
@@ -444,6 +449,9 @@ static void RefreshConfig()
                            SerialInterface::SIDevices::SIDEVICE_WIIU_ADAPTER;
     s_config_rumble_enabled[i] = Config::Get(Config::GetInfoForAdapterRumble(i));
   }
+  // NSR: the adapter can feed a standard controller (NSRPadSource.h) while every
+  // SI port stays SIDEVICE_GC_CONTROLLER, so scan for it on that request too.
+  s_is_adapter_wanted |= NSRSourceChannel().has_value();
 }
 
 void Init()
@@ -1011,6 +1019,83 @@ bool IsDetected(const char** error_message)
 #elif GCADAPTER_USE_ANDROID_IMPLEMENTATION
   return s_detected;
 #endif
+}
+
+// --- NSR: adapter as the input of a standard controller ---------------------
+// See Core/NSR/NSRPadSource.h for why this exists instead of SIDEVICE_WIIU_ADAPTER.
+// Called on the CPU thread from Pad::GetStatus/Rumble, like Input()/Output().
+std::optional<int> NSRSourceChannel()
+{
+  static const std::optional<int> channel = [] {
+    const char* value = std::getenv("NSR_PAD_ADAPTER");
+    return NSRPadSource::ParseChannel(value ? value : "");
+  }();
+  return channel;
+}
+
+static std::optional<int> NSRPluggedChannel()
+{
+  const auto preferred = NSRSourceChannel();
+  if (!preferred || !IsDetected(nullptr))
+    return std::nullopt;
+  std::array<bool, NSRPadSource::CHANNELS> plugged{};
+  {
+    std::lock_guard lk(s_read_mutex);
+    for (int chan = 0; chan < NSRPadSource::CHANNELS; ++chan)
+      plugged[chan] = s_port_states[chan].controller_type != ControllerType::None;
+  }
+  return NSRPadSource::PickChannel(*preferred, plugged);
+}
+
+std::optional<GCPadStatus> NSRStandardControllerInput()
+{
+  if (!NSRSourceChannel() || !IsDetected(nullptr))
+    return std::nullopt;
+  static int s_logged_chan = -2;  // -1: adapter present, no pad plugged in
+  const auto chan = NSRPluggedChannel();
+  if (const int now = chan.value_or(-1); now != s_logged_chan)
+  {
+    s_logged_chan = now;
+    NOTICE_LOG_FMT(CONTROLLERINTERFACE, "NSR pad source: adapter port {} feeds port 1",
+                   now < 0 ? std::string("none (neutral pad)") : std::to_string(now + 1));
+  }
+  if (!chan)
+    return NSRPadSource::NeutralPad();
+  std::lock_guard lk(s_read_mutex);
+  const auto& state = s_port_states[*chan];
+  return NSRPadSource::StandardControllerPad(state.status, state.origin);
+}
+
+bool NSRRumble(bool on)
+{
+  // Same choice as NSRStandardControllerInput: no adapter, the mapping rumbles.
+  if (!NSRSourceChannel() || !IsDetected(nullptr))
+    return false;
+  if (const auto chan = NSRPluggedChannel())
+    Output(*chan, on ? 1 : 0);
+  return true;
+}
+
+std::string NSRSourceSummary()
+{
+  const auto preferred = NSRSourceChannel();
+  if (!preferred)
+    return "adapter source off";
+  const char* error = nullptr;
+  if (!IsDetected(&error))
+    return fmt::format("adapter source port {}: adapter not detected{}{}", *preferred + 1,
+                       error ? ", " : "", error ? error : "");
+  std::string plugged;
+  {
+    std::lock_guard lk(s_read_mutex);
+    for (int chan = 0; chan < NSRPadSource::CHANNELS; ++chan)
+    {
+      if (s_port_states[chan].controller_type != ControllerType::None)
+        plugged += (plugged.empty() ? "" : ",") + std::to_string(chan + 1);
+    }
+  }
+  return fmt::format("adapter source port {}: adapter detected, pads on [{}]", *preferred + 1,
+                     plugged);
 }
 
 }  // namespace GCAdapter

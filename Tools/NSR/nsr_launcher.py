@@ -28,7 +28,8 @@ NFLStreet-dolphin folder (next to Dolphin.exe) and does four things:
      unless the player unticks "Upload game results".
 
 Reborn is never modified: its files are only read, this Dolphin runs in
-portable mode with its own settings and saves (User/ next to it), and
+portable mode with its own settings (User/ next to it). Offline saves persist;
+netplay uses fresh disposable cards and canonical SRAM owned by the fork, and
 Reborn's HD textures are loaded read-only from its install.
 
 Structure: pure helpers (dolphin_command & co., unit-tested), then Launcher,
@@ -109,6 +110,7 @@ ROLLBACK_ENV = {
 # the mixer room to absorb those stalls for ~48 ms more audio latency, which
 # is not felt in a football game. Offline practice keeps Dolphin's defaults.
 NETPLAY_AUDIO_BUFFER_MS = 128
+NETPLAY_INPUT_ARGS = ["-C", "Dolphin.Input.BackgroundInput=True"]
 NETPLAY_AUDIO_ARGS = ["-C", "Dolphin.Core.AudioFillGaps=True",
                       "-C", f"Dolphin.Core.AudioBufferSize={NETPLAY_AUDIO_BUFFER_MS}"]
 
@@ -172,8 +174,10 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     """Command line and environment for the netplay Dolphin.
 
     start=None: practice offline. open_ui=True: just open Dolphin's window
-    (controller setup), no game. Every setting that affects determinism is
-    passed explicitly so all machines match regardless of local Dolphin config.
+    (controller setup), no game. The fork installs its canonical Netplay config
+    layer and disposable empty cards for NSR_NETPLAY, then agrees the effective
+    settings with every peer before guest boot. These flags also document the
+    launcher profile; local UI/game config cannot override the fork layer.
     """
     exe = os.environ.get("NSR_DOLPHIN") or os.path.join(folder, "Dolphin.exe")
     args = [exe, "-u", os.path.join(folder, "User")]
@@ -203,12 +207,21 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
              "-C", "Dolphin.Core.CustomRTCValue=0x30000000"]
     for port in range(4):  # controllers in ports 1..players; the rest empty
         args += ["-C", f"Dolphin.Core.SIDevice{port}={6 if port < players else 0}"]
+    # The player's controller (nsr_controllers.controller_kind), netplay and
+    # offline alike. Port 1 stays a standard controller (6) even for a USB
+    # GameCube adapter: NSR_PAD_ADAPTER makes the fork read the adapter as
+    # port 1's input instead of switching the port to the adapter device (12),
+    # which the game can tell apart (see controller_kind). NSR_PAD_KIND/DEVICE
+    # are only logged, so "my controller isn't recognized" is diagnosable.
+    env.update(controllers.controller_kind(os.path.join(folder, "User")).env())
     # Per-match RNG seed: agreed in the lobby for netplay; fresh per launch
     # offline, so Quick Play differs every time either way.
     env["NSR_SEED"] = str(start.seed if start else secrets.randbits(32))
     if start:
         env.update({
             "NSR_NETPLAY": "1",
+            # Compatibility is independent of the optional telemetry upload.
+            "NSR_FINGERPRINT": fingerprint or "",
             "NSR_PLAYER": str(start.player),
             "NSR_PLAYERS": str(start.players),
             "NSR_PORT": str(lobby.PORT),
@@ -225,6 +238,11 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
             env["NSR_DELAY"] = str(MENU_LOCKSTEP_DELAY)
             args += ["-C", "Dolphin.Core.FastDiscSpeed=True"]
         args += NETPLAY_AUDIO_ARGS
+        # A joiner's Dolphin is started by a network message, not a click, so
+        # Windows' foreground lock keeps its window behind the launcher; with
+        # Dolphin's default (BackgroundInput off) that player's controller is
+        # then ignored. Host-side input policy only: pads are still exchanged.
+        args += NETPLAY_INPUT_ARGS
         if start.rendezvous:
             # Room code: hole punching through the rendezvous server.
             env.update({"NSR_RENDEZVOUS": start.rendezvous, "NSR_ROOM": start.room,
@@ -609,12 +627,47 @@ class Launcher:
         args, env = dolphin_command(self.folder, start, self.reborn_install(), open_ui=open_ui,
                                     name=self.state["name"], fingerprint=self.state["game"]["fingerprint"],
                                     telemetry=self.state["telemetry"])
+        if not open_ui:  # same values the fork logs in nsr-p*.log ("local pad:")
+            adapter = env.get("NSR_PAD_ADAPTER")
+            log(self.folder, f"controller ({'netplay' if start else 'offline'}): "
+                f"kind={env.get('NSR_PAD_KIND', '?')} device={env.get('NSR_PAD_DEVICE') or '-'}"
+                + (f" usb-adapter-port={int(adapter) + 1}" if adapter else ""))
         try:
-            self._popen(args, env=env, cwd=self.folder)
+            # The fork truncates this per-player log at connection setup. Clear
+            # it here too so a failed launch cannot surface an older mismatch.
+            if start is not None and not open_ui:
+                with open(env["NSR_LOG"], "w", encoding="utf-8"):
+                    pass
+            process = self._popen(args, env=env, cwd=self.folder)
         except OSError as e:
             self.notify(f"Couldn't start Dolphin ({args[0]}): {e}", "error")
             return False
+        if start is not None and not open_ui and hasattr(process, "poll"):
+            self._spawn(lambda: self._watch_boot_sync(process, env["NSR_LOG"]))
         return True
+
+    def _watch_boot_sync(self, process, path: str) -> None:
+        """Surface the fork's named preboot failure without exposing wire internals.
+
+        Stop watching as soon as the boot barrier passes. Gameplay and Dolphin's
+        later exit status belong to its normal UI, not this connection watcher.
+        """
+        deadline = time.monotonic() + 130  # rendezvous + peer-connect windows
+        while time.monotonic() < deadline:
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    lines = f.read(65536).splitlines()
+            except OSError:
+                lines = []
+            for line in lines:
+                if "boot sync mismatch" in line or "boot sync failed BEFORE boot" in line:
+                    self.notify(line.removeprefix("[NSR] "), "error")
+                    return
+                if "boot sync PASSED" in line:
+                    return
+            if process.poll() is not None:
+                return
+            time.sleep(0.2)
 
     def play_offline(self) -> None:
         self.launch(None)
@@ -755,7 +808,7 @@ class Launcher:
             return {"state": "off"}
         fallback = telemetry_config(self.folder)
         url = gamestats.games_url(self._env.get("NSR_GAMES_URL", "") or fallback["url"])
-        dirs = gamestats.stats_dirs(self.reborn_install(), self._env)
+        dirs = gamestats.stats_dirs(self.reborn_install(), self._env, own_user_dir=self.user_dir)
         try:
             res = self.uploader.run_once(dirs, self.state["name"], url=url, shared_key=fallback["key"],
                                          force=force)

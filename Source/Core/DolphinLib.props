@@ -257,10 +257,14 @@
     <ClInclude Include="Core\GeckoCodeConfig.h" />
     <ClInclude Include="Core\HLE\HLE_Misc.h" />
     <ClInclude Include="Core\HLE\HLE_OS.h" />
+    <ClInclude Include="Core\NSR\NSRBootSync.h" />
+    <ClInclude Include="Core\NSR\NSRBootAgreement.h" />
     <ClInclude Include="Core\NSR\NSRNetplay.h" />
     <ClInclude Include="Core\NSR\NSRGameStats.h" />
     <ClInclude Include="Core\NSR\NSRGameStatsRead.h" />
     <ClInclude Include="Core\NSR\NSRGameStatsIdentity.h" />
+    <ClInclude Include="Core\NSR\NSRDraftLog.h" />
+    <ClInclude Include="Core\NSR\NSRPadSource.h" />
     <ClInclude Include="Core\NSR\NSRTelemetry.h" />
     <ClInclude Include="Core\NSR\NSRTelemetryLogic.h" />
     <ClInclude Include="Core\NSR\NSRRollbackNetplay.h" />
@@ -951,6 +955,7 @@
     <ClCompile Include="Core\GeckoCodeConfig.cpp" />
     <ClCompile Include="Core\HLE\HLE_Misc.cpp" />
     <ClCompile Include="Core\HLE\HLE_OS.cpp" />
+    <ClCompile Include="Core\NSR\NSRBootSync.cpp" />
     <ClCompile Include="Core\NSR\NSRNetplay.cpp" />
     <ClCompile Include="Core\NSR\NSRGameStats.cpp" />
     <ClCompile Include="Core\NSR\NSRTelemetry.cpp" />

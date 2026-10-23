@@ -17,9 +17,12 @@
 //     -o nsr-rollback-netplay-test && ./nsr-rollback-netplay-test
 
 #include "Core/NSR/NSRRollbackNetplay.h"
+#include "Core/NSR/NSRBootAgreement.h"
 #include "Core/NSR/NSRRollbackLogic.h"
 #include "Core/NSR/NSRTelemetryLogic.h"
 #include "Core/NSR/NSRGameStatsRead.h"
+#include "Core/NSR/NSRDraftLog.h"
+#include "Core/NSR/NSRPadSource.h"
 #include "Core/NSR/NSRGameStatsIdentity.h"
 
 #include <algorithm>
@@ -1605,8 +1608,203 @@ static void TestGameStatsIdentity()
   assert(GS::EncodeCaptureAnchor({2, 0, 7}).empty());
 }
 
+// The boot protocol must reject malformed messages and report actual card or
+// emulation-setting differences, including missing fields from older builds.
+static void TestBootAgreementWire()
+{
+  using namespace NSRBootSync;
+  const BootMessage local{BootKind::Settings, 0, 3,
+      {{"Dolphin.Core.CPUThread", "False"}, {"MemoryCard.A.contents", "empty-v1"}}};
+  const auto bytes = EncodeBoot(local);
+  const auto decoded = DecodeBoot(bytes);
+  assert(decoded && decoded->fields == local.fields);
+  for (std::size_t n = 0; n < 8; ++n)
+    assert(!DecodeBoot(std::span(bytes).first(n)));
+  auto bad = bytes;
+  bad[4] = 2;
+  assert(!DecodeBoot(bad));
+  bad = bytes;
+  bad[6] = 3;
+  assert(!DecodeBoot(bad));
+  bad = bytes;
+  bad.pop_back();
+  assert(!DecodeBoot(bad));
+  bad = bytes;
+  bad.insert(bad.end(), bytes.begin() + 8, bytes.end());
+  assert(!DecodeBoot(bad));
+  bad.assign(MAX_BOOT_PACKET + 1, 0);
+  assert(!DecodeBoot(bad));
+  auto other = local.fields;
+  other["MemoryCard.A.contents"] = "different-save";
+  assert(BootDifferences(local.fields, other) ==
+         std::vector<std::string>{"MemoryCard.A.contents"});
+  other = local.fields;
+  other.erase("Dolphin.Core.CPUThread");
+  assert(BootDifferences(local.fields, other) ==
+         std::vector<std::string>{"Dolphin.Core.CPUThread"});
+  assert(DecodeBoot(EncodeBoot({BootKind::Ready, 1, 3, {}})));
+  assert(DecodeBoot(EncodeBoot({BootKind::Go, 0, 3, {}})));
+  assert(!DecodeBoot(EncodeBoot({BootKind::Ready, 1, 3, local.fields})));
+  assert(!DecodeBoot(EncodeBoot({BootKind::Settings, 1, 3, {}})));
+}
+
+// Pickup draft recorder (NSRDraftLog.h): synthetic GN7E69 rev-0 draft table and
+// pool exercise the live reader, ordered pick capture, gaps and restarts.
+static void TestDraftLog()
+{
+  namespace GS = NSRGameStats;
+  std::vector<std::uint8_t> ram(0x500000), vmem(0x100);
+  const auto put = [&ram](std::uint32_t address, std::uint32_t value, unsigned size = 4) {
+    for (unsigned i = 0; i < size; ++i)
+      ram[(address & 0x1ffffff) + i] = static_cast<std::uint8_t>(value >> ((size - i - 1) * 8));
+  };
+  const std::uint32_t table = 0x80400000, counts = 0x80400100, handles = 0x80400110,
+                      pool = 0x80401000, pool_size = 20;
+  put(GS::DRAFT_MODE_ADDRESS, GS::DRAFT_MODE_PICKUP);
+  put(GS::DRAFT_TABLE_ADDRESS, table);
+  put(table + 4, counts);
+  put(table + 8, handles);
+  put(table + 0x14, 2, 1);
+  put(table + 0x16, 7, 1);
+  put(handles, 1, 1);  // drafter 0 uses registry slot 1, drafter 1 slot 0
+  put(handles + 1, 0, 1);
+  put(GS::PAD_MAP_ADDRESS, 0);
+  put(GS::PAD_MAP_ADDRESS + 4, 1);
+  put(GS::DRAFT_POOL_ADDRESS, pool);
+  put(GS::DRAFT_POOL_COUNT_ADDRESS, pool_size);
+  for (std::uint32_t i = 0; i < pool_size; ++i)
+  {
+    put(pool + i * 0x18, 100 + i);
+    put(pool + i * 0x18 + 4, 0xffffffff);
+  }
+  std::array<std::uint32_t, 2> team_count{}, drafter_count{};
+  // Commit like fn_8001AA8C: team pick index, team and drafter into the record.
+  const auto commit = [&](std::uint32_t index, std::uint32_t team, std::uint32_t drafter) {
+    put(pool + index * 0x18 + 4, team_count[team]);
+    put(pool + index * 0x18 + 0x14, team, 1);
+    put(pool + index * 0x18 + 0x15, drafter, 1);
+    ++team_count[team];
+    ++drafter_count[drafter];
+    put(table + 0x0c + team, team_count[team], 1);
+    put(counts + drafter, drafter_count[drafter], 1);
+  };
+  const GS::Memory memory{ram, vmem};
+  GS::DraftLog log;
+  auto view = GS::ReadDraft(memory);
+  assert(view && view->total == 0 && view->picked.empty());
+  log.Observe(*view);
+  // Snake from team 1: B, A, A, B, B, ... with drafter == team here.
+  const std::array<std::uint32_t, 14> teams{1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0};
+  for (std::uint32_t n = 0; n < 14; ++n)
+  {
+    commit(19 - n, teams[n], teams[n]);
+    view = GS::ReadDraft(memory);
+    assert(view && view->total == n + 1);
+    log.Observe(*view);
+    log.Observe(*view);  // an unchanged frame adds nothing
+  }
+  assert(log.Complete() && log.Picks().size() == 14);
+  for (std::uint32_t n = 0; n < 14; ++n)
+  {
+    const auto& pick = log.Picks()[n];
+    assert(pick.pick == n + 1 && pick.pgid == 119 - n && pick.team == teams[n]);
+    assert(pick.controller == (teams[n] == 0 ? 1 : 0));
+    assert(pick.pad == static_cast<std::int32_t>(teams[n] == 0 ? 1 : 0));
+  }
+  assert(log.Picks()[0].round == 1 && log.Picks()[2].round == 2 && log.Picks()[13].round == 7);
+
+  // Torn/stale states are rejected: other mode, count mismatch, duplicate ids.
+  put(GS::DRAFT_MODE_ADDRESS, 3);
+  assert(!GS::ReadDraft(memory));
+  put(GS::DRAFT_MODE_ADDRESS, GS::DRAFT_MODE_PICKUP);
+  put(table + 0x0c, 6, 1);
+  assert(!GS::ReadDraft(memory));
+  put(table + 0x0c, 7, 1);
+  put(pool + 6 * 0x18, 119);  // pool id 119 now twice
+  assert(!GS::ReadDraft(memory));
+  put(pool + 6 * 0x18, 106);
+  put(GS::DRAFT_TABLE_ADDRESS, 0x81fffff0);  // outside MEM1 view
+  assert(!GS::ReadDraft(memory));
+  put(GS::DRAFT_TABLE_ADDRESS, table);
+
+  // A new draft (zero picks) restarts; two picks in one frame are a gap.
+  for (std::uint32_t i = 0; i < pool_size; ++i)
+    put(pool + i * 0x18 + 4, 0xffffffff);
+  team_count = {};
+  drafter_count = {};
+  put(table + 0x0c, 0, 2);
+  put(counts, 0, 2);
+  log.Observe(*GS::ReadDraft(memory));
+  assert(log.Picks().empty() && !log.Complete());
+  commit(0, 0, 0);
+  commit(1, 1, 1);
+  log.Observe(*GS::ReadDraft(memory));
+  assert(log.Picks().size() == 2 && log.Picks()[0].pick == 0 && !log.Complete());
+}
+
+// USB GameCube adapter as a standard controller's input (NSRPadSource.h): the
+// guest-visible origin/error bits never pass, rest positions recentre to the
+// standard controller's fixed origin, and the port is always connected.
+static void TestPadSourceAdapter()
+{
+  using namespace NSRPadSource;
+  // Netplay ports never read as unplugged; a connected pad passes untouched;
+  // offline keeps the unplugged pad (the game re-probes when it appears).
+  GCPadStatus unplugged{};  // what GCPad::GetInput returns without its device
+  unplugged.isConnected = false;
+  const GCPadStatus held = NetplayPad(unplugged, true);
+  assert(held.isConnected && held.button == 0 && held.stickX == 0x80 && held.stickY == 0x80 &&
+         held.substickX == 0x80 && held.substickY == 0x80 && held.triggerLeft == 0);
+  assert(!NetplayPad(unplugged, false).isConnected);
+  GCPadStatus live = NeutralPad();
+  live.button = PAD_BUTTON_START;
+  live.stickX = 0xf0;
+  const GCPadStatus passed = NetplayPad(live, true);
+  assert(passed.button == PAD_BUTTON_START && passed.stickX == 0xf0 && passed.isConnected);
+  assert(ParseChannel("0") == 0 && ParseChannel("3") == 3);
+  assert(!ParseChannel("") && !ParseChannel("4") && !ParseChannel("off") && !ParseChannel("01"));
+  assert(PickChannel(2, {false, true, true, false}) == 2);
+  assert(PickChannel(0, {false, false, false, true}) == 3);
+  assert(!PickChannel(0, {false, false, false, false}));
+
+  GCPadStatus origin{};
+  origin.button = PAD_GET_ORIGIN;
+  origin.stickX = 0x7a;
+  origin.stickY = 0x84;
+  origin.substickX = 0x80;
+  origin.substickY = 0x7e;
+  origin.triggerLeft = 0x20;
+  origin.triggerRight = 0x18;
+  GCPadStatus raw = origin;  // first report after plugging in: at rest + GET_ORIGIN
+  raw.button = PAD_GET_ORIGIN | PAD_ERR_STATUS | PAD_USE_ORIGIN | PAD_BUTTON_A | PAD_TRIGGER_Z;
+  const GCPadStatus rest = StandardControllerPad(raw, origin);
+  assert(rest.button == (PAD_BUTTON_A | PAD_TRIGGER_Z));
+  assert(rest.stickX == 0x80 && rest.stickY == 0x80 && rest.substickX == 0x80 &&
+         rest.substickY == 0x80);
+  assert(rest.triggerLeft == 0 && rest.triggerRight == 0);
+  assert(rest.analogA == 0xff && rest.analogB == 0 && rest.isConnected);
+
+  raw.button = PAD_BUTTON_B;
+  raw.stickX = 0xff;   // full right from a left-of-centre rest: clamps, never wraps
+  raw.stickY = 0x00;
+  raw.triggerLeft = 0x10;  // below rest
+  raw.triggerRight = 0xf0;
+  raw.isConnected = false;
+  const GCPadStatus moved = StandardControllerPad(raw, origin);
+  assert(moved.stickX == 0xff && moved.stickY == 0x00);
+  assert(moved.triggerLeft == 0 && moved.triggerRight == 0xd8);
+  assert(moved.analogA == 0 && moved.analogB == 0xff && moved.isConnected);
+
+  const GCPadStatus neutral = NeutralPad();
+  assert(neutral.button == 0 && neutral.stickX == 0x80 && neutral.substickY == 0x80 &&
+         neutral.triggerLeft == 0 && neutral.isConnected);
+}
+
 int main()
 {
+  TestPadSourceAdapter();
+  TestDraftLog();
+  TestBootAgreementWire();
   TestGameStatsMemoryReader();
   TestGameStatsIdentity();
   TestHandoffAgreement();
