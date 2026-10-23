@@ -4,6 +4,7 @@
 #include "VideoCommon/EFBInterface.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <memory>
 
@@ -23,6 +24,15 @@
 #include "VideoCommon/VideoConfig.h"
 
 std::unique_ptr<EFBInterfaceBase> g_efb_interface;
+
+// NSR netplay: see EFBInterfaceBase::SetCanonicalPeeks. Written on the
+// emulation start/stop path, read on the CPU thread.
+static std::atomic<bool> s_nsr_canonical_peeks{false};
+
+void EFBInterfaceBase::SetCanonicalPeeks(bool enabled)
+{
+  s_nsr_canonical_peeks.store(enabled, std::memory_order_relaxed);
+}
 
 EFBInterfaceBase::~EFBInterfaceBase() = default;
 
@@ -67,7 +77,9 @@ u32 EFBInterfaceBase::PeekColor(u16 x, u16 y)
   if (ShouldSkipAccess(x, y))
     return 0;
 
-  u32 color = PeekColorInternal(x, y);
+  // NSR netplay: the Null backend's answer, then the same alpha handling.
+  u32 color =
+      s_nsr_canonical_peeks.load(std::memory_order_relaxed) ? 0 : PeekColorInternal(x, y);
 
   // check what to do with the alpha channel (GX_PokeAlphaRead)
   PixelEngine::AlphaReadMode alpha_read_mode =
@@ -124,7 +136,7 @@ u32 HardwareEFBInterface::PeekDepthInternal(u16 x, u16 y)
 
 u32 EFBInterfaceBase::PeekDepth(u16 x, u16 y)
 {
-  if (ShouldSkipAccess(x, y))
+  if (ShouldSkipAccess(x, y) || s_nsr_canonical_peeks.load(std::memory_order_relaxed))
     return 0;
 
   return PeekDepthInternal(x, y);
