@@ -43,3 +43,11 @@ CMakeLists.txt.user
 /.vscode/
 # Ignore flatpak-builder's cache dir
 .flatpak-builder
+
+# Per-player Reborn imports and game metadata must never enter this public fork.
+Assets/
+User/
+*.iso
+nsr-image.json
+nsr-reborn.txt
+nsr-launcher.json
