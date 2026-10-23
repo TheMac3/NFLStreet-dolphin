@@ -1768,8 +1768,8 @@ static void TestQuickstartNavigation()
   {
     Navigator nav(mode);
     std::uint32_t frame = 1;
-    const std::array<std::uint32_t, 10> screens{3, 0x10003, 0x10003, 0x10003,
-        1, 1, 1, 0x11, 0x11, mode == Mode::Pickup ? 0xfU : 7U};
+    const std::array<std::uint32_t, 8> screens{3, 0x10003, 0x10003, 0x10003,
+        1, 1, 1, 0x11};
     for (std::uint32_t step = 0; step < screens.size(); ++step)
     {
       for (int i = 0; i < 75; ++i)
@@ -1779,25 +1779,43 @@ static void TestQuickstartNavigation()
         assert(nav.StepIndex() == step);
         ++frame;
       }
+      // A transient controller screen must not finish the macro. Stability
+      // restarts after an unrelated screen; every waiting pad remains neutral.
+      if (step == 7)
+      {
+        for (std::uint32_t elapsed = 0; elapsed < 60; ++elapsed)
+        {
+          const auto result = nav.Poll(frame++, screens[step]);
+          assert(nav.Active() && result && (*result == std::array<std::uint16_t, 4>{}));
+        }
+        nav.Poll(frame++, 0xffffffff);
+        assert(nav.Active());
+      }
       const auto begin = frame;
-      for (std::uint32_t elapsed = 0; elapsed <= (step == 9 ? 60U : 120U); ++elapsed)
+      for (std::uint32_t elapsed = 0; elapsed <= (step == 7 ? 60U : 120U); ++elapsed)
       {
         // A different next screen acknowledges START without reissuing it.
         const auto screen = step == 0 && elapsed >= 70 ? 0x10003U : screens[step];
         const auto result = nav.Poll(frame, screen);
         assert(nav.Poll(frame, screen) == result);
         assert(result);
-        if (elapsed < 60 || elapsed >= 66)
+        if (step == 7)
+          assert(nav.Active() == (elapsed < 60));
+        if (step == 7 || elapsed < 60 || elapsed >= 66)
           assert((*result == std::array<std::uint16_t, 4>{}));
-        else if (step == 7)
-          assert((*result == std::array<std::uint16_t, 4>{0, 2, 2, 2}));
-        else if (step == 8)
-          assert((*result == std::array<std::uint16_t, 4>{0x100, 0x100, 0x100, 0x100}));
+        else
+        {
+          const std::array<std::uint16_t, 7> presses{0x1000, 4, 4, 0x100,
+              static_cast<std::uint16_t>(mode == Mode::Pickup ? 0 : 0x200),
+              static_cast<std::uint16_t>(mode == Mode::Pickup ? 8 : 1), 0x100};
+          assert((*result == std::array<std::uint16_t, 4>{presses[step], 0, 0, 0}));
+        }
         ++frame;
       }
       assert(frame > begin);
     }
     assert(!nav.Active() && !nav.Failed());
+    assert(!nav.Poll(frame, 0x11));  // humans own the still-visible controller screen
     assert(!nav.Poll(frame + 100, 3));
   }
   Navigator slow(Mode::QuickPlay);

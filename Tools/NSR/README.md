@@ -3,6 +3,8 @@
 Copied from the NFLStreet repo (`tools/`, commit 3c549d4) by
 
 Copied from the NFLStreet repo (`tools/`, commit 63af08a) by
+
+Copied from the NFLStreet repo (`tools/`, commit c29f43c) by
 `scripts/sync-launcher-to-fork.sh`. Don't edit here; edit in NFLStreet and
 re-sync. The Windows CI workflow (`.github/workflows/nsr-windows.yml`)
 builds `nsr_launcher.py` (with `nsr_controllers.py`, `nsr_gamestats.py`, `nsr_textures.py`, the content-update
