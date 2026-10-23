@@ -6,6 +6,7 @@
 // strict graphics settings. Revisit this list whenever upstream adds a synced
 // setting. Host audio, rendering backend, textures and controller mapping stay local.
 #include "Core/NSR/NSRBootSync.h"
+#include "Core/NSR/NSRQuickstart.h"
 
 #include <algorithm>
 #include <array>
@@ -226,7 +227,9 @@ public:
 bool Enabled()
 {
   const char* value = std::getenv("NSR_NETPLAY");
-  return value && *value;
+  const char* quickstart = std::getenv("NSR_QUICKSTART");
+  return (value && *value) ||
+         (quickstart && NSRQuickstart::Parse(quickstart) != NSRQuickstart::Mode::Manual);
 }
 
 // Allocate empty cards before connecting. No save or SRAM from User/ is read.

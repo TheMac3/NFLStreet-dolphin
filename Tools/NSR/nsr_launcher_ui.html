@@ -243,6 +243,13 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
             <div class="mode blue" id="modeIp"><h2>Host by IP</h2><p>Advanced: friends type your address. Needs port 51515 forwarded for internet play.</p></div>
             <div class="mode green" id="modePractice"><h2>Practice</h2><p>Same setup on this PC only, no network.</p></div>
           </div>
+          <div style="margin-top:18px">
+            <label class="label" for="gameMode">Game mode</label>
+            <select id="gameMode" style="margin:8px 0;padding:10px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:8px">
+              <option value="quick-play">Quick Play</option><option value="pickup">Pickup Game</option><option value="manual">Manual (menus)</option>
+            </select>
+            <div class="note">Quickstart puts the host against the joiners, then you pick teams or draft. Practice uses this choice too. Manual keeps offline saves.</div>
+          </div>
           <div class="row" style="margin-top:18px">
             <div><div class="label" style="margin-bottom:6px">Input delay (frames, for everyone)</div><div class="seg" id="delaySeg"></div></div>
             <div class="grow"></div>
@@ -266,7 +273,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
             <button class="btn red big" id="btnJoin">Join room</button>
             <button class="btn" id="btnLeave" disabled>Leave</button>
           </div>
-          <div class="info" id="joinInfo"></div>
+          <div class="info" id="joinInfo"></div><div class="note" id="joinGameMode"></div>
         </div>
         <div class="card players"><div class="ph"><h3>Players</h3><span class="faint" id="joinSlots">–</span></div><ol id="joinPlayers"></ol></div>
       </div>
@@ -319,6 +326,17 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
             <button class="btn" id="btnBrowse">Browse for NSR.iso…</button>
           </div>
           <div class="note">Everyone you play with must have the same fingerprint.</div>
+        </div>
+        <div class="card">
+          <div class="label">Game updates</div>
+          <div class="info" id="contentText" style="margin-top:6px">–</div>
+          <div class="note" id="contentLog" style="margin-top:4px;white-space:pre-line"></div>
+          <div class="row" style="margin-top:16px">
+            <button class="btn" id="btnUpdates">Check for updates</button>
+          </div>
+          <div style="height:14px"></div>
+          <div class="toggle" id="autoUpdates"><div class="switch"></div><div><b>Install game updates automatically</b>
+            <div class="note" style="margin-top:4px">Roster and rating updates from Mason. Only his edit lists are downloaded (signed, checked); your game copy is rebuilt from your own Reborn install, and the old copy stays until the new one checks out. Off: updates are only shown here.</div></div></div>
         </div>
       </div>
     </section>
@@ -395,6 +413,8 @@ function statusOf(s) {
   const g = s.game;
   if (g.state === "ready") return ["", "Ready to play"];
   if (g.state === "building" || g.state === "checking") return ["busy", g.text || "Working…"];
+  const ct = s.content || {};
+  if (g.state === "ready" && ct.state === "available") return ["warn", "Game update available (Settings)"];
   if (g.state === "stale" || g.state === "missing") return ["warn", "Set up your game copy in Settings"];
   return ["err", g.text || "Game copy problem"];
 }
@@ -411,6 +431,8 @@ function render(s) {
   show("gameBadge", g.state !== "ready" && g.state !== "checking");
   show("ctlBadge", !(c.port1 && c.port1.mapped));
 
+  setValue("gameMode", s.quickstart || "manual");
+  $("gameMode").disabled = h.state !== "idle";
   // host
   $("roomsDot").className = "dot " + (s.rooms ? "" : "warn");
   setText("roomsText", s.rooms ? "Room codes on" : "Room codes off in this download");
@@ -437,6 +459,7 @@ function render(s) {
   setValue("joinCode", S.joinTyped ? $("joinCode").value : (s.last_host || ""));
   const waiting = j.state === "waiting";
   enable("btnJoin", !waiting); enable("btnLeave", waiting); $("joinCode").disabled = waiting;
+  setText("joinGameMode", "Game mode: " + ((s.game_modes || {})[j.quickstart] || "Manual (menus)"));
   setText("btnJoin", waiting ? "Waiting for host…" : "Join room");
   setText("joinInfo", j.info || "");
   renderPlayers("joinPlayers", "joinSlots", j.players, 4);
@@ -471,6 +494,12 @@ function render(s) {
   setText("gameText", (g.text || "") + (g.note ? "\n" + g.note : ""));
   show("gameBar", g.progress != null); $("gameProg").style.width = (g.progress || 0) + "%";
   enable("btnFind", !g.busy); enable("btnBrowse", !g.busy);
+  const ct = s.content || {};
+  setText("contentText", ct.text || (ct.version ? "Game content v" + ct.version : "No game updates installed."));
+  setText("contentLog", ct.latest && ct.changelog && ct.state !== "off" ? "v" + ct.latest + ": " + ct.changelog : "");
+  $("autoUpdates").classList.toggle("on", !!ct.auto);
+  enable("btnUpdates", !ct.busy && !g.busy);
+  setText("btnUpdates", ct.busy ? "Checking…" : "Check for updates");
   setText("folderPath", "This folder: " + (s.folder || ""));
 
   if (s.notice && s.notice.id !== S.noticeId) { S.noticeId = s.notice.id; toast(s.notice.text, s.notice.kind); }
@@ -488,6 +517,7 @@ async function poll() {
 function wire() {
   document.querySelectorAll(".nav button").forEach(b => b.onclick = () => go(b.dataset.page));
   document.querySelectorAll("[data-go]").forEach(b => b.onclick = () => go(b.dataset.go));
+  $("gameMode").onchange = () => call("set_quickstart", $("gameMode").value);
   $("playHost").onclick = () => go("host");
   $("playJoin").onclick = () => { go("join"); $("joinCode").focus(); };
   $("tilePractice").onclick = $("modePractice").onclick = () => call("play_offline");
@@ -506,6 +536,8 @@ function wire() {
   $("telemetry").onclick = () => call("set_telemetry", !(S.snap && S.snap.telemetry));
   $("gameStats").onclick = () => call("set_game_stats", !(S.snap && S.snap.game_stats && S.snap.game_stats.enabled));
   $("btnFind").onclick = () => call("find_game");
+  $("btnUpdates").onclick = () => call("check_updates");
+  $("autoUpdates").onclick = () => call("set_auto_updates", !(S.snap && S.snap.content && S.snap.content.auto));
   $("btnBrowse").onclick = () => call("browse_iso");
   document.addEventListener("contextmenu", (e) => { if (!(e.target instanceof HTMLInputElement)) e.preventDefault(); });
 }
@@ -526,11 +558,14 @@ async function start() {
 function demoApi(page) {
   const names = { host: ["Mason", "Tuna", "wolfspeedy"], join: ["Marcus", "Mason"] };
   const base = { rev: 1, name: "Mason", telemetry: true, delay: 1,
+    quickstart: "pickup", game_modes: { "quick-play": "Quick Play", pickup: "Pickup Game", manual: "Manual (menus)" },
     game_stats: { enabled: true, state: "ok", text: "14 game result files sent.", sent: 14, pending: 0 }, max_delay: 4, last_host: "", rooms: true,
     folder: "C:\\Users\\mason\\Desktop\\NFLStreetRollback",
-    game: { state: "ready", text: "Ready for rollback netplay.", fingerprint: "7F3A-29C4", note: "", progress: null, busy: false },
+    game: { state: "ready", text: "Ready for rollback netplay.", fingerprint: "7F3A-29C4", note: "", progress: null, busy: false, content: { version: 3, serial: 4 } },
+    content: { state: "current", text: "Up to date: content v3 — Week 6 speed tweaks", version: 3, latest: 3,
+      changelog: "Week 6 speed tweaks", auto: true, busy: false },
     host: { state: "idle", mode: "", code: "", info: "", players: [], can_start: false },
-    join: { state: "idle", info: "", players: [] },
+    join: { state: "idle", info: "", players: [], quickstart: "pickup" },
     controllers: { state: "synced", message: "Using your Reborn controller settings.",
       source: "C:\\Games\\NFL Street Reborn\\runtime\\User\\Config\\GCPadNew.ini",
       port1: { mapped: true, family: "PlayStation 4 controller", device: "DInput/0/Wireless Controller",

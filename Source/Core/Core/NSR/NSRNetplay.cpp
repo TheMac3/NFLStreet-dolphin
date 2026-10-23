@@ -12,6 +12,7 @@
 
 #include "Core/NSR/NSRNetplay.h"
 #include "Core/NSR/NSRBootSync.h"
+#include "Core/NSR/NSRQuickstart.h"
 #include "Core/NSR/NSRBootAgreement.h"
 #include "Core/NSR/NSRGameStats.h"
 #include "Core/NSR/NSRRollbackLogic.h"
@@ -155,6 +156,8 @@ struct Packet
 
 struct Session
 {
+  NSRQuickstart::Navigator quickstart;
+  u32 quickstart_screen = 0xffffffff;
   // Preboot all-peer manifest + ready + host release barrier. No guest frame is
   // allowed before every participant has compared every named field.
   bool boot_pending = false;
@@ -4102,26 +4105,64 @@ bool ValidateRollbackImage(Core::System& system)
   return true;
 }
 
-// QS-TRACE (temporary exploration)
-static void QsTrace(const Core::CPUThreadGuard& guard, u32 frame)
+// Read the active command-stack screen, with full extents checked before every
+// dereference (GN7E69 r0). Transitions with no active entry simply keep waiting.
+static u32 QuickstartScreen(const Core::CPUThreadGuard& guard)
 {
-  static bool on = std::getenv("NSR_QS_TRACE") != nullptr;
-  static u32 last = 0xFFFFFFFF;
-  if (!on) return;
   auto& memory = guard.GetSystem().GetMemory();
   const u8* ram = memory.GetRAM();
   const u32 size = memory.GetRamSizeReal();
-  auto rd = [&](u32 a, u32& out) {
-    if ((a & 0xFE000000) != 0x80000000) return false;
-    const u32 o = a & 0x01FFFFFF;
-    if (o + 4 > size) return false;
-    out = Common::swap32(ram + o);
+  const auto read = [&](u32 address, u32& out) {
+    if (address < 0x80000000 || address > 0x81800000 - 4)
+      return false;
+    const u32 offset = address - 0x80000000;
+    if (size < 4 || offset > size - 4)
+      return false;
+    out = Common::swap32(ram + offset);
     return true;
   };
-  u32 root = 0, index = 0, array = 0, gs = 0xFFFFFFFF;
-  if (rd(0x803EB688, root) && rd(root + 0x3C, index) && rd(root + 0x48, array) && index < 128 &&
-      rd(array + index * 0x14 + 4, gs)) {}
-  if (gs != last) { Log("QS screen {}/{} at frame {} (idx {})", gs >> 16, gs & 0xFFFF, frame, index); last = gs; }
+  u32 root = 0, index = 0, array = 0, screen = 0xffffffff;
+  if (read(0x803EB688, root) && root <= 0x817fffb4 &&
+      read(root + 0x3c, index) && read(root + 0x48, array) && index < 128 &&
+      array <= 0x817ff600 && read(array + index * 0x14 + 4, screen))
+    return screen;
+  return 0xffffffff;
+}
+
+// Apply the macro only after the lockstep barrier: every peer sees the same
+// screen and frame here. All raw human pads are suppressed until handoff.
+static void ApplyQuickstart(const Core::CPUThreadGuard& guard, u32 frame,
+                            std::array<Pad, MAX_PLAYERS>& pads)
+{
+  auto& s = s_session;
+  if (!s.quickstart.Active())
+    return;
+  const u32 screen = QuickstartScreen(guard);
+  if (screen != s.quickstart_screen)
+  {
+    Log("quickstart screen {}/{} frame {} step {}", screen >> 16, screen & 0xffff,
+        frame, s.quickstart.StepIndex());
+    s.quickstart_screen = screen;
+  }
+  if (const auto buttons = s.quickstart.Poll(frame, screen))
+  {
+    for (u32 port = 0; port < MAX_PLAYERS; ++port)
+    {
+      pads[port] = NeutralPad();
+      pads[port][0] = static_cast<u8>((*buttons)[port] >> 8);
+      pads[port][1] = static_cast<u8>((*buttons)[port]);
+    }
+  }
+  if (s.quickstart.Failed())
+  {
+    Log("quickstart FAILED: menu timeout at frame {} step {}; stopping", frame,
+        s.quickstart.StepIndex());
+    s.failed = true;
+    StopForRollbackTransportFailure();
+  }
+  else if (!s.quickstart.Active())
+    Log("quickstart COMPLETE frame {} screen {}/{}; human pads enabled", frame,
+        screen >> 16, screen & 0xffff);
 }
 
 // Run milestone-1 raw-pad lockstep for one poll.  Keeping this independent
@@ -4154,7 +4195,11 @@ static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 fra
   //    remap/PADClamp run in-game on the agreed pads afterwards), or the test
   //    script if one is loaded. Record it for frame + delay.
   Pad local;
-  if (const auto scripted = ScriptPad(guard, frame))
+  if (s.quickstart.Active())
+  {
+    local = NeutralPad();
+  }
+  else if (const auto scripted = ScriptPad(guard, frame))
   {
     local = *scripted;
   }
@@ -4218,7 +4263,7 @@ static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 fra
   std::array<Pad, MAX_PLAYERS> pads{};
   for (u32 i = 0; i < s.players; ++i)
     pads[i] = i == s.me ? s.local_pads.at(frame) : s.remote_pads[i].at(frame);
-  QsTrace(guard, frame);
+  ApplyQuickstart(guard, frame, pads);
   s.applied.emplace(frame, pads);
   WritePads(guard, buf, pads);
 
@@ -4265,10 +4310,24 @@ static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 fra
 bool PrepareBoot()
 {
   Session& s = s_session;
+  const auto mode = NSRQuickstart::Parse(Env("NSR_QUICKSTART"));
+  if (!mode)
+    return false;
+  s.quickstart = NSRQuickstart::Navigator(*mode);
   s.boot_pending = true;
   if (const auto manifest = NSRBootSync::Prepare())
   {
     s.boot_manifest = *manifest;
+    if (*mode != NSRQuickstart::Mode::Manual)
+    {
+      s.boot_manifest["Quickstart.Mode"] = Env("NSR_QUICKSTART");
+      s.boot_manifest["Quickstart.Version"] = NSRQuickstart::VERSION;
+    }
+    if (Env("NSR_NETPLAY").empty())
+    {
+      s.boot_pending = false;  // offline quickstart uses the same fresh-card route
+      return true;
+    }
     s.enabled = Setup();
     if (s.enabled)
     {
@@ -4370,7 +4429,14 @@ void RollbackPollHook(const Core::CPUThreadGuard& guard)
       LockstepExchange(guard, scratch, retrace);
       return;
     }
-    QsTrace(guard, retrace);
+    if (!ConfigForRollback().netplay_enabled && s_session.quickstart.Active())
+    {
+      std::array<Pad, MAX_PLAYERS> pads{};
+      ApplyQuickstart(guard, retrace, pads);
+      for (u32 i = 0; i < PAD_SIZE; ++i)
+        PowerPC::MMU::HostWrite<u8>(guard, pads[0][i], scratch + i);
+      return;
+    }
     // Raw pads, before Reborn's remap: the test script replaces port 0.
     if (auto scripted = ScriptPad(guard, retrace))
     {
