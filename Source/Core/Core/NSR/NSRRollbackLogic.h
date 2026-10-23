@@ -436,4 +436,13 @@ constexpr SongTimeline HoldSongOneFrame(SongTimeline song)
     ++song.end;
   return song;
 }
+// lifecycle3: a sound-replay throttle stamp needs the barrier's clock shift
+// only if the game wrote it during the last frame (after the frame-start
+// counter `frame_start`, at or before `now`); older stamps came from the
+// agreed clock domain, and 0 marks an entry that never played.  u32 wrap-safe.
+constexpr bool StampWrittenSince(std::uint32_t stamp, std::uint32_t frame_start,
+                                 std::uint32_t now)
+{
+  return stamp != 0 && now - stamp <= now - frame_start;
+}
 }  // namespace NSRNetplay::RollbackLogic

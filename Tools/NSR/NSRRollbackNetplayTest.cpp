@@ -1210,6 +1210,13 @@ static void TestInGameHeapNamePadding()
 // it must retain same-frame progress that controls audio-loader catch-up.
 static void TestAudioPollFrame()
 {
+  // lifecycle3: only stamps written in the last frame follow a clock shift.
+  static_assert(RL::StampWrittenSince(0x1000, 0x0FF0, 0x1002));
+  static_assert(RL::StampWrittenSince(0x0FF0, 0x0FF0, 0x1002));
+  static_assert(!RL::StampWrittenSince(0x0FEF, 0x0FF0, 0x1002));  // older: agreed domain
+  static_assert(!RL::StampWrittenSince(0, 0x0FF0, 0x1002));       // never played
+  static_assert(RL::StampWrittenSince(2, 0xFFFFFFF0u, 4));         // across u32 wrap
+  static_assert(!RL::StampWrittenSince(0xFFFFFFE0u, 0xFFFFFFF0u, 4));
   assert((RL::BeginAudioPollFrame({7238, 43}, 7239) == RL::AudioPollState{7239, 0}));
   assert((RL::BeginAudioPollFrame({7238, 193}, 7239) == RL::AudioPollState{7239, 0}));
   assert((RL::BeginAudioPollFrame({7239, 999}, 7239) == RL::AudioPollState{7239, 999}));

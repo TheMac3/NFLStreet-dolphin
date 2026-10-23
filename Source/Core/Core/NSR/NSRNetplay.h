@@ -191,6 +191,18 @@ void PresentHook(const Core::CPUThreadGuard& guard);    // HookType::Gate
 // backend returns and what all determinism tests ran with).
 constexpr unsigned int PEEK_Z_FN = 0x80198B24;
 void PeekZHook(const Core::CPUThreadGuard& guard);  // HookType::Gate
+// fn_80073210(max_retraces) waits, one sound-service pass and retrace per
+// iteration, until the music stream's playback position starts to advance
+// (EA Trax start, e.g. after a re-draft's loading screen).  The position is
+// the audio middleware's own, so the iteration count follows each machine's
+// audio thread; with frame-driven clocks every extra virtual retrace moved
+// the VI/RTC clocks, and peers reached the next match up to 31 retraces apart
+// (lifecycle3: re-draft re-entry mismatch at 0x802D55BC after the clock
+// barrier).  During a frame-driven lifecycle it returns at once (PresentHook,
+// original first instruction checked before patching).  Revisit if music
+// should wait for its stream again: that needs a modeled stream position.
+constexpr unsigned int STREAM_START_WAIT_FN = 0x80073210;
+constexpr unsigned int STREAM_START_WAIT_FIRST = 0x9421FFB0;  // stwu r1,-0x50(r1)
 // The game's VI pre-retrace callback fn_801F7DF4 advances a retrace counter
 // (*(0x803EBE44)+0x20) and a retrace-driven clock that game code reads. The
 // rollback frame routine also calls it once per frame. During the session
