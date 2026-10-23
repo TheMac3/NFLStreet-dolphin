@@ -302,7 +302,7 @@ def write_list(our_user_dir: str, ts: TextureSet) -> str | None:
     if not folders:
         try:
             os.remove(path)
-        except OSError:
+        except FileNotFoundError:
             pass
         return None
     os.makedirs(os.path.dirname(path), exist_ok=True)

@@ -224,10 +224,9 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     # Imported presentation assets only. This launch path never resolves or
     # opens a Reborn source; both prompt sets were captured during setup.
     tex = textures.compose(folder, icons, pad.kind)
-    try:
-        textures.write_list(os.path.join(folder, "User"), tex)
-    except OSError as e:
-        tex.warnings.append(f"could not write the texture list: {e}")
+    # Never launch through a stale list: an older launcher may have recorded
+    # Reborn paths there. The caller surfaces write failures before starting.
+    textures.write_list(os.path.join(folder, "User"), tex)
     env["NSR_TEXTURES"] = tex.summary()  # logged by the launcher; the fork ignores it
     if tex.warnings:
         env["NSR_TEXTURES_WARNING"] = " ".join(tex.warnings)
@@ -1114,10 +1113,14 @@ class Launcher:
             self.uploader.remember_server(start.telemetry_url, start.telemetry_token)
             self._stats_wake.set()
         selected_draft = lobby.draft_settings(start.draft) if start else self.draft_settings()
-        args, env = dolphin_command(self.folder, start, None, open_ui=open_ui,
-                                    name=self.state["name"], fingerprint=self.room_fingerprint(selected_draft),
-                                    telemetry=self.state["telemetry"], quickstart=self.state["quickstart"],
-                                    icons=self._icons_setting(), resolution=self._resolution_setting())
+        try:
+            args, env = dolphin_command(self.folder, start, None, open_ui=open_ui,
+                                        name=self.state["name"], fingerprint=self.room_fingerprint(selected_draft),
+                                        telemetry=self.state["telemetry"], quickstart=self.state["quickstart"],
+                                        icons=self._icons_setting(), resolution=self._resolution_setting())
+        except OSError as e:
+            self.notify(f"Couldn't prepare the local texture list: {e}. Close the game and retry.", "error")
+            return False
         if not open_ui:  # same values the fork logs in nsr-p*.log ("local pad:")
             adapter = env.get("NSR_PAD_ADAPTER")
             log(self.folder, f"controller ({'netplay' if start else 'offline'}): "
@@ -1404,13 +1407,15 @@ class Launcher:
         old = textures.read_store(self.folder)
         install = install or old.get("install") or self.reborn_install(search=True)
         if not install and not old and not force:
-            self.refresh_textures()  # a prebuilt custom image may have no source
+            textures.write_list(self.user_dir, self.refresh_textures())  # clear legacy source references
             return
         label = self._patcher.read_manifest(self.folder).get("source_label") if hasattr(self._patcher, "read_manifest") else ""
         manifest = textures.ensure_store(self.folder, install, self._env, force=force,
             version=(label or "unknown").removeprefix("Reborn "), progress=lambda d, t: self._set("game",
                 text="Importing Reborn textures into your local folder…", progress=round(d * 100 / max(t, 1))))
-        self.refresh_textures()
+        # Publish the local list during setup too: the developer batch entry
+        # can then launch immediately without a first normal gameplay launch.
+        textures.write_list(self.user_dir, self.refresh_textures())
         if not self._textures_logged:
             log(self.folder, textures.store_summary(manifest))
             self._textures_logged = True
