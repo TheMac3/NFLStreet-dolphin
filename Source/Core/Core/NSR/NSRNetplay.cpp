@@ -14,6 +14,7 @@
 #include "Core/NSR/NSRBootSync.h"
 #include "Core/NSR/NSRQuickstart.h"
 #include "Core/NSR/NSRBootAgreement.h"
+#include "Core/NSR/NSRContent.h"
 #include "Core/NSR/NSRGameStats.h"
 #include "Core/NSR/NSRRollbackLogic.h"
 #include "Core/NSR/NSRRollbackNetplay.h"
@@ -5193,6 +5194,13 @@ static std::vector<PerMachineRange> PerMachineRanges(Core::System& system, const
   if (!with_heaps)
     return out;
   std::set<u32> heaps;
+  // GN7E69 rev 0: match DigestExclusions' validated known-heap seed even
+  // when no audio allocation is currently live. Pickup's cocky draft probe
+  // exposed counter/stale-free-space differences after the last audio block
+  // was freed. Keep used game payloads and the both-dumps-free oracle intact.
+  constexpr u32 SMALL_AUDIO_HEAP = 0x804C4810;
+  if (HeapDescriptor(ram, SMALL_AUDIO_HEAP))
+    heaps.insert(SMALL_AUDIO_HEAP);
   for (const auto& [p, recorded] : s_audio_blocks)
   {
     const u32 heap = rd(p - 8);
@@ -6123,6 +6131,9 @@ static RollbackNet::ConfigFingerprint LocalConfigFingerprint(Core::System& syste
       text += fmt::format("{:08x},", value);
     return text;
   };
+  const auto content = NSRContent::Fingerprint();
+  for (std::size_t i = 0; i < content.size(); ++i)
+    fp.fields[static_cast<std::size_t>(ConfigField::ContentSha0) + i] = content[i];
   fp[ConfigField::Protocol] = (u64{RollbackNet::VERSION} << 8) | RollbackNet::HANDOFF_VERSION;
   fp[ConfigField::StateDigest] = (u64{c.digest_every} << 16) |
                                  (u64{STATE_DIGEST_RANGES_VERSION} << 8) |
@@ -7737,6 +7748,12 @@ void InGameHook(const Core::CPUThreadGuard& guard)
     r.session_saw_in_game = true;
 }
 
+// Native load completion, outside frame-dependent caches and rollback history.
+void ContentDatabaseHook(const Core::CPUThreadGuard& guard)
+{
+  NSRContent::DatabaseLoaded(guard, s_rb.in_resim, s_rb.live);
+}
+
 // Observational HLE Start hook at GN7E69 rev-0 MVP calculation completion.
 // It preserves the original instruction, PPC registers and all guest state.
 void GameStatsMvpHook(const Core::CPUThreadGuard& guard)
@@ -9274,7 +9291,12 @@ namespace
 // no correction can cross a prior match or menu transition.
 void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
 {
-  (void)guard;
+  if (!NSRContent::Ready())
+  {
+    Log("content was not applied: refusing rollback session");
+    Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+    return;
+  }
   Rollback& r = s_rb;
   s_rb_lifecycle_hold = 0;  // fix/lifecycle: no grace window carries over
   s_rb_confirm_frames = 0;
@@ -9499,6 +9521,7 @@ bool IsReplayCatchingUp()
 
 void Shutdown(const Core::CPUThreadGuard& guard)
 {
+  NSRContent::Reset();
   NSRGameStats::Reset();
   if (s_rb_watchdog.joinable())
   {

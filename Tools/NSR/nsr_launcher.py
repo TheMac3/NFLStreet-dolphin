@@ -4,7 +4,7 @@
 nsr-*.json/.txt file names keep their old internal names on purpose).
 
 A window that replaces command lines and .bat files. It lives in the
-NFLStreet-dolphin folder (next to Dolphin.exe) and does four things:
+NFLStreet-dolphin folder (next to Dolphin.exe) and handles these workflows:
 
   1. Game: find NFL Street Reborn's NSR.iso (or browse to it), build the
      rollback netplay image (nsr_patcher.prepare_image), and show its
@@ -29,10 +29,10 @@ NFLStreet-dolphin folder (next to Dolphin.exe) and does four things:
   6. Content updates (docs/content-updates.md): on start, before hosting or
      joining, and on "Check for updates", fetch Mason's signed content
      manifest, verify it (nsr_content), download the ratings packs it names
-     (our own edit lists, never game data) and rebuild nsr-net.iso from the
-     player's own Reborn install; the previous image stays until the new one
-     matches the manifest's fingerprint. "Install updates automatically" off
-     = only report them. Offline = keep the current image.
+     (our own edit lists, never game data), and stage them for boot-time
+     injection by the matching fork. The unedited image stays unchanged.
+     A setting preserves the image-rebuild fallback. Offline practice re-verifies
+     the installed signed release and applies the same edits.
 
 Reborn is never modified: its files are only read, this Dolphin runs in
 portable mode with its own settings (User/ next to it). Offline saves persist;
@@ -487,11 +487,16 @@ class Launcher:
         self._content_cache = nsr_content.Cache(self.folder, content_keys)
         self._clock = clock
         self._checked_at = None   # clock() of the last successful manifest check
+        self._runtime_content = None  # installed, signed runtime release (also used offline)
         self._source_sha = ""     # SHA-256 of the Reborn image nsr-net.iso was built from
         self._proc = None         # the Dolphin we started, to avoid rebuilding under it
         self.rev = 0
         self._notice_id = 0
         cfg = self.cfg
+        import draftmodes
+        order, first = cfg.get("draft_order", "alternating"), cfg.get("draft_first", "stock")
+        order = order if order in draftmodes.ORDERS else "alternating"
+        first = first if first in draftmodes.FIRSTS else "stock"
         self.state = {
             "app": APP_TITLE, "folder": self.folder,
             "name": str(cfg.get("name", env.get("USERNAME", "Player")))[:24],
@@ -507,12 +512,14 @@ class Launcher:
             "max_delay": MAX_DELAY, "last_host": str(cfg.get("last_host", "")),
             "rooms": bool(self.rv_server),
             "game": {"state": "checking", "text": "Checking your game copy…", "fingerprint": "",
-                     "note": "", "progress": None, "busy": False, "content": None},
+                     "note": "", "progress": None, "busy": False, "content": None,
+                     "draft_order": order, "draft_first": first},
             # Content updates. state: idle|off|checking|downloading|updating|current|
             # available|offline|blocked|error. version: installed (0 = none applied),
             # latest: newest verified on the server.
             "content": {"state": "idle", "text": "", "version": None, "latest": None, "changelog": "",
-                        "auto": bool(cfg.get("content_auto", True)), "busy": False},
+                        "auto": bool(cfg.get("content_auto", True)), "busy": False,
+                        "runtime": bool(cfg.get("content_runtime", True))},
             "host": {"state": "idle", "mode": "", "code": "", "players": [], "can_start": False,
                      "info": "" if self.rv_server else "Room codes aren't set up in this download "
                              "(no room server). Use “Host by IP”."},
@@ -634,19 +641,50 @@ class Launcher:
     def _ready(self, fp: str, note: str = "", content: dict | None = None) -> None:
         self._set("game", state="ready", fingerprint=fp, note=note.strip(), progress=None, content=content,
                   text="Ready for rollback netplay. Everyone you play with must have the same fingerprint.")
+        self._set("game", room_fingerprint=self.room_fingerprint())
         self._set("content", version=content["version"] if content else None)
 
+    def room_fingerprint(self) -> str:
+        """Agree runtime settings in room admission; M2 also agrees the full boot bundle."""
+        import draftmodes
+        g = self.state["game"]
+        return draftmodes.room_fingerprint(g["fingerprint"], g["draft_order"], g["draft_first"])
+
+    def set_draft(self, order: str, first: str) -> None:
+        """Persist a room setting without rebuilding; every peer must select it."""
+        import draftmodes
+        draftmodes.patch_names(order, first)
+        with self._lock:
+            if (self.state["game"]["busy"] or self.state["content"]["busy"] or self._dolphin_running()
+                    or self.state["host"]["state"] != "idle" or self.state["join"]["state"] != "idle"):
+                self.notify("Close the game, leave your room and wait for updates before changing draft setup.", "error")
+                return
+            self.cfg.update(draft_order=order, draft_first=first)
+            self._save()
+            self._set("game", draft_order=order, draft_first=first,
+                      note=f"Pickup draft: {order}; first: {first}. Applied at game load; all peers must agree.")
+            self._set("game", room_fingerprint=self.room_fingerprint())
+
     def _check_game_now(self) -> None:
+        """Restore the real image identity, content and matching draft manifest."""
         st = self._patcher.image_status(self.folder)
         if st is None:
             self._set("game", state="missing", fingerprint="", content=None,
                       text="Not set up yet. Click “Find Reborn automatically”.")
         elif st.playable:
             self._source_sha = getattr(st, "source_sha256", "") or ""
-            self._ready(st.fingerprint, {"release": "", "content": "", "custom": "Unrecognized Reborn version: "
-                                         "compare fingerprints with friends."}.get(
+            self._ready(st.fingerprint, {"release": "", "content": st.note, "custom": st.note + "; compare fingerprints with friends."}.get(
                 st.kind, "Custom game copy (e.g. a ratings pack): everyone needs the identical copy."),
                 getattr(st, "content", None))
+            try:
+                self._runtime_content = self._installed_runtime()
+                if self._runtime_content:
+                    self._validate_runtime(self._runtime_content)
+                    self._ready(st.fingerprint, "Ratings are applied when the game starts.",
+                                self._runtime_content.descriptor())
+            except (OSError, nsr_content.ContentError) as exc:
+                self._set("game", state="stale", fingerprint="", content=None,
+                          text=f"Installed runtime content could not be verified: {exc}")
         else:
             self._set("game", state="stale", fingerprint="", content=None,
                       text=f"Your game copy ({st.fingerprint}) is {st.note} and can't play this "
@@ -677,7 +715,7 @@ class Launcher:
             if self.state["game"]["busy"]:
                 return None
             before = dict(self.state["game"])
-            self._set("game", busy=True, state="building", progress=0, text=text)
+            self._set("game", busy=True, state="building", fingerprint="", progress=0, text=text)
             return before
 
     def _run_build(self, iso: str, content=None, strict: bool = False, restore: dict | None = None) -> bool:
@@ -689,22 +727,38 @@ class Launcher:
                   "build": "Building the netplay copy…" if not content else
                            f"Building the netplay copy with game content v{content.version}…",
                   "verify": "Fingerprinting…"}
-        extra = {"content": content, "content_strict": strict} if content else {}
+        built = False
+        runtime = content if self.state["content"]["runtime"] else None
+        extra = {"content": content, "content_strict": strict} if content and not runtime else {}
+        order, first = self.state["game"]["draft_order"], self.state["game"]["draft_first"]
         try:
             r = self._patcher.prepare_image(iso, self.folder, progress=lambda st, d, t: self._set(
                 "game", text=labels.get(st, st), progress=round(d * 100 / max(t, 1))), **extra)
+            built = True
             self.cfg["reborn_iso"] = iso
             self.cfg["reborn_install"] = r.reborn_install
             self._save()
             self._source_sha = getattr(r, "source_sha256", "") or self._source_sha
             applied = getattr(r, "content", None)
             descriptor = applied.descriptor() if applied else (
-                nsr_content.content_descriptor(0, 0) if r.matches_reference else None)
-            note = "" if r.matches_reference else (
-                "Unrecognized Reborn version: compare fingerprints with friends."
+                nsr_content.content_descriptor(0, 0)
+                if r.matches_reference or getattr(r, "base_content_known", False) else None)
+            note = f"Pickup draft: {order}; first: {first}. " + ("" if r.matches_reference else (
+                ("Custom draft build: compare fingerprints with friends." if r.reborn_label else
+                 "Unrecognized Reborn version: compare fingerprints with friends.")
                 if r.matches_reference is None else
-                "WARNING: doesn't match the reference build; ask Mason before playing.")
-            if content and not applied:
+                "WARNING: doesn't match the reference build; ask Mason before playing."))
+            if runtime:
+                self._validate_runtime(runtime, r.fingerprint)
+                self._activate_runtime(runtime)
+                descriptor = runtime.descriptor()
+                note = "Ratings are applied when the game starts."
+            else:
+                self._content_cache.clear_runtime()
+                self.cfg.pop("runtime_installed", None)
+                self._save()
+                self._runtime_content = None
+            if content and not applied and not runtime:
                 note = (note + f"\nGame content v{content.version} doesn't support this Reborn version yet; "
                                "built without it.").strip()
             self._ready(r.fingerprint, note, descriptor)
@@ -715,16 +769,21 @@ class Launcher:
                                       "Nothing was written. Ask Mason for an updated launcher.")
         except nsr_content.ContentError as e:
             log(self.folder, f"content build failed: {e}")
-            self._fail_build(restore, f"The game content update didn't apply: {e}")
+            self._fail_build(restore, f"The game content update didn't apply: {e}", recheck=built)
         except (OSError, ValueError) as e:
             self._fail_build(restore, f"Couldn't build the game copy: {e}"
-                             + (" (Is the game still running?)" if isinstance(e, PermissionError) else ""))
+                             + (" (Is the game still running?)" if isinstance(e, PermissionError) else ""), recheck=built)
         finally:
             self._set("game", busy=False)
         return False
 
-    def _fail_build(self, restore: dict | None, text: str) -> None:
-        if restore:
+    def _fail_build(self, restore: dict | None, text: str, recheck: bool = False) -> None:
+        """Restore UI only while prepare_image kept the prior image. If a later
+        runtime activation fails, re-read actual disk state before allowing play."""
+        if recheck:
+            self._check_game_now()
+            self.notify(text + " The base image was rebuilt; check Game copy before playing.", "error")
+        elif restore:
             restore = {k: v for k, v in restore.items() if k != "busy"}
             self._set("game", **{**restore, "progress": None})
             self.notify(text + " Your previous game copy was kept.", "error")
@@ -734,9 +793,15 @@ class Launcher:
     def prepare(self, iso: str) -> None:
         """Build the game copy from a Reborn image the player picked/found,
         with the newest verified content update when one is known."""
-        if self._claim_build("Checking Reborn's game file…") is None:
-            return
-        self._spawn(lambda: self._run_build(iso, self._known_content(), strict=False))
+        with self._lock:
+            if (self._dolphin_running() or self.state["content"]["busy"]
+                    or self.state["host"]["state"] != "idle" or self.state["join"]["state"] != "idle"):
+                self.notify("Close the game, leave your room and wait for updates before rebuilding.", "error")
+                return
+            before = self._claim_build("Checking Reborn's game file…")
+            if before is None:
+                return
+        self._spawn(lambda: self._run_build(iso, self._known_content(), strict=False, restore=before))
 
     # -- controllers --
     def reborn_install(self, search: bool = False) -> str | None:
@@ -786,6 +851,48 @@ class Launcher:
     # -- content updates --
     def content_base(self) -> str:
         return content_url(self.folder, self._env, self.uploader.state.get("url", ""))
+
+    def set_content_runtime(self, on: bool) -> None:
+        """Choose the delivery path for the next update; the installed release
+        stays active until Check for updates completes the switch safely."""
+        self.cfg["content_runtime"] = bool(on)
+        self._save()
+        self._set("content", runtime=bool(on), text="Click Check for updates to apply this setting.")
+
+    def _installed_runtime(self):
+        """A separately persisted identity detects deletion or replacement of the
+        signed installed pointer, including between room entry and launch."""
+        active = self._content_cache.runtime_content()
+        expected = self.cfg.get("runtime_installed")
+        if expected:
+            if active is None or expected != self._runtime_identity(active):
+                raise nsr_content.ContentError("Installed runtime content is missing or changed. Check for updates or rebuild the base.")
+        return active
+
+    @staticmethod
+    def _runtime_identity(content) -> dict:
+        """Only metadata is duplicated; trust still comes from the signed file."""
+        import hashlib
+        return {"version": content.version, "sha256": hashlib.sha256(content.runtime_bytes()).hexdigest()}
+
+    def _activate_runtime(self, content) -> None:
+        """Publish the signed pointer first, then its expected identity. A crash
+        between them blocks launch rather than silently selecting other ratings."""
+        self._content_cache.activate_runtime(content)
+        self.cfg["runtime_installed"] = self._runtime_identity(content)
+        # Installation metadata must not use the legacy best-effort settings
+        # writer: a failed save must be visible, so missing packs cannot later
+        # be mistaken for an intentional stock installation.
+        nsr_content._atomic_write(os.path.join(self.folder, CONFIG_NAME),
+                                  json.dumps(self.cfg, indent=1).encode("utf-8"))
+        self._runtime_content = content
+
+    def _validate_runtime(self, content, fingerprint=None) -> None:
+        """Pin the signed release to the known unedited image before activation."""
+        build = content.build_for(self._source_sha)
+        if not build or (fingerprint or self.state["game"]["fingerprint"]) != patcher.fingerprint(build["base_sha256"]):
+            raise nsr_content.ContentError("Runtime ratings need the stock rollback image. Find Reborn once to rebuild it.")
+        content.validate_runtime_image(os.path.join(self.folder, patcher.OUTPUT_NAME), self._source_sha)
 
     def set_auto_updates(self, on: bool) -> None:
         self.cfg["content_auto"] = bool(on)
@@ -878,7 +985,8 @@ class Launcher:
         what = nsr_content.describe(release)
         self._set("content", latest=release["version"], changelog=release["changelog"])
         installed = self.state["game"].get("content")
-        if installed and installed["version"] == release["version"]:
+        if (installed and installed["version"] == release["version"]
+                and bool(self._runtime_content) == self.state["content"]["runtime"]):
             return self._content("current", f"Up to date: {what}")
         if not self._usable(payload):
             return self._content("blocked", f"Game content v{release['version']} needs a newer "
@@ -900,7 +1008,7 @@ class Launcher:
         if blocker:
             return self._content("available", f"Update available: {what}. {blocker}")
         iso = self._reborn_iso()
-        if not iso:
+        if not iso and not self.state["content"]["runtime"]:
             return self._content("blocked", f"Update available: {what}. It's built from your Reborn install: "
                                             "click “Find Reborn automatically” in Settings.")
         if self._source_sha and self._source_sha not in release["builds"]:
@@ -916,6 +1024,17 @@ class Launcher:
         except nsr_content.ContentError as e:
             log(self.folder, f"content pack rejected: {e}")
             return self._content("error", "The update's files didn't verify, so nothing was changed.")
+        if self.state["content"]["runtime"]:
+            try:
+                self._validate_runtime(content)
+                self._activate_runtime(content)
+                self._ready(self.state["game"]["fingerprint"], "Ratings are applied when the game starts.",
+                            content.descriptor())
+                self.notify(f"Game updated: {what}")
+                return self._content("current", f"Up to date: {what}")
+            except (OSError, nsr_content.ContentError) as exc:
+                self._check_game_now()
+                return self._content("blocked", f"Runtime update could not finish: {exc}")
         restore = self._claim_build(f"Updating to game content v{content.version}…")
         if restore is None:
             return self._content("available", f"Update available: {what}. Wait for the current build to finish.")
@@ -952,7 +1071,7 @@ class Launcher:
             self.uploader.remember_server(start.telemetry_url, start.telemetry_token)
             self._stats_wake.set()
         args, env = dolphin_command(self.folder, start, self.reborn_install(), open_ui=open_ui,
-                                    name=self.state["name"], fingerprint=self.state["game"]["fingerprint"],
+                                    name=self.state["name"], fingerprint=self.room_fingerprint(),
                                     telemetry=self.state["telemetry"], quickstart=self.state["quickstart"],
                                     icons=self._icons_setting(), resolution=self._resolution_setting())
         if not open_ui:  # same values the fork logs in nsr-p*.log ("local pad:")
@@ -973,8 +1092,20 @@ class Launcher:
             if start is not None and not open_ui:
                 with open(env["NSR_LOG"], "w", encoding="utf-8"):
                     pass
+            if not open_ui:
+                active = self._installed_runtime()
+                import draftmodes
+                order, first = self.state["game"]["draft_order"], self.state["game"]["draft_first"]
+                if active:
+                    self._validate_runtime(active)
+                if active or draftmodes.patch_names(order, first):
+                    if draftmodes.patch_names(order, first) and self.state["game"]["fingerprint"] not in {
+                            patcher.fingerprint(digest) for _, digest in patcher.KNOWN_INPUTS.values()}:
+                        raise nsr_content.ContentError("Runtime draft settings need the stock rollback base. Rebuild your game copy once.")
+                    env.update(self._content_cache.runtime_env(active, order, first))
+                    args += ["--nsr-runtime-content=1"]
             self._proc = self._popen(args, env=env, cwd=self.folder)
-        except OSError as e:
+        except (OSError, nsr_content.ContentError) as e:
             self.notify(f"Couldn't start Dolphin ({args[0]}): {e}", "error")
             return False
         if start is not None and not open_ui and hasattr(self._proc, "poll"):
@@ -1043,7 +1174,7 @@ class Launcher:
 
         def work():
             self._preflight_update()
-            h = self._lobby.RoomHost(self.rv_server, self.state["name"], self.state["game"]["fingerprint"],
+            h = self._lobby.RoomHost(self.rv_server, self.state["name"], self.room_fingerprint(),
                                      on_change=self._roster, on_error=lambda why: self._set("host", info=why),
                                      content=self._content_descriptor(), quickstart=self.state["quickstart"])
             try:
@@ -1061,7 +1192,7 @@ class Launcher:
             return
         self._set("host", state="opening", mode="ip", info="Opening a direct lobby…")
         try:
-            h = self._lobby.LobbyHost(self.state["name"], self.state["game"]["fingerprint"],
+            h = self._lobby.LobbyHost(self.state["name"], self.room_fingerprint(),
                                       on_change=self._roster,
                                       on_reject=lambda who, why: self._set("host", info=f"Refused {who}: {why}"),
                                       content=self._content_descriptor(), quickstart=self.state["quickstart"])
@@ -1143,9 +1274,9 @@ class Launcher:
             kw = {"on_lobby": on_lobby, "cancel": cancel, "content": self._content_descriptor(),
                   "on_game_mode": lambda selected: self._set("join", quickstart=selected)}
             if direct:
-                return self._lobby.join(target, self.state["name"], self.state["game"]["fingerprint"], **kw)
+                return self._lobby.join(target, self.state["name"], self.room_fingerprint(), **kw)
             return self._lobby.join_room(self.rv_server, target, self.state["name"],
-                                         self.state["game"]["fingerprint"], **kw)
+                                         self.room_fingerprint(), **kw)
 
         def work():
             self._preflight_update()
@@ -1276,11 +1407,14 @@ class WebApi:
     def set_telemetry(self, on): self._l.set_telemetry(bool(on))
     def set_game_stats(self, on): self._l.set_game_stats(bool(on))
     def set_auto_updates(self, on): self._l.set_auto_updates(bool(on))
+    def set_content_runtime(self, on): self._l.set_content_runtime(bool(on))
     def check_updates(self): self._l.check_updates()
     def set_delay(self, delay): self._l.set_delay(delay)
     def set_quickstart(self, selected): self._l.set_quickstart(selected)
     def set_button_icons(self, choice): self._l.set_button_icons(str(choice))
     def set_resolution(self, value): self._l.set_resolution(value)
+    # Both manual and signed-content rebuilds preserve these image choices.
+    def set_draft(self, order, first): self._l.set_draft(order, first)
     def find_game(self): self._l.find_game()
     def host_room(self): self._l.host_room()
     def host_ip(self): self._l.host_ip()
@@ -1472,6 +1606,23 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
                     variable=auto_var, command=lambda: launcher.set_auto_updates(auto_var.get())) \
         .grid(row=11, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
+    runtime_var = tk.BooleanVar(value=launcher.state["content"]["runtime"])
+    ttk.Checkbutton(sp, text="Apply ratings at game start (off: rebuild the image)",
+                    variable=runtime_var, command=lambda: launcher.set_content_runtime(runtime_var.get())) \
+        .grid(row=12, column=0, columnspan=4, sticky="w", pady=(6, 0))
+    ttk.Label(sp, text="Pickup draft / first team").grid(row=13, column=0, sticky="w", pady=(12, 0))
+    draft_order = tk.StringVar(value=launcher.state["game"]["draft_order"])
+    draft_first = tk.StringVar(value=launcher.state["game"]["draft_first"])
+    order_box = ttk.Combobox(sp, textvariable=draft_order, values=("alternating", "snake", "cocky"), state="readonly", width=14)
+    first_box = ttk.Combobox(sp, textvariable=draft_first, values=("stock", "team-one", "team-two"), state="readonly", width=14)
+    order_box.grid(row=14, column=0, sticky="w")
+    first_box.grid(row=14, column=1, sticky="w")
+    # Both native sides may contain the host; these choices deliberately name teams.
+    order_box.bind("<<ComboboxSelected>>", lambda _: launcher.set_draft(draft_order.get(), draft_first.get()))
+    first_box.bind("<<ComboboxSelected>>", lambda _: launcher.set_draft(draft_order.get(), draft_first.get()))
+    ttk.Label(sp, text="Cocky: seven picks each. Team One/Two are in-game sides. Applied at game load; all peers must agree.",
+              wraplength=560).grid(row=15, column=0, columnspan=4, sticky="w")
+
     def browse():
         iso = filedialog.askopenfilename(title="Pick NFL Street Reborn's NSR.iso (content\\games)",
                                          filetypes=[("Reborn game image", "NSR.iso"), ("ISO", "*.iso")])
@@ -1518,7 +1669,12 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
             else:
                 progress.grid(row=7, column=0, columnspan=3, sticky="w", pady=4)
                 progress.configure(value=g["progress"])
-            enable(b_find, not g["busy"]); enable(b_browse, not g["busy"])
+            setup_idle = (not g["busy"] and not s["content"]["busy"]
+                          and h["state"] == "idle" and j["state"] == "idle")
+            enable(b_find, setup_idle); enable(b_browse, setup_idle)
+            draft_order.set(g["draft_order"]); draft_first.set(g["draft_first"])
+            order_box.configure(state="readonly" if setup_idle else "disabled")
+            first_box.configure(state="readonly" if setup_idle else "disabled")
             ct = s["content"]
             content_text.configure(text=(ct["text"] or "No game updates installed.")
                                    + (f"\nv{ct['latest']}: {ct['changelog']}" if ct["latest"] and ct["changelog"]

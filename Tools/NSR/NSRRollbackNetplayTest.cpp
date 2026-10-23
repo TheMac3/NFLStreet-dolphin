@@ -24,6 +24,8 @@
 #include "Core/NSR/NSRGameStatsRead.h"
 #include "Core/NSR/NSRDraftLog.h"
 #include "Core/NSR/NSRPadSource.h"
+#include "Core/NSR/NSRContentRead.h"
+#include "Core/NSR/NSRDraft.h"
 #include "Core/NSR/NSRGameStatsIdentity.h"
 
 #include <algorithm>
@@ -1522,6 +1524,86 @@ static void TestGameStatsMemoryReader()
   assert(ram[0x3ebe88] == 0x7e);  // all reads preserve synthetic guest memory
 }
 
+// Packed writes must update every roster copy atomically, preserve neighbors,
+// reject stale/missing/duplicate edits and never write a deleted physical row.
+static void TestRuntimeContent()
+{
+  namespace C = NSRContent;
+  std::vector<std::uint8_t> ram(0x400000), vmem(0x1000);
+  const auto put = [&](std::uint32_t offset, std::uint32_t value, unsigned size = 4) {
+    for (unsigned i = 0; i < size; ++i)
+      vmem[offset + i] = static_cast<std::uint8_t>(value >> ((size - i - 1) * 8));
+  };
+  const auto tag = [&](std::uint32_t offset, std::string_view name) {
+    std::copy(name.begin(), name.end(), vmem.begin() + offset);
+  };
+  ram[0x3ebe88] = 0x7e;
+  ram[0x3ebe8a] = 1;
+  put(0x104, 0x7e000200);
+  tag(0x108, "TATS");
+  tag(0x21c, "YALP");
+  put(0x214, 0x7e000400);
+  put(0x220, 16);
+  put(0x224, 127);
+  put(0x240, 3, 2);
+  put(0x242, 3, 2);
+  put(0x244, 3, 2);
+  put(0x24a, 3, 1);
+  for (unsigned i = 0; i < 3; ++i)
+  {
+    put(0x24c + i * 16, i == 2 ? 3 : 0);
+    put(0x250 + i * 16, i == 0 ? 0 : (i == 1 ? 32 : 67));
+    put(0x258 + i * 16, i == 2 ? 7 : 32);
+  }
+  tag(0x254, "ANFP");
+  tag(0x264, "ANLP");
+  tag(0x274, "DPSP");
+  for (unsigned i = 0; i < 3; ++i)
+  {
+    tag(0x400 + i * 16, "Ada");
+    tag(0x404 + i * 16, "Test");
+    vmem[0x408 + i * 16] = 0xb1;
+    vmem[0x409 + i * 16] = 0x9a;  // rating 70, surrounding bits nonzero
+  }
+  vmem[0x41f] = 1;  // middle copy is deleted
+  const NSRGameStats::Memory memory{ram, vmem};
+  const auto original = vmem;
+  const std::vector<C::Edit> edits{{" ada ", "TEST", "PSPD", 17, {70}}};
+  const auto writes = C::Plan(memory, edits);
+  assert(vmem == original && writes && writes->size() == 4);
+  for (const auto& [address, value] : *writes)
+    vmem[address - 0x7e000000] = value;
+  assert(vmem[0x408] == 0xa4 && vmem[0x409] == 0x5a);
+  assert(vmem[0x428] == 0xa4 && vmem[0x429] == 0x5a);
+  assert(vmem[0x418] == original[0x418] && vmem[0x419] == original[0x419]);
+  const auto rejects = [&](std::vector<C::Edit> bad) {
+    vmem = original;
+    assert(!C::Plan(memory, bad));
+    assert(vmem == original);
+  };
+  rejects({{"Ada", "Test", "PSPD", 17, {71}}});
+  rejects({{"Absent", "Test", "PSPD", 17, {70}}});
+  rejects({edits[0], edits[0]});
+  rejects({{"Ada", "Test", "PXYZ", 17, {70}}});
+  rejects({{"Ada", "Test", "PSPD", 128, {70}}});
+  rejects({edits[0], {"Absent", "Test", "PSPD", 17, {70}}});
+  vmem = original;
+  put(0x214, 0x7e000fff);
+  assert(!C::Plan(memory, edits));
+  // Each content identity field participates in wire agreement and diagnostics.
+  NSRNetplay::RollbackNet::ConfigFingerprint a, b;
+  for (auto field : {NSRNetplay::RollbackNet::ConfigField::ContentSha0,
+                     NSRNetplay::RollbackNet::ConfigField::ContentSha3,
+                     NSRNetplay::RollbackNet::ConfigField::ContentVersion,
+                     NSRNetplay::RollbackNet::ConfigField::ContentPolicy})
+  {
+    b = a;
+    b[field] = 1;
+    assert(NSRNetplay::RollbackNet::ConfigDigest(a) != NSRNetplay::RollbackNet::ConfigDigest(b));
+    assert(NSRNetplay::RollbackNet::ConfigDifferences(a, b).size() == 1);
+  }
+}
+
 // Identity validation is independent of sockets; attribution to the established
 // connection remains the adapter's existing PacketSenderMatchesPeer contract.
 static void TestGameStatsIdentity()
@@ -1809,12 +1891,48 @@ static void TestQuickstartNavigation()
   assert(stalled.Failed());
 }
 
+// Runtime draft plans use synthetic MEM1 only: validate the full fixed recipe
+// before writes, reject changed native instructions and tolerate exact reloads.
+static void TestRuntimeDraft()
+{
+  std::vector<std::uint8_t> ram(0x420000);
+  std::copy_n("GN7E69", 6, ram.begin());
+  const auto put = [&](std::uint32_t address, std::uint32_t value) {
+    for (std::uint32_t i = 0; i < 4; ++i)
+      ram[address - 0x80000000 + i] = static_cast<std::uint8_t>(value >> (24 - 8 * i));
+  };
+  put(0x8001abac, 0x816d9768);
+  put(0x80018fc0, 0x48063bad);
+  const NSRGameStats::Memory memory{ram, {}};
+  std::string error;
+  for (std::uint32_t order = 0; order < 3; ++order)
+    for (std::uint32_t first = 0; first < 3; ++first)
+    {
+      const auto before = ram;
+      const auto plan = NSRContent::PlanDraft(memory, order, first, &error);
+      assert(plan && ram == before);
+    }
+  auto plan = NSRContent::PlanDraft(memory, 1, 2, &error);
+  assert(plan && !plan->empty());
+  for (const auto& [address, value] : *plan)
+    put(address, value);
+  assert(NSRContent::PlanDraft(memory, 1, 2, &error) == plan);
+  assert(!NSRContent::PlanDraft(memory, 2, 2, &error));
+  put(0x80411604, 0xdeadbeef);
+  assert(!NSRContent::PlanDraft(memory, 1, 2, &error));
+  assert(!NSRContent::PlanDraft(memory, 3, 0, &error));
+  ram[7] = 1;
+  assert(!NSRContent::PlanDraft(memory, 0, 0, &error));
+}
+
 int main()
 {
   TestPadSourceAdapter();
   TestDraftLog();
   TestQuickstartNavigation();
   TestBootAgreementWire();
+  TestRuntimeContent();
+  TestRuntimeDraft();
   TestGameStatsMemoryReader();
   TestGameStatsIdentity();
   TestHandoffAgreement();

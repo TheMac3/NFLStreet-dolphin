@@ -141,6 +141,10 @@ add_library(core
   NSR/NSRBootSync.h
   NSR/NSRQuickstart.h
   NSR/NSRBootAgreement.h
+  NSR/NSRContent.cpp
+  NSR/NSRDraft.h
+  NSR/NSRContent.h
+  NSR/NSRContentRead.h
   NSR/NSRNetplay.cpp
   NSR/NSRGameStats.cpp
   NSR/NSRGameStats.h
