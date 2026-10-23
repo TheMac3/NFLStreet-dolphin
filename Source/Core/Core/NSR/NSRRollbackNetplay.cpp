@@ -208,7 +208,8 @@ std::optional<HandoffPacket> HandoffAgreement::HostProposal() const
 std::uint8_t AutoInputDelay(double one_way_ms, double jitter_ms, const AutoDelayRule& rule)
 {
   const double frame_ms = FRAME_US / 1000.0;
-  const double need = (std::max(0.0, one_way_ms) + rule.jitter_weight * std::max(0.0, jitter_ms)) /
+  const double need = (std::max(0.0, one_way_ms - rule.one_way_bias_ms) +
+                       rule.jitter_weight * std::max(0.0, jitter_ms)) /
                       frame_ms;
   const double frames = std::ceil(need - rule.predict_frames - 1e-9);
   const double clamped =

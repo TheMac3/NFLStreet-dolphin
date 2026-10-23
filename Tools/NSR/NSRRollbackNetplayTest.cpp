@@ -1832,19 +1832,23 @@ static void TestHandoffInputDelay()
   assert(me0.HostProposal()->input_delay == 2);
 }
 
-// The automatic delay rule: ceil((one-way + 2 x jitter) / frame) - 1, in [1, 4].
+// The automatic delay rule on ENet readings: ceil((one-way - 8 + jitter) /
+// frame) - 1, in [1, 4]. Values are the proxy sweep's (2026-10-23) and
+// Mason's 2026-10-22 session (ENet RTT 72, variance ~8).
 static void TestAutoInputDelay()
 {
   assert(RN::AutoInputDelay(0.0, 0.0) == 1);
-  assert(RN::AutoInputDelay(10.0, 2.0) == 1);    // LAN
-  assert(RN::AutoInputDelay(20.0, 4.0) == 1);    // 28 ms -> 1.7 frames
-  assert(RN::AutoInputDelay(36.5, 10.0) == 3);   // 56.5 ms -> 3.4 frames
-  assert(RN::AutoInputDelay(36.5, 3.0) == 2);    // 42.5 ms -> 2.5 frames
-  assert(RN::AutoInputDelay(75.0, 10.0) == 4);
+  assert(RN::AutoInputDelay(27.5, 9.0) == 1);    // 20 ms path
+  assert(RN::AutoInputDelay(36.5, 15.0) == 2);   // 40 ms path
+  assert(RN::AutoInputDelay(41.0, 9.0) == 2);    // 70 ms path
+  assert(RN::AutoInputDelay(36.0, 8.0) == 2);    // Mason's 73 ms link
+  assert(RN::AutoInputDelay(56.0, 8.0) == 3);    // 110 ms path, calm
+  assert(RN::AutoInputDelay(59.5, 16.0) == 4);   // 110 ms path, jittery
+  assert(RN::AutoInputDelay(79.0, 9.0) == 4);    // 150 ms path
   assert(RN::AutoInputDelay(500.0, 50.0) == 4);  // clamped
-  RN::AutoDelayRule loose;
-  loose.jitter_weight = 1.0;
-  assert(RN::AutoInputDelay(36.5, 10.0, loose) == 2);
+  RN::AutoDelayRule strict;
+  strict.predict_frames = 0.0;
+  assert(RN::AutoInputDelay(41.0, 9.0, strict) == 3);
 }
 
 int main()

@@ -185,17 +185,27 @@ std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes);
 
 // Automatic rollback input delay (fix/audio2), chosen by player 0 before
 // each rollback epoch from the links it measured during the lockstep menus.
-// `one_way_ms`: the worst one-way input latency between any two players
-// (half the RTT for a direct link; in a star, a joiner's input reaches
-// another joiner through the host, so half the sum of both RTTs); `jitter_ms`:
-// the worst RTT variation of those links. The delay covers the expected
-// latency plus a jitter margin minus what prediction is allowed to absorb
-// (`predict_frames` of shallow rollback), clamped to [min_delay, max_delay].
-// See the tuning table in NFLStreet docs/research-log.md (2026-10-23).
+// `one_way_ms`: the worst one-way input latency between any two players as
+// ENet reports it (half its smoothed RTT for a direct link; in a star, a
+// joiner's input reaches another joiner through the host, so half the sum of
+// both RTTs); `jitter_ms`: the worst ENet RTT variation of those links.
+//
+//   delay = clamp(ceil((one_way - bias + jitter_weight x jitter) / frame)
+//                 - predict_frames, min_delay, max_delay)
+//
+// bias: ENet acknowledges on its next host service, which NSR runs once per
+// frame on both ends, so its RTT reads ~16-20 ms above the path (proxy sweep
+// 2026-10-23: 20/40/70/110/150 ms paths read 40/60/90/128/170) and its
+// variance about twice the configured jitter; hence bias 8 ms one-way and
+// weight 1. predict_frames 1: one frame of latency is left to prediction, so
+// rollbacks stay ~1 frame deep (shallow and cheap with fix/audio2's audio)
+// while the delay stays at 1-2 frames up to ~70 ms RTT. Tuning table: NFLStreet
+// docs/research-log.md (2026-10-23).
 struct AutoDelayRule
 {
-  double jitter_weight = 2.0;   // margin = weight x jitter
-  double predict_frames = 1.0;  // latency rollback is allowed to absorb
+  double one_way_bias_ms = 8.0;  // ENet scheduling overestimate, one way
+  double jitter_weight = 1.0;    // margin = weight x ENet RTT variance
+  double predict_frames = 1.0;   // latency rollback is allowed to absorb
   std::uint8_t min_delay = 1, max_delay = 4;
 };
 std::uint8_t AutoInputDelay(double one_way_ms, double jitter_ms, const AutoDelayRule& rule = {});
