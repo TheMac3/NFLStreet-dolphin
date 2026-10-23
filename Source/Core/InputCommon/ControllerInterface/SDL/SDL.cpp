@@ -23,6 +23,7 @@
 #include "Core/HW/SI/SI_Device.h"
 
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
+#include "InputCommon/ControllerInterface/SDL/NSRTestVirtualPads.h"  // TEST-ONLY, env-gated
 #include "InputCommon/ControllerInterface/SDL/SDLGamepad.h"
 #include "InputCommon/GCAdapter.h"
 
@@ -170,6 +171,7 @@ InputBackend::InputBackend(ControllerInterface* controller_interface)
     Common::SetCurrentThreadName("SDL Hotplug Thread");
 
     Common::ScopeGuard quit_guard([] {
+      NSRTestVirtualPads::Shutdown();  // NSR TEST-ONLY: no-op unless NSR_TEST_VIRTUAL_PADS
       // TODO: there seems to be some sort of memory leak with SDL, quit isn't freeing everything up
       SDL_Quit();
     });
@@ -190,6 +192,9 @@ InputBackend::InputBackend(ControllerInterface* controller_interface)
       }
       m_stop_event_type = custom_events_start;
       m_populate_event_type = custom_events_start + 1;
+
+      // NSR TEST-ONLY: emulated controllers (no-op unless NSR_TEST_VIRTUAL_PADS is set).
+      NSRTestVirtualPads::AttachFromEnv();
 
       // Drain all of the events and add the initial joysticks before returning. Otherwise, the
       // individual joystick events as well as the custom populate event will be handled _after_
@@ -237,6 +242,7 @@ void InputBackend::PopulateDevices()
 
 void InputBackend::UpdateInput(std::vector<std::weak_ptr<ciface::Core::Device>>&)
 {
+  NSRTestVirtualPads::Drive();  // NSR TEST-ONLY: no-op unless NSR_TEST_VIRTUAL_PADS is set
   SDL_UpdateGamepads();
 }
 

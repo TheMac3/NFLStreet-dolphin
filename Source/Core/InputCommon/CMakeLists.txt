@@ -175,6 +175,8 @@ endif()
 
 if(ENABLE_SDL)
   target_sources(inputcommon PRIVATE
+    ControllerInterface/SDL/NSRTestVirtualPads.cpp
+    ControllerInterface/SDL/NSRTestVirtualPads.h
     ControllerInterface/SDL/SDL.cpp
     ControllerInterface/SDL/SDL.h
     ControllerInterface/SDL/SDLGamepad.cpp

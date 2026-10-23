@@ -4293,6 +4293,25 @@ static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 fra
   s.applied.emplace(frame, pads);
   WritePads(guard, buf, pads);
 
+  // NSR TEST-ONLY (controller permutation test, NFLStreet docs/controller-testing.md):
+  // log the agreed pads whenever they change, so every peer's log shows each
+  // player's exchanged input. Host-side log only; inert unless NSR_TEST_PAD_TRACE.
+  if (static const bool pad_trace = !Env("NSR_TEST_PAD_TRACE").empty(); pad_trace)
+  {
+    static std::array<Pad, MAX_PLAYERS> s_traced{};
+    if (pads != s_traced)
+    {
+      s_traced = pads;
+      std::string line;
+      for (u32 i = 0; i < s.players; ++i)
+      {
+        line += fmt::format(" p{}={:02x}{:02x}/{:+d}/{:+d}", i, pads[i][0], pads[i][1],
+                            static_cast<s8>(pads[i][2]), static_cast<s8>(pads[i][3]));
+      }
+      Log("pad trace frame {}:{}", frame, line);
+    }
+  }
+
   // 4. Periodic desync check: hash MEM1 after the agreed pads are in the
   //    buffer (same emulated instant on every machine).
   if (frame % CHECKSUM_INTERVAL == 0 && frame > 0 && s_rb.session_generation == 0)
