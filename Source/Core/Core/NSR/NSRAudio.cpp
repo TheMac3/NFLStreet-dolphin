@@ -184,7 +184,7 @@ void FadeBlock(const s16* in, s16* out)
       if (s_f.pos < s_f.len)
       {
         const float w = static_cast<float>(s_f.pos + 1) / static_cast<float>(s_f.len + 1);
-        const float old = s_f.tail[2 * s_f.pos + ch];
+        const float old = s_f.tail[2 * s_f.pos + static_cast<u32>(ch)];
         v = static_cast<s16>(std::lround(old + (static_cast<float>(now) - old) * w));
       }
       out[2 * i + ch] = static_cast<s16>(Common::swap16(static_cast<u16>(v)));
