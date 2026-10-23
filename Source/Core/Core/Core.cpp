@@ -68,6 +68,7 @@
 #include "Core/NetPlayClient.h"
 #include "Core/NetPlayProto.h"
 #include "Core/NSR/NSRNetplay.h"
+#include "Core/NSR/NSRTelemetry.h"
 #include "Core/PatchEngine.h"
 #include "Core/PowerPC/GDBStub.h"
 #include "Core/PowerPC/JitInterface.h"
@@ -277,6 +278,7 @@ void Stop(Core::System& system)  // - Hammertime!
     s_state.store(State::Stopping);
   }
 
+  NSRTelemetry::StopRequested();  // Start the bounded send budget before CPU/HW teardown.
   NotifyStateChanged(State::Stopping);
 
   AchievementManager::GetInstance().CloseGame();

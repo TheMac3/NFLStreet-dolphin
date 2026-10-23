@@ -87,12 +87,38 @@ constexpr std::array<const char*, static_cast<size_t>(Hist::Count)> HIST_NAMES{
     "rollback_depth",  "frame_interval_us", "step_us",         "live_unit_us",
     "save_us",         "restore_us",        "live_ranges_us",  "jit_us",
     "check_us",        "net_rtt_us",        "remote_input_late_frames",
-    "prediction_frames", "time_sync_wait_us", "net_stall_us",
+    "prediction_frames", "time_sync_wait_us", "net_stall_us", "lockstep_wait_us",
 };
 constexpr std::array<const char*, static_cast<size_t>(EventKind::Count)> EVENT_NAMES{
     "session_enter", "session_leave", "desync",            "peer_desync", "hang",
     "uncorrectable", "input_timeout", "transport_failure", "note",
+    "phase",         "connection",    "handoff_abort",     "config_mismatch", "shutdown",
+    "desync_summary",
+    "stop_requested",
 };
+constexpr std::array<const char*, static_cast<size_t>(Phase::Count)> PHASE_NAMES{
+    "none", "lockstep-menu", "rollback-match", "post-match",
+};
+
+// Events that explain why a run went wrong; the shutdown event names the
+// last one, so "why did it stop" is one record.
+constexpr bool IsProblem(EventKind kind)
+{
+  switch (kind)
+  {
+  case EventKind::Desync:
+  case EventKind::PeerDesync:
+  case EventKind::Hang:
+  case EventKind::Uncorrectable:
+  case EventKind::InputTimeout:
+  case EventKind::TransportFailure:
+  case EventKind::HandoffAbort:
+  case EventKind::ConfigMismatch:
+    return true;
+  default:
+    return false;
+  }
+}
 
 // Every enum entry needs a name (a short initializer list would leave nullptr).
 template <size_t N>
@@ -104,7 +130,7 @@ constexpr bool AllNamed(const std::array<const char*, N>& names)
   return true;
 }
 static_assert(AllNamed(COUNTER_NAMES) && AllNamed(GAUGE_NAMES) && AllNamed(HIST_NAMES) &&
-              AllNamed(EVENT_NAMES));
+              AllNamed(EVENT_NAMES) && AllNamed(PHASE_NAMES));
 
 // Bucket count for 64-bit values: values < 2*SUB are exact, then SUB buckets
 // per power of two up to 2^64 (see BucketIndex).
@@ -133,6 +159,7 @@ struct Window
   bool have_frame = false;
   std::uint64_t dropped = 0;  // records the queue/retry buffer dropped before this window
   std::uint32_t generation = 0;
+  Phase phase = Phase::None;  // SetPhase closes the window, so one phase per window
   std::array<std::array<std::uint64_t, SLOTS>, static_cast<size_t>(Counter::Count)> counters{};
   std::array<std::array<GaugeAcc, SLOTS>, static_cast<size_t>(Gauge::Count)> gauges{};
   std::array<std::array<std::unique_ptr<HistAcc>, SLOTS>, static_cast<size_t>(Hist::Count)> hists;
@@ -166,6 +193,25 @@ std::atomic<bool> s_enabled{false};
 // Rearm() (the next session) clears it.
 std::atomic<bool> s_shut_down{false};
 Settings s_settings;  // written once under s_init_mutex before s_configured
+// Start() facts for the header (under s_init_mutex; read by HeaderJson).
+StartInfo s_start;
+bool s_have_start = false;
+// Current phase (CPU thread writes; events from any thread read it), the
+// last live frame seen, and the last problem event (for the shutdown event).
+std::atomic<std::uint8_t> s_phase{static_cast<std::uint8_t>(Phase::None)};
+std::atomic<std::uint32_t> s_last_frame{0};
+std::atomic<int> s_last_problem{-1};
+std::atomic<std::uint32_t> s_last_problem_frame{0};
+std::atomic<int> s_first_problem{-1};
+const char* PhaseName(Phase phase)
+{
+  const size_t i = static_cast<size_t>(phase);
+  return i < PHASE_NAMES.size() ? PHASE_NAMES[i] : "none";
+}
+Phase LoadPhase()
+{
+  return static_cast<Phase>(s_phase.load(std::memory_order_relaxed));
+}
 
 std::mutex s_queue_mutex;
 std::condition_variable s_queue_cv;
@@ -316,8 +362,9 @@ std::string SerializeWindow(const Window& w, std::uint64_t seq)
   std::string out;
   out.reserve(2048);
   Envelope(out, "window", seq);
-  out += fmt::format(",\"window\":{},\"generation\":{},\"t\":{},\"t_end\":{},\"mono_ms\":", w.seq,
-                     w.generation, w.start_unix_ms, w.end_unix_ms);
+  out += fmt::format(",\"window\":{},\"generation\":{},\"phase\":\"{}\",\"t\":{},\"t_end\":{},"
+                     "\"mono_ms\":",
+                     w.seq, w.generation, PhaseName(w.phase), w.start_unix_ms, w.end_unix_ms);
   JsonNumber(out, w.start_mono_ms);
   out += ",\"mono_end_ms\":";
   JsonNumber(out, w.end_mono_ms);
@@ -455,7 +502,11 @@ std::string HeaderJson()
   const Settings& s = s_settings;
   std::string out;
   Envelope(out, "header", s_record_seq.fetch_add(1));
-  out += fmt::format(",\"t\":{},\"mono_ms\":0,\"schema\":1", UnixMs());
+  // schema 2 (2026-10-18): phase, build_id, netplay, config (docs/telemetry.md).
+  out += fmt::format(",\"t\":{},\"mono_ms\":0,\"schema\":2,\"phase\":\"{}\"", UnixMs(),
+                     PhaseName(LoadPhase()));
+  out += ",\"build_id\":";
+  JsonString(out, Clean(Common::GetScmRevGitStr(), 12));
   out += ",\"room_code\":";
   JsonString(out, s.room_code);
   out += ",\"player_name\":";
@@ -464,6 +515,8 @@ std::string HeaderJson()
   JsonString(out, Common::GetScmRevGitStr());
   out += ",\"desc\":";
   JsonString(out, Common::GetScmRevStr());
+  out += ",\"branch\":";
+  JsonString(out, Clean(Common::GetScmBranchStr(), 64));
   out += "},\"game\":{\"id\":";
   JsonString(out, Clean(SConfig::GetInstance().GetGameID(), 16));
   out += fmt::format(",\"revision\":{},\"fingerprint\":", SConfig::GetInstance().GetRevision());
@@ -477,6 +530,26 @@ std::string HeaderJson()
   out += fmt::format(",\"window_ms\":{},\"budget_us\":{},\"rollback_env\":",
                      s.interval.count(), s.budget_us);
   out += RollbackEnvJson();
+  if (s_have_start)
+  {
+    const StartInfo& st = s_start;
+    out += fmt::format(",\"netplay\":{{\"players\":{},\"delay\":{},\"star\":{},\"punch\":{},"
+                       "\"rollback_image\":{}}}",
+                       st.players, st.delay, st.star, st.punch, st.rollback_image);
+    out += ",\"config\":{\"scope\":";
+    JsonString(out, st.config_scope);
+    out += fmt::format(",\"digest\":\"{:016x}\",\"fields\":{{", st.config_digest);
+    bool first = true;
+    for (const auto& [name, value] : st.config_fields)
+    {
+      if (!first)
+        out.push_back(',');
+      first = false;
+      JsonString(out, name);
+      out += fmt::format(":\"{:016x}\"", value);
+    }
+    out += "}}";
+  }
   out += "}";
   return out;
 }
@@ -829,6 +902,7 @@ Window& Open()
     s_cpu.open = std::make_unique<Window>();
     s_cpu.open->seq = s_cpu.window_seq++;
     s_cpu.open->generation = s_cpu.generation;
+    s_cpu.open->phase = LoadPhase();
     s_cpu.window_start = Clock::now();
     s_cpu.open->start_unix_ms = UnixMs();
     s_cpu.open->start_mono_ms = MonoMs(s_cpu.window_start);
@@ -963,8 +1037,21 @@ void LiveFrame(std::uint32_t frame, Clock::time_point now)
     w.have_frame = true;
   }
   w.frame_last = frame;
+  s_last_frame.store(frame, std::memory_order_relaxed);
   ++w.counters[static_cast<size_t>(Counter::LiveFrames)][0];
   TryHandOff();
+  if (now - s_cpu.window_start >= s_settings.interval)
+    CloseWindow(now);
+}
+
+// Windows remain visible while ENet is connecting or waiting for input.
+void Poll()
+{
+  if (!Enabled())
+    return;
+  Open();
+  TryHandOff();
+  const auto now = Clock::now();
   if (now - s_cpu.window_start >= s_settings.interval)
     CloseWindow(now);
 }
@@ -983,7 +1070,7 @@ void SessionEnter(const RollbackInfo& info)
          Int("io_idle", info.io_idle), Int("audio_rollback", info.audio_rollback),
          Int("dirty_tracking", info.dirty_tracking), Int("dirty_mode", info.dirty_mode),
          Int("frame_mode", info.frame_mode),
-         Int("vmem_bytes", info.vmem_bytes)});
+         Int("vmem_bytes", info.vmem_bytes), Hex("config_digest", info.config_digest)});
 }
 
 void SessionLeave(std::uint32_t frame, std::string_view reason, std::initializer_list<Field> totals)
@@ -994,18 +1081,36 @@ void SessionLeave(std::uint32_t frame, std::string_view reason, std::initializer
   Event(EventKind::SessionLeave, frame, totals, reason);
 }
 
+namespace
+{
+// Envelope + event name, frame, times and phase: the start of every event.
+std::string EventPrefix(EventKind kind, std::uint32_t frame, size_t reserve)
+{
+  std::string out;
+  out.reserve(reserve);
+  Envelope(out, "event", s_record_seq.fetch_add(1));
+  out += ",\"event\":";
+  JsonString(out, EVENT_NAMES[static_cast<size_t>(kind)]);
+  out += fmt::format(",\"frame\":{},\"phase\":\"{}\",\"t\":{},\"mono_ms\":", frame,
+                     PhaseName(LoadPhase()), UnixMs());
+  JsonNumber(out, MonoMs(Clock::now()));
+  if (IsProblem(kind))
+  {
+    int unset = -1;
+    s_first_problem.compare_exchange_strong(unset, static_cast<int>(kind));
+    s_last_problem.store(static_cast<int>(kind), std::memory_order_relaxed);
+    s_last_problem_frame.store(frame, std::memory_order_relaxed);
+  }
+  return out;
+}
+}  // namespace
+
 void Event(EventKind kind, std::uint32_t frame, std::initializer_list<Field> fields,
            std::string_view text)
 {
   if (!Enabled())
     return;
-  std::string out;
-  out.reserve(256);
-  Envelope(out, "event", s_record_seq.fetch_add(1));
-  out += ",\"event\":";
-  JsonString(out, EVENT_NAMES[static_cast<size_t>(kind)]);
-  out += fmt::format(",\"frame\":{},\"t\":{},\"mono_ms\":", frame, UnixMs());
-  JsonNumber(out, MonoMs(Clock::now()));
+  std::string out = EventPrefix(kind, frame, 256);
   out += ",\"fields\":{";
   bool first = true;
   for (const Field& f : fields)
@@ -1032,11 +1137,110 @@ void Event(EventKind kind, std::uint32_t frame, std::initializer_list<Field> fie
   if (!text.empty())
   {
     out += ",\"text\":";
-    JsonString(out, Clean(text, 160));
+    JsonString(out, Clean(text, 320));  // handoff/config messages name both sides
   }
   out += "}";
-  const bool urgent = kind != EventKind::SessionEnter && kind != EventKind::Note;
+  const bool urgent =
+      kind != EventKind::SessionEnter && kind != EventKind::Note && kind != EventKind::Phase;
   PushRecord(Record{nullptr, std::move(out), urgent});
+}
+
+void DesyncSummary(const DesyncSummaryInfo& info)
+{
+  if (!Enabled())
+    return;
+  // At most 4096 units (~45 KB of JSON): the server rejects records over
+  // 64 KB.  Real summaries have ~400 (24 MB MEM1 / 64 KB regions).
+  constexpr size_t MAX_UNITS = 4096;
+  const size_t n = std::min(info.units.size(), MAX_UNITS);
+  std::string out = EventPrefix(EventKind::DesyncSummary, info.frame, 512 + n * 11);
+  out += fmt::format(",\"generation\":{},\"evidence_frame\":{},\"fields\":{{\"player\":{},\"local\":\"{:016x}\",\"remote\":\"{:016x}\","
+                     "\"semantic\":\"{:016x}\",\"semantic_valid\":{},\"aram\":\"{:016x}\",\"aram_valid\":{},"
+                     "\"excluded_ranges\":{},\"excluded_hash\":\"{:016x}\","
+                     "\"unit_bytes\":{},\"units\":{},\"units_truncated\":{}}}",
+                     info.generation, info.evidence_frame == UINT32_MAX ? info.frame : info.evidence_frame,
+                     info.player, info.local, info.remote, info.semantic, info.semantic_valid,
+                     info.aram, info.aram_valid, info.excluded_ranges,
+                     info.excluded_hash, info.unit_bytes, info.units.size(),
+                     info.units.size() > n ? 1 : 0);
+  out += ",\"source\":";
+  JsonString(out, Clean(info.source ? info.source : "", 32));
+  // File name only: a directory would carry the OS user name.
+  std::string_view bundle = info.bundle;
+  if (const size_t slash = bundle.find_last_of("/\\"); slash != std::string_view::npos)
+    bundle.remove_prefix(slash + 1);
+  out += ",\"bundle\":";
+  JsonString(out, Clean(bundle, 128));
+  out += ",\"digests\":[";
+  for (size_t i = 0; i < n; ++i)
+  {
+    if (i)
+      out.push_back(',');
+    out += fmt::format("\"{:08x}\"", info.units[i]);
+  }
+  out += "]}";
+  PushRecord(Record{nullptr, std::move(out), true});
+}
+
+void Start(const StartInfo& info)
+{
+  Rearm();  // a new boot after a previous core shutdown (GUI process)
+  bool resend = false;
+  {
+    std::lock_guard lk(s_init_mutex);
+    s_start = info;
+    s_have_start = true;
+    s_phase = static_cast<std::uint8_t>(info.phase);
+    resend = s_configured.load();
+  }
+  // Not configured yet: Configure (via Enabled) sends the header with these
+  // facts.  Already running (something reported first): send it again.
+  if (Enabled() && resend)
+    PushRecord(Record{nullptr, HeaderJson(), true});
+}
+
+void SetPhase(Phase phase, std::uint32_t frame)
+{
+  const Phase old = LoadPhase();
+  if (old == phase)
+    return;
+  s_phase.store(static_cast<std::uint8_t>(phase), std::memory_order_relaxed);
+  if (!Enabled())
+    return;
+  CloseWindow(Clock::now());
+  Event(EventKind::Phase, frame, {}, fmt::format("{} -> {}", PhaseName(old), PhaseName(phase)));
+}
+
+Phase CurrentPhase()
+{
+  return LoadPhase();
+}
+
+std::string BundlePrefix()
+{
+  if (!Enabled())
+    return {};
+  std::string prefix = s_settings.local_path;
+  if (prefix.size() > 6 && prefix.ends_with(".jsonl"))
+    prefix.resize(prefix.size() - 6);
+  return prefix;
+}
+
+void Shutdown(std::string_view reason, std::initializer_list<Field> fields)
+{
+  if (s_configured.load() && s_enabled.load())
+  {
+    std::string text(reason);
+    if (const int first = s_first_problem.load(); first >= 0 && first < static_cast<int>(EventKind::Count))
+      text += fmt::format("; first problem: {}", EVENT_NAMES[static_cast<size_t>(first)]);
+    if (const int last = s_last_problem.load(); last >= 0 && last < static_cast<int>(EventKind::Count))
+    {
+      text += fmt::format("; last problem: {} at frame {}", EVENT_NAMES[static_cast<size_t>(last)],
+                          s_last_problem_frame.load());
+    }
+    Event(EventKind::Shutdown, s_last_frame.load(), fields, text);
+  }
+  Shutdown();
 }
 
 void Desync(std::uint32_t frame, std::uint64_t local_checksum, std::uint64_t remote_checksum,
@@ -1064,7 +1268,10 @@ void Shutdown()
         s_queue.push_back(Record{std::move(s_cpu.closed), {}, true});
       s_cpu.closed.reset();
     }
-    s_stop_deadline = (Clock::now() + FINAL_SEND_BUDGET).time_since_epoch().count();
+    // Core::Stop may have already started this budget. Never extend it.
+    Clock::rep unset = 0;
+    s_stop_deadline.compare_exchange_strong(
+        unset, (Clock::now() + FINAL_SEND_BUDGET).time_since_epoch().count());
     {
       std::lock_guard lk(s_queue_mutex);
       s_stop = true;
@@ -1078,9 +1285,28 @@ void Shutdown()
   }
   std::lock_guard lk(s_init_mutex);
   s_cpu = CpuState{};
+  s_start = StartInfo{};
+  s_have_start = false;
+  s_phase = static_cast<std::uint8_t>(Phase::None);
+  s_last_frame = 0;
+  s_last_problem = -1;
+  s_first_problem = -1;
+  s_last_problem_frame = 0;
   s_enabled = false;
   s_shut_down = true;
   s_configured = true;  // stays off until Rearm()
+}
+
+void StopRequested()
+{
+  // No lazy Configure on a host thread during teardown. The CPU thread owns
+  // the remaining records and Shutdown joins the sender after CPU exit.
+  if (!s_enabled.load(std::memory_order_acquire))
+    return;
+  Clock::rep unset = 0;
+  s_stop_deadline.compare_exchange_strong(
+      unset, (Clock::now() + FINAL_SEND_BUDGET).time_since_epoch().count());
+  Event(EventKind::StopRequested, s_last_frame.load(), {}, "Core::Stop requested");
 }
 
 void Rearm()
