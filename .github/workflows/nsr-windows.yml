@@ -168,7 +168,7 @@ jobs:
           rem DEBUG ONLY. Friends: use NFLStreetRollback.exe (room codes) instead.
           rem NFLStreetRollback netplay by IP address, 2-4 players, same settings
           rem as the launcher's rollback mode (input delay 1, lockstep menus,
-          rem rollback matches). Run NFLStreetRollback-Patcher.exe once first (makes nsr-net.iso).
+          rem rollback matches). Run NFLStreetRollback.exe once first (imports the local game/assets).
           rem Usage:  NFLStreetRollback-debug.bat PLAYER PLAYERS [PEERS] [SEED]
           rem   PLAYER  your number, 0..PLAYERS-1 (0 = the player everyone connects to)
           rem   PLAYERS 2, 3 or 4
@@ -216,12 +216,9 @@ jobs:
           if %NSR_PLAYERS% GEQ 2 set SI1=6
           if %NSR_PLAYERS% GEQ 3 set SI2=6
           if %NSR_PLAYERS% GEQ 4 set SI3=6
-          set TEXTURES=
-          set REBORN=
-          if exist "%~dp0nsr-reborn.txt" (
-            set /p REBORN=<"%~dp0nsr-reborn.txt"
-          )
-          if defined REBORN set TEXTURES=-C "Dolphin.General.LoadPath=%REBORN%\content" -C Graphics.Settings.HiresTextures=True -C Graphics.Settings.CacheHiresTextures=False
+          rem The launcher imports assets and writes our local ordered list.
+          rem Debug starts never resolve or read a Reborn folder.
+          set TEXTURES=-C Graphics.Settings.HiresTextures=True -C Graphics.Settings.CacheHiresTextures=False
           "%~dp0Dolphin.exe" -u "%~dp0User" %TEXTURES% -C Dolphin.Interface.UsePanicHandlers=False -C Dolphin.Core.CPUThread=False -C Dolphin.Core.EnableCustomRTC=True -C Dolphin.Core.CustomRTCValue=0x30000000 -C Dolphin.Core.SIDevice0=6 -C Dolphin.Core.SIDevice1=%SI1% -C Dolphin.Core.SIDevice2=%SI2% -C Dolphin.Core.SIDevice3=%SI3% -C Dolphin.Core.FastDiscSpeed=True -b -e "%~dp0nsr-net.iso"
           endlocal
           '@ | Set-Content -Encoding ascii Binary/x64/NFLStreetRollback-debug.bat
@@ -247,6 +244,10 @@ jobs:
           $repo = "${{ github.server_url }}/${{ github.repository }}"
           $pkg = "package/NFLStreetRollback"
           New-Item -ItemType Directory -Force $pkg | Out-Null
+          # Fail before staging/uploading any player's imported asset store.
+          $privateDirs = Get-ChildItem -Recurse -Directory Binary/x64 | Where-Object {
+            $_.Name -in 'Assets','User','NSRTextures','GN7E69','prompt-packages' }
+          if ($privateDirs) { throw "Local Reborn assets must never be packaged" }
           Copy-Item -Recurse Binary/x64/* $pkg
           # Dolphin's self-updater would offer to replace this fork with an
           # official Dolphin build (no rollback netplay); friends get updates as a
@@ -337,8 +338,14 @@ jobs:
           so he can fix lag. Never your button presses or any files. Untick it
           to send nothing.
 
-          Never share game files: not nsr-net.iso, not NSR.iso, not anything
-          from the Reborn folder. Everyone builds their own copy in step 3.
+          First launch imports textures and button icons into Assets/ using
+          your own Reborn install. Later launches use this local store and
+          nsr-net.iso even if Reborn is removed. Settings > Advanced > Re-import
+          from Reborn refreshes it; rebuilding the game image needs Reborn's
+          NSR.iso again. Nothing is sent anywhere during local import.
+
+          Never share game files: not nsr-net.iso, NSR.iso, Assets/, User/,
+          or anything from Reborn. Everyone imports their own copy in step 3.
 
           If something breaks, tell Mason what the window said, and send the
           nsr-p*.log files from this folder if he asks.
@@ -347,6 +354,7 @@ jobs:
           # Contents guard: no game images, saves, memory cards, dumps or secrets.
           $bad = Get-ChildItem -Recurse -File $pkg | Where-Object {
             $_.Extension -in '.iso','.gcm','.rvz','.wbfs','.ciso','.gcz','.nkit','.gci','.sav','.dtm','.env','.pem','.key' -or
+            ($_.Name -like 'tex1_*') -or
             $_.Name -in 'nsr-telemetry.txt','nsr-net.iso','nsr-image.json','nsr-reborn.txt','nsr-launcher.json','nsr-launcher.log','GCPadNew.ini.before-reborn-import' }
           if ($bad) { $bad | ForEach-Object { Write-Error "unexpected file in package: $($_.FullName)" }; exit 1 }
           foreach ($f in 'Dolphin.exe','NFLStreetRollback.exe','NFLStreetRollback-Patcher.exe','README-FIRST.txt','VERSION.txt','SOURCE.txt','portable.txt') {

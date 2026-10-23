@@ -22,8 +22,8 @@ NFLStreet-dolphin folder (next to Dolphin.exe) and handles these workflows:
   4. Controllers: the player's NFL Street Reborn controller setup is copied
      into this Dolphin automatically (nsr_controllers.py), so a pad mapped in
      Reborn's launcher works here without mapping it twice.
-  5. Game results: new per-game stats files that Reborn's own Dolphin writes
-     (GameStats/, stats/queue/) are uploaded in the background to Mason's
+  5. Game results: new per-game stats files our own Dolphin writes
+     (User/GameStats/) are uploaded in the background to Mason's
      server for the shared Stats page (nsr_gamestats.py, docs/stats.md),
      unless the player unticks "Upload game results".
   6. Content updates (docs/content-updates.md): on start, before hosting or
@@ -37,7 +37,10 @@ NFLStreet-dolphin folder (next to Dolphin.exe) and handles these workflows:
 Reborn is never modified: its files are only read, this Dolphin runs in
 portable mode with its own settings (User/ next to it). Offline saves persist;
 netplay uses fresh disposable cards and canonical SRAM owned by the fork, and
-Reborn's HD textures are loaded read-only from its install.
+Reborn's HD textures are imported into our private Assets/ store on first
+setup (nsr_textures.py). Subsequent launches use only our local image/assets
+and controller Config. Only metadata probes detect source updates; the
+Settings → Advanced re-import button explicitly refreshes the local assets.
 
 Structure: pure helpers (dolphin_command & co., unit-tested), then Launcher,
 the UI-agnostic state machine every button calls (also tested, with fake
@@ -150,7 +153,7 @@ def app_dir() -> str:
     return os.getcwd()
 
 
-GAME_STATS_NOTE = ("Final scores and box-score stats of the games you finish in NFL Street Reborn (the "
+GAME_STATS_NOTE = ("Final scores and box-score stats of the games you finish in NFLStreetRollback (the "
                    "files its Dolphin saves after the Game Stats/MVP screens), your name above and a random "
                    "ID for this install. Never other files, folder paths, or your PC's name. Untick to upload "
                    "nothing.")
@@ -218,15 +221,9 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
         return args, env
     players = start.players if start else 1
     pad = controllers.controller_kind(os.path.join(folder, "User"))
-    # Reborn's HD textures, composed by reference (nsr_textures): its pristine
-    # library (menus, real-player headshots), the mods the player turned on in
-    # Reborn, and the button icons for this player's controller (or the
-    # setting), listed for the fork's ordered texture overlay. Before
-    # 2026-10-23 this passed -C GFX.Settings.*, which Dolphin ignores (the -C
-    # system is "Graphics"), so HD textures never loaded and the game showed
-    # its "MISSING TEXTURES" placeholders. Not cached up front, as Reborn's
-    # own GN7E69 game INI: prefetching the ~8 GB library costs ~15 GB of RAM.
-    tex = textures.compose(reborn_install, icons, pad.kind, os.environ)
+    # Imported presentation assets only. This launch path never resolves or
+    # opens a Reborn source; both prompt sets were captured during setup.
+    tex = textures.compose(folder, icons, pad.kind)
     try:
         textures.write_list(os.path.join(folder, "User"), tex)
     except OSError as e:
@@ -480,6 +477,7 @@ class Launcher:
         self._patcher = patcher_mod or patcher
         self._env = env
         self._lock = threading.RLock()
+        self._textures_logged = False
         self._host = None
         self._join_cancel = None
         # Background game-results uploader: its own long-lived thread (tests pass
@@ -638,7 +636,7 @@ class Launcher:
     def refresh_textures(self) -> textures.TextureSet:
         """What the next launch will show (nothing is written here)."""
         pad = controllers.controller_kind(self.user_dir)
-        ts = textures.compose(self.reborn_install(), self._icons_setting(), pad.kind, self._env)
+        ts = textures.compose(self.folder, self._icons_setting(), pad.kind)
         self._set("textures", icons=self._icons_setting(), effective=ts.icons, why=ts.icons_why,
                   base_kind=ts.base_kind, base=ts.base or "",
                   packages=[f"{p.id} {p.version}" for p in ts.packages],
@@ -646,11 +644,12 @@ class Launcher:
         return ts
 
     def need_game(self) -> bool:
+        if self.state["game"].get("busy"):
+            self.notify("The game is still getting ready. One moment…", "info")
+            return True
         if not self.state["game"]["fingerprint"]:
-            if self.state["game"].get("busy"):
-                self.notify("The game is still getting ready (first start only). One moment…", "info")
-            else:
-                self.notify("Couldn't find NFL Street Reborn. Settings → Advanced → Locate Reborn.", "error")
+            self.notify(self.state["game"].get("text") or
+                        "Couldn't find NFL Street Reborn. Settings → Advanced → Locate Reborn.", "error")
             return True
         return False
 
@@ -784,9 +783,19 @@ class Launcher:
             if content and not applied and not runtime:
                 note = (note + f"\nGame content v{content.version} doesn't support this Reborn version yet; "
                                "built without it.").strip()
+            self.sync_controllers_now()
+            self._ensure_assets(install=r.reborn_install)
             self._ready(r.fingerprint, note, descriptor)
-            self.sync_controllers()  # the install may be new to us: pick up its pad setup
             return True
+        except textures.ImportError as e:
+            # The ISO may already have been published. Retain it on disk, but
+            # do not call a first setup complete with only half its assets.
+            if textures.read_store(self.folder):
+                self._check_game_now()
+                self.notify(f"{e} Your existing local textures are kept.", "error")
+            else:
+                self._set("game", state="error", fingerprint="", progress=None, text=str(e))
+            log(self.folder, f"local texture import: {e}")
         except isopatch.PatchError:
             self._fail_build(restore, "This Reborn version isn't supported yet (the game code changed). "
                                       "Nothing was written. Ask Mason for an updated launcher.")
@@ -839,8 +848,19 @@ class Launcher:
         return install if install and os.path.isdir(install) else None
 
     def sync_controllers_now(self, force: bool = False, search: bool = False) -> controllers.SyncResult:
-        source = controllers.find_reborn_source(self.reborn_install(search), self._env)
-        res = controllers.sync_controllers(self.user_dir, source, self.cfg.get("controllers"), force)
+        # Once imported (or mapped in our Dolphin), our Config owns controls.
+        # Only the explicit import button may read Reborn again.
+        record = self.cfg.get("controllers") or {}
+        own_pad = os.path.join(self.user_dir, "Config", "GCPadNew.ini")
+        if not force and (record.get("written") or os.path.isfile(own_pad)
+                          or textures.read_store(self.folder, validate=False)):
+            source = None
+            synced = record.get("written") == controllers.text_hash(controllers.read_text(own_pad) or "")
+            res = controllers.SyncResult("up-to-date" if synced else "kept-yours", record,
+                                         "Using your saved NFLStreetRollback controller settings.")
+        else:
+            source = controllers.find_reborn_source(self.reborn_install(search), self._env)
+            res = controllers.sync_controllers(self.user_dir, source, record, force)
         if res.record != self.cfg.get("controllers"):
             self.cfg["controllers"] = res.record
             self._save()
@@ -1030,10 +1050,10 @@ class Launcher:
                                            or self.state["join"]["state"] != "idle") else "")
         if blocker:
             return self._content("available", f"Update available: {what}. {blocker}")
-        iso = self._reborn_iso()
+        iso = self._reborn_iso() if not self.state["content"]["runtime"] else None
         if not iso and not self.state["content"]["runtime"]:
-            return self._content("blocked", f"Update available: {what}. It's built from your Reborn install: "
-                                            "click “Find Reborn automatically” in Settings.")
+            return self._content("blocked", f"Update available: {what}. Reborn's game file (NSR.iso) is needed for "
+                                            "this rebuild. Locate Reborn in Settings → Advanced. Your current game copy is kept.")
         if self._source_sha and self._source_sha not in release["builds"]:
             return self._content("blocked", f"Game content v{release['version']} doesn't support your Reborn "
                                             "version yet. Ask Mason.")
@@ -1089,12 +1109,12 @@ class Launcher:
         except Exception as e:  # noqa: BLE001
             log(self.folder, f"controller sync failed: {e!r}")
         if start is not None and getattr(start, "telemetry_url", ""):
-            # Remember the server (and this room's token as registration proof)
-            # so Reborn-only games can be uploaded later too.
+            # Remember the server and this room's token as registration proof
+            # for our own native game-result captures.
             self.uploader.remember_server(start.telemetry_url, start.telemetry_token)
             self._stats_wake.set()
         selected_draft = lobby.draft_settings(start.draft) if start else self.draft_settings()
-        args, env = dolphin_command(self.folder, start, self.reborn_install(), open_ui=open_ui,
+        args, env = dolphin_command(self.folder, start, None, open_ui=open_ui,
                                     name=self.state["name"], fingerprint=self.room_fingerprint(selected_draft),
                                     telemetry=self.state["telemetry"], quickstart=self.state["quickstart"],
                                     icons=self._icons_setting(), resolution=self._resolution_setting())
@@ -1346,7 +1366,10 @@ class Launcher:
             return {"state": "off"}
         fallback = telemetry_config(self.folder)
         url = gamestats.games_url(self._env.get("NSR_GAMES_URL", "") or fallback["url"])
-        dirs = gamestats.stats_dirs(self.reborn_install(), self._env, own_user_dir=self.user_dir)
+        # The self-contained launcher discovers only its own native captures.
+        # Reborn assets, manifests and source paths never enter the uploader.
+        own_stats = os.path.join(self.user_dir, "GameStats")
+        dirs = [own_stats] if os.path.isdir(own_stats) else []
         try:
             res = self.uploader.run_once(dirs, self.state["name"], url=url, shared_key=fallback["key"],
                                          force=force)
@@ -1363,7 +1386,7 @@ class Launcher:
                 "offline": "Server unreachable; will retry.", "waiting": "Will retry shortly.",
                 }.get(res["state"], f"Upload problem ({res['state']}); will retry.")
         if not dirs:
-            text = "No Reborn game results folder found yet. " + text
+            text = "No local game results folder found yet. " + text
         self._set("game_stats", state=res["state"], text=text, sent=res["total_sent"], pending=res["pending"])
         if res.get("sent"):
             log(self.folder, f"game stats: sent {res['sent']}, {res['pending']} pending")
@@ -1375,8 +1398,62 @@ class Launcher:
             self._stats_wake.wait(gamestats.INTERVAL_S)
             self._stats_wake.clear()
 
+    # -- local presentation import (serialized by the existing setup busy flag) --
+    def _ensure_assets(self, force: bool = False, install: str | None = None) -> None:
+        """Metadata-check or import inside setup; normal composition is local only."""
+        old = textures.read_store(self.folder)
+        install = install or old.get("install") or self.reborn_install(search=True)
+        if not install and not old and not force:
+            self.refresh_textures()  # a prebuilt custom image may have no source
+            return
+        label = self._patcher.read_manifest(self.folder).get("source_label") if hasattr(self._patcher, "read_manifest") else ""
+        manifest = textures.ensure_store(self.folder, install, self._env, force=force,
+            version=(label or "unknown").removeprefix("Reborn "), progress=lambda d, t: self._set("game",
+                text="Importing Reborn textures into your local folder…", progress=round(d * 100 / max(t, 1))))
+        self.refresh_textures()
+        if not self._textures_logged:
+            log(self.folder, textures.store_summary(manifest))
+            self._textures_logged = True
+
+    def _import_assets_setup(self, force: bool = False) -> None:
+        """Keep a working generation on failure; surface first-import disk errors."""
+        with self._lock:
+            if (self._dolphin_running() or self.state["content"]["busy"]
+                    or self.state["host"]["state"] != "idle" or self.state["join"]["state"] != "idle"):
+                self.notify("Close the game, leave your room and wait for updates before importing.", "error")
+                return
+            before = self._claim_build("Checking your local texture store…")
+            if before is None:
+                return
+        try:
+            self._ensure_assets(force)
+            if before["state"] == "ready":
+                self._set("game", **{**before, "busy": True, "progress": None})
+            else:
+                self._check_game_now()  # retry after a first-import failure
+            if force:
+                self.notify("Reborn textures imported into your local folder.")
+        except (OSError, ValueError) as e:
+            if textures.read_store(self.folder):
+                self._set("game", **{**before, "busy": True, "progress": None})
+                self.notify(f"{e} Your existing local textures are kept.", "error")
+                if not self._textures_logged:
+                    log(self.folder, textures.store_summary(textures.read_store(self.folder)))
+                    self._textures_logged = True
+            else:
+                self._set("game", state="error", fingerprint="", text=str(e), progress=None)
+            log(self.folder, f"local texture import: {e}")
+        finally:
+            self._set("game", busy=False)
+
+    def reimport_reborn(self) -> None:
+        """Settings → Advanced: refresh assets, preserving our ISO and controls."""
+        self._spawn(lambda: self._import_assets_setup(force=True))
+
     def _startup_checks(self) -> None:
         self._check_game_now()
+        if self.state["game"]["state"] == "ready":
+            self._import_assets_setup()
         self.update_content_now(user=False)  # auto: install; manual: just report
         # One-click start: a missing or outdated game copy is built right away
         # from the Reborn install we can find (what "Find Reborn automatically"
@@ -1388,8 +1465,10 @@ class Launcher:
             self.find_game()
 
     def startup(self) -> None:
-        self._spawn(self._startup_checks)
-        self.sync_controllers()
+        def setup():
+            self.sync_controllers_now(search=True)
+            self._startup_checks()
+        self._spawn(setup)
         self._loop_spawn(self._stats_loop)
 
     def shutdown(self) -> None:
@@ -1452,6 +1531,7 @@ class WebApi:
     def play_offline(self): self._l.play_offline()
     def setup_controllers(self): self._l.setup_controllers()
     def import_controllers(self): self._l.import_controllers()
+    def reimport_reborn(self): self._l.reimport_reborn()
     def refresh_controllers(self): self._l.refresh_controllers()
     def copy_text(self, text): return copy_to_clipboard(str(text))
 
@@ -1629,6 +1709,7 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     stats_text = label(sp, 5, style="Muted.TLabel")
     game_text = label(sp, 6, pady=(14, 4))
     progress = ttk.Progressbar(sp, length=300, mode="determinate")
+    ttk.Button(sp, text="Re-import from Reborn", command=launcher.reimport_reborn).grid(row=8, column=2, sticky="w", pady=8)
     b_find = ttk.Button(sp, text="Find Reborn automatically", command=launcher.find_game)
     b_browse = ttk.Button(sp, text="Browse for NSR.iso…")
     b_find.grid(row=8, column=0, sticky="w")

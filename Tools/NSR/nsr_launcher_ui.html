@@ -334,7 +334,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
             <div class="note" style="margin-top:4px">Connection and rollback counters, your name and the room code, to help fix netplay. Never your button presses, files, or game data. Off: nothing is sent or kept.</div></div></div>
           <div style="height:14px"></div>
           <div class="toggle" id="gameStats"><div class="switch"></div><div><b>Upload game results to Mason's server</b>
-            <div class="note" style="margin-top:4px">For the shared Stats page: final scores and box-score stats of the games you finish in NFL Street Reborn (the files its Dolphin saves after the Game Stats/MVP screens), your name and a random ID for this install. Never other files, folder paths, or your PC's name. Off: nothing is uploaded.</div>
+            <div class="note" style="margin-top:4px">For the shared Stats page: final scores and box-score stats of the games you finish in NFLStreetRollback (saved after the Game Stats/MVP screens), your name and a random ID for this install. Never other files, folder paths, or your PC's name. Off: nothing is uploaded.</div>
             <div class="note" id="gameStatsText" style="margin-top:4px"></div></div></div>
         </div>
         <div class="card"><div class="label" style="margin-bottom:8px">Graphics: internal resolution</div>
@@ -348,8 +348,9 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
           <div class="row" style="margin-top:16px">
             <button class="btn red" id="btnFind">Locate Reborn automatically</button>
             <button class="btn" id="btnBrowse">Browse for NSR.iso…</button>
+            <button class="btn" id="btnReimport">Re-import from Reborn</button>
           </div>
-          <div class="note">Built automatically from your NFL Street Reborn install. Only needed if Reborn
+          <div class="note">Game and textures are imported locally from your own Reborn install; nothing is uploaded. Reborn is only needed again for a rebuild or re-import. Locate it here if Reborn
             wasn't found or moved. Everyone you play with must show the same fingerprint.</div>
         </details>
         <div class="card">
@@ -533,7 +534,7 @@ function render(s) {
   setText("gameText", (g.text || "") + (g.note ? "\n" + g.note : ""));
   show("gameBar", g.progress != null); $("gameProg").style.width = (g.progress || 0) + "%";
   const setupIdle = !g.busy && !(s.content && s.content.busy) && h.state === "idle" && j.state === "idle";
-  enable("btnFind", setupIdle); enable("btnBrowse", setupIdle);
+  enable("btnFind", setupIdle); enable("btnBrowse", setupIdle); enable("btnReimport", setupIdle);
   const draftOrder = { alternating: "Alternating", snake: "Snake", cocky: "Cocky" };
   const draftFirst = { stock: "Select Controller", "team-one": "Team One", "team-two": "Team Two" };
   setText("hostDraft", "Pickup draft: " + (draftOrder[g.draft_order] || "Alternating")
@@ -586,6 +587,7 @@ function wire() {
   $("gameStats").onclick = () => call("set_game_stats", !(S.snap && S.snap.game_stats && S.snap.game_stats.enabled));
   // Stage both choices together; the backend clears readiness until rebuilt.
   $("draftOrder").onchange = $("draftFirst").onchange = () => call("set_draft", $("draftOrder").value, $("draftFirst").value);
+  $("btnReimport").onclick = () => call("reimport_reborn");
   $("btnFind").onclick = () => call("find_game");
   $("btnUpdates").onclick = () => call("check_updates");
   $("runtimeContent").onclick = () => call("set_content_runtime", !(S.snap && S.snap.content && S.snap.content.runtime));

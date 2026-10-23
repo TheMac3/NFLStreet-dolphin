@@ -40,6 +40,7 @@ import argparse
 import hashlib
 import json
 import os
+from pathlib import Path
 import sys
 import time
 
@@ -54,9 +55,8 @@ MANIFEST_NAME = "nsr-image.json"  # sidecar describing nsr-net.iso (no paths)
 # isopatch's rollback bytes change (then update KNOWN_INPUTS' outputs).
 ROLLBACK_RECIPE = "gn7e69-r0-rollback-v1"
 NETPLAY_MODE = "rollback"  # what this image plays (nsr_lobby.RELEASE_MODE)
-# Where the Reborn install was found, for nsr-netplay.bat to point Dolphin's
-# texture loading at Reborn's own HD texture pack (read-only; nothing in the
-# Reborn install is ever modified or copied).
+# Source install discovery for the first local texture/controller import.
+# Normal play uses our Assets store and does not require this path to exist.
 REBORN_PATH_NAME = "nsr-reborn.txt"
 
 # Known Reborn images (SHA-256 of app/content/games/NSR.iso) and the netplay
@@ -186,7 +186,10 @@ def reborn_install_of(iso: str) -> str | None:
     """Reborn's install folder (the one holding content/textures), if it is one."""
     games_dir = os.path.dirname(os.path.abspath(iso))
     install = os.path.dirname(os.path.dirname(games_dir))
-    return install if os.path.isdir(os.path.join(install, "content", "textures")) else None
+    expected_layout = (os.path.basename(games_dir).lower() == "games"
+                       and os.path.basename(os.path.dirname(games_dir)).lower() == "content")
+    return install if (os.path.isdir(os.path.join(install, "content", "textures"))
+                       or expected_layout and os.path.isdir(install)) else None
 
 
 def saved_reborn_install(out_dir: str) -> str | None:
@@ -199,7 +202,8 @@ def saved_reborn_install(out_dir: str) -> str | None:
             path = f.read().strip()
     except OSError:
         return None
-    return path if path and os.path.isdir(os.path.join(path, "content", "textures")) else None
+    return path if path and (os.path.isdir(os.path.join(path, "content", "textures"))
+                             or os.path.isdir(os.path.join(path, "content", "games"))) else None
 
 
 def write_manifest(out_dir: str, digest_in: str, label: str | None, digest_out: str,
@@ -273,6 +277,12 @@ def prepare_image(iso: str, out_dir: str, progress=None, content: "nsr_content.C
     without content), the edits are applied to the fresh copy, and the result
     must equal the release's output_sha256 exactly (ContentError otherwise,
     and the previous nsr-net.iso is kept)."""
+    if not os.path.isfile(iso):
+        raise FileNotFoundError("Reborn's game file (NSR.iso) is needed for this rebuild. "
+                                "Locate Reborn in Settings → Advanced. Your existing game copy is kept.")
+    install = reborn_install_of(iso)
+    if install and Path(out_dir).resolve().is_relative_to(Path(install).resolve()):
+        raise ValueError("Keep NFLStreetRollback in its own folder outside Reborn before building/importing.")
     choices = draftmodes.patch_names(draft_order, draft_first)
     step = (lambda st: (lambda d, t: progress(st, d, t))) if progress else (lambda st: None)
     digest_in = sha256(iso, progress=step("check")) if progress else sha256(iso, "checking Reborn image")
@@ -427,7 +437,7 @@ def run(iso: str | None, out_dir: str, draft_order="alternating", draft_first="s
     else:
         print("Compare this fingerprint with everyone you play with: it must be identical.")
     if r.reborn_install:
-        print(f"Reborn textures will be used read-only from: {os.path.join(r.reborn_install, 'content', 'textures')}")
+        print("The launcher will import textures locally from your Reborn install on first start.")
     print("\nYour Reborn install was only read, never changed.")
     print(f"Next: start a game with the NFLStreetRollback launcher (it uses {OUTPUT_NAME} from this folder).")
     return 0
