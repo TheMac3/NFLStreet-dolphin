@@ -4,10 +4,10 @@ What a content release is (docs/content-updates.md): OUR edit data only, never
 game bytes. A release names one or more ratings packs (JSON lists of
 "player X: attribute Y from <expected> to <value>"), the patch recipe it
 targets, and, for every supported Reborn input image (by SHA-256), the
-image fingerprint each player's launcher must end up with after building
-nsr-net.iso locally from their own Reborn install. The game image itself is
-never distributed; every friend's launcher rebuilds it (nsr_patcher.prepare_image
-with content=...), and the expected output digest proves the build matched.
+unedited base plus the expected image-baked output. Runtime delivery retains the
+base and applies a verified edits-only bundle at native database load. The
+fallback rebuilds locally (nsr_patcher.prepare_image with content=...) and checks
+the expected output digest. The game image itself is never distributed.
 
 Wire format (served read-only by services/telemetry at /v1/content/...):
 
@@ -436,6 +436,38 @@ class Content:
     def descriptor(self) -> dict:
         return content_descriptor(self.version, self.serial)
 
+    def runtime_bytes(self) -> bytes:
+        """A deterministic edits-only boot bundle; serial/signatures stay outside
+        its identity so re-signing the same release does not change gameplay."""
+        if len(self.edits) > MAX_EDITS:
+            raise ContentError("Runtime releases support at most 5000 total edits; use image baking.")
+        for edit in self.edits:
+            for key in ("first_name", "last_name"):
+                if not all(32 <= ord(c) < 127 for c in edit[key]):
+                    raise ContentError("Runtime ratings currently require ASCII player names; use image baking.")
+        raw = canonical({"format": "nsrb.runtime-content.v1", "version": self.version,
+                         "packs": self.packs})
+        if len(raw) > 4 * 1024 * 1024:
+            raise ContentError("Runtime content bundle is too large; use image baking.")
+        return raw
+
+    def validate_runtime_image(self, image: str, source_sha: str) -> None:
+        """Validate the signed base/template contract and all edits without writing
+        an image. The caller checks the actual image fingerprint separately."""
+        import discpatch
+        import eadb
+        build = self.build_for(source_sha)
+        if build is None:
+            raise ContentError("Runtime content does not support this Reborn image.")
+        template = discpatch.read_file(image, build["roster_file"])
+        if hashlib.sha256(template).hexdigest() != build["template_sha256"]:
+            raise ContentError("Runtime content needs the unedited rollback roster; rebuild the base once.")
+        try:
+            eadb.apply_edits(template, self.edits)
+        except ValueError as exc:
+            raise ContentError(f"Runtime edits do not fit this roster: {exc}") from None
+        self.runtime_bytes()
+
 
 class Cache:
     """Verified manifest and packs under <folder>/nsr-content (no game data)."""
@@ -480,6 +512,47 @@ class Cache:
                 _atomic_write(self._pack_path(entry["sha256"]), raw)
             packs.append(pack)
         return Content(payload, packs)
+
+    def activate_runtime(self, content: Content) -> None:
+        """Retain the verified signed envelope as the installed release, separate
+        from the newest manifest (a later failed download must keep this one)."""
+        with open(os.path.join(self.root, "manifest.json"), "rb") as f:
+            raw = f.read(MAX_MANIFEST_BYTES + 1)
+        if verify_manifest(raw, self.keys) != content.payload:
+            raise ContentError("The verified manifest changed during installation; retry the update.")
+        _atomic_write(os.path.join(self.root, "active-runtime.json"), raw)
+
+    def runtime_content(self) -> Content | None:
+        """Re-verify the installed envelope and cached packs, including offline.
+        Corruption raises: launching stock after silently losing edits is unsafe."""
+        try:
+            with open(os.path.join(self.root, "active-runtime.json"), "rb") as f:
+                raw = f.read(MAX_MANIFEST_BYTES + 1)
+        except FileNotFoundError:
+            return None
+        return self.load(verify_manifest(raw, self.keys))
+
+    def runtime_env(self, content: Content | None, draft_order="alternating", draft_first="stock") -> dict[str, str]:
+        """Write an immutable ratings/settings bundle for Dolphin.
+        Dolphin re-hashes these bytes once before accepting the native load."""
+        import draftmodes
+        raw = draftmodes.runtime_bytes(content, draft_order, draft_first)
+        if raw is None:
+            return {}
+        if len(raw) > 4 * 1024 * 1024:
+            raise ContentError("Combined runtime settings exceed the bundle size limit.")
+        sha = hashlib.sha256(raw).hexdigest()
+        path = os.path.abspath(os.path.join(self.root, "runtime", sha + ".json"))
+        _atomic_write(path, raw)
+        return {"NSR_CONTENT_PACK": path, "NSR_CONTENT_SHA256": sha,
+                "NSR_CONTENT_VERSION": str(content.version if content else 0)}
+
+    def clear_runtime(self) -> None:
+        """Retire our active pointer only after a fallback image build succeeds."""
+        try:
+            os.unlink(os.path.join(self.root, "active-runtime.json"))
+        except FileNotFoundError:
+            pass
 
 
 # --- room descriptors ------------------------------------------------------------------

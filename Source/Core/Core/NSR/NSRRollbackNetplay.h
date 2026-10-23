@@ -35,7 +35,8 @@ constexpr std::uint32_t HANDOFF_MAGIC = 0x4E535248;  // 'NSRH'
 // therefore fail to parse each other instead of comparing values that mean
 // different things.  VERSION 6 keeps frame-driven time, DVD completion and
 // audio modeling active during post-match lockstep; an older peer would run
-// that transition with incompatible lifecycle semantics.
+// that transition with incompatible lifecycle semantics. HANDOFF_VERSION 5
+// includes the full runtime-content SHA-256, content version and hook policy.
 constexpr std::uint8_t VERSION = 6;
 constexpr std::uint8_t HANDOFF_VERSION = 5;
 constexpr std::size_t MAX_PLAYERS = 4;
@@ -86,6 +87,12 @@ enum class ConfigField : std::uint8_t
   ResimGates,      // audio/effect gates, skip lists, resim vsync, async present, PEEKZ
   SessionRules,    // fixed epoch, NSR_RB_SESSION_END, auto re-entry, auto handoff
   DolphinCore,     // cheats, MMU, MEM1 override, FPRF, accurate NaNs, custom RTC
+  ContentSha0,     // full runtime bundle SHA-256, first 64 bits
+  ContentSha1,
+  ContentSha2,
+  ContentSha3,
+  ContentVersion,  // release identity
+  ContentPolicy,   // injection hook/rules version
   Count
 };
 constexpr std::size_t CONFIG_FIELDS = static_cast<std::size_t>(ConfigField::Count);

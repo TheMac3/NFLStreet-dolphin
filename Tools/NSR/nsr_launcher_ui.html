@@ -174,6 +174,11 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
 .bar { height: 8px; border-radius: 4px; background: #24242b; overflow: hidden; margin-top: 12px; }
 .bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--red), #ff6a5c); transition: width .2s; }
 .fp { font-size: 22px; font-weight: 800; letter-spacing: 1px; margin: 4px 0 2px; }
+/* Image setup choices use native keyboard-accessible selects, sized like the other controls. */
+.draft-settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-top: 12px; }
+.draft-settings label { display: flex; flex-direction: column; gap: 6px; }
+.draft-settings select { width: 100%; font: inherit; color: var(--text); background: #0e0e12; border: 1px solid #2a2a32; border-radius: 8px; padding: 8px; }
+.draft-settings select:disabled { opacity: .45; }
 .help ol { padding-left: 20px; margin: 0; } .help li { margin: 0 0 10px; color: #d2d2db; }
 .help h3 { margin: 0 0 10px; font-size: 16px; }
 
@@ -251,12 +256,21 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
             </select>
             <div class="note">Quick Play or Pickup Game goes straight to Select Controller (pick sides, first pick / ball first). Practice uses this choice too. Manual keeps offline saves.</div>
           </div>
+        <div class="card">
+          <!-- Room/practice policy is frozen at creation and sent to every joiner. -->
+          <div class="draft-settings">
+            <label>Pickup draft <select id="draftOrder"><option value="alternating">Alternating (stock)</option><option value="snake">Snake (A,B,B,A…)</option><option value="cocky">Cocky (7 picks each)</option></select></label>
+            <label>First team <select id="draftFirst"><option value="stock">Select Controller (native)</option><option value="team-one">Team One</option><option value="team-two">Team Two</option></select></label>
+          </div>
+          <p class="muted">Team One/Two are in-game sides. The host’s choice applies to everyone. Stock uses Select Controller; an explicit team fixes first pick there. Applies only to Pickup.</p>
+        </div>
           <div class="row" style="margin-top:18px">
             <div><div class="label" style="margin-bottom:6px">Input delay (for everyone)</div><div class="seg" id="delaySeg"></div></div>
             <div class="grow"></div>
             <button class="btn red big" id="btnStart" disabled>Start game</button>
           </div>
           <div class="note">Auto picks 1–4 frames from the connection at every match. Pick a number to fix it. The host's choice applies to everyone.</div>
+          <div class="note" id="hostDraft"></div>
           <div class="info" id="hostInfo"></div>
         </div>
         <div class="card players"><div class="ph"><h3>Players</h3><span class="faint" id="hostSlots">0 / 4</span></div><ol id="hostPlayers"></ol></div>
@@ -274,7 +288,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
             <button class="btn red big" id="btnJoin">Join room</button>
             <button class="btn" id="btnLeave" disabled>Leave</button>
           </div>
-          <div class="info" id="joinInfo"></div><div class="note" id="joinGameMode"></div>
+          <div class="info" id="joinInfo"></div><div class="note" id="joinGameMode"></div><div class="note" id="joinDraft"></div>
         </div>
         <div class="card players"><div class="ph"><h3>Players</h3><span class="faint" id="joinSlots">–</span></div><ol id="joinPlayers"></ol></div>
       </div>
@@ -347,7 +361,9 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
           </div>
           <div style="height:14px"></div>
           <div class="toggle" id="autoUpdates"><div class="switch"></div><div><b>Install game updates automatically</b>
-            <div class="note" style="margin-top:4px">Roster and rating updates from Mason. Only his edit lists are downloaded (signed, checked); your game copy is rebuilt from your own Reborn install, and the old copy stays until the new one checks out. Off: updates are only shown here.</div></div></div>
+            <div class="note" style="margin-top:4px">Roster and rating updates from Mason. Only his edit lists are downloaded (signed, checked); ratings apply when the game starts. Your game image stays the same. Off: updates are only shown here.</div></div></div>
+          <div class="toggle" id="runtimeContent"><div class="switch"></div><div><b>Apply ratings at game start</b>
+            <div class="note" style="margin-top:4px">Off: rebuild the game image for each update. Click Check for updates after changing this setting.</div></div></div>
         </div>
       </div>
     </section>
@@ -364,7 +380,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
         </ol></div>
         <div class="card"><h3>If something's wrong</h3><ol>
           <li>Windows Firewall asks about Dolphin the first time: tick Private (and Public) networks and allow it.</li>
-          <li>“Game versions differ”: everyone needs the same NFLStreetRollback download and the same Reborn version.</li>
+          <li>“Fingerprints differ”: everyone needs the same download and Reborn version. Pickup draft settings come from the host.</li>
           <li>Controller not responding: plug it in before starting, then Controllers → Use my Reborn controller settings.</li>
           <li>Send Mason the nsr-p*.log files from this folder if he asks.</li>
         </ol><div class="path" id="folderPath"></div></div>
@@ -516,8 +532,18 @@ function render(s) {
   setText("gameFp", g.fingerprint || "–");
   setText("gameText", (g.text || "") + (g.note ? "\n" + g.note : ""));
   show("gameBar", g.progress != null); $("gameProg").style.width = (g.progress || 0) + "%";
-  enable("btnFind", !g.busy); enable("btnBrowse", !g.busy);
+  const setupIdle = !g.busy && !(s.content && s.content.busy) && h.state === "idle" && j.state === "idle";
+  enable("btnFind", setupIdle); enable("btnBrowse", setupIdle);
+  const draftOrder = { alternating: "Alternating", snake: "Snake", cocky: "Cocky" };
+  const draftFirst = { stock: "Select Controller", "team-one": "Team One", "team-two": "Team Two" };
+  setText("hostDraft", "Pickup draft: " + (draftOrder[g.draft_order] || "Alternating")
+    + " · First pick: " + (draftFirst[g.draft_first] || "Select Controller"));
+  setText("joinDraft", j.draft_label || "");
+  $("draftOrder").value = g.draft_order || "alternating";
+  $("draftFirst").value = g.draft_first || "stock";
+  enable("draftOrder", setupIdle); enable("draftFirst", setupIdle);
   const ct = s.content || {};
+  $("runtimeContent").classList.toggle("on", !!ct.runtime);
   setText("contentText", ct.text || (ct.version ? "Game content v" + ct.version : "No game updates installed."));
   setText("contentLog", ct.latest && ct.changelog && ct.state !== "off" ? "v" + ct.latest + ": " + ct.changelog : "");
   $("autoUpdates").classList.toggle("on", !!ct.auto);
@@ -558,8 +584,11 @@ function wire() {
   $("nameIn").onchange = () => call("set_name", $("nameIn").value.trim());
   $("telemetry").onclick = () => call("set_telemetry", !(S.snap && S.snap.telemetry));
   $("gameStats").onclick = () => call("set_game_stats", !(S.snap && S.snap.game_stats && S.snap.game_stats.enabled));
+  // Stage both choices together; the backend clears readiness until rebuilt.
+  $("draftOrder").onchange = $("draftFirst").onchange = () => call("set_draft", $("draftOrder").value, $("draftFirst").value);
   $("btnFind").onclick = () => call("find_game");
   $("btnUpdates").onclick = () => call("check_updates");
+  $("runtimeContent").onclick = () => call("set_content_runtime", !(S.snap && S.snap.content && S.snap.content.runtime));
   $("autoUpdates").onclick = () => call("set_auto_updates", !(S.snap && S.snap.content && S.snap.content.auto));
   $("btnBrowse").onclick = () => call("browse_iso");
   document.addEventListener("contextmenu", (e) => { if (!(e.target instanceof HTMLInputElement)) e.preventDefault(); });
@@ -597,11 +626,11 @@ function demoApi(page) {
     quickstart: "pickup", game_modes: { "quick-play": "Quick Play", pickup: "Pickup Game", manual: "Manual (menus)" },
     game_stats: { enabled: true, state: "ok", text: "14 game result files sent.", sent: 14, pending: 0 }, max_delay: 4, last_host: "", rooms: true,
     folder: "C:\\Users\\mason\\Desktop\\NFLStreetRollback",
-    game: { state: "ready", text: "Ready for rollback netplay.", fingerprint: "7F3A-29C4", note: "", progress: null, busy: false, content: { version: 3, serial: 4 } },
+    game: { draft_order: "snake", draft_first: "team-two", state: "ready", text: "Ready for rollback netplay.", fingerprint: "7F3A-29C4", note: "", progress: null, busy: false, content: { version: 3, serial: 4 } },
     content: { state: "current", text: "Up to date: content v3 — Week 6 speed tweaks", version: 3, latest: 3,
       changelog: "Week 6 speed tweaks", auto: true, busy: false },
     host: { state: "idle", mode: "", code: "", info: "", players: [], can_start: false },
-    join: { state: "idle", info: "", players: [], quickstart: "pickup" },
+    join: { state: "idle", info: "", players: [], quickstart: "pickup", draft_label: "Pickup draft: Snake · First pick: Team Two" },
     controllers: { state: "synced", message: "Using your Reborn controller settings.",
       source: "C:\\Games\\NFL Street Reborn\\runtime\\User\\Config\\GCPadNew.ini",
       port1: { mapped: true, family: "PlayStation 4 controller", device: "DInput/0/Wireless Controller",

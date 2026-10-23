@@ -24,6 +24,8 @@
 #include "Core/NSR/NSRGameStatsRead.h"
 #include "Core/NSR/NSRDraftLog.h"
 #include "Core/NSR/NSRPadSource.h"
+#include "Core/NSR/NSRContentRead.h"
+#include "Core/NSR/NSRDraft.h"
 #include "Core/NSR/NSRGameStatsIdentity.h"
 
 #include <algorithm>
@@ -75,8 +77,8 @@ static void TestHandoffAgreement()
   assert(!agreement.Complete());
   assert(agreement.Accept(peer2));
   assert(agreement.Complete());
-  assert(agreement.HostClock() == 100);
-  assert(agreement.HostAuxClock() == 1000);
+  assert(agreement.HostClock() == 100u);
+  assert(agreement.HostAuxClock() == 1000u);
   // A retransmission may not change its sender's clock.
   RN::HandoffPacket moved = peer2;
   moved.sync_clock = 123;
@@ -87,8 +89,8 @@ static void TestHandoffAgreement()
                             122, 1220);
   assert(leaf.Accept(
       {0, 3, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd, {}, 100, 1000}));
-  assert(leaf.HostClock() == 100);
-  assert(leaf.HostAuxClock() == 1000);
+  assert(leaf.HostClock() == 100u);
+  assert(leaf.HostAuxClock() == 1000u);
   assert(leaf.Accept(peer1));
   assert(leaf.Complete());
 
@@ -148,7 +150,7 @@ static void TestMispredictedPlayers()
   a.Assemble(101);
   assert(a.MispredictedPlayers(101) == 0);
   Deliver(b, &a, 101);
-  assert(a.PendingRollback() == 101 && a.MispredictedPlayers(101) == 0x2);
+  assert(a.PendingRollback() == 101u && a.MispredictedPlayers(101) == 0x2);
   assert(a.MispredictedPlayers(5) == 0);
 }
 
@@ -166,7 +168,7 @@ static void TestPredictionAndCorrection()
   a.Assemble(100);
   a.Assemble(101);  // player 1 is still predicted neutral
   Deliver(b, &a, 101);
-  assert(a.PendingRollback() == 101);
+  assert(a.PendingRollback() == 101u);
   a.BeginRollback();
   assert(!a.PendingRollback());
   assert(a.Assemble(101)[1] == right);
@@ -194,7 +196,7 @@ static void TestPredictionWindowAndAcks()
   const auto oldest = a.OldestUnackedLocal();
   assert(oldest && *oldest == 204);
   assert(a.Accept(stale));  // unsequenced delivery must not regress that ack
-  assert(a.OldestUnackedLocal() == 204);
+  assert(a.OldestUnackedLocal() == 204u);
 }
 
 // A receiver that misses more than one datagram's history must first receive
@@ -363,8 +365,8 @@ static void TestChecksumMismatch()
   b.UpdateFinalized();
   Deliver(a, &b, 301);
   Deliver(b, &a, 301);
-  assert(a.FirstDesync() == 301);
-  assert(b.FirstDesync() == 301);
+  assert(a.FirstDesync() == 301u);
+  assert(b.FirstDesync() == 301u);
 }
 
 // With local input delay, the confirmed input prefix can lead the most recent
@@ -385,7 +387,7 @@ static void TestDelayedChecksumFinalization()
   // history merely because the diagnostic window advanced.
   a.SubmitLocal(350, {});
   a.TrimBefore(1000);
-  assert(a.OldestUnackedLocal() == 350);
+  assert(a.OldestUnackedLocal() == 350u);
 }
 
 // Strict decoding rejects truncation and a forged player count before state
@@ -616,7 +618,7 @@ static void TestAckAdvanceTrimsRetransmission()
   assert(a.BuildPacket(107).pads.size() == 10);
   assert(b.Accept(a.BuildPacket(107)));
   assert(a.Accept(b.BuildPacket(100)));  // acknowledges 100..109
-  assert(a.OldestUnackedLocal() == 110);
+  assert(a.OldestUnackedLocal() == 110u);
   assert(a.BuildPacket(107).pads.empty());
   a.SubmitLocal(108, ValidationPad(0, 108));  // frame 110
   const RN::Packet next = a.BuildPacket(108);
@@ -888,11 +890,11 @@ static void TestEarliestCorrectionIsSticky()
   p1.SubmitLocal(104, one);
   p2.SubmitLocal(102, two);
   assert(local.Accept(p1.BuildPacket(104)));
-  assert(local.PendingRollback() == 104);
+  assert(local.PendingRollback() == 104u);
   assert(local.Accept(p2.BuildPacket(102)));
-  assert(local.PendingRollback() == 102);
+  assert(local.PendingRollback() == 102u);
   assert(local.Accept(p1.BuildPacket(104)));  // duplicate
-  assert(local.PendingRollback() == 102);
+  assert(local.PendingRollback() == 102u);
 }
 
 // Loss, reordered delivery, and duplicates may delay acknowledgement but
@@ -949,10 +951,10 @@ static void TestChecksumAgreementAndStickyDesync()
     Deliver(a, &b, frame);
     Deliver(b, &a, frame);
   }
-  assert(a.FirstDesync() == 903);
-  assert(b.FirstDesync() == 903);
+  assert(a.FirstDesync() == 903u);
+  assert(b.FirstDesync() == 903u);
   a.SetStateChecksum(905, 904);  // later agreement cannot clear it
-  assert(a.FirstDesync() == 903);
+  assert(a.FirstDesync() == 903u);
 }
 
 // Stage-4 transitions are independent generations. Reordered stale packets
@@ -1204,7 +1206,7 @@ static void TestPureRollbackHelpers()
   const auto target = RL::FindIdleTarget(96, 90, true, [&](std::uint32_t frame) {
     return idle.contains(frame);
   });
-  assert(target == 95);
+  assert(target == 95u);
   assert(!RL::FindIdleTarget(89, 90, true, [&](std::uint32_t) { return true; }));
   assert(!RL::FindIdleTarget(95, 90, false, [&](std::uint32_t) { return true; }));
 
@@ -1215,8 +1217,8 @@ static void TestPureRollbackHelpers()
     audited.push_back(*RL::NextRotatingAuditPage(pages, &cursor));
   assert((audited == std::vector<std::uint32_t>{4, 8, 12, 4, 8}));
   assert(cursor == 5);
-  assert(RL::NextRotatingAuditPage(pages, &cursor) == 12);
-  assert(RL::NextRotatingAuditPage(pages, &cursor) == 4);
+  assert(RL::NextRotatingAuditPage(pages, &cursor) == 12u);
+  assert(RL::NextRotatingAuditPage(pages, &cursor) == 4u);
   const std::span<const std::uint32_t> no_pages;
   assert(!RL::NextRotatingAuditPage(no_pages, &cursor));
 
@@ -1522,6 +1524,86 @@ static void TestGameStatsMemoryReader()
   assert(ram[0x3ebe88] == 0x7e);  // all reads preserve synthetic guest memory
 }
 
+// Packed writes must update every roster copy atomically, preserve neighbors,
+// reject stale/missing/duplicate edits and never write a deleted physical row.
+static void TestRuntimeContent()
+{
+  namespace C = NSRContent;
+  std::vector<std::uint8_t> ram(0x400000), vmem(0x1000);
+  const auto put = [&](std::uint32_t offset, std::uint32_t value, unsigned size = 4) {
+    for (unsigned i = 0; i < size; ++i)
+      vmem[offset + i] = static_cast<std::uint8_t>(value >> ((size - i - 1) * 8));
+  };
+  const auto tag = [&](std::uint32_t offset, std::string_view name) {
+    std::copy(name.begin(), name.end(), vmem.begin() + offset);
+  };
+  ram[0x3ebe88] = 0x7e;
+  ram[0x3ebe8a] = 1;
+  put(0x104, 0x7e000200);
+  tag(0x108, "TATS");
+  tag(0x21c, "YALP");
+  put(0x214, 0x7e000400);
+  put(0x220, 16);
+  put(0x224, 127);
+  put(0x240, 3, 2);
+  put(0x242, 3, 2);
+  put(0x244, 3, 2);
+  put(0x24a, 3, 1);
+  for (unsigned i = 0; i < 3; ++i)
+  {
+    put(0x24c + i * 16, i == 2 ? 3 : 0);
+    put(0x250 + i * 16, i == 0 ? 0 : (i == 1 ? 32 : 67));
+    put(0x258 + i * 16, i == 2 ? 7 : 32);
+  }
+  tag(0x254, "ANFP");
+  tag(0x264, "ANLP");
+  tag(0x274, "DPSP");
+  for (unsigned i = 0; i < 3; ++i)
+  {
+    tag(0x400 + i * 16, "Ada");
+    tag(0x404 + i * 16, "Test");
+    vmem[0x408 + i * 16] = 0xb1;
+    vmem[0x409 + i * 16] = 0x9a;  // rating 70, surrounding bits nonzero
+  }
+  vmem[0x41f] = 1;  // middle copy is deleted
+  const NSRGameStats::Memory memory{ram, vmem};
+  const auto original = vmem;
+  const std::vector<C::Edit> edits{{" ada ", "TEST", "PSPD", 17, {70}}};
+  const auto writes = C::Plan(memory, edits);
+  assert(vmem == original && writes && writes->size() == 4);
+  for (const auto& [address, value] : *writes)
+    vmem[address - 0x7e000000] = value;
+  assert(vmem[0x408] == 0xa4 && vmem[0x409] == 0x5a);
+  assert(vmem[0x428] == 0xa4 && vmem[0x429] == 0x5a);
+  assert(vmem[0x418] == original[0x418] && vmem[0x419] == original[0x419]);
+  const auto rejects = [&](std::vector<C::Edit> bad) {
+    vmem = original;
+    assert(!C::Plan(memory, bad));
+    assert(vmem == original);
+  };
+  rejects({{"Ada", "Test", "PSPD", 17, {71}}});
+  rejects({{"Absent", "Test", "PSPD", 17, {70}}});
+  rejects({edits[0], edits[0]});
+  rejects({{"Ada", "Test", "PXYZ", 17, {70}}});
+  rejects({{"Ada", "Test", "PSPD", 128, {70}}});
+  rejects({edits[0], {"Absent", "Test", "PSPD", 17, {70}}});
+  vmem = original;
+  put(0x214, 0x7e000fff);
+  assert(!C::Plan(memory, edits));
+  // Each content identity field participates in wire agreement and diagnostics.
+  NSRNetplay::RollbackNet::ConfigFingerprint a, b;
+  for (auto field : {NSRNetplay::RollbackNet::ConfigField::ContentSha0,
+                     NSRNetplay::RollbackNet::ConfigField::ContentSha3,
+                     NSRNetplay::RollbackNet::ConfigField::ContentVersion,
+                     NSRNetplay::RollbackNet::ConfigField::ContentPolicy})
+  {
+    b = a;
+    b[field] = 1;
+    assert(NSRNetplay::RollbackNet::ConfigDigest(a) != NSRNetplay::RollbackNet::ConfigDigest(b));
+    assert(NSRNetplay::RollbackNet::ConfigDifferences(a, b).size() == 1);
+  }
+}
+
 // Identity validation is independent of sockets; attribution to the established
 // connection remains the adapter's existing PacketSenderMatchesPeer contract.
 static void TestGameStatsIdentity()
@@ -1648,25 +1730,44 @@ static void TestDraftLog()
   auto view = GS::ReadDraft(memory);
   assert(view && view->total == 0 && view->picked.empty());
   log.Observe(*view);
-  // Snake from team 1: B, A, A, B, B, ... with drafter == team here.
-  const std::array<std::uint32_t, 14> teams{1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0};
-  for (std::uint32_t n = 0; n < 14; ++n)
+  // All policies and both native first sides: round is a team's own pick
+  // number, never overall/2 (which would mislabel cocky's opening seven).
+  for (std::uint32_t policy = 0; policy < 3; ++policy)
   {
-    commit(19 - n, teams[n], teams[n]);
-    view = GS::ReadDraft(memory);
-    assert(view && view->total == n + 1);
-    log.Observe(*view);
-    log.Observe(*view);  // an unchanged frame adds nothing
+    for (std::uint32_t first_team = 0; first_team < 2; ++first_team)
+    {
+      for (std::uint32_t i = 0; i < pool_size; ++i)
+        put(pool + i * 0x18 + 4, 0xffffffff);
+      team_count = {};
+      drafter_count = {};
+      put(table + 0x0c, 0, 2);
+      put(counts, 0, 2);
+      // Native init always starts drafter slot zero on the chosen first
+      // team. Controller handles follow that mapping, not team == drafter.
+      put(handles, first_team == 0 ? 1u : 0u, 1);
+      put(handles + 1, first_team == 0 ? 0u : 1u, 1);
+      log.Observe(*GS::ReadDraft(memory));
+      std::array<std::uint32_t, 2> rounds{};
+      for (std::uint32_t n = 0; n < 14; ++n)
+      {
+        const std::uint32_t relative = policy == 0 ? n % 2 :
+                                       policy == 1 ? ((n + 1) / 2) % 2 : n / 7;
+        const std::uint32_t team = relative ^ first_team;
+        const std::uint32_t drafter = team ^ first_team;
+        commit(19 - n, team, drafter);
+        view = GS::ReadDraft(memory);
+        assert(view && view->total == n + 1);
+        log.Observe(*view);
+        log.Observe(*view);  // an unchanged frame adds nothing
+        const auto& pick = log.Picks().back();
+        assert(pick.pick == n + 1 && pick.pgid == 119 - n && pick.team == team);
+        assert(pick.drafter == drafter && pick.round == ++rounds[team]);
+        assert(pick.controller == (team == 0 ? 1 : 0));
+        assert(pick.pad == static_cast<std::int32_t>(team == 0 ? 1 : 0));
+      }
+      assert(log.Complete() && log.Picks().size() == 14);
+    }
   }
-  assert(log.Complete() && log.Picks().size() == 14);
-  for (std::uint32_t n = 0; n < 14; ++n)
-  {
-    const auto& pick = log.Picks()[n];
-    assert(pick.pick == n + 1 && pick.pgid == 119 - n && pick.team == teams[n]);
-    assert(pick.controller == (teams[n] == 0 ? 1 : 0));
-    assert(pick.pad == static_cast<std::int32_t>(teams[n] == 0 ? 1 : 0));
-  }
-  assert(log.Picks()[0].round == 1 && log.Picks()[2].round == 2 && log.Picks()[13].round == 7);
 
   // Torn/stale states are rejected: other mode, count mismatch, duplicate ids.
   put(GS::DRAFT_MODE_ADDRESS, 3);
@@ -1869,6 +1970,42 @@ static void TestAutoInputDelay()
   assert(RN::AutoInputDelay(41.0, 9.0, strict) == 3);
 }
 
+// Runtime draft plans use synthetic MEM1 only: validate the full fixed recipe
+// before writes, reject changed native instructions and tolerate exact reloads.
+static void TestRuntimeDraft()
+{
+  std::vector<std::uint8_t> ram(0x420000);
+  std::copy_n("GN7E69", 6, ram.begin());
+  const auto put = [&](std::uint32_t address, std::uint32_t value) {
+    for (std::uint32_t i = 0; i < 4; ++i)
+      ram[address - 0x80000000 + i] = static_cast<std::uint8_t>(value >> (24 - 8 * i));
+  };
+  put(0x8001abac, 0x816d9768);
+  put(0x80018fc0, 0x48063bad);
+  put(0x800114f4, 0x880d96ca);
+  put(0x80010b34, 0x888d96ca);
+  const NSRGameStats::Memory memory{ram, {}};
+  std::string error;
+  for (std::uint32_t order = 0; order < 3; ++order)
+    for (std::uint32_t first = 0; first < 3; ++first)
+    {
+      const auto before = ram;
+      const auto plan = NSRContent::PlanDraft(memory, order, first, &error);
+      assert(plan && ram == before);
+    }
+  auto plan = NSRContent::PlanDraft(memory, 1, 2, &error);
+  assert(plan && !plan->empty());
+  for (const auto& [address, value] : *plan)
+    put(address, value);
+  assert(NSRContent::PlanDraft(memory, 1, 2, &error) == plan);
+  assert(!NSRContent::PlanDraft(memory, 2, 2, &error));
+  put(0x80411604, 0xdeadbeef);
+  assert(!NSRContent::PlanDraft(memory, 1, 2, &error));
+  assert(!NSRContent::PlanDraft(memory, 3, 0, &error));
+  ram[7] = 1;
+  assert(!NSRContent::PlanDraft(memory, 0, 0, &error));
+}
+
 int main()
 {
   TestHandoffInputDelay();
@@ -1877,6 +2014,8 @@ int main()
   TestDraftLog();
   TestQuickstartNavigation();
   TestBootAgreementWire();
+  TestRuntimeContent();
+  TestRuntimeDraft();
   TestGameStatsMemoryReader();
   TestGameStatsIdentity();
   TestHandoffAgreement();

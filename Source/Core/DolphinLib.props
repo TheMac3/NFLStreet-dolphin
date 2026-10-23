@@ -261,6 +261,9 @@
     <ClInclude Include="Core\NSR\NSRBootSync.h" />
     <ClInclude Include="Core\NSR\NSRQuickstart.h" />
     <ClInclude Include="Core\NSR\NSRBootAgreement.h" />
+    <ClInclude Include="Core\NSR\NSRContent.h" />
+    <ClInclude Include="Core\NSR\NSRDraft.h" />
+    <ClInclude Include="Core\NSR\NSRContentRead.h" />
     <ClInclude Include="Core\NSR\NSRNetplay.h" />
     <ClInclude Include="Core\NSR\NSRGameStats.h" />
     <ClInclude Include="Core\NSR\NSRGameStatsRead.h" />
@@ -959,6 +962,7 @@
     <ClCompile Include="Core\HLE\HLE_OS.cpp" />
     <ClCompile Include="Core\NSR\NSRBootSync.cpp" />
     <ClCompile Include="Core\NSR\NSRAudio.cpp" />
+    <ClCompile Include="Core\NSR\NSRContent.cpp" />
     <ClCompile Include="Core\NSR\NSRNetplay.cpp" />
     <ClCompile Include="Core\NSR\NSRGameStats.cpp" />
     <ClCompile Include="Core\NSR\NSRTelemetry.cpp" />

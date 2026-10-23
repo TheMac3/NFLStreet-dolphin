@@ -53,6 +53,8 @@ const char* ConfigFieldName(ConfigField field)
       "resim_speed",    "instant_disc",    "io_idle",        "audio_rollback",
       "game_image",     "launcher_image",  "seed",           "restore_ranges",
       "audio_clock",    "resim_gates",     "session_rules",  "dolphin_core",
+      "content_sha0", "content_sha1", "content_sha2", "content_sha3",
+      "content_version", "content_policy",
   };
   const auto index = static_cast<std::size_t>(field);
   return index < NAMES.size() ? NAMES[index] : "unknown";
