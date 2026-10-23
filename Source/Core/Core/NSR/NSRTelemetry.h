@@ -20,6 +20,12 @@
 //     window), and everything that could not be delivered is appended to a
 //     local JSONL file under the Dolphin user folder (NSR/Telemetry/).
 //
+// Coverage (2026-10-18): the whole netplay session, not only rollback matches.
+// The glue calls Start() when netplay is set up (before the peers connect),
+// so the header, connection problems, lockstep-menu windows and desyncs, the
+// handoff barriers and the shutdown reason all reach the server even when a
+// run never gets to a match.  Each window and event carries its Phase.
+//
 // Metrics: Count / SetGauge / Observe.
 // Configuration (environment wins over Dolphin config [NSR] in Dolphin.ini):
 //   NSR_TELEMETRY=0             disabled, whatever else is set
@@ -61,12 +67,16 @@
 
 #pragma once
 
+#pragma once
+
 #include <array>
 #include <chrono>
 #include <cstdint>
 #include <initializer_list>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace NSRTelemetry
 {
@@ -127,6 +137,7 @@ enum class Hist : std::uint8_t
   PredictionFrames,        // live frame minus confirmed-through frame
   TimeSyncWaitUs,          // host wait per time-sync yield
   NetStallUs,              // host wait per prediction-window stall
+  LockstepWaitUs,          // lockstep menus: host wait per frame for the peers' pads
   Count
 };
 
@@ -141,6 +152,28 @@ enum class EventKind : std::uint8_t
   InputTimeout,
   TransportFailure,
   Note,
+  // Whole-session coverage (2026-10-18; docs/telemetry.md "Session phases").
+  Phase,           // the netplay phase changed (fields: from, to as names in text)
+  Connection,      // connection progress: connected, retry (text names it)
+  HandoffAbort,    // a lockstep<->rollback transition barrier failed (text: why)
+  ConfigMismatch,  // a peer's config fingerprint differs (text names the fields)
+  Shutdown,        // the emulation stopped (text: reason, last problem)
+  DesyncSummary,   // digests of the local state at a desync frame (no RAM bytes)
+  StopRequested,   // Core::Stop on the host thread, before CPU/HW teardown
+  Count
+};
+
+// Where the netplay session is.  Every window and event carries it, so a
+// desync in the lockstep menus is told apart from one in a match.  Frame
+// numbers are per phase: lockstep-menu uses the retrace counter the
+// milestone-1 exchange agrees on, rollback-match and post-match the rollback
+// unit counter.  Offline/test runs stay `none` until a rollback session.
+enum class Phase : std::uint8_t
+{
+  None,
+  LockstepMenu,
+  RollbackMatch,
+  PostMatch,
   Count
 };
 
@@ -203,6 +236,47 @@ struct RollbackInfo
   std::uint32_t dirty_mode = 0;  // NSRNetplay DirtyTracker::Mode wire value
   bool frame_mode = false;
   std::uint32_t vmem_bytes = 0;
+  std::uint64_t config_digest = 0;  // the epoch's agreed config digest (0: offline)
+};
+
+// Netplay start (header) facts the glue knows and this module does not:
+// the rollback config fingerprint (so mixed builds/configs are visible from
+// the headers alone, before any handoff could refuse them) and the topology.
+struct StartInfo
+{
+  Phase phase = Phase::LockstepMenu;  // the phase the header reports
+  std::uint64_t config_digest = 0;
+  // Boot settings before guest boot; rollback initialization after RbInit.
+  std::string config_scope = "rollback";
+  std::vector<std::pair<std::string, std::uint64_t>> config_fields;
+  std::uint32_t players = 0;
+  std::uint32_t delay = 0;
+  bool star = true;
+  bool punch = false;           // via the rendezvous (hole punching)
+  bool rollback_image = false;  // the rollback hooks are active (RbInit ran)
+};
+
+// A desync's local evidence, uploaded so two players' summaries can be
+// diffed server-side without anyone sending files.  Only hashes: `units`
+// are 32-bit folds of the state digest per `unit_bytes` of state (MEM1
+// regions in lockstep; groups of state pages in rollback), never RAM bytes.
+struct DesyncSummaryInfo
+{
+  std::uint32_t frame = 0;
+  std::uint32_t generation = 0;
+  std::uint32_t evidence_frame = UINT32_MAX;  // Defaults to frame; leave may prove an older slot.
+  int player = NO_PEER;              // the peer whose checksum differed
+  std::uint64_t local = 0, remote = 0;
+  const char* source = "";           // "lockstep_mem1", "rollback_state", "handoff_state"
+  std::uint32_t unit_bytes = 0;      // state bytes per unit digest
+  std::vector<std::uint32_t> units;  // per-unit digests, in address order
+  std::uint64_t semantic = 0;        // the semantic-words checksum, when known
+  bool semantic_valid = false;
+  std::uint64_t aram = 0;            // already-computed gameplay-ring digest
+  bool aram_valid = false;           // false for lockstep or an expired ring slot
+  std::uint32_t excluded_ranges = 0; // digest exclusions in effect (rollback)
+  std::uint64_t excluded_hash = 0;   // ... and a hash of their list
+  std::string bundle;                // local bundle file name (no directory), if written
 };
 
 // --- lifecycle (CPU thread) --------------------------------------------------
@@ -212,10 +286,27 @@ bool Enabled();
 // Full stop: flush the open window, give the sender a short grace period to
 // deliver, spill the rest to the local file.  Called from NSRNetplay::Shutdown.
 void Shutdown();
+// Host-thread Core::Stop notification: start the shared network deadline and
+// queue an urgent reason without touching CPU-thread windows or joining it.
+void StopRequested();
 // After Shutdown, telemetry stays off (late callers during teardown are
 // ignored) until Rearm(): the rollback glue calls it when a session starts,
 // i.e. on the next boot in a long-lived (GUI) process.
 void Rearm();
+// Netplay connected/connecting (lockstep menus): rearm, record the start facts
+// for the header and start the sender.  Call before any other telemetry call
+// of the run so the header carries them; a later call re-sends the header.
+void Start(const StartInfo& info);
+// Phase changes close the open window (windows never straddle phases) and
+// raise a `phase` event.  CPU thread.
+void SetPhase(Phase phase, std::uint32_t frame);
+Phase CurrentPhase();
+// Prefix for this run's local desync bundle files, next to the local JSONL
+// (`<user>/NSR/Telemetry/<session>-p<k>-<run>`); empty when disabled.
+std::string BundlePrefix();
+// Shutdown with a reason: one `shutdown` event (reason, the last problem
+// event seen, `fields`) and then Shutdown().
+void Shutdown(std::string_view reason, std::initializer_list<Field> fields);
 
 void SessionEnter(const RollbackInfo& info);
 // `totals`: session totals for the leave event (rollbacks, re-sims, ...).
@@ -230,6 +321,9 @@ void Observe(Hist h, std::uint64_t value, int peer = NO_PEER);
 // Per live frame (CPU thread): advances the window clock and closes the
 // window when its interval elapsed.  `frame` is the live frame just finished.
 void LiveFrame(std::uint32_t frame, std::chrono::steady_clock::time_point now);
+// Connection/input waits still close periodic windows, without inventing
+// live frames. Called by the thread currently owning the ENet session.
+void Poll();
 
 // --- events (any thread) -----------------------------------------------------
 void Event(EventKind kind, std::uint32_t frame, std::initializer_list<Field> fields = {},
@@ -237,6 +331,8 @@ void Event(EventKind kind, std::uint32_t frame, std::initializer_list<Field> fie
 // Convenience for the stage-2 checksum oracle: counts and reports the mismatch.
 void Desync(std::uint32_t frame, std::uint64_t local_checksum, std::uint64_t remote_checksum,
             int player);
+// The `desync_summary` event (see DesyncSummaryInfo).  Any thread.
+void DesyncSummary(const DesyncSummaryInfo& info);
 
 // --- test hooks ----------------------------------------------------------------
 // Percentile from the module's histogram bucketing (exposed for the unit test).

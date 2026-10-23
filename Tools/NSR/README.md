@@ -1,9 +1,10 @@
 # NFLStreetRollback launcher (vendored)
 
-Copied from the NFLStreet repo (`tools/`, commit c82d4fa) by
+Copied from the NFLStreet repo (`tools/`, commit c09ef0c) by
 `scripts/sync-launcher-to-fork.sh`. Don't edit here; edit in NFLStreet and
 re-sync. The Windows CI workflow (`.github/workflows/nsr-windows.yml`)
-builds `nsr_launcher.py` (with `nsr_controllers.py`, `nsr_gamestats.py` and the bundled
+builds `nsr_launcher.py` (with `nsr_controllers.py`, `nsr_gamestats.py`, the content-update
+modules `nsr_content.py`/`rsasig.py`/`eadb.py`/`discpatch.py` and the bundled
 `nsr_launcher_ui.html` web UI, shown through pywebview/WebView2) into
 "NFLStreetRollback.exe" and `nsr_patcher.py` into NFLStreetRollback-Patcher.exe with
 PyInstaller and ships both in the friends zip.
@@ -19,3 +20,4 @@ Controller-kind delta synchronized from NFLStreet branch `fix/padkind`:
 `nsr_controllers.py` (whole file: SIDevice import, `controller_kind`) and the
 `nsr_launcher.py` hunks that pass `NSR_PAD_KIND`/`NSR_PAD_DEVICE`/
 `NSR_PAD_ADAPTER` and log the controller kind.
+

@@ -18,6 +18,7 @@
 
 #include "Core/NSR/NSRRollbackNetplay.h"
 #include "Core/NSR/NSRBootAgreement.h"
+#include "Core/NSR/NSRQuickstart.h"
 #include "Core/NSR/NSRRollbackLogic.h"
 #include "Core/NSR/NSRTelemetryLogic.h"
 #include "Core/NSR/NSRGameStatsRead.h"
@@ -1329,6 +1330,41 @@ static void TestPureRollbackHelpers()
   assert(RL::PageNeedsCopy(7, std::nullopt));
 }
 
+// Whole-session telemetry must preserve the legacy wire hash with collection
+// on or off, while a changed region must be visible in the diagnostic list.
+static void TestTelemetryLockstepEvidence()
+{
+  namespace TL = NSRTelemetry::Logic;
+  std::array<unsigned char, 96> ram{};
+  for (size_t i = 0; i < ram.size(); ++i)
+    ram[i] = static_cast<unsigned char>(i);
+  const auto skip = [](std::uint32_t off) { return off >= 32 && off < 48; };
+  std::uint64_t original = 1469598103934665603ULL;
+  for (std::uint32_t off = 0; off + 8 <= ram.size(); off += 8)
+  {
+    if (skip(off))
+      continue;
+    std::uint64_t word;
+    std::memcpy(&word, ram.data() + off, 8);
+    original = (original ^ word) * 1099511628211ULL;
+  }
+  std::vector<std::uint64_t> regions;
+  assert(TL::LockstepMem1Hash(ram.data(), 96, skip) == original);
+  assert(TL::LockstepMem1Hash(ram.data(), 96, skip, &regions, 32) == original);
+  const auto before = TL::FoldUnits(regions, 1);
+  assert(before.size() == 3);
+  ram[80] ^= 1;
+  assert(TL::LockstepMem1Hash(ram.data(), 96, skip, &regions, 32) != original);
+  const auto after = TL::FoldUnits(regions, 1);
+  assert(before[0] == after[0] && before[1] == after[1] && before[2] != after[2]);
+  const auto changed = regions;
+  ram[40] ^= 1;  // An excluded word changes neither wire nor region hashes.
+  TL::LockstepMem1Hash(ram.data(), 96, skip, &regions, 32);
+  assert(regions == changed);
+  assert(TL::FoldUnits({}, 16).empty());
+  assert(TL::FoldUnits(regions, 2).size() == 2);  // Keep the short final unit.
+}
+
 // Telemetry shutdown (final review L1): every pending batch shares ONE
 // deadline. Fake clock in milliseconds; the fake server takes `latency` per
 // request and, like the sender's curl progress-callback abort, gives up with
@@ -1800,10 +1836,65 @@ static void TestPadSourceAdapter()
          neutral.triggerLeft == 0 && neutral.isConnected);
 }
 
+// Navigation must ignore wall-clock gaps and duplicate polls, wait on screens,
+// release buttons between edges, fail closed and stay finished on menu return.
+static void TestQuickstartNavigation()
+{
+  using namespace NSRQuickstart;
+  assert(Parse("") == Mode::Manual && Parse("manual") == Mode::Manual);
+  assert(!Parse("quick-play;other") && !Parse("unknown"));
+  Navigator manual;
+  assert(!manual.Poll(0, 3));
+  for (const auto mode : {Mode::QuickPlay, Mode::Pickup})
+  {
+    Navigator nav(mode);
+    std::uint32_t frame = 1;
+    const std::array<std::uint32_t, 10> screens{3, 0x10003, 0x10003, 0x10003,
+        1, 1, 1, 0x11, 0x11, mode == Mode::Pickup ? 0xfU : 7U};
+    for (std::uint32_t step = 0; step < screens.size(); ++step)
+    {
+      for (int i = 0; i < 75; ++i)
+      {
+        const auto result = nav.Poll(frame, 0xffffffff);
+        assert(result && (*result == std::array<std::uint16_t, 4>{}));
+        assert(nav.StepIndex() == step);
+        ++frame;
+      }
+      const auto begin = frame;
+      for (std::uint32_t elapsed = 0; elapsed <= (step == 9 ? 60U : 120U); ++elapsed)
+      {
+        // A different next screen acknowledges START without reissuing it.
+        const auto screen = step == 0 && elapsed >= 70 ? 0x10003U : screens[step];
+        const auto result = nav.Poll(frame, screen);
+        assert(nav.Poll(frame, screen) == result);
+        assert(result);
+        if (elapsed < 60 || elapsed >= 66)
+          assert((*result == std::array<std::uint16_t, 4>{}));
+        else if (step == 7)
+          assert((*result == std::array<std::uint16_t, 4>{0, 2, 2, 2}));
+        else if (step == 8)
+          assert((*result == std::array<std::uint16_t, 4>{0x100, 0x100, 0x100, 0x100}));
+        ++frame;
+      }
+      assert(frame > begin);
+    }
+    assert(!nav.Active() && !nav.Failed());
+    assert(!nav.Poll(frame + 100, 3));
+  }
+  Navigator slow(Mode::QuickPlay);
+  for (std::uint32_t frame = 1; frame < 500; ++frame) slow.Poll(frame, 3);
+  assert(slow.StepIndex() == 0);  // title hasn't accepted START yet
+  Navigator stalled(Mode::Pickup);
+  stalled.Poll(1, 0xffffffff);
+  stalled.Poll(18002, 0xffffffff);
+  assert(stalled.Failed());
+}
+
 int main()
 {
   TestPadSourceAdapter();
   TestDraftLog();
+  TestQuickstartNavigation();
   TestBootAgreementWire();
   TestGameStatsMemoryReader();
   TestGameStatsIdentity();
@@ -1839,6 +1930,7 @@ int main()
   TestInGameHeapNamePadding();
   TestAudioPollFrame();
   TestWindowUndoLog();
+  TestTelemetryLockstepEvidence();
   TestTelemetryFinalFlushIsBounded();
   std::puts("NSR rollback exchange tests passed");
   return 0;

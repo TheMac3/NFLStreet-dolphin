@@ -12,6 +12,7 @@
 
 #include "Core/NSR/NSRNetplay.h"
 #include "Core/NSR/NSRBootSync.h"
+#include "Core/NSR/NSRQuickstart.h"
 #include "Core/NSR/NSRBootAgreement.h"
 #include "Core/NSR/NSRGameStats.h"
 #include "Core/NSR/NSRRollbackLogic.h"
@@ -103,6 +104,8 @@
 #include "InputCommon/ControllerEmu/ControllerEmu.h"  // NSR local pad log
 #include "InputCommon/GCAdapter.h"                   // NSR local pad log
 #include "InputCommon/InputConfig.h"                 // NSR local pad log
+#include "Core/NSR/NSRTelemetryLogic.h"  // NSR telemetry: lockstep hash with region digests
+#include "Common/FileUtil.h"             // NSR telemetry: desync bundle directory
 #include "VideoCommon/CommandProcessor.h"
 #include "VideoCommon/Fifo.h"
 
@@ -161,6 +164,8 @@ struct Packet
 
 struct Session
 {
+  NSRQuickstart::Navigator quickstart;
+  u32 quickstart_screen = 0xffffffff;
   // Preboot all-peer manifest + ready + host release barrier. No guest frame is
   // allowed before every participant has compared every named field.
   bool boot_pending = false;
@@ -321,25 +326,21 @@ Pad NeutralPad()
   return Pad{};  // no buttons, centred sticks, no triggers, err = 0 (connected)
 }
 
-u64 HashMem1(Core::System& system)
+u64 HashMem1(Core::System& system, std::vector<u64>* regions = nullptr)
 {
-  // FNV-1a over 64-bit words of MEM1, skipping HASH_SKIP.
+  // FNV-1a over 64-bit words of MEM1, skipping HASH_SKIP.  NSR telemetry:
+  // with `regions`, the same pass also hashes each 64 KiB region for the
+  // desync summary; the returned (wire) hash is the same either way.
   auto& memory = system.GetMemory();
-  const u8* base = memory.GetRAM();
-  const u32 size = memory.GetRamSizeReal();
-  u64 h = 1469598103934665603ULL;
-  for (u32 off = 0; off + 8 <= size; off += 8)
-  {
-    bool skip = false;
-    for (const auto& [lo, hi] : HASH_SKIP)
-      skip |= off >= lo && off < hi;
-    if (skip)
-      continue;
-    u64 w;
-    std::memcpy(&w, base + off, 8);
-    h = (h ^ w) * 1099511628211ULL;
-  }
-  return h;
+  return NSRTelemetry::Logic::LockstepMem1Hash(
+      memory.GetRAM(), memory.GetRamSizeReal(),
+      [](u32 off) {
+        bool skip = false;
+        for (const auto& [lo, hi] : HASH_SKIP)
+          skip |= off >= lo && off < hi;
+        return skip;
+      },
+      regions);
 }
 
 bool ParseAddress(const std::string& text, ENetAddress* out)
@@ -416,6 +417,16 @@ void SendRaw(const ENetAddress& to, const std::string& payload)
 //   NSR_NETPLAY=host                (player 0 of 2, binds NSR_PORT)
 //   NSR_NETPLAY=client NSR_PEER=ip:port   (player 1 of 2)
 // or the general form for 2-4 players
+// NSR telemetry, whole session (glue block at the end of this file).
+void TelemetryNetplayStart();
+void TelemetryShutdown();
+void TelemetryLockstepFrame(u32 frame, std::chrono::steady_clock::time_point wait_start);
+std::vector<u64>* TelemetryLockstepRegions(u32 frame);
+void TelemetryLockstepDesync(u32 frame, u32 player, u64 local, u64 remote);
+std::string DesyncBundlePrefix(bool claim);
+void TelemetryNoteBundle(const std::string& path, u32 frame);
+u32 TelemetryLiveFrame();  // the current phase's frame (defined with the glue)
+
 //   NSR_NETPLAY=1 NSR_PLAYER=k NSR_PLAYERS=n NSR_PORT=p
 //   NSR_PEERS=ip:port,ip:port,...   (addresses of players 0..k-1, in order)
 bool ReadConfig(Session& s, std::vector<std::string>* lower_peers)
@@ -518,12 +529,22 @@ bool Setup()
   }
   std::vector<std::string> lower_peers;
   LogLocalPad();
-  if (!ReadConfig(s, &lower_peers))
+  const bool config_ok = ReadConfig(s, &lower_peers);
+  if (!Env("NSR_NETPLAY").empty())
+    TelemetryNetplayStart();  // NSR telemetry: header + windows from here on, not only in matches
+  if (!config_ok)
+  {
+    if (!Env("NSR_NETPLAY").empty())
+      NSRTelemetry::Event(NSRTelemetry::EventKind::TransportFailure, 0, {},  // NSR telemetry
+                          "bad netplay config");
     return false;
+  }
   NSRGameStats::Configure(s.me, s.players, true);
   if (enet_initialize() != 0)
   {
     Log("enet_initialize failed");
+    NSRTelemetry::Event(NSRTelemetry::EventKind::TransportFailure, 0, {},  // NSR telemetry
+                        "enet_initialize failed");
     return false;
   }
 
@@ -543,6 +564,8 @@ bool Setup()
   if (!s.host)
   {
     Log("enet_host_create failed (port {})", addr.port);
+    NSRTelemetry::Event(NSRTelemetry::EventKind::TransportFailure, 0,  // NSR telemetry
+                        {NSRTelemetry::Int("port", addr.port)}, "enet_host_create failed");
     return false;
   }
   // Connect to every lower-numbered player. The connect data carries our
@@ -593,11 +616,14 @@ bool AllConnected()
 void DumpSnapshot(u32 frame)
 {
   Session& s = s_session;
-  const std::string prefix = Env("NSR_DUMP_PREFIX");
-  if (prefix.empty() || s.dumped)
+  if (s.dumped)
     return;
   auto it = s.snapshots.find(frame);
   if (it == s.snapshots.end())
+    return;
+  // NSR_DUMP_PREFIX, else (telemetry on) the run's bundle prefix next to its JSONL.
+  const std::string prefix = DesyncBundlePrefix(true);
+  if (prefix.empty())
     return;
   const std::string path = prefix + "-" + std::to_string(frame) + ".bin";
   if (FILE* f = std::fopen(path.c_str(), "wb"))
@@ -606,6 +632,7 @@ void DumpSnapshot(u32 frame)
     std::fclose(f);
     s.dumped = true;
     Log("wrote {}", path);
+    TelemetryNoteBundle(path, frame);  // NSR telemetry
   }
 }
 
@@ -623,10 +650,15 @@ void CheckHash(u32 player, u32 frame)
     Log("DESYNC at frame {} vs player {}: local {:016x} remote {:016x}", frame, player,
         local->second, remote->second);
     DumpSnapshot(frame);
+    TelemetryLockstepDesync(frame, player, local->second, remote->second);  // NSR telemetry
+    // Explicit test-only stop exercises the real Core::Stop/flush path.
+    if (Env("NSR_TEST_STOP_ON_DESYNC") == "1")
+    {
+      s.failed = true;
+      Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+    }
   }
 }
-
-u32 TelemetryLiveFrame();  // NSR telemetry: next live frame (defined with the glue)
 
 // Bind the sender carried in an unsequenced datagram to the ENet connection
 // that delivered it.  A star leaf receives both the host's own packets and
@@ -686,6 +718,8 @@ void HandleBootPacket(const ENetPacket* packet, u32 source)
         names += (names.empty() ? "" : ", ") + name;
       Log("boot sync mismatch from player {} BEFORE boot: {}. Use the same NFLStreetRollback build "
           "and session settings on every PC.", sender, names);
+      NSRTelemetry::Event(NSRTelemetry::EventKind::ConfigMismatch, 0,
+                          {NSRTelemetry::Int("player", sender)}, "boot settings: " + names);
       s.failed = true;
       return;
     }
@@ -998,11 +1032,15 @@ void Service(int timeout_ms)
       if (index >= s.players || index == s.me)
       {
         Log("rejected connection with invalid player index {}", index);
+        NSRTelemetry::Event(NSRTelemetry::EventKind::Connection, TelemetryLiveFrame(),  // NSR telemetry
+                            {NSRTelemetry::Int("index", index)}, "rejected invalid player index");
         enet_peer_disconnect_now(event.peer, 0);
       }
       else if (s.peers[index] && s.peers[index] != event.peer && Linked(index))
       {
         Log("duplicate connection claiming player {}", index);
+        NSRTelemetry::Event(NSRTelemetry::EventKind::TransportFailure, TelemetryLiveFrame(),  // NSR telemetry
+                            {NSRTelemetry::Int("player", index)}, "duplicate connection");
         enet_peer_disconnect_now(event.peer, 0);
         s.failed = true;
         StopForRollbackTransportFailure();
@@ -1019,6 +1057,8 @@ void Service(int timeout_ms)
                              enet_packet_create(s.boot_manifests[i].data(),
                                                 s.boot_manifests[i].size(), ENET_PACKET_FLAG_RELIABLE));
         }
+        NSRTelemetry::Event(NSRTelemetry::EventKind::Connection, TelemetryLiveFrame(),  // NSR telemetry
+                            {NSRTelemetry::Int("player", index)}, "connected");
         // A star host replays already-known leaf identities to a new leaf;
         // mesh peers send only their own connection-bound identity.
         for (const auto& identity : NSRGameStats::Identities())
@@ -1045,12 +1085,21 @@ void Service(int timeout_ms)
           s.punch.connect_attempts < 4)
       {
         Log("connect attempt {} to the host failed; retrying", s.punch.connect_attempts);
+        NSRTelemetry::Event(NSRTelemetry::EventKind::Connection, TelemetryLiveFrame(),  // NSR telemetry
+                            {NSRTelemetry::Int("attempt", s.punch.connect_attempts)},
+                            "connect attempt failed; retrying");
         SendPunches();
         ConnectToHost();
         break;
       }
       if (event.peer->data)
         Log("player {} disconnected", PeerIndex(event.peer));
+      NSRTelemetry::Event(NSRTelemetry::EventKind::TransportFailure, TelemetryLiveFrame(),  // NSR telemetry
+                          {NSRTelemetry::Int("player", event.peer->data ?
+                                                           static_cast<s64>(PeerIndex(event.peer)) :
+                                                           -1),
+                           NSRTelemetry::Int("exchanged", s.exchanged_once)},
+                          "peer disconnected");
       s.failed = true;
       StopForRollbackTransportFailure();
       break;
@@ -1058,6 +1107,7 @@ void Service(int timeout_ms)
       break;
     }
   }
+  NSRTelemetry::Poll();  // Includes preboot and input waits with zero live frames.
   // One small host-only results announcement per completed stats snapshot.
   // It never stalls simulation; only file publication waits for this metadata.
   if (const auto anchor = NSRGameStats::TakeCaptureAnchor(); !anchor.empty())
@@ -1106,6 +1156,8 @@ bool SetupPunch()
   if (!s.host)
   {
     Log("enet_host_create failed");
+    NSRTelemetry::Event(NSRTelemetry::EventKind::TransportFailure, 0, {},  // NSR telemetry
+                        "enet_host_create failed (punch)");
     return false;
   }
   s.host->intercept = Intercept;
@@ -1130,6 +1182,9 @@ bool SetupPunch()
     if (now - start > std::chrono::milliseconds(CONNECT_TIMEOUT_MS))
     {
       Log("rendezvous: not every player registered within {} ms", CONNECT_TIMEOUT_MS);
+      NSRTelemetry::Event(NSRTelemetry::EventKind::TransportFailure, 0,  // NSR telemetry
+                          {NSRTelemetry::Int("timeout_ms", CONNECT_TIMEOUT_MS)},
+                          "rendezvous: not every player registered");
       return false;
     }
   }
@@ -1244,12 +1299,25 @@ bool WaitForConnection()
     if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(CONNECT_TIMEOUT_MS))
     {
       Log("not all {} players connected within {} ms; giving up", s.players, CONNECT_TIMEOUT_MS);
+      NSRTelemetry::Event(NSRTelemetry::EventKind::TransportFailure, TelemetryLiveFrame(),  // NSR telemetry
+                          {NSRTelemetry::Int("players", s.players),
+                           NSRTelemetry::Int("timeout_ms", CONNECT_TIMEOUT_MS)},
+                          "not all players connected");
       s.failed = true;
       StopForRollbackTransportFailure();
     }
   }
   if (!s.failed)
+  {
     Log("all {} players connected", s.players);
+    NSRTelemetry::Event(  // NSR telemetry
+        NSRTelemetry::EventKind::Connection, TelemetryLiveFrame(),
+        {NSRTelemetry::Int("players", s.players),
+         NSRTelemetry::Int("wait_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          std::chrono::steady_clock::now() - start)
+                                          .count())},
+        "all players connected");
+  }
   return !s.failed;
 }
 
@@ -1726,6 +1794,9 @@ void TelemetryUnitEnd(const Core::CPUThreadGuard& guard);
 void TelemetrySessionEnter();
 void TelemetrySessionLeave(const char* reason);
 void TelemetryShutdown();
+void TelemetryLinkGauges();
+void TelemetryStateDesyncSummary();
+void TelemetryHandoffDesyncSummary(u32 frame, u32 player, u64 local, u64 remote, bool leave);
 
 std::optional<u64> ParseU64(const std::string& text)
 {
@@ -3258,6 +3329,8 @@ void RbInit(Core::System& system)
   }
   Log("rollback image: force={} keep-ranges={} hash-log={} net={} delay={} max-pred={}", r.force,
       keep.size(), r.hash_log, r.net_enabled, r.net_delay, r.max_prediction);
+  if (s_session.enabled)
+    TelemetryNetplayStart();  // Enrich the preboot header now RAM/config are ready.
 }
 
 // ---------------------------------------------------------------------------
@@ -4220,6 +4293,66 @@ bool ValidateRollbackImage(Core::System& system)
   return true;
 }
 
+// Read the active command-stack screen, with full extents checked before every
+// dereference (GN7E69 r0). Transitions with no active entry simply keep waiting.
+static u32 QuickstartScreen(const Core::CPUThreadGuard& guard)
+{
+  auto& memory = guard.GetSystem().GetMemory();
+  const u8* ram = memory.GetRAM();
+  const u32 size = memory.GetRamSizeReal();
+  const auto read = [&](u32 address, u32& out) {
+    if (address < 0x80000000 || address > 0x81800000 - 4)
+      return false;
+    const u32 offset = address - 0x80000000;
+    if (size < 4 || offset > size - 4)
+      return false;
+    out = Common::swap32(ram + offset);
+    return true;
+  };
+  u32 root = 0, index = 0, array = 0, screen = 0xffffffff;
+  if (read(0x803EB688, root) && root <= 0x817fffb4 &&
+      read(root + 0x3c, index) && read(root + 0x48, array) && index < 128 &&
+      array <= 0x817ff600 && read(array + index * 0x14 + 4, screen))
+    return screen;
+  return 0xffffffff;
+}
+
+// Apply the macro only after the lockstep barrier: every peer sees the same
+// screen and frame here. All raw human pads are suppressed until handoff.
+static void ApplyQuickstart(const Core::CPUThreadGuard& guard, u32 frame,
+                            std::array<Pad, MAX_PLAYERS>& pads)
+{
+  auto& s = s_session;
+  if (!s.quickstart.Active())
+    return;
+  const u32 screen = QuickstartScreen(guard);
+  if (screen != s.quickstart_screen)
+  {
+    Log("quickstart screen {}/{} frame {} step {}", screen >> 16, screen & 0xffff,
+        frame, s.quickstart.StepIndex());
+    s.quickstart_screen = screen;
+  }
+  if (const auto buttons = s.quickstart.Poll(frame, screen))
+  {
+    for (u32 port = 0; port < MAX_PLAYERS; ++port)
+    {
+      pads[port] = NeutralPad();
+      pads[port][0] = static_cast<u8>((*buttons)[port] >> 8);
+      pads[port][1] = static_cast<u8>((*buttons)[port]);
+    }
+  }
+  if (s.quickstart.Failed())
+  {
+    Log("quickstart FAILED: menu timeout at frame {} step {}; stopping", frame,
+        s.quickstart.StepIndex());
+    s.failed = true;
+    StopForRollbackTransportFailure();
+  }
+  else if (!s.quickstart.Active())
+    Log("quickstart COMPLETE frame {} screen {}/{}; human pads enabled", frame,
+        screen >> 16, screen & 0xffff);
+}
+
 // Run milestone-1 raw-pad lockstep for one poll.  Keeping this independent
 // from either game-side stub lets the rollback image use the same proven
 // ordering in menus: PADRead -> agreement -> Reborn remap/PADClamp.
@@ -4250,7 +4383,11 @@ static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 fra
   //    remap/PADClamp run in-game on the agreed pads afterwards), or the test
   //    script if one is loaded. Record it for frame + delay.
   Pad local;
-  if (const auto scripted = ScriptPad(guard, frame))
+  if (s.quickstart.Active())
+  {
+    local = NeutralPad();
+  }
+  else if (const auto scripted = ScriptPad(guard, frame))
   {
     local = *scripted;
   }
@@ -4300,6 +4437,21 @@ static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 fra
     if (s.failed || now - start > std::chrono::milliseconds(limit_ms))
     {
       Log("a player went silent at frame {}", frame);
+      {
+        // NSR telemetry: which players' pads were missing, and for how long.
+        s64 missing = 0;
+        for (u32 i = 0; i < s.players; ++i)
+          if (i != s.me && !s.remote_pads[i].contains(frame))
+            missing |= s64{1} << i;
+        NSRTelemetry::Event(
+            s.failed ? NSRTelemetry::EventKind::TransportFailure : NSRTelemetry::EventKind::InputTimeout, frame,
+            {NSRTelemetry::Int("missing_players_mask", missing),
+             NSRTelemetry::Int("limit_ms", limit_ms), NSRTelemetry::Int("failed", s.failed),
+             NSRTelemetry::Int("waited_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                now - start)
+                                                .count())},
+            s.failed ? "lockstep exchange aborted" : "lockstep: a player went silent");
+      }
       s.failed = true;
       StopForRollbackTransportFailure();
       return false;
@@ -4314,20 +4466,38 @@ static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 fra
   std::array<Pad, MAX_PLAYERS> pads{};
   for (u32 i = 0; i < s.players; ++i)
     pads[i] = i == s.me ? s.local_pads.at(frame) : s.remote_pads[i].at(frame);
+  ApplyQuickstart(guard, frame, pads);
   s.applied.emplace(frame, pads);
   WritePads(guard, buf, pads);
+  TelemetryLockstepFrame(frame, start);  // NSR telemetry: lockstep-menu window clock
 
   // 4. Periodic desync check: hash MEM1 after the agreed pads are in the
   //    buffer (same emulated instant on every machine).
   if (frame % CHECKSUM_INTERVAL == 0 && frame > 0 && s_rb.session_generation == 0)
   {
-    s.local_hashes[frame] = HashMem1(system);
+    // Test-only GN7E69 rev 0 fault: perturb an otherwise unused final MEM1
+    // word on the selected peer, at a checksum boundary. Production runs
+    // never set these variables. This tests real RAM evidence, not a forged
+    // event or HTTP fixture, and stops through Core::Stop when requested.
+    const auto fault = ParseU32(Env("NSR_TEST_LOCKSTEP_DESYNC_AT"));
+    if (fault && frame == *fault &&
+        s.me == ParseU32(Env("NSR_TEST_LOCKSTEP_DESYNC_PLAYER")).value_or(1))
+    {
+      auto& memory = system.GetMemory();
+      memory.GetRAM()[memory.GetRamSizeReal() - 8] ^= 1;
+      Log("test lockstep RAM fault at frame {}", frame);
+    }
+    s.local_hashes[frame] = HashMem1(system, TelemetryLockstepRegions(frame));
     s.last_sent_hash_frame = frame;
-    if (!Env("NSR_DUMP_PREFIX").empty() && !s.dumped)
+    // NSR telemetry: with telemetry on and no NSR_DUMP_PREFIX, the desync
+    // bundle goes next to the run's JSONL, so keep the recent copies then
+    // too (two: the peers' checksums for a frame arrive within frames).
+    if (const std::string prefix = DesyncBundlePrefix(false); !prefix.empty() && !s.dumped)
     {
       auto& memory = system.GetMemory();
       s.snapshots[frame].assign(memory.GetRAM(), memory.GetRAM() + memory.GetRamSizeReal());
-      while (s.snapshots.size() > 4)
+      const size_t keep = Env("NSR_DUMP_PREFIX").empty() ? 2 : 4;
+      while (s.snapshots.size() > keep)
         s.snapshots.erase(s.snapshots.begin());
     }
     for (u32 i = 0; i < s.players; ++i)
@@ -4360,10 +4530,24 @@ static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 fra
 bool PrepareBoot()
 {
   Session& s = s_session;
+  const auto mode = NSRQuickstart::Parse(Env("NSR_QUICKSTART"));
+  if (!mode)
+    return false;
+  s.quickstart = NSRQuickstart::Navigator(*mode);
   s.boot_pending = true;
   if (const auto manifest = NSRBootSync::Prepare())
   {
     s.boot_manifest = *manifest;
+    if (*mode != NSRQuickstart::Mode::Manual)
+    {
+      s.boot_manifest["Quickstart.Mode"] = Env("NSR_QUICKSTART");
+      s.boot_manifest["Quickstart.Version"] = NSRQuickstart::VERSION;
+    }
+    if (Env("NSR_NETPLAY").empty())
+    {
+      s.boot_pending = false;  // offline quickstart uses the same fresh-card route
+      return true;
+    }
     s.enabled = Setup();
     if (s.enabled)
     {
@@ -4405,6 +4589,7 @@ bool PrepareBoot()
   else
   {
     Log("boot sync failed BEFORE boot: could not create disposable cards");
+    TelemetryNetplayStart();
     s.failed = true;
   }
   if (s.boot_go && !s.failed)
@@ -4415,6 +4600,10 @@ bool PrepareBoot()
   }
   Log("boot sync failed BEFORE boot (incompatible peer, disconnected peer or timeout). "
       "All players must use the same NFLStreetRollback build; inspect the named mismatch above.");
+  NSRTelemetry::Event(NSRTelemetry::EventKind::TransportFailure, 0, {},
+                      "boot agreement failed or timed out before guest boot");
+  s.failed = true;
+  TelemetryShutdown();  // Core never initialized, so its HW shutdown cannot flush us.
   if (s.host)
   {
     for (u32 i = 0; i < s.players; ++i)
@@ -4463,6 +4652,14 @@ void RollbackPollHook(const Core::CPUThreadGuard& guard)
     if (r.auto_handoff && !r.vtime_on && !r.menu_frame_lockstep)
     {
       LockstepExchange(guard, scratch, retrace);
+      return;
+    }
+    if (!ConfigForRollback().netplay_enabled && s_session.quickstart.Active())
+    {
+      std::array<Pad, MAX_PLAYERS> pads{};
+      ApplyQuickstart(guard, retrace, pads);
+      for (u32 i = 0; i < PAD_SIZE; ++i)
+        PowerPC::MMU::HostWrite<u8>(guard, pads[0][i], scratch + i);
       return;
     }
     // Raw pads, before Reborn's remap: the test script replaces port 0.
@@ -5312,6 +5509,8 @@ struct StateDigest
   std::vector<u32> slot_frame;
   std::vector<std::vector<u64>> slot_values;
   std::vector<u64> slot_semantic;
+  std::vector<u64> slot_aram;  // Telemetry evidence; reuse the digest already computed here.
+  u64 last_aram = 0;          // The one-off handoff digest's ARAM component.
   std::vector<std::vector<RollbackLogic::Range>> slot_excluded;
   u32 dumped_through = RollbackNet::NO_FRAME;  // NSR_RB_DIGEST_DUMP_EVERY progress
   // The boot-time I/O objects, fixed at the first rollback entry (see
@@ -5727,6 +5926,7 @@ static u64 RbStateDigest(Core::System& system, const std::vector<u8>* slot, u64 
   XXH3_64bits_reset_withSeed(&state, STATE_DIGEST_RANGES_VERSION);
   XXH3_64bits_update(&state, &semantic, sizeof(semantic));
   const u64 aram = RbAramDigest(system, slot != nullptr);
+  sd.last_aram = aram;
   XXH3_64bits_update(&state, &aram, sizeof(aram));
   for (const RollbackLogic::Range& x : sd.excluded)
   {
@@ -5744,11 +5944,13 @@ static u64 RbStateDigest(Core::System& system, const std::vector<u8>* slot, u64 
       sd.slot_frame.assign(slots, RollbackNet::NO_FRAME);
       sd.slot_values.assign(slots, {});
       sd.slot_semantic.assign(slots, 0);
+      sd.slot_aram.assign(slots, 0);
       sd.slot_excluded.assign(slots, {});
     }
     sd.slot_frame[frame % slots] = frame;
     sd.slot_values[frame % slots] = sd.values;
     sd.slot_semantic[frame % slots] = semantic;
+    sd.slot_aram[frame % slots] = aram;
     sd.slot_excluded[frame % slots] = sd.excluded;
   }
   const auto end = std::chrono::steady_clock::now();
@@ -5793,7 +5995,7 @@ static void RbTestCorrupt(u8* ram, u32 frame)
 // diffing against the other peer's file to find the diverged pages).
 static void RbDumpDesync(Core::System& system, u32 frame)
 {
-  const std::string prefix = Env("NSR_DUMP_PREFIX");
+  const std::string prefix = DesyncBundlePrefix(true);  // NSR telemetry: else the run's bundle
   const Rollback& r = s_rb;
   const StateDigest& sd = s_digest;
   if (prefix.empty() || r.ring.empty() || sd.slot_frame.size() != r.ring.size())
@@ -5838,6 +6040,7 @@ static void RbDumpDesync(Core::System& system, u32 frame)
     std::fclose(f);
   }
   Log("wrote {} (+ .vmem, .permachine, .excl, .pages) for the desync at frame {}", path, frame);
+  TelemetryNoteBundle(path, frame);  // NSR telemetry
 }
 
 // A handoff mismatch happens outside the snapshot ring, so preserve the live
@@ -5845,7 +6048,7 @@ static void RbDumpDesync(Core::System& system, u32 frame)
 // of RbDumpDesync and is intentionally failure-only.
 static void RbDumpHandoffDesync(Core::System& system, u32 frame)
 {
-  const std::string prefix = Env("NSR_DUMP_PREFIX");
+  const std::string prefix = DesyncBundlePrefix(true);  // NSR telemetry: else the run's bundle
   if (prefix.empty())
     return;
   const std::string path = fmt::format("{}-handoff-desync-{}.bin", prefix, frame);
@@ -5879,6 +6082,7 @@ static void RbDumpHandoffDesync(Core::System& system, u32 frame)
     std::fclose(f);
   }
   Log("wrote {} (+ .vmem, .permachine, .aram, .excl, .pages) for handoff mismatch", path);
+  TelemetryNoteBundle(path, frame);  // NSR telemetry
 }
 
 // Diagnostics: NSR_RB_DIGEST_DUMP_EVERY=n (with NSR_DUMP_PREFIX) writes the
@@ -6039,7 +6243,7 @@ static void FailConfigMismatch(u32 player, const RollbackNet::ConfigFingerprint*
                          local_digest, remote_digest);
   }
   Log("bad config fingerprint from player {}: refusing rollback; differing: {}", player, fields);
-  NSRTelemetry::Event(NSRTelemetry::EventKind::Note, TelemetryLiveFrame(),  // NSR telemetry
+  NSRTelemetry::Event(NSRTelemetry::EventKind::ConfigMismatch, TelemetryLiveFrame(),  // NSR telemetry
                       {NSRTelemetry::Int("config_mismatch_player", static_cast<s64>(player)),
                        NSRTelemetry::Hex("local_config", local_digest),
                        NSRTelemetry::Hex("remote_config", remote_digest)},
@@ -6053,6 +6257,8 @@ static void FailConfigMismatch(u32 player, const RollbackNet::ConfigFingerprint*
 static bool FailHandoff(const std::string& message)
 {
   Log("DESYNC: HANDOFF ABORT: {}", message);
+  NSRTelemetry::Event(NSRTelemetry::EventKind::HandoffAbort, TelemetryLiveFrame(), {},  // NSR telemetry
+                      message);
   s_session.failed = true;
   s_rb_handoff.reset();
   Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
@@ -6201,6 +6407,8 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
   {
     const RollbackNet::HandoffPacket& other = *s_rb_handoff->Mismatch();
     RbDumpHandoffDesync(guard.GetSystem(), frame);
+    TelemetryHandoffDesyncSummary(frame, other.sender, semantic, other.semantic_hash,
+                                  kind == RollbackNet::HandoffKind::LeaveRollback);  // NSR telemetry
     return FailHandoff(fmt::format(
         "state/frame mismatch from player {}: local kind {} frame {} state digest {:016x}, "
         "remote kind {} frame {} state digest {:016x}",
@@ -6404,17 +6612,7 @@ static bool RbNetworkPreflight(u32 live)
   {
     // NSR telemetry: ENet link quality per peer and the prediction window.
     namespace T = NSRTelemetry;
-    for (u32 i = 0; i < s.players; ++i)
-    {
-      if (i == s.me || !Linked(i))
-        continue;
-      const ENetPeer* peer = s.peers[i];
-      T::SetGauge(T::Gauge::NetRttMs, peer->roundTripTime, static_cast<int>(i));
-      T::SetGauge(T::Gauge::NetRttVarMs, peer->roundTripTimeVariance, static_cast<int>(i));
-      T::SetGauge(T::Gauge::NetLossPct,
-                  100.0 * peer->packetLoss / static_cast<double>(ENET_PEER_PACKET_LOSS_SCALE),
-                  static_cast<int>(i));
-    }
+    TelemetryLinkGauges();
     T::SetGauge(T::Gauge::FrameAdvantage, s_rb_exchange->FrameAdvantage(live));
     T::SetGauge(T::Gauge::InputDelay, r.net_delay);
     T::SetGauge(T::Gauge::MaxPrediction, r.max_prediction);
@@ -6541,6 +6739,7 @@ static bool RbNetworkPreflight(u32 live)
       RbDumpDesync(Core::System::GetInstance(), all[s_rb_desyncs_dumped].frame);
     }
   }
+  TelemetryStateDesyncSummary();  // NSR telemetry: after the bundle above is written
   return !s.failed;
 }
 
@@ -6655,6 +6854,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
       if (!RbNetworkPreflight(t))
         return 0;
       pass_pads = FromNetPads(s_rb_exchange->Assemble(t));
+      TelemetryLockstepFrame(t, {});  // NSR telemetry: post-match window clock
     }
     if (r.record)
     {
@@ -9518,9 +9718,22 @@ void Shutdown(const Core::CPUThreadGuard& guard)
 // and host times into histograms; it only reads host-side counters and, for
 // the audio clock, one word of the session model (no writes, no guest-visible
 // effect).  All functions are CPU-thread only.
-// Deferred: stage-2 network metrics (RTT, loss, lateness, time sync, desync
-// checksums) are fed by the netcode itself through NSRTelemetry's API; see the
-// integration list in NSRTelemetry.h.  Revisit when stage 2 lands.
+// Stage-2 network metrics and errors are fed by the netcode itself through
+// NSRTelemetry's API; see the integration list in NSRTelemetry.h.
+//
+// Whole-session coverage (2026-10-18): a real playtest desynced in the
+// lockstep menus and the server got nothing, because telemetry started only
+// at rollback session entry.  Now Setup() starts it (TelemetryNetplayStart),
+// the lockstep exchange drives the window clock (TelemetryLockstepFrame), and
+// every desync -- lockstep MEM1 hash, rollback state digest, handoff barrier
+// -- also writes the local bundle (the existing dump code, with the run's
+// telemetry prefix when NSR_DUMP_PREFIX is unset) and uploads a summary of
+// per-64 KiB digests that the server diffs between players.  Still passive:
+// host-side reads only; the extra lockstep work (region hashes in the same
+// pass, two MEM1 copies kept for the bundle) runs only with telemetry on,
+// on the host side of the exchange.
+// The already-computed ARAM component is retained with the digest slot, so
+// equal MEM1/VMEM regions can still identify gameplay-ring divergence.
 // ===========================================================================
 namespace NSRNetplay
 {
@@ -9535,6 +9748,17 @@ struct TelemetryGlue
   u64 rollbacks = 0, resim = 0, mispredictions = 0, uncorrectable = 0, skipped_busy = 0;
   u64 pages_copied = 0, pages_seen = 0;
   u32 ac_extra = 0;
+  // Whole session: lockstep frame clock, recent lockstep region hashes (by
+  // checksum frame), the desync bundles written this run, summaries sent.
+  bool have_lockstep_end = false;
+  std::chrono::steady_clock::time_point lockstep_end;
+  u32 lockstep_frame = 0;
+  std::map<u32, std::vector<u64>> lockstep_regions;
+  std::string last_bundle;
+  u32 last_bundle_frame = 0;
+  u32 bundles = 0;
+  u32 summaries = 0;
+  std::optional<std::pair<u32, u32>> summarized;  // (session generation, frame)
 };
 TelemetryGlue s_tm;
 
@@ -9659,6 +9883,8 @@ void TelemetrySessionEnter()
   if (!NSRTelemetry::Enabled())
     return;
   const Rollback& r = s_rb;
+  NSRTelemetry::SetPhase(NSRTelemetry::Phase::RollbackMatch, r.vtime_from);
+  s_tm.have_lockstep_end = false;
   TelemetryBaseline();
   NSRTelemetry::RollbackInfo info;
   info.enter_frame = r.vtime_from;
@@ -9672,6 +9898,7 @@ void TelemetrySessionEnter()
   info.dirty_mode = static_cast<u32>(s_dirty.mode);
   info.frame_mode = r.frame_mode;
   info.vmem_bytes = r.vmem_bytes;
+  info.config_digest = s_rb_exchange ? s_rb_exchange->Config() : 0;
   NSRTelemetry::SessionEnter(info);
   if (s_dirty.protect_fallback)
   {
@@ -9695,17 +9922,305 @@ void TelemetrySessionLeave(const char* reason)
                    T::Int("quiet_skips", static_cast<s64>(r.skipped_busy))});
   s_tm.step_open = false;
   s_tm.have_last_end = false;
+  // Automatic stage 4 continues in post-match frame lockstep; any other
+  // leave also returns to the game's menus (offline runs: `none` before).
+  if (!reason || std::string_view(reason) != "core shutdown")
+    T::SetPhase(T::Phase::PostMatch, r.tick_running);
 }
 
 void TelemetryShutdown()
 {
-  NSRTelemetry::Shutdown();
+  namespace T = NSRTelemetry;
+  const Session& s = s_session;
+  // Shutdown runs before LeaveRollbackSession("core shutdown"), whose own
+  // telemetry call would then be a no-op: report the leave first.
+  if (s_rb.vtime_on && T::Enabled())
+    TelemetrySessionLeave("core shutdown");
+  T::Shutdown(s.failed ? "netplay failure (NSR stopped the core)" : "core stop",
+              {T::Int("failed", s.failed), T::Int("netplay", s.enabled),
+               T::Int("exchanged", s.exchanged_once),
+               T::Int("lockstep_desyncs", static_cast<s64>(s.desyncs)),
+               T::Int("sessions", static_cast<s64>(s_rb.session_generation))});
   s_tm = TelemetryGlue{};
 }
 
+// The frame events are filed under: the lockstep retrace counter in the
+// lockstep menus, else the rollback unit counter.
 u32 TelemetryLiveFrame()
 {
+  if (NSRTelemetry::CurrentPhase() == NSRTelemetry::Phase::LockstepMenu)
+    return s_tm.lockstep_frame;
   return s_rb.live;
+}
+
+// --- whole-session coverage (see the block comment above) ------------------
+void TelemetryNetplayStart()
+{
+  namespace T = NSRTelemetry;
+  const Session& s = s_session;
+  T::StartInfo info;
+  info.phase = T::Phase::LockstepMenu;
+  info.players = s.players;
+  info.delay = s.delay;
+  info.star = s.star;
+  info.punch = s.punch.enabled;
+  info.rollback_image = s_rb.initialized;
+  // Setup also runs before Core::Init: RAM is absent then. Hash the named
+  // boot manifest without exposing its values. RbInit refreshes the header
+  // with the rollback initialization fingerprint once RAM and hooks exist.
+  // Runtime text patches can change GameImage before entry; session_enter
+  // carries the final agreed epoch digest (docs/telemetry.md).
+  if (!s_rb.initialized)
+  {
+    info.config_scope = "boot";
+    const auto encoded = NSRBootSync::EncodeBoot(
+        {NSRBootSync::BootKind::Settings, 0, static_cast<u8>(s.players), s.boot_manifest});
+    info.config_digest = XXH3_64bits(encoded.data(), encoded.size());
+    for (const auto& [name, value] : s.boot_manifest)
+      info.config_fields.emplace_back(name, XXH3_64bits(value.data(), value.size()));
+  }
+  else
+  {
+    const auto fp = LocalConfigFingerprint(Core::System::GetInstance());
+    info.config_digest = RollbackNet::ConfigDigest(fp);
+    for (size_t i = 0; i < RollbackNet::CONFIG_FIELDS; ++i)
+    {
+      const auto field = static_cast<RollbackNet::ConfigField>(i);
+      info.config_fields.emplace_back(RollbackNet::ConfigFieldName(field), fp[field]);
+    }
+  }
+  T::Start(info);
+}
+
+void TelemetryLinkGauges()
+{
+  namespace T = NSRTelemetry;
+  const Session& s = s_session;
+  if (!s.host || !T::Enabled())
+    return;
+  for (u32 i = 0; i < s.players; ++i)
+  {
+    if (i == s.me || !Linked(i))
+      continue;
+    const ENetPeer* peer = s.peers[i];
+    T::SetGauge(T::Gauge::NetRttMs, peer->roundTripTime, static_cast<int>(i));
+    T::SetGauge(T::Gauge::NetRttVarMs, peer->roundTripTimeVariance, static_cast<int>(i));
+    T::SetGauge(T::Gauge::NetLossPct,
+                100.0 * peer->packetLoss / static_cast<double>(ENET_PEER_PACKET_LOSS_SCALE),
+                static_cast<int>(i));
+  }
+}
+
+// One lockstep frame done (pre-match retrace lockstep, or post-match frame
+// lockstep when `wait_start` is default).  Host time only.
+void TelemetryLockstepFrame(u32 frame, std::chrono::steady_clock::time_point wait_start)
+{
+  namespace T = NSRTelemetry;
+  if (!T::Enabled())
+    return;
+  const auto now = std::chrono::steady_clock::now();
+  const auto us = [](auto d) {
+    return static_cast<u64>(std::max<s64>(
+        0, std::chrono::duration_cast<std::chrono::microseconds>(d).count()));
+  };
+  s_tm.lockstep_frame = frame;
+  if (wait_start != std::chrono::steady_clock::time_point{})
+  {
+    T::Observe(T::Hist::LockstepWaitUs, us(now - wait_start));
+    T::SetGauge(T::Gauge::InputDelay, s_session.delay);
+    TelemetryLinkGauges();  // rollback/post-match: RbNetworkPreflight sets them
+  }
+  if (s_tm.have_lockstep_end)
+  {
+    const u64 interval = us(now - s_tm.lockstep_end);
+    T::Observe(T::Hist::FrameIntervalUs, interval);
+    if (interval > 17535)  // 16.7 ms frame budget + 5%
+      T::Count(T::Counter::FramesOverBudget);
+    if (interval > 50000)
+      T::Count(T::Counter::HostStalls);
+  }
+  s_tm.have_lockstep_end = true;
+  s_tm.lockstep_end = now;
+  T::LiveFrame(frame, now);
+}
+
+// Storage for this checksum frame's region hashes (nullptr: telemetry off,
+// so HashMem1 does exactly its old work).
+std::vector<u64>* TelemetryLockstepRegions(u32 frame)
+{
+  if (!NSRTelemetry::Enabled())
+    return nullptr;
+  std::vector<u64>* out = &s_tm.lockstep_regions[frame];
+  while (s_tm.lockstep_regions.size() > 4)
+    s_tm.lockstep_regions.erase(s_tm.lockstep_regions.begin());
+  return s_tm.lockstep_regions.contains(frame) ? &s_tm.lockstep_regions[frame] : out;
+}
+
+// NSR_DUMP_PREFIX when set (diagnostics, unchanged), else the run's bundle
+// prefix next to its telemetry JSONL.  Default bundles are capped per run
+// (a dump is ~25-30 MB: MEM1 plus sidecars); `claim` counts one.
+std::string DesyncBundlePrefix(bool claim)
+{
+  if (std::string env = Env("NSR_DUMP_PREFIX"); !env.empty())
+    return env;
+  constexpr u32 MAX_DEFAULT_BUNDLES = 2;
+  if (s_tm.bundles >= MAX_DEFAULT_BUNDLES)
+    return {};
+  std::string prefix = NSRTelemetry::BundlePrefix();
+  if (claim && !prefix.empty())
+  {
+    ++s_tm.bundles;
+    File::CreateFullPath(prefix);  // the folder exists only once something was written locally
+  }
+  return prefix;
+}
+
+void TelemetryNoteBundle(const std::string& path, u32 frame)
+{
+  s_tm.last_bundle = path;
+  s_tm.last_bundle_frame = frame;
+}
+
+std::string BundleFor(u32 frame)
+{
+  return !s_tm.last_bundle.empty() && s_tm.last_bundle_frame == frame ? s_tm.last_bundle : "";
+}
+
+constexpr u32 MAX_SUMMARIES = 4;  // per run: the first desyncs are the informative ones
+
+void TelemetryLockstepDesync(u32 frame, u32 player, u64 local, u64 remote)
+{
+  namespace T = NSRTelemetry;
+  if (!T::Enabled())
+    return;
+  T::Desync(frame, local, remote, static_cast<int>(player));
+  if (s_tm.summaries >= MAX_SUMMARIES)
+    return;
+  ++s_tm.summaries;
+  T::DesyncSummaryInfo info;
+  info.frame = frame;
+  info.player = static_cast<int>(player);
+  info.local = local;
+  info.remote = remote;
+  info.source = "lockstep_mem1";
+  info.unit_bytes = 0x10000;
+  if (const auto it = s_tm.lockstep_regions.find(frame); it != s_tm.lockstep_regions.end())
+  {
+    info.units = T::Logic::FoldUnits(it->second, 1);
+    info.bundle = BundleFor(frame);
+    if (!info.bundle.empty())
+    {
+      // The full 64-bit region hashes stay in the local bundle.
+      if (FILE* f = std::fopen((info.bundle + ".regions").c_str(), "w"))
+      {
+        std::fprintf(f, "# lockstep MEM1 FNV-1a per 64 KiB region at frame %u (HASH_SKIP "
+                        "words skipped); region index, hash\n",
+                     frame);
+        for (size_t i = 0; i < it->second.size(); ++i)
+          std::fprintf(f, "%zx %016llx\n", i, static_cast<unsigned long long>(it->second[i]));
+        std::fclose(f);
+      }
+    }
+  }
+  T::DesyncSummary(info);
+}
+
+// Rollback per-frame digest mismatch: summarize the ring slot's page values
+// (16 pages = 64 KiB per unit), once per distinct first-desync frame.
+void TelemetryStateDesyncSummary()
+{
+  namespace T = NSRTelemetry;
+  const Rollback& r = s_rb;
+  if (!s_rb_exchange || s_tm.summaries >= MAX_SUMMARIES || !T::Enabled())
+    return;
+  const auto desync = s_rb_exchange->FirstDesync();
+  if (!desync)
+    return;
+  const std::pair<u32, u32> key{r.session_generation, *desync};
+  if (s_tm.summarized == key)
+    return;
+  s_tm.summarized = key;
+  ++s_tm.summaries;
+  const RollbackNet::DesyncInfo d =
+      s_rb_exchange->FirstDesyncInfo().value_or(RollbackNet::DesyncInfo{0, *desync, 0, 0});
+  T::DesyncSummaryInfo info;
+  info.frame = *desync;
+  info.generation = r.session_generation;
+  info.player = d.player;
+  info.local = d.local;
+  info.remote = d.remote;
+  info.source = "rollback_state";
+  info.unit_bytes = 16 * DirtyTracker::PAGE;
+  const StateDigest& sd = s_digest;
+  const size_t index = r.ring.empty() ? 0 : *desync % r.ring.size();
+  if (index < sd.slot_frame.size() && sd.slot_frame[index] == *desync)
+  {
+    info.units = T::Logic::FoldUnits(sd.slot_values[index], 16);
+    info.semantic = sd.slot_semantic[index];
+    info.semantic_valid = true;
+    info.aram = sd.slot_aram[index];
+    info.aram_valid = true;
+    info.excluded_ranges = static_cast<u32>(sd.slot_excluded[index].size());
+    info.excluded_hash = XXH3_64bits(sd.slot_excluded[index].data(),
+                                     sd.slot_excluded[index].size() * sizeof(RollbackLogic::Range));
+  }
+  info.bundle = BundleFor(*desync);
+  T::DesyncSummary(info);
+}
+
+// Entry proves live RAM; leave can instead prove the last confirmed match
+// slot (fix/lifecycle). Never present live teardown RAM as that older state.
+void TelemetryHandoffDesyncSummary(u32 frame, u32 player, u64 local, u64 remote, bool leave)
+{
+  namespace T = NSRTelemetry;
+  if (!T::Enabled())
+    return;
+  T::Desync(frame, local, remote, static_cast<int>(player));
+  if (s_tm.summaries >= MAX_SUMMARIES)
+    return;
+  ++s_tm.summaries;
+  T::DesyncSummaryInfo info;
+  info.frame = frame;
+  info.generation = s_rb.session_generation;
+  info.player = static_cast<int>(player);
+  info.local = local;
+  info.remote = remote;
+  info.source = "handoff_state";
+  info.unit_bytes = 16 * DirtyTracker::PAGE;
+  info.units = T::Logic::FoldUnits(s_digest.values, 16);
+  info.aram = s_digest.last_aram;
+  info.aram_valid = !s_digest.values.empty();
+  info.excluded_ranges = static_cast<u32>(s_digest.excluded.size());
+  info.excluded_hash = XXH3_64bits(s_digest.excluded.data(),
+                                   s_digest.excluded.size() * sizeof(RollbackLogic::Range));
+  if (const auto proof = leave && s_rb_exchange ?
+                            s_rb_exchange->LocalStateChecksumAtOrBefore(s_rb.tick_running) :
+                            std::nullopt)
+  {
+    info.source = "handoff_match_state";
+    info.evidence_frame = proof->first;
+    info.units.clear();
+    info.aram_valid = false;
+    const size_t index = s_rb.ring.empty() ? 0 : proof->first % s_rb.ring.size();
+    if (index < s_digest.slot_frame.size() && s_digest.slot_frame[index] == proof->first)
+    {
+      info.units = T::Logic::FoldUnits(s_digest.slot_values[index], 16);
+      info.semantic = s_digest.slot_semantic[index];
+      info.semantic_valid = true;
+      info.aram = s_digest.slot_aram[index];
+      info.aram_valid = true;
+      info.excluded_ranges = static_cast<u32>(s_digest.slot_excluded[index].size());
+      info.excluded_hash = XXH3_64bits(s_digest.slot_excluded[index].data(),
+                                     s_digest.slot_excluded[index].size() * sizeof(RollbackLogic::Range));
+      RbDumpDesync(Core::System::GetInstance(), proof->first);
+    }
+    info.bundle = BundleFor(proof->first);
+  }
+  else
+  {
+    info.bundle = BundleFor(frame);
+  }
+  T::DesyncSummary(info);
 }
 }  // namespace
 }  // namespace NSRNetplay

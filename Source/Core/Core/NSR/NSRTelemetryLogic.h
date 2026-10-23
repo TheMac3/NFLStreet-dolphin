@@ -10,6 +10,9 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <vector>
 
 namespace NSRTelemetry::Logic
 {
@@ -69,4 +72,64 @@ FinalFlushResult FinalFlush(Queue& queue, TimePoint deadline, Now&& now, Post&& 
   }
   return result;
 }
+
+// ---------------------------------------------------------------------------
+// Desync summaries (whole-session telemetry, 2026-10-18).  Peers upload
+// digests of their own state at a desync frame; the server diffs two
+// players' lists to name the differing regions.  Only hashes leave the
+// machine, never RAM bytes.
+
+constexpr std::uint64_t FNV_OFFSET = 1469598103934665603ULL;
+constexpr std::uint64_t FNV_PRIME = 1099511628211ULL;
+
+// The milestone-1 lockstep MEM1 hash: FNV-1a over 64-bit words, skipping
+// words whose offset `skip(off)` excludes.  With `regions`, the same pass
+// also hashes each `region_bytes` region on its own (same skips, same
+// words), so the wire hash is unchanged whether or not regions are wanted.
+template <typename Skip>
+std::uint64_t LockstepMem1Hash(const unsigned char* base, std::uint32_t size, Skip&& skip,
+                               std::vector<std::uint64_t>* regions = nullptr,
+                               std::uint32_t region_bytes = 0x10000)
+{
+  std::uint64_t h = FNV_OFFSET;
+  if (regions)
+    regions->assign((size + region_bytes - 1) / region_bytes, FNV_OFFSET);
+  for (std::uint32_t off = 0; off + 8 <= size; off += 8)
+  {
+    if (skip(off))
+      continue;
+    std::uint64_t w;
+    std::memcpy(&w, base + off, 8);
+    h = (h ^ w) * FNV_PRIME;
+    if (regions)
+    {
+      std::uint64_t& r = (*regions)[off / region_bytes];
+      r = (r ^ w) * FNV_PRIME;
+    }
+  }
+  return h;
+}
+
+// Fold 64-bit digests into 32-bit unit digests of `per_unit` consecutive
+// values each (a short last unit is folded as is).  Used for the rollback
+// state digest's per-page values (16 pages = 64 KB per unit) and for the
+// lockstep region hashes (per_unit 1).  32 bits per unit keeps a summary
+// near 4 KB; a false "equal" needs a 2^-32 collision in that unit.
+inline std::vector<std::uint32_t> FoldUnits(const std::vector<std::uint64_t>& values,
+                                            std::size_t per_unit)
+{
+  std::vector<std::uint32_t> out;
+  if (per_unit == 0)
+    return out;
+  out.reserve((values.size() + per_unit - 1) / per_unit);
+  for (std::size_t i = 0; i < values.size(); i += per_unit)
+  {
+    std::uint64_t h = FNV_OFFSET;
+    for (std::size_t j = i; j < values.size() && j < i + per_unit; ++j)
+      h = (h ^ values[j]) * FNV_PRIME;
+    out.push_back(static_cast<std::uint32_t>(h ^ (h >> 32)));
+  }
+  return out;
+}
+
 }  // namespace NSRTelemetry::Logic
