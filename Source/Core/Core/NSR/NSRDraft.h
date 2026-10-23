@@ -33,6 +33,22 @@ inline constexpr std::array<std::uint32_t, 6> DRAFT_ONE{{
 inline constexpr std::array<std::uint32_t, 6> DRAFT_TWO{{
   0x812d900c, 0x2c09000f, 0x4082000c, 0x38600000, 0x4e800020, 0x4bc6b458,
 }};
+inline constexpr std::array<std::uint32_t, 7> DRAFT_SELECTREADONE{{
+  0x812d900c, 0x2c09000f, 0x4082000c, 0x38000001, 0x980d96ca, 0x880d96ca,
+  0x4bbffda0,
+}};
+inline constexpr std::array<std::uint32_t, 7> DRAFT_SELECTREADTWO{{
+  0x812d900c, 0x2c09000f, 0x4082000c, 0x38000000, 0x980d96ca, 0x880d96ca,
+  0x4bbffda0,
+}};
+inline constexpr std::array<std::uint32_t, 7> DRAFT_SELECTCOMMITONE{{
+  0x812d900c, 0x2c09000f, 0x4082000c, 0x38800001, 0x988d96ca, 0x888d96ca,
+  0x4bbff3a0,
+}};
+inline constexpr std::array<std::uint32_t, 7> DRAFT_SELECTCOMMITTWO{{
+  0x812d900c, 0x2c09000f, 0x4082000c, 0x38800000, 0x988d96ca, 0x888d96ca,
+  0x4bbff3a0,
+}};
 
 // Plan every word before any write. Exact reapplication after a native reload
 // is safe; a different or stale patch/revision fails closed. The caller commits
@@ -76,6 +92,11 @@ inline std::optional<std::map<std::uint32_t, std::uint32_t>> PlanDraft(
   if (first)
     valid = valid && (first == 1 ? cave(0x80411700, DRAFT_ONE) : cave(0x80411700, DRAFT_TWO)) &&
             append(0x80018fc0, 0x483f8741, 0x48063bad);
+  if (first)
+    valid = valid && (first == 1 ? cave(0x80411740, DRAFT_SELECTREADONE) : cave(0x80411740, DRAFT_SELECTREADTWO)) &&
+            (first == 1 ? cave(0x80411780, DRAFT_SELECTCOMMITONE) : cave(0x80411780, DRAFT_SELECTCOMMITTWO)) &&
+            append(0x800114f4, 0x4840024c, 0x880d96ca) &&
+            append(0x80010b34, 0x48400c4c, 0x888d96ca);
   if (!valid)
   {
     *error = "draft original instruction/cave mismatch";

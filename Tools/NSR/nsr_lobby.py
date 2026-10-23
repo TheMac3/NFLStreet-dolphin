@@ -97,6 +97,34 @@ def _quickstart_message(msg: dict, selected: str) -> dict:
     return msg
 
 
+# A room owns its immutable Pickup policy. Missing extensions mean native stock;
+# nondefault rooms require an explicit capability and an echo from the service.
+DRAFT_VERSION = 1
+
+
+def draft_settings(value=None) -> dict:
+    """Validate the whole room policy before showing it or passing it to Dolphin."""
+    if value is None:
+        return {"order": "alternating", "first": "stock"}
+    if (not isinstance(value, dict) or set(value) != {"order", "first"}
+            or value["order"] not in ("alternating", "snake", "cocky")
+            or value["first"] not in ("stock", "team-one", "team-two")):
+        raise ConnectionError("Unknown Pickup draft setup. Update NFLStreetRollback.")
+    return dict(value)
+
+
+def draft_label(value=None) -> str:
+    """Use one human-readable lobby label in both launcher views."""
+    draft = draft_settings(value)
+    first = {"stock": "Select Controller", "team-one": "Team One", "team-two": "Team Two"}[draft["first"]]
+    return f"Pickup draft: {draft['order'].capitalize()} · First pick: {first}"
+
+
+def _draft_message(msg: dict, selected=None) -> dict:
+    """Carry policy and capability together without changing protocol v2."""
+    msg.update(draft=draft_settings(selected), draft_version=DRAFT_VERSION)
+    return msg
+
 
 def _check_mode(mode: str) -> str:
     if mode not in MODES:
@@ -152,6 +180,7 @@ class StartInfo:
     telemetry_url: str = ""    # ingest endpoint granted by the room server
     telemetry_token: str = ""  # per-session/per-player token (docs/telemetry.md)
     quickstart: str = "manual"  # optional game-mode route, independent of netplay mode
+    draft: dict = field(default_factory=draft_settings)
 
 
 def _send(sock: socket.socket, msg: dict) -> None:
@@ -193,6 +222,7 @@ class LobbyHost:
     mode: str = RELEASE_MODE
     content: dict | None = None  # our nsr_content descriptor (None: don't compare)
     quickstart: str = "manual"
+    draft: dict | None = None
     _joiners: list[_Joiner] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _server: socket.socket | None = None
@@ -200,6 +230,7 @@ class LobbyHost:
 
     def open(self) -> None:
         self.quickstart = quickstart_id(self.quickstart)
+        self.draft = draft_settings(self.draft)
         self._server = socket.create_server((self.bind, self.port), reuse_port=False)
         self._server.settimeout(0.5)
         threading.Thread(target=self._accept_loop, daemon=True).start()
@@ -215,7 +246,8 @@ class LobbyHost:
             joiners = list(self._joiners)
         for j in joiners:
             try:
-                _send(j.sock, _quickstart_message({"type": "lobby", "players": names}, self.quickstart))
+                message = _quickstart_message({"type": "lobby", "players": names}, self.quickstart)
+                _send(j.sock, _draft_message(message, self.draft))
             except OSError:
                 pass
         self.on_change(names)
@@ -248,11 +280,13 @@ class LobbyHost:
                       f"{self.mode}. Everyone needs the same NFLStreetRollback download.")
         elif self.quickstart != "manual" and hello.get("quickstart_version") != QUICKSTART_VERSION:
             reason = "This room uses quickstart. Update NFLStreetRollback or ask the host for Manual (menus)."
+        elif self.draft != draft_settings() and hello.get("draft_version") != DRAFT_VERSION:
+            reason = "This room uses custom Pickup drafting. Update NFLStreetRollback."
         elif content:
             reason, action = content
         elif hello.get("fingerprint") != self.fingerprint:
             reason = (f"Game setup mismatch: yours is {hello.get('fingerprint')}, the host's is "
-                      f"{self.fingerprint}. Everyone needs the same Reborn version, patches and Pickup draft settings.")
+                      f"{self.fingerprint}. Everyone needs the same Reborn version, patches.")
         with self._lock:
             if reason is None and len(self._joiners) + 1 >= MAX_PLAYERS:
                 reason = "The lobby is full (4 players)."
@@ -295,10 +329,11 @@ class LobbyHost:
         seed = secrets.randbits(32)  # per-match RNG seed, sent to everyone
         for k, j in enumerate(joiners, start=1):
             _send(j.sock, {"type": "start", "player": k, "players": players, "delay": delay,
-                           "seed": seed, "mode": mode, "quickstart": self.quickstart})
+                           "seed": seed, "mode": mode, "quickstart": self.quickstart, "draft": self.draft})
             j.sock.close()
         self._server.close()
-        return StartInfo(0, players, delay, "", seed=seed, mode=mode, quickstart=self.quickstart)
+        return StartInfo(0, players, delay, "", seed=seed, mode=mode,
+                         quickstart=self.quickstart, draft=draft_settings(self.draft))
 
     def close(self) -> None:
         self._closed = True
@@ -318,7 +353,8 @@ def join(host: str, name: str, fingerprint: str,
          on_lobby: Callable[[list[str]], None] = lambda names: None,
          cancel: threading.Event | None = None, port: int = PORT,
          mode: str = RELEASE_MODE, content: dict | None = None,
-         on_game_mode: Callable[[str], None] = lambda selected: None) -> StartInfo:
+         on_game_mode: Callable[[str], None] = lambda selected: None,
+         on_draft: Callable[[dict], None] = lambda selected: None) -> StartInfo:
     """Connect to a host's lobby and wait for Start. Raises ConnectionError
     with a readable reason if refused, closed, or unreachable."""
     if ":" in host:
@@ -334,8 +370,9 @@ def join(host: str, name: str, fingerprint: str,
     _check_mode(mode)
     _send(sock, _with_content({"type": "hello", "name": name, "fingerprint": fingerprint,
                                "version": PROTOCOL_VERSION, "mode": mode,
-                               "quickstart_version": QUICKSTART_VERSION}, content))
+                               "quickstart_version": QUICKSTART_VERSION, "draft_version": DRAFT_VERSION}, content))
     buf = b""
+    shown_draft = None
     try:
         while True:
             if cancel and cancel.is_set():
@@ -354,16 +391,24 @@ def join(host: str, name: str, fingerprint: str,
                 if kind == "lobby":
                     on_lobby(list(msg["players"]))
                     on_game_mode(quickstart_id(msg.get("quickstart")))
+                    current_draft = draft_settings(msg.get("draft"))
+                    if shown_draft is not None and shown_draft != current_draft:
+                        raise ConnectionError("The host changed the draft setup; rejoin the room.")
+                    shown_draft = current_draft
+                    on_draft(current_draft)
                 elif kind == "reject":
                     raise _rejected(msg, "Refused by the host.")
                 elif kind == "closed":
                     raise ConnectionError("The host closed the lobby.")
                 elif kind == "start":
+                    if shown_draft != draft_settings(msg.get("draft")):
+                        raise ConnectionError("The host changed the draft setup; rejoin the room.")
                     agreed = _agreed_mode(msg, mode, "The host")
                     return StartInfo(int(msg["player"]), int(msg["players"]),
                                      int(msg.get("delay", 2)), address,
                                      seed=int(msg.get("seed", 0x13579BDF)), mode=agreed,
-                                     quickstart=quickstart_id(msg.get("quickstart")))
+                                     quickstart=quickstart_id(msg.get("quickstart")),
+                                     draft=draft_settings(msg.get("draft")))
     finally:
         sock.close()
 
@@ -399,6 +444,7 @@ class RoomHost:
     mode: str = RELEASE_MODE
     content: dict | None = None  # our nsr_content descriptor (sent with create)
     quickstart: str = "manual"
+    draft: dict | None = None
     code: str = ""
     _sock: socket.socket | None = None
     _start: StartInfo | None = None
@@ -406,6 +452,7 @@ class RoomHost:
     _started: threading.Event = field(default_factory=threading.Event)
 
     def open(self) -> str:
+        self.draft = draft_settings(self.draft)
         host, port = _split(self.rendezvous, RENDEZVOUS_PORT)
         try:
             self._sock = socket.create_connection((host, port), timeout=10)
@@ -415,7 +462,8 @@ class RoomHost:
         _send(self._sock, _with_content({"type": "create", "name": self.name, "fingerprint": self.fingerprint,
                                          "version": RENDEZVOUS_VERSION, "mode": _check_mode(self.mode),
                                          "quickstart": quickstart_id(self.quickstart),
-                                         "quickstart_version": QUICKSTART_VERSION},
+                                         "quickstart_version": QUICKSTART_VERSION,
+                                         "draft": self.draft, "draft_version": DRAFT_VERSION},
                                         self.content))
         lines = _lines(self._sock)
         first = next(lines, None)
@@ -424,6 +472,9 @@ class RoomHost:
         if quickstart_id(first.get("quickstart")) != self.quickstart:
             self.close()
             raise ConnectionError("This room server needs an update for quickstart. Choose Manual (menus) to play now.")
+        if draft_settings(first.get("draft")) != self.draft:
+            self.close()
+            raise ConnectionError("This room server needs an update for Pickup drafting. Use Alternating / Stock for now.")
         self.code = first["code"]
         self._sock.settimeout(None)
         threading.Thread(target=self._read, args=(lines,), daemon=True).start()
@@ -440,6 +491,8 @@ class RoomHost:
                 elif kind == "start":
                     try:
                         self._start = _start_info(msg, self.rendezvous, self.mode)
+                        if self._start.draft != self.draft:
+                            raise ConnectionError("The room server changed the draft setup; reopen the room.")
                         if self._start.quickstart != self.quickstart:
                             raise ConnectionError("The room server changed the game mode; reopen the room.")
                     except ConnectionError as e:
@@ -490,14 +543,15 @@ def _start_info(msg: dict, rendezvous: str, expected_mode: str = RELEASE_MODE) -
                      mode=mode, room_code=str(msg.get("code", ""))[:16],
                      telemetry_url=str(telemetry.get("url", "")),
                      telemetry_token=str(telemetry.get("token", "")),
-                     quickstart=quickstart_id(msg.get("quickstart")))
+                     quickstart=quickstart_id(msg.get("quickstart")), draft=draft_settings(msg.get("draft")))
 
 
 def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
               on_lobby: Callable[[list[str]], None] = lambda names: None,
               cancel: threading.Event | None = None, mode: str = RELEASE_MODE,
               content: dict | None = None,
-              on_game_mode: Callable[[str], None] = lambda selected: None) -> StartInfo:
+              on_game_mode: Callable[[str], None] = lambda selected: None,
+              on_draft: Callable[[dict], None] = lambda selected: None) -> StartInfo:
     """Join a room by code and wait for the host's Start. Raises
     ConnectionError with a readable reason if refused, closed, or unreachable."""
     host, port = _split(rendezvous, RENDEZVOUS_PORT)
@@ -509,8 +563,9 @@ def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
     _check_mode(mode)
     _send(sock, _with_content({"type": "join", "code": code, "name": name, "fingerprint": fingerprint,
                                "version": RENDEZVOUS_VERSION, "mode": mode,
-                               "quickstart_version": QUICKSTART_VERSION}, content))
+                               "quickstart_version": QUICKSTART_VERSION, "draft_version": DRAFT_VERSION}, content))
     buf = b""
+    shown_draft = None
     try:
         while True:
             if cancel and cancel.is_set():
@@ -529,11 +584,18 @@ def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
                 if kind == "lobby":
                     on_lobby(list(msg["players"]))
                     on_game_mode(quickstart_id(msg.get("quickstart")))
+                    current_draft = draft_settings(msg.get("draft"))
+                    if shown_draft is not None and shown_draft != current_draft:
+                        raise ConnectionError("The host changed the draft setup; rejoin the room.")
+                    shown_draft = current_draft
+                    on_draft(current_draft)
                 elif kind == "reject":
                     raise _rejected(msg, "Refused.")
                 elif kind == "closed":
                     raise ConnectionError(msg.get("reason", "Refused."))
                 elif kind == "start":
+                    if shown_draft != draft_settings(msg.get("draft")):
+                        raise ConnectionError("The room server changed the draft setup; rejoin the room.")
                     return _start_info(msg, rendezvous, mode)
     finally:
         sock.close()

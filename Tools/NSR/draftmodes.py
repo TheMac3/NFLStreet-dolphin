@@ -17,6 +17,11 @@ INIT_SITE = 0x80018FC0
 FIRST_TEAM_FN = 0x8007CB6C
 CODE = 0x80411600  # dormant profile cave; rollback and profile are mutually exclusive
 INIT_CODE = CODE + 0x100
+SELECT_READ_SITE = 0x800114F4
+SELECT_COMMIT_SITE = 0x80010B34
+SELECT_FIRST = 0x803EB96A
+SELECT_READ_CODE = INIT_CODE + 0x40
+SELECT_COMMIT_CODE = INIT_CODE + 0x80
 TABLE = 0x803EBA08
 MODE = 0x803EB2AC
 PICKUP = 15
@@ -112,6 +117,26 @@ def init_routine(first: str) -> list[int]:
     return words
 
 
+def select_routine(first: str, *, commit: bool = False) -> list[int]:
+    """Keep Select Controller's displayed and committed GTPG choice coherent.
+
+    GN7E69 r0: the screen getter reads r13-0x6936, and its accept path
+    passes that byte to the native GTPG setter. Clamp both for an explicit
+    room choice; Stock installs neither hook. The native setter still owns
+    the database update, so ball-first and draft-first use the same value.
+    """
+    if first not in FIRSTS[1:]:
+        raise ip.PatchError("Select Controller hook needs an explicit team")
+    code = SELECT_COMMIT_CODE if commit else SELECT_READ_CODE
+    site = SELECT_COMMIT_SITE if commit else SELECT_READ_SITE
+    register = 4 if commit else 0
+    return _assemble(code, [ip.lwz(9, -0x6FF4, 13), ip.cmpwi(9, PICKUP),
+                            ("bne", "native"),
+                            ip.addi(register, 0, 1 if first == "team-one" else 0),
+                            ip.stb(register, -0x6936, 13), "native",
+                            ip.lbz(register, -0x6936, 13), ("b", site + 4)])
+
+
 def apply(iso, patches: set[str]) -> None:
     """Write guarded original-code recipes into an already copied private image."""
     validate_patches(patches)
@@ -131,6 +156,12 @@ def apply(iso, patches: set[str]) -> None:
             ip.write_words(iso, INIT_CODE, words, expect=[0] * len(words))
             ip.write_words(iso, INIT_SITE, [ip.b(INIT_SITE, INIT_CODE, link=True)],
                            expect=[ip.b(INIT_SITE, FIRST_TEAM_FN, link=True)])
+            for commit, code, site, register in ((False, SELECT_READ_CODE, SELECT_READ_SITE, 0),
+                                                  (True, SELECT_COMMIT_CODE, SELECT_COMMIT_SITE, 4)):
+                words = select_routine(first, commit=commit)
+                ip.write_words(iso, code, words, expect=[0] * len(words))
+                ip.write_words(iso, site, [ip.b(site, code)],
+                               expect=[ip.lbz(register, -0x6936, 13)])
 
 
 def runtime_bytes(content=None, order="alternating", first="stock"):

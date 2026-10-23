@@ -523,7 +523,7 @@ class Launcher:
             "host": {"state": "idle", "mode": "", "code": "", "players": [], "can_start": False,
                      "info": "" if self.rv_server else "Room codes aren't set up in this download "
                              "(no room server). Use “Host by IP”."},
-            "join": {"state": "idle", "info": "", "players": [], "quickstart": "manual"},
+            "join": {"state": "idle", "info": "", "players": [], "quickstart": "manual", "draft_label": ""},
             "controllers": {"state": "checking", "message": "", "source": "",
                             "port1": controllers.port1_summary(self.user_dir), "backup": ""},
             # Button icons (nsr_textures): the setting (auto|gamecube|playstation|
@@ -644,14 +644,20 @@ class Launcher:
         self._set("game", room_fingerprint=self.room_fingerprint())
         self._set("content", version=content["version"] if content else None)
 
-    def room_fingerprint(self) -> str:
-        """Agree runtime settings in room admission; M2 also agrees the full boot bundle."""
+    def draft_settings(self) -> dict:
+        """Snapshot the host/practice choice; joiners use their room StartInfo instead."""
+        g = self.state["game"]
+        return {"order": g["draft_order"], "first": g["draft_first"]}
+
+    def room_fingerprint(self, selected=None) -> str:
+        """Label the launch with its agreed policy; M2 compares the full boot bundle."""
         import draftmodes
         g = self.state["game"]
-        return draftmodes.room_fingerprint(g["fingerprint"], g["draft_order"], g["draft_first"])
+        selected = lobby.draft_settings(selected) if selected is not None else self.draft_settings()
+        return draftmodes.room_fingerprint(g["fingerprint"], selected["order"], selected["first"])
 
     def set_draft(self, order: str, first: str) -> None:
-        """Persist a room setting without rebuilding; every peer must select it."""
+        """Persist the next host/practice room choice without rebuilding the base image."""
         import draftmodes
         draftmodes.patch_names(order, first)
         with self._lock:
@@ -662,7 +668,7 @@ class Launcher:
             self.cfg.update(draft_order=order, draft_first=first)
             self._save()
             self._set("game", draft_order=order, draft_first=first,
-                      note=f"Pickup draft: {order}; first: {first}. Applied at game load; all peers must agree.")
+                      note=f"Pickup draft: {order}; first: {first}. Shared with joiners; applied at Select Controller and the draft.")
             self._set("game", room_fingerprint=self.room_fingerprint())
 
     def _check_game_now(self) -> None:
@@ -1070,8 +1076,9 @@ class Launcher:
             # so Reborn-only games can be uploaded later too.
             self.uploader.remember_server(start.telemetry_url, start.telemetry_token)
             self._stats_wake.set()
+        selected_draft = lobby.draft_settings(start.draft) if start else self.draft_settings()
         args, env = dolphin_command(self.folder, start, self.reborn_install(), open_ui=open_ui,
-                                    name=self.state["name"], fingerprint=self.room_fingerprint(),
+                                    name=self.state["name"], fingerprint=self.room_fingerprint(selected_draft),
                                     telemetry=self.state["telemetry"], quickstart=self.state["quickstart"],
                                     icons=self._icons_setting(), resolution=self._resolution_setting())
         if not open_ui:  # same values the fork logs in nsr-p*.log ("local pad:")
@@ -1095,7 +1102,7 @@ class Launcher:
             if not open_ui:
                 active = self._installed_runtime()
                 import draftmodes
-                order, first = self.state["game"]["draft_order"], self.state["game"]["draft_first"]
+                order, first = selected_draft["order"], selected_draft["first"]
                 if active:
                     self._validate_runtime(active)
                 if active or draftmodes.patch_names(order, first):
@@ -1174,9 +1181,10 @@ class Launcher:
 
         def work():
             self._preflight_update()
-            h = self._lobby.RoomHost(self.rv_server, self.state["name"], self.room_fingerprint(),
+            h = self._lobby.RoomHost(self.rv_server, self.state["name"], self.state["game"]["fingerprint"],
                                      on_change=self._roster, on_error=lambda why: self._set("host", info=why),
-                                     content=self._content_descriptor(), quickstart=self.state["quickstart"])
+                                     content=self._content_descriptor(), quickstart=self.state["quickstart"],
+                                     draft=self.draft_settings())
             try:
                 code = h.open()
             except ConnectionError as e:
@@ -1192,10 +1200,11 @@ class Launcher:
             return
         self._set("host", state="opening", mode="ip", info="Opening a direct lobby…")
         try:
-            h = self._lobby.LobbyHost(self.state["name"], self.room_fingerprint(),
+            h = self._lobby.LobbyHost(self.state["name"], self.state["game"]["fingerprint"],
                                       on_change=self._roster,
                                       on_reject=lambda who, why: self._set("host", info=f"Refused {who}: {why}"),
-                                      content=self._content_descriptor(), quickstart=self.state["quickstart"])
+                                      content=self._content_descriptor(), quickstart=self.state["quickstart"],
+                                      draft=self.draft_settings())
             h.open()
         except OSError as e:
             self._set("host", state="idle", mode="")
@@ -1266,17 +1275,18 @@ class Launcher:
         cancel = threading.Event()
         self._join_cancel = cancel
         self._set(last_host=target)
-        self._set("join", state="waiting", players=[], quickstart="manual",
+        self._set("join", state="waiting", players=[], quickstart="manual", draft_label="",
                   info=f"Joining {target}… waiting for the host to start.")
         on_lobby = lambda names: self._set("join", players=list(names))  # noqa: E731
 
         def attempt():
             kw = {"on_lobby": on_lobby, "cancel": cancel, "content": self._content_descriptor(),
-                  "on_game_mode": lambda selected: self._set("join", quickstart=selected)}
+                  "on_game_mode": lambda selected: self._set("join", quickstart=selected),
+                  "on_draft": lambda selected: self._set("join", draft_label=lobby.draft_label(selected))}
             if direct:
-                return self._lobby.join(target, self.state["name"], self.room_fingerprint(), **kw)
+                return self._lobby.join(target, self.state["name"], self.state["game"]["fingerprint"], **kw)
             return self._lobby.join_room(self.rv_server, target, self.state["name"],
-                                         self.room_fingerprint(), **kw)
+                                         self.state["game"]["fingerprint"], **kw)
 
         def work():
             self._preflight_update()
@@ -1610,18 +1620,18 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     ttk.Checkbutton(sp, text="Apply ratings at game start (off: rebuild the image)",
                     variable=runtime_var, command=lambda: launcher.set_content_runtime(runtime_var.get())) \
         .grid(row=12, column=0, columnspan=4, sticky="w", pady=(6, 0))
-    ttk.Label(sp, text="Pickup draft / first team").grid(row=13, column=0, sticky="w", pady=(12, 0))
+    ttk.Label(hp, text="Pickup draft / first team").grid(row=8, column=0, sticky="w", pady=(12, 0))
     draft_order = tk.StringVar(value=launcher.state["game"]["draft_order"])
     draft_first = tk.StringVar(value=launcher.state["game"]["draft_first"])
-    order_box = ttk.Combobox(sp, textvariable=draft_order, values=("alternating", "snake", "cocky"), state="readonly", width=14)
-    first_box = ttk.Combobox(sp, textvariable=draft_first, values=("stock", "team-one", "team-two"), state="readonly", width=14)
-    order_box.grid(row=14, column=0, sticky="w")
-    first_box.grid(row=14, column=1, sticky="w")
+    order_box = ttk.Combobox(hp, textvariable=draft_order, values=("alternating", "snake", "cocky"), state="readonly", width=14)
+    first_box = ttk.Combobox(hp, textvariable=draft_first, values=("stock", "team-one", "team-two"), state="readonly", width=14)
+    order_box.grid(row=9, column=0, sticky="w")
+    first_box.grid(row=9, column=1, sticky="w")
     # Both native sides may contain the host; these choices deliberately name teams.
     order_box.bind("<<ComboboxSelected>>", lambda _: launcher.set_draft(draft_order.get(), draft_first.get()))
     first_box.bind("<<ComboboxSelected>>", lambda _: launcher.set_draft(draft_order.get(), draft_first.get()))
-    ttk.Label(sp, text="Cocky: seven picks each. Team One/Two are in-game sides. Applied at game load; all peers must agree.",
-              wraplength=560).grid(row=15, column=0, columnspan=4, sticky="w")
+    ttk.Label(hp, text="Cocky: seven picks each. Team One/Two are in-game sides. Shared with joiners; applied at Select Controller and the draft.",
+              wraplength=560).grid(row=10, column=0, columnspan=4, sticky="w")
 
     def browse():
         iso = filedialog.askopenfilename(title="Pick NFL Street Reborn's NSR.iso (content\\games)",
@@ -1648,14 +1658,14 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
             status.configure(text=("● Ready to play" if g["state"] == "ready" else "● " + g["text"])
                              + f"     {s['name']} · Port 1")
             host_code.configure(text=h["code"] if h["state"] in ("open", "starting") else "")
-            host_info.configure(text=h["info"])
+            host_info.configure(text=h["info"] + "\n" + lobby.draft_label(launcher.draft_settings()))
             mode_var.set(lobby.QUICKSTARTS[s["quickstart"]])
             mode_picker.configure(state="readonly" if h["state"] == "idle" else "disabled")
             set_list(host_roster, h["players"])
             idle = h["state"] == "idle"
             enable(b_open, idle and s["rooms"]); enable(b_ip, idle)
             enable(b_close, not idle); enable(b_start, h["state"] == "open" and h["can_start"])
-            join_info.configure(text=j["info"] + "\nGame mode: " + lobby.QUICKSTARTS[j["quickstart"]])
+            join_info.configure(text=j["info"] + "\nGame mode: " + lobby.QUICKSTARTS[j["quickstart"]] + "\n" + j.get("draft_label", ""))
             set_list(join_roster, j["players"])
             enable(b_join, j["state"] == "idle"); enable(b_leave, j["state"] == "waiting")
             p1 = c["port1"]

@@ -1730,25 +1730,39 @@ static void TestDraftLog()
   auto view = GS::ReadDraft(memory);
   assert(view && view->total == 0 && view->picked.empty());
   log.Observe(*view);
-  // Snake from team 1: B, A, A, B, B, ... with drafter == team here.
-  const std::array<std::uint32_t, 14> teams{1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0};
-  for (std::uint32_t n = 0; n < 14; ++n)
+  // All policies and both native first sides: round is a team's own pick
+  // number, never overall/2 (which would mislabel cocky's opening seven).
+  for (std::uint32_t policy = 0; policy < 3; ++policy)
   {
-    commit(19 - n, teams[n], teams[n]);
-    view = GS::ReadDraft(memory);
-    assert(view && view->total == n + 1);
-    log.Observe(*view);
-    log.Observe(*view);  // an unchanged frame adds nothing
+    for (std::uint32_t first_team = 0; first_team < 2; ++first_team)
+    {
+      for (std::uint32_t i = 0; i < pool_size; ++i)
+        put(pool + i * 0x18 + 4, 0xffffffff);
+      team_count = {};
+      drafter_count = {};
+      put(table + 0x0c, 0, 2);
+      put(counts, 0, 2);
+      log.Observe(*GS::ReadDraft(memory));
+      std::array<std::uint32_t, 2> rounds{};
+      for (std::uint32_t n = 0; n < 14; ++n)
+      {
+        const std::uint32_t relative = policy == 0 ? n % 2 :
+                                       policy == 1 ? ((n + 1) / 2) % 2 : n / 7;
+        const std::uint32_t team = relative ^ first_team;
+        commit(19 - n, team, team);
+        view = GS::ReadDraft(memory);
+        assert(view && view->total == n + 1);
+        log.Observe(*view);
+        log.Observe(*view);  // an unchanged frame adds nothing
+        const auto& pick = log.Picks().back();
+        assert(pick.pick == n + 1 && pick.pgid == 119 - n && pick.team == team);
+        assert(pick.round == ++rounds[team]);
+        assert(pick.controller == (team == 0 ? 1 : 0));
+        assert(pick.pad == static_cast<std::int32_t>(team == 0 ? 1 : 0));
+      }
+      assert(log.Complete() && log.Picks().size() == 14);
+    }
   }
-  assert(log.Complete() && log.Picks().size() == 14);
-  for (std::uint32_t n = 0; n < 14; ++n)
-  {
-    const auto& pick = log.Picks()[n];
-    assert(pick.pick == n + 1 && pick.pgid == 119 - n && pick.team == teams[n]);
-    assert(pick.controller == (teams[n] == 0 ? 1 : 0));
-    assert(pick.pad == static_cast<std::int32_t>(teams[n] == 0 ? 1 : 0));
-  }
-  assert(log.Picks()[0].round == 1 && log.Picks()[2].round == 2 && log.Picks()[13].round == 7);
 
   // Torn/stale states are rejected: other mode, count mismatch, duplicate ids.
   put(GS::DRAFT_MODE_ADDRESS, 3);
@@ -1921,6 +1935,8 @@ static void TestRuntimeDraft()
   };
   put(0x8001abac, 0x816d9768);
   put(0x80018fc0, 0x48063bad);
+  put(0x800114f4, 0x880d96ca);
+  put(0x80010b34, 0x888d96ca);
   const NSRGameStats::Memory memory{ram, {}};
   std::string error;
   for (std::uint32_t order = 0; order < 3; ++order)
