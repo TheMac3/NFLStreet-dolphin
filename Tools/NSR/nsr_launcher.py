@@ -500,7 +500,10 @@ class Launcher:
 
     def need_game(self) -> bool:
         if not self.state["game"]["fingerprint"]:
-            self.notify("Set up your game copy first (Settings → Game copy).", "error")
+            if self.state["game"].get("busy"):
+                self.notify("The game is still getting ready (first start only). One moment…", "info")
+            else:
+                self.notify("Couldn't find NFL Street Reborn. Settings → Advanced → Locate Reborn.", "error")
             return True
         return False
 
