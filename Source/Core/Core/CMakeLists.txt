@@ -139,6 +139,7 @@ add_library(core
   NSR/NSRTelemetryLogic.h
   NSR/NSRBootSync.cpp
   NSR/NSRBootSync.h
+  NSR/NSRQuickstart.h
   NSR/NSRBootAgreement.h
   NSR/NSRNetplay.cpp
   NSR/NSRGameStats.cpp

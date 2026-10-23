@@ -18,6 +18,7 @@
 
 #include "Core/NSR/NSRRollbackNetplay.h"
 #include "Core/NSR/NSRBootAgreement.h"
+#include "Core/NSR/NSRQuickstart.h"
 #include "Core/NSR/NSRRollbackLogic.h"
 #include "Core/NSR/NSRTelemetryLogic.h"
 #include "Core/NSR/NSRGameStatsRead.h"
@@ -1754,10 +1755,65 @@ static void TestPadSourceAdapter()
          neutral.triggerLeft == 0 && neutral.isConnected);
 }
 
+// Navigation must ignore wall-clock gaps and duplicate polls, wait on screens,
+// release buttons between edges, fail closed and stay finished on menu return.
+static void TestQuickstartNavigation()
+{
+  using namespace NSRQuickstart;
+  assert(Parse("") == Mode::Manual && Parse("manual") == Mode::Manual);
+  assert(!Parse("quick-play;other") && !Parse("unknown"));
+  Navigator manual;
+  assert(!manual.Poll(0, 3));
+  for (const auto mode : {Mode::QuickPlay, Mode::Pickup})
+  {
+    Navigator nav(mode);
+    std::uint32_t frame = 1;
+    const std::array<std::uint32_t, 10> screens{3, 0x10003, 0x10003, 0x10003,
+        1, 1, 1, 0x11, 0x11, mode == Mode::Pickup ? 0xfU : 7U};
+    for (std::uint32_t step = 0; step < screens.size(); ++step)
+    {
+      for (int i = 0; i < 75; ++i)
+      {
+        const auto result = nav.Poll(frame, 0xffffffff);
+        assert(result && (*result == std::array<std::uint16_t, 4>{}));
+        assert(nav.StepIndex() == step);
+        ++frame;
+      }
+      const auto begin = frame;
+      for (std::uint32_t elapsed = 0; elapsed <= (step == 9 ? 60U : 120U); ++elapsed)
+      {
+        // A different next screen acknowledges START without reissuing it.
+        const auto screen = step == 0 && elapsed >= 70 ? 0x10003U : screens[step];
+        const auto result = nav.Poll(frame, screen);
+        assert(nav.Poll(frame, screen) == result);
+        assert(result);
+        if (elapsed < 60 || elapsed >= 66)
+          assert((*result == std::array<std::uint16_t, 4>{}));
+        else if (step == 7)
+          assert((*result == std::array<std::uint16_t, 4>{0, 2, 2, 2}));
+        else if (step == 8)
+          assert((*result == std::array<std::uint16_t, 4>{0x100, 0x100, 0x100, 0x100}));
+        ++frame;
+      }
+      assert(frame > begin);
+    }
+    assert(!nav.Active() && !nav.Failed());
+    assert(!nav.Poll(frame + 100, 3));
+  }
+  Navigator slow(Mode::QuickPlay);
+  for (std::uint32_t frame = 1; frame < 500; ++frame) slow.Poll(frame, 3);
+  assert(slow.StepIndex() == 0);  // title hasn't accepted START yet
+  Navigator stalled(Mode::Pickup);
+  stalled.Poll(1, 0xffffffff);
+  stalled.Poll(18002, 0xffffffff);
+  assert(stalled.Failed());
+}
+
 int main()
 {
   TestPadSourceAdapter();
   TestDraftLog();
+  TestQuickstartNavigation();
   TestBootAgreementWire();
   TestGameStatsMemoryReader();
   TestGameStatsIdentity();

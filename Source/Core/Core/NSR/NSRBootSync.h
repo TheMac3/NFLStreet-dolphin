@@ -11,7 +11,8 @@
 
 namespace NSRBootSync
 {
-// True only for a configured NSR network session, never offline practice.
+// Network sessions and explicit offline quickstart need canonical fresh cards.
+// Manual offline practice retains persistent saves.
 bool Enabled();
 // Install the Netplay layer and return effective named settings and card digests.
 // Returns nullopt on temporary-card creation failure; the caller must abort boot.

@@ -19,8 +19,9 @@ Protocol: one TCP connection per joining player to the host, newline-delimited
 JSON messages.
 
   joiner -> host  {"type": "hello", "name": str, "fingerprint": str, "version": int,
-                   "mode": "rollback"|"lockstep"}
-  host -> joiner  {"type": "reject", "reason": str}                 (then closes)
+                   "mode": "rollback"|"lockstep", "content": {"version", "serial"}}
+  host -> joiner  {"type": "reject", "reason": str, "action": str}  (then closes;
+                                                                    action optional)
   host -> all     {"type": "lobby", "players": [name, ...]}          (on any change;
                                                                     index = player number)
   host -> joiner  {"type": "start", "player": k, "players": n, "delay": d, "seed": u32,
@@ -39,6 +40,21 @@ message, and a joiner refuses a start whose mode differs from its own. The
 fingerprint check catches mixed images on its own as well (different recipe,
 different bytes), which is what keeps old room servers that ignore "mode"
 safe (see RENDEZVOUS_VERSION below).
+
+Quickstart (docs/quickstart.md). Optional quickstart IDs and capability version
+1 preserve manual rooms on protocol v2. An automatic room refuses a launcher
+without the capability; a new host refuses to silently lose its selection on
+an older room service. StartInfo carries the authoritative ID to Dolphin.
+
+Content updates (docs/content-updates.md). Every request may also carry
+"content": the installed content version and the manifest serial it came
+from (nsr_content.content_descriptor). Host/room compare it before the
+fingerprint, so the outdated side gets "Click Check for updates" instead
+of a bare fingerprint mismatch; the reject then carries "action"
+("update_content" / "host_update_content", raised here as RoomRejected).
+The field is optional both ways: older launchers and room servers ignore
+it, and without it on both sides only the fingerprint decides (it still
+catches every content mismatch, just with the generic message).
 """
 from __future__ import annotations
 
@@ -49,6 +65,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Callable
 
+import nsr_content
+
 PORT = 51515
 MAX_PLAYERS = 4
 # 2: hello/start carry "mode" (rollback release). Direct-IP lobbies run in the
@@ -57,6 +75,27 @@ MAX_PLAYERS = 4
 PROTOCOL_VERSION = 2
 MODES = ("lockstep", "rollback")
 RELEASE_MODE = "rollback"  # what this launcher's image plays (nsr_patcher.NETPLAY_MODE)
+
+# Optional v1 room extension. Missing fields retain manual menus for old clients
+# and services. Nonmanual rooms admit only peers explicitly supporting this route.
+QUICKSTART_VERSION = 1
+QUICKSTARTS = {"quick-play": "Quick Play", "pickup": "Pickup Game", "manual": "Manual (menus)"}
+
+
+def quickstart_id(value=None) -> str:
+    """Validate untrusted room selections; unknown routes must never run."""
+    if value is None:
+        return "manual"
+    if not isinstance(value, str) or value not in QUICKSTARTS:
+        raise ConnectionError("Unknown game mode. Everyone needs the latest NFLStreetRollback download.")
+    return value
+
+
+def _quickstart_message(msg: dict, selected: str) -> dict:
+    """Attach the bounded selection and capability without changing protocol v2."""
+    msg.update(quickstart=quickstart_id(selected), quickstart_version=QUICKSTART_VERSION)
+    return msg
+
 
 
 def _check_mode(mode: str) -> str:
@@ -78,6 +117,25 @@ def _agreed_mode(msg: dict, expected: str, who: str) -> str:
     return mode
 
 
+class RoomRejected(ConnectionError):
+    """Refused by the host/room. action names what fixes it (e.g.
+    nsr_content.UPDATE_ACTION) when the server says so, else ""."""
+
+    def __init__(self, reason: str, action: str = ""):
+        super().__init__(reason)
+        self.action = action if action in (nsr_content.UPDATE_ACTION, nsr_content.HOST_UPDATE_ACTION) else ""
+
+
+def _rejected(msg: dict, default: str) -> RoomRejected:
+    return RoomRejected(str(msg.get("reason", default))[:400], str(msg.get("action", "")))
+
+
+def _with_content(msg: dict, content: dict | None) -> dict:
+    if content is not None:
+        msg["content"] = nsr_content.content_descriptor(content["version"], content["serial"])
+    return msg
+
+
 @dataclass
 class StartInfo:
     player: int          # our player number (0 = host)
@@ -93,6 +151,7 @@ class StartInfo:
     room_code: str = ""   # "NSRB-4K7QX" (display only; telemetry header)
     telemetry_url: str = ""    # ingest endpoint granted by the room server
     telemetry_token: str = ""  # per-session/per-player token (docs/telemetry.md)
+    quickstart: str = "manual"  # optional game-mode route, independent of netplay mode
 
 
 def _send(sock: socket.socket, msg: dict) -> None:
@@ -132,12 +191,15 @@ class LobbyHost:
     port: int = PORT
     bind: str = ""
     mode: str = RELEASE_MODE
+    content: dict | None = None  # our nsr_content descriptor (None: don't compare)
+    quickstart: str = "manual"
     _joiners: list[_Joiner] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _server: socket.socket | None = None
     _closed: bool = False
 
     def open(self) -> None:
+        self.quickstart = quickstart_id(self.quickstart)
         self._server = socket.create_server((self.bind, self.port), reuse_port=False)
         self._server.settimeout(0.5)
         threading.Thread(target=self._accept_loop, daemon=True).start()
@@ -153,7 +215,7 @@ class LobbyHost:
             joiners = list(self._joiners)
         for j in joiners:
             try:
-                _send(j.sock, {"type": "lobby", "players": names})
+                _send(j.sock, _quickstart_message({"type": "lobby", "players": names}, self.quickstart))
             except OSError:
                 pass
         self.on_change(names)
@@ -176,13 +238,18 @@ class LobbyHost:
             sock.close()
             return
         name = str(hello.get("name") or "Player")[:24]
-        reason = None
+        reason, action = None, ""
+        content = nsr_content.room_content_reason(self.content, hello.get("content"))
         if hello.get("type") != "hello" or hello.get("version") != PROTOCOL_VERSION:
             reason = ("Your launcher is a different version from the host's. "
                       "Everyone needs the same NFLStreetRollback download.")
         elif hello.get("mode", "lockstep") != self.mode:
             reason = (f"Your launcher plays {hello.get('mode', 'lockstep')} netplay; this lobby is "
                       f"{self.mode}. Everyone needs the same NFLStreetRollback download.")
+        elif self.quickstart != "manual" and hello.get("quickstart_version") != QUICKSTART_VERSION:
+            reason = "This room uses quickstart. Update NFLStreetRollback or ask the host for Manual (menus)."
+        elif content:
+            reason, action = content
         elif hello.get("fingerprint") != self.fingerprint:
             reason = (f"Game image mismatch: yours is {hello.get('fingerprint')}, the host's is "
                       f"{self.fingerprint}. Everyone needs the same Reborn version and patches.")
@@ -194,7 +261,7 @@ class LobbyHost:
         if reason:
             self.on_reject(name, reason)  # before replying, so the host's UI is never behind
             try:
-                _send(sock, {"type": "reject", "reason": reason})
+                _send(sock, {"type": "reject", "reason": reason, **({"action": action} if action else {})})
             finally:
                 sock.close()
             return
@@ -228,10 +295,10 @@ class LobbyHost:
         seed = secrets.randbits(32)  # per-match RNG seed, sent to everyone
         for k, j in enumerate(joiners, start=1):
             _send(j.sock, {"type": "start", "player": k, "players": players, "delay": delay,
-                           "seed": seed, "mode": mode})
+                           "seed": seed, "mode": mode, "quickstart": self.quickstart})
             j.sock.close()
         self._server.close()
-        return StartInfo(0, players, delay, "", seed=seed, mode=mode)
+        return StartInfo(0, players, delay, "", seed=seed, mode=mode, quickstart=self.quickstart)
 
     def close(self) -> None:
         self._closed = True
@@ -250,7 +317,8 @@ class LobbyHost:
 def join(host: str, name: str, fingerprint: str,
          on_lobby: Callable[[list[str]], None] = lambda names: None,
          cancel: threading.Event | None = None, port: int = PORT,
-         mode: str = RELEASE_MODE) -> StartInfo:
+         mode: str = RELEASE_MODE, content: dict | None = None,
+         on_game_mode: Callable[[str], None] = lambda selected: None) -> StartInfo:
     """Connect to a host's lobby and wait for Start. Raises ConnectionError
     with a readable reason if refused, closed, or unreachable."""
     if ":" in host:
@@ -264,8 +332,9 @@ def join(host: str, name: str, fingerprint: str,
     address = sock.getpeername()[0]
     sock.settimeout(0.5)
     _check_mode(mode)
-    _send(sock, {"type": "hello", "name": name, "fingerprint": fingerprint,
-                 "version": PROTOCOL_VERSION, "mode": mode})
+    _send(sock, _with_content({"type": "hello", "name": name, "fingerprint": fingerprint,
+                               "version": PROTOCOL_VERSION, "mode": mode,
+                               "quickstart_version": QUICKSTART_VERSION}, content))
     buf = b""
     try:
         while True:
@@ -284,15 +353,17 @@ def join(host: str, name: str, fingerprint: str,
                 kind = msg.get("type")
                 if kind == "lobby":
                     on_lobby(list(msg["players"]))
+                    on_game_mode(quickstart_id(msg.get("quickstart")))
                 elif kind == "reject":
-                    raise ConnectionError(msg.get("reason", "Refused by the host."))
+                    raise _rejected(msg, "Refused by the host.")
                 elif kind == "closed":
                     raise ConnectionError("The host closed the lobby.")
                 elif kind == "start":
                     agreed = _agreed_mode(msg, mode, "The host")
                     return StartInfo(int(msg["player"]), int(msg["players"]),
                                      int(msg.get("delay", 2)), address,
-                                     seed=int(msg.get("seed", 0x13579BDF)), mode=agreed)
+                                     seed=int(msg.get("seed", 0x13579BDF)), mode=agreed,
+                                     quickstart=quickstart_id(msg.get("quickstart")))
     finally:
         sock.close()
 
@@ -326,6 +397,8 @@ class RoomHost:
     on_change: Callable[[list[str]], None] = lambda names: None
     on_error: Callable[[str], None] = lambda reason: None
     mode: str = RELEASE_MODE
+    content: dict | None = None  # our nsr_content descriptor (sent with create)
+    quickstart: str = "manual"
     code: str = ""
     _sock: socket.socket | None = None
     _start: StartInfo | None = None
@@ -339,12 +412,18 @@ class RoomHost:
         except OSError as e:
             raise ConnectionError(f"Couldn't reach the room server ({self.rendezvous}): "
                                   f"{e.strerror or e}") from e
-        _send(self._sock, {"type": "create", "name": self.name, "fingerprint": self.fingerprint,
-                           "version": RENDEZVOUS_VERSION, "mode": _check_mode(self.mode)})
+        _send(self._sock, _with_content({"type": "create", "name": self.name, "fingerprint": self.fingerprint,
+                                         "version": RENDEZVOUS_VERSION, "mode": _check_mode(self.mode),
+                                         "quickstart": quickstart_id(self.quickstart),
+                                         "quickstart_version": QUICKSTART_VERSION},
+                                        self.content))
         lines = _lines(self._sock)
         first = next(lines, None)
         if not first or first.get("type") != "room":
             raise ConnectionError((first or {}).get("reason", "The room server refused the room."))
+        if quickstart_id(first.get("quickstart")) != self.quickstart:
+            self.close()
+            raise ConnectionError("This room server needs an update for quickstart. Choose Manual (menus) to play now.")
         self.code = first["code"]
         self._sock.settimeout(None)
         threading.Thread(target=self._read, args=(lines,), daemon=True).start()
@@ -361,6 +440,8 @@ class RoomHost:
                 elif kind == "start":
                     try:
                         self._start = _start_info(msg, self.rendezvous, self.mode)
+                        if self._start.quickstart != self.quickstart:
+                            raise ConnectionError("The room server changed the game mode; reopen the room.")
                     except ConnectionError as e:
                         self._error = str(e)
                     self._started.set()
@@ -408,12 +489,15 @@ def _start_info(msg: dict, rendezvous: str, expected_mode: str = RELEASE_MODE) -
                      rendezvous=rendezvous, room=room, key=str(msg["key"]), seed=seed,
                      mode=mode, room_code=str(msg.get("code", ""))[:16],
                      telemetry_url=str(telemetry.get("url", "")),
-                     telemetry_token=str(telemetry.get("token", "")))
+                     telemetry_token=str(telemetry.get("token", "")),
+                     quickstart=quickstart_id(msg.get("quickstart")))
 
 
 def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
               on_lobby: Callable[[list[str]], None] = lambda names: None,
-              cancel: threading.Event | None = None, mode: str = RELEASE_MODE) -> StartInfo:
+              cancel: threading.Event | None = None, mode: str = RELEASE_MODE,
+              content: dict | None = None,
+              on_game_mode: Callable[[str], None] = lambda selected: None) -> StartInfo:
     """Join a room by code and wait for the host's Start. Raises
     ConnectionError with a readable reason if refused, closed, or unreachable."""
     host, port = _split(rendezvous, RENDEZVOUS_PORT)
@@ -423,8 +507,9 @@ def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
         raise ConnectionError(f"Couldn't reach the room server ({rendezvous}): {e.strerror or e}") from e
     sock.settimeout(0.5)
     _check_mode(mode)
-    _send(sock, {"type": "join", "code": code, "name": name, "fingerprint": fingerprint,
-                 "version": RENDEZVOUS_VERSION, "mode": mode})
+    _send(sock, _with_content({"type": "join", "code": code, "name": name, "fingerprint": fingerprint,
+                               "version": RENDEZVOUS_VERSION, "mode": mode,
+                               "quickstart_version": QUICKSTART_VERSION}, content))
     buf = b""
     try:
         while True:
@@ -443,7 +528,10 @@ def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
                 kind = msg.get("type")
                 if kind == "lobby":
                     on_lobby(list(msg["players"]))
-                elif kind in ("reject", "closed"):
+                    on_game_mode(quickstart_id(msg.get("quickstart")))
+                elif kind == "reject":
+                    raise _rejected(msg, "Refused.")
+                elif kind == "closed":
                     raise ConnectionError(msg.get("reason", "Refused."))
                 elif kind == "start":
                     return _start_info(msg, rendezvous, mode)
