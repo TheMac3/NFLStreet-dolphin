@@ -22,6 +22,7 @@
 #include "Core/NSR/NSRTelemetryLogic.h"
 #include "Core/NSR/NSRGameStatsRead.h"
 #include "Core/NSR/NSRDraftLog.h"
+#include "Core/NSR/NSRPadSource.h"
 #include "Core/NSR/NSRGameStatsIdentity.h"
 
 #include <algorithm>
@@ -1660,8 +1661,54 @@ static void TestDraftLog()
   assert(log.Picks().size() == 2 && log.Picks()[0].pick == 0 && !log.Complete());
 }
 
+// USB GameCube adapter as a standard controller's input (NSRPadSource.h): the
+// guest-visible origin/error bits never pass, rest positions recentre to the
+// standard controller's fixed origin, and the port is always connected.
+static void TestPadSourceAdapter()
+{
+  using namespace NSRPadSource;
+  assert(ParseChannel("0") == 0 && ParseChannel("3") == 3);
+  assert(!ParseChannel("") && !ParseChannel("4") && !ParseChannel("off") && !ParseChannel("01"));
+  assert(PickChannel(2, {false, true, true, false}) == 2);
+  assert(PickChannel(0, {false, false, false, true}) == 3);
+  assert(!PickChannel(0, {false, false, false, false}));
+
+  GCPadStatus origin{};
+  origin.button = PAD_GET_ORIGIN;
+  origin.stickX = 0x7a;
+  origin.stickY = 0x84;
+  origin.substickX = 0x80;
+  origin.substickY = 0x7e;
+  origin.triggerLeft = 0x20;
+  origin.triggerRight = 0x18;
+  GCPadStatus raw = origin;  // first report after plugging in: at rest + GET_ORIGIN
+  raw.button = PAD_GET_ORIGIN | PAD_ERR_STATUS | PAD_USE_ORIGIN | PAD_BUTTON_A | PAD_TRIGGER_Z;
+  const GCPadStatus rest = StandardControllerPad(raw, origin);
+  assert(rest.button == (PAD_BUTTON_A | PAD_TRIGGER_Z));
+  assert(rest.stickX == 0x80 && rest.stickY == 0x80 && rest.substickX == 0x80 &&
+         rest.substickY == 0x80);
+  assert(rest.triggerLeft == 0 && rest.triggerRight == 0);
+  assert(rest.analogA == 0xff && rest.analogB == 0 && rest.isConnected);
+
+  raw.button = PAD_BUTTON_B;
+  raw.stickX = 0xff;   // full right from a left-of-centre rest: clamps, never wraps
+  raw.stickY = 0x00;
+  raw.triggerLeft = 0x10;  // below rest
+  raw.triggerRight = 0xf0;
+  raw.isConnected = false;
+  const GCPadStatus moved = StandardControllerPad(raw, origin);
+  assert(moved.stickX == 0xff && moved.stickY == 0x00);
+  assert(moved.triggerLeft == 0 && moved.triggerRight == 0xd8);
+  assert(moved.analogA == 0 && moved.analogB == 0xff && moved.isConnected);
+
+  const GCPadStatus neutral = NeutralPad();
+  assert(neutral.button == 0 && neutral.stickX == 0x80 && neutral.substickY == 0x80 &&
+         neutral.triggerLeft == 0 && neutral.isConnected);
+}
+
 int main()
 {
+  TestPadSourceAdapter();
   TestDraftLog();
   TestBootAgreementWire();
   TestGameStatsMemoryReader();

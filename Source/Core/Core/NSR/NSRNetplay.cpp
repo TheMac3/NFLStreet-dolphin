@@ -98,6 +98,11 @@
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 #include "Core/NSR/NSRTelemetry.h"  // NSR telemetry
+#include "Core/HW/GCPad.h"                          // NSR local pad log
+#include "Core/HW/SI/SI_Device.h"                    // NSR local pad log
+#include "InputCommon/ControllerEmu/ControllerEmu.h"  // NSR local pad log
+#include "InputCommon/GCAdapter.h"                   // NSR local pad log
+#include "InputCommon/InputConfig.h"                 // NSR local pad log
 #include "VideoCommon/CommandProcessor.h"
 #include "VideoCommon/Fifo.h"
 
@@ -478,6 +483,26 @@ bool SetupPunch();
 void SendPunches();
 void ConnectToHost();
 
+// --- NSR local pad log -------------------------------------------------------
+// "My controller isn't recognized" reports need to show what this machine
+// reads for port 1: the launcher's classification of the player's controller
+// (NSR_PAD_KIND/NSR_PAD_DEVICE; host-only, never in the boot manifest), the
+// effective SI device, whether the GCPad1 mapping's device is plugged in, and
+// the USB adapter source (Core/NSR/NSRPadSource.h). Logged once per session.
+void LogLocalPad()
+{
+  std::string mapping = "none";
+  if (const auto* pad = ::Pad::GetConfig()->GetController(0))
+  {
+    mapping = fmt::format("'{}' {}", pad->GetDefaultDevice().ToString(),
+                          pad->IsDefaultDeviceConnected() ? "connected" : "NOT connected");
+  }
+  Log("local pad: kind={} device='{}' si_device0={} mapping={} {}", Env("NSR_PAD_KIND", "?"),
+      Env("NSR_PAD_DEVICE").substr(0, 96),
+      static_cast<int>(Config::Get(Config::GetInfoForSIDevice(0))), mapping,
+      GCAdapter::NSRSourceSummary());
+}
+
 bool Setup()
 {
   Session& s = s_session;
@@ -488,6 +513,7 @@ bool Setup()
       s.log = f;
   }
   std::vector<std::string> lower_peers;
+  LogLocalPad();
   if (!ReadConfig(s, &lower_peers))
     return false;
   NSRGameStats::Configure(s.me, s.players, true);

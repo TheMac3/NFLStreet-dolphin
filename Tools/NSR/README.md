@@ -14,3 +14,8 @@ named preboot failures are shown in the launcher and the compatibility image
 fingerprint remains present when telemetry is disabled. The rest of this
 vendored baseline remains at the source commit above; unrelated content-update
 integration is a separate synchronization step.
+
+Controller-kind delta synchronized from NFLStreet branch `fix/padkind`:
+`nsr_controllers.py` (whole file: SIDevice import, `controller_kind`) and the
+`nsr_launcher.py` hunks that pass `NSR_PAD_KIND`/`NSR_PAD_DEVICE`/
+`NSR_PAD_ADAPTER` and log the controller kind.

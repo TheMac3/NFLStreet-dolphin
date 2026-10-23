@@ -207,6 +207,13 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
              "-C", "Dolphin.Core.CustomRTCValue=0x30000000"]
     for port in range(4):  # controllers in ports 1..players; the rest empty
         args += ["-C", f"Dolphin.Core.SIDevice{port}={6 if port < players else 0}"]
+    # The player's controller (nsr_controllers.controller_kind), netplay and
+    # offline alike. Port 1 stays a standard controller (6) even for a USB
+    # GameCube adapter: NSR_PAD_ADAPTER makes the fork read the adapter as
+    # port 1's input instead of switching the port to the adapter device (12),
+    # which the game can tell apart (see controller_kind). NSR_PAD_KIND/DEVICE
+    # are only logged, so "my controller isn't recognized" is diagnosable.
+    env.update(controllers.controller_kind(os.path.join(folder, "User")).env())
     # Per-match RNG seed: agreed in the lobby for netplay; fresh per launch
     # offline, so Quick Play differs every time either way.
     env["NSR_SEED"] = str(start.seed if start else secrets.randbits(32))
@@ -620,6 +627,11 @@ class Launcher:
         args, env = dolphin_command(self.folder, start, self.reborn_install(), open_ui=open_ui,
                                     name=self.state["name"], fingerprint=self.state["game"]["fingerprint"],
                                     telemetry=self.state["telemetry"])
+        if not open_ui:  # same values the fork logs in nsr-p*.log ("local pad:")
+            adapter = env.get("NSR_PAD_ADAPTER")
+            log(self.folder, f"controller ({'netplay' if start else 'offline'}): "
+                f"kind={env.get('NSR_PAD_KIND', '?')} device={env.get('NSR_PAD_DEVICE') or '-'}"
+                + (f" usb-adapter-port={int(adapter) + 1}" if adapter else ""))
         try:
             # The fork truncates this per-player log at connection setup. Clear
             # it here too so a failed launch cannot surface an older mismatch.
