@@ -1742,6 +1742,10 @@ static void TestDraftLog()
       drafter_count = {};
       put(table + 0x0c, 0, 2);
       put(counts, 0, 2);
+      // Native init always starts drafter slot zero on the chosen first
+      // team. Controller handles follow that mapping, not team == drafter.
+      put(handles, first_team == 0 ? 1u : 0u, 1);
+      put(handles + 1, first_team == 0 ? 0u : 1u, 1);
       log.Observe(*GS::ReadDraft(memory));
       std::array<std::uint32_t, 2> rounds{};
       for (std::uint32_t n = 0; n < 14; ++n)
@@ -1749,14 +1753,15 @@ static void TestDraftLog()
         const std::uint32_t relative = policy == 0 ? n % 2 :
                                        policy == 1 ? ((n + 1) / 2) % 2 : n / 7;
         const std::uint32_t team = relative ^ first_team;
-        commit(19 - n, team, team);
+        const std::uint32_t drafter = team ^ first_team;
+        commit(19 - n, team, drafter);
         view = GS::ReadDraft(memory);
         assert(view && view->total == n + 1);
         log.Observe(*view);
         log.Observe(*view);  // an unchanged frame adds nothing
         const auto& pick = log.Picks().back();
         assert(pick.pick == n + 1 && pick.pgid == 119 - n && pick.team == team);
-        assert(pick.round == ++rounds[team]);
+        assert(pick.drafter == drafter && pick.round == ++rounds[team]);
         assert(pick.controller == (team == 0 ? 1 : 0));
         assert(pick.pad == static_cast<std::int32_t>(team == 0 ? 1 : 0));
       }
