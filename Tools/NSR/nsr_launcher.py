@@ -77,6 +77,7 @@ import nsr_gamestats as gamestats  # noqa: E402
 import nsr_content  # noqa: E402
 import nsr_lobby as lobby  # noqa: E402
 import nsr_patcher as patcher  # noqa: E402
+import nsr_textures as textures  # noqa: E402
 
 APP_TITLE = "NFLStreetRollback"  # window title; user-facing product name
 CONFIG_NAME = "nsr-launcher.json"
@@ -121,6 +122,14 @@ NETPLAY_AUDIO_BUFFER_MS = 128
 NETPLAY_INPUT_ARGS = ["-C", "Dolphin.Input.BackgroundInput=True"]
 NETPLAY_AUDIO_ARGS = ["-C", "Dolphin.Core.AudioFillGaps=True",
                       "-C", f"Dolphin.Core.AudioBufferSize={NETPLAY_AUDIO_BUFFER_MS}"]
+# Internal resolution choices (Settings → Graphics). 0 = leave it to our
+# Dolphin's own GFX.ini (native 1x unless the player changed it there).
+# Presentation only: the fork answers EFB peeks canonically in netplay, so
+# peers may differ. Each step costs frame time because single-core Dolphin
+# renders on the emulation thread (OGL, k=2 misprediction, RTX 3070 Ti:
+# 14.5 ms per live frame at 1x vs 19.9 ms at 3x; local/work/textures/REPORT.md),
+# hence no higher default.
+RESOLUTIONS = (0, 1, 2, 3, 4)
 
 
 # --- pure helpers (tested without a GUI) --------------------------------------
@@ -178,7 +187,8 @@ def telemetry_env(folder: str, start: lobby.StartInfo, name: str, fingerprint: s
 
 def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: str | None,
                     open_ui: bool = False, name: str = "Player", fingerprint: str = "",
-                    telemetry: bool = True, quickstart: str = "manual") -> tuple[list[str], dict[str, str]]:
+                    telemetry: bool = True, quickstart: str = "manual", icons: str = "auto",
+                    resolution: int = 0) -> tuple[list[str], dict[str, str]]:
     """Command line and environment for the netplay Dolphin.
 
     start=None: practice offline. open_ui=True: just open Dolphin's window
@@ -198,14 +208,27 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     if open_ui:
         return args, env
     players = start.players if start else 1
-    load_path = controllers.reborn_load_path(reborn_install, os.environ) if reborn_install else None
-    if load_path:
-        # Reborn's composed texture tree (library + the player's mods), as its
-        # own Dolphin loads it; see controllers.reborn_load_path. Cached like
-        # Reborn's GFX.ini so textures don't stream in mid-match.
-        args += ["-C", f"Dolphin.General.LoadPath={load_path}",
-                 "-C", "GFX.Settings.HiresTextures=True",
-                 "-C", "GFX.Settings.CacheHiresTextures=True"]
+    pad = controllers.controller_kind(os.path.join(folder, "User"))
+    # Reborn's HD textures, composed by reference (nsr_textures): its pristine
+    # library (menus, real-player headshots), the mods the player turned on in
+    # Reborn, and the button icons for this player's controller (or the
+    # setting), listed for the fork's ordered texture overlay. Before
+    # 2026-10-23 this passed -C GFX.Settings.*, which Dolphin ignores (the -C
+    # system is "Graphics"), so HD textures never loaded and the game showed
+    # its "MISSING TEXTURES" placeholders. Not cached up front, as Reborn's
+    # own GN7E69 game INI: prefetching the ~8 GB library costs ~15 GB of RAM.
+    tex = textures.compose(reborn_install, icons, pad.kind, os.environ)
+    try:
+        textures.write_list(os.path.join(folder, "User"), tex)
+    except OSError as e:
+        tex.warnings.append(f"could not write the texture list: {e}")
+    env["NSR_TEXTURES"] = tex.summary()  # logged by the launcher; the fork ignores it
+    if tex.warnings:
+        env["NSR_TEXTURES_WARNING"] = " ".join(tex.warnings)
+    args += ["-C", "Graphics.Settings.HiresTextures=True",
+             "-C", "Graphics.Settings.CacheHiresTextures=False"]
+    if resolution in RESOLUTIONS[1:]:
+        args += ["-C", f"Graphics.Settings.InternalResolution={resolution}"]
     # Some Quick Play paths make Reborn's own code read through a null pointer
     # (harmless under Dolphin, which returns 0); keep those warnings out of
     # popup dialogs during a match. They still go to Dolphin's log.
@@ -221,7 +244,7 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     # port 1's input instead of switching the port to the adapter device (12),
     # which the game can tell apart (see controller_kind). NSR_PAD_KIND/DEVICE
     # are only logged, so "my controller isn't recognized" is diagnosable.
-    env.update(controllers.controller_kind(os.path.join(folder, "User")).env())
+    env.update(pad.env())
     # Per-match RNG seed: agreed in the lobby for netplay; fresh per launch
     # offline, so Quick Play differs every time either way.
     env["NSR_SEED"] = str(start.seed if start else secrets.randbits(32))
@@ -496,6 +519,11 @@ class Launcher:
             "join": {"state": "idle", "info": "", "players": [], "quickstart": "manual"},
             "controllers": {"state": "checking", "message": "", "source": "",
                             "port1": controllers.port1_summary(self.user_dir), "backup": ""},
+            # Button icons (nsr_textures): the setting (auto|gamecube|playstation|
+            # xbox), what a launch would use now, and the texture source summary.
+            "textures": {"icons": self._icons_setting(), "effective": "", "why": "",
+                         "base_kind": "", "base": "", "packages": [], "warning": ""},
+            "resolution": self._resolution_setting(),
             "notice": None,
         }
 
@@ -555,6 +583,43 @@ class Launcher:
 
     def set_delay(self, delay) -> None:
         self._set(delay=self._clamp_delay(delay))
+
+    def _icons_setting(self) -> str:
+        v = self.cfg.get("button_icons", "auto")
+        return v if v in textures.ICON_CHOICES else "auto"
+
+    def _resolution_setting(self) -> int:
+        try:
+            v = int(self.cfg.get("resolution", 0))
+        except (TypeError, ValueError):
+            return 0
+        return v if v in RESOLUTIONS else 0
+
+    def set_button_icons(self, choice: str) -> None:
+        """Button icons: auto (from the controller) or a fixed set. Per PC only."""
+        self.cfg["button_icons"] = choice if choice in textures.ICON_CHOICES else "auto"
+        self._save()
+        self._set("textures", icons=self._icons_setting())
+        self._spawn(self.refresh_textures)
+
+    def set_resolution(self, value) -> None:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = 0
+        self.cfg["resolution"] = value if value in RESOLUTIONS else 0
+        self._save()
+        self._set(resolution=self._resolution_setting())
+
+    def refresh_textures(self) -> textures.TextureSet:
+        """What the next launch will show (nothing is written here)."""
+        pad = controllers.controller_kind(self.user_dir)
+        ts = textures.compose(self.reborn_install(), self._icons_setting(), pad.kind, self._env)
+        self._set("textures", icons=self._icons_setting(), effective=ts.icons, why=ts.icons_why,
+                  base_kind=ts.base_kind, base=ts.base or "",
+                  packages=[f"{p.id} {p.version}" for p in ts.packages],
+                  warning=" ".join(ts.warnings))
+        return ts
 
     def need_game(self) -> bool:
         if not self.state["game"]["fingerprint"]:
@@ -696,6 +761,10 @@ class Launcher:
         self._set("controllers", state=CONTROLLER_STATES.get(res.action, res.action), message=res.message,
                   source=source.gcpad if source else "", backup=res.backup or "",
                   port1=controllers.port1_summary(self.user_dir))
+        try:  # Auto button icons follow the (possibly just imported) controller
+            self.refresh_textures()
+        except Exception as e:  # noqa: BLE001
+            log(self.folder, f"texture refresh failed: {e!r}")
         return res
 
     def sync_controllers(self, force: bool = False) -> None:
@@ -884,12 +953,20 @@ class Launcher:
             self._stats_wake.set()
         args, env = dolphin_command(self.folder, start, self.reborn_install(), open_ui=open_ui,
                                     name=self.state["name"], fingerprint=self.state["game"]["fingerprint"],
-                                    telemetry=self.state["telemetry"], quickstart=self.state["quickstart"])
+                                    telemetry=self.state["telemetry"], quickstart=self.state["quickstart"],
+                                    icons=self._icons_setting(), resolution=self._resolution_setting())
         if not open_ui:  # same values the fork logs in nsr-p*.log ("local pad:")
             adapter = env.get("NSR_PAD_ADAPTER")
             log(self.folder, f"controller ({'netplay' if start else 'offline'}): "
                 f"kind={env.get('NSR_PAD_KIND', '?')} device={env.get('NSR_PAD_DEVICE') or '-'}"
                 + (f" usb-adapter-port={int(adapter) + 1}" if adapter else ""))
+            # Which texture folders and button icons this launch shows, so a
+            # "MISSING TEXTURES"/wrong-icons report is diagnosable from the log.
+            log(self.folder, f"{env.get('NSR_TEXTURES', 'textures ?')} "
+                f"resolution={self._resolution_setting() or 'dolphin'}")
+            if env.get("NSR_TEXTURES_WARNING"):
+                log(self.folder, f"textures warning: {env['NSR_TEXTURES_WARNING']}")
+                self.notify(env["NSR_TEXTURES_WARNING"], "error")
         try:
             # The fork truncates this per-player log at connection setup. Clear
             # it here too so a failed launch cannot surface an older mismatch.
@@ -1202,6 +1279,8 @@ class WebApi:
     def check_updates(self): self._l.check_updates()
     def set_delay(self, delay): self._l.set_delay(delay)
     def set_quickstart(self, selected): self._l.set_quickstart(selected)
+    def set_button_icons(self, choice): self._l.set_button_icons(str(choice))
+    def set_resolution(self, value): self._l.set_resolution(value)
     def find_game(self): self._l.find_game()
     def host_room(self): self._l.host_room()
     def host_ip(self): self._l.host_ip()
