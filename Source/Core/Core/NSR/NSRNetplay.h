@@ -47,7 +47,12 @@
 //   NSR_RB_NET = 1       lockstep menus and exchange frame-keyed match inputs
 //   NSR_RB_VTIME_FROM=t  fixed first rollback frame for tests; when omitted,
 //                        InGame drives checked menu -> match -> menu handoffs
-//   NSR_RB_DELAY = n     local input delay, default 1
+//   NSR_RB_DELAY = n     local input delay, default 1; player 0's value is
+//                        proposed in each entry handoff and adopted by every
+//                        peer (fix/audio2)
+//   NSR_RB_DELAY = auto  player 0 picks 1..4 per match from the measured
+//                        links (RollbackNet::AutoInputDelay; tuning:
+//                        NSR_RB_AUTO_DELAY_JITTER / _PREDICT)
 //   NSR_RB_MAX_PRED = n  maximum remote prediction window, default 7
 //   NSR_RB_TIME_SYNC=0   disable the default frame-advantage host wait
 // Network mode implies I/O-idle restores and audio rollback. It ignores the

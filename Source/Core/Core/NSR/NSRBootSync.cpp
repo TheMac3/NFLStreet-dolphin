@@ -3,8 +3,10 @@
 
 // NSR's boot contract: a high-priority, nonpersistent config layer and fresh
 // empty GCI cards. Mirrors ConfigLoaders/NetPlayConfigLoader.cpp, including its
-// strict graphics settings. Revisit this list whenever upstream adds a synced
-// setting. Host audio, rendering backend, textures and controller mapping stay local.
+// strict graphics settings, minus the presentation-only ones (internal resolution,
+// MSAA/SSAA; see BootLayer::Load). Revisit this list whenever upstream adds a synced
+// setting. Host audio, rendering backend, resolution, textures and controller mapping
+// stay local.
 #include "Core/NSR/NSRBootSync.h"
 #include "Core/NSR/NSRQuickstart.h"
 
@@ -29,6 +31,7 @@
 #include "Core/HW/Sram.h"
 #include "Core/HW/SI/SI_Device.h"
 #include "Core/NSR/NSRRollbackNetplay.h"
+#include "VideoCommon/EFBInterface.h"
 
 #define XXH_INLINE_ALL
 #include <xxhash.h>
@@ -142,9 +145,6 @@ public:
                Config::MAIN_BLUETOOTH_PASSTHROUGH_ENABLED.GetDefaultValue());
     layer->Set(Config::GFX_HACK_VERTEX_ROUNDING,
                Config::GFX_HACK_VERTEX_ROUNDING.GetDefaultValue());
-    layer->Set(Config::GFX_EFB_SCALE, Config::GFX_EFB_SCALE.GetDefaultValue());
-    layer->Set(Config::GFX_HACK_COPY_EFB_SCALED,
-               Config::GFX_HACK_COPY_EFB_SCALED.GetDefaultValue());
     layer->Set(Config::GFX_FAST_DEPTH_CALC, Config::GFX_FAST_DEPTH_CALC.GetDefaultValue());
     layer->Set(Config::GFX_ENABLE_PIXEL_LIGHTING,
                Config::GFX_ENABLE_PIXEL_LIGHTING.GetDefaultValue());
@@ -164,8 +164,6 @@ public:
                Config::GFX_ENHANCE_ARBITRARY_MIPMAP_DETECTION_THRESHOLD.GetDefaultValue());
     layer->Set(Config::GFX_ENABLE_GPU_TEXTURE_DECODING,
                Config::GFX_ENABLE_GPU_TEXTURE_DECODING.GetDefaultValue());
-    layer->Set(Config::GFX_MSAA, Config::GFX_MSAA.GetDefaultValue());
-    layer->Set(Config::GFX_SSAA, Config::GFX_SSAA.GetDefaultValue());
     layer->Set(Config::SESSION_GCI_FOLDER_CURRENT_GAME_ONLY,
                Config::SESSION_GCI_FOLDER_CURRENT_GAME_ONLY.GetDefaultValue());
     layer->Set(Config::SESSION_CODE_SYNC_OVERRIDE,
@@ -198,11 +196,17 @@ public:
     layer->Set(Config::SESSION_GCI_FOLDER_CURRENT_GAME_ONLY, true);
     layer->Set(Config::SESSION_CODE_SYNC_OVERRIDE, false);
     layer->Set(Config::SYSCONF_PROGRESSIVE_SCAN, false);
-    // Disable GPU-dependent readback enhancements as in strict stock netplay.
-    layer->Set(Config::GFX_MSAA, 1);
-    layer->Set(Config::GFX_SSAA, false);
-    layer->Set(Config::GFX_EFB_SCALE, 1);
-    layer->Set(Config::GFX_HACK_COPY_EFB_SCALED, false);
+    // Presentation stays per player (feat/textures, 2026-10-23): internal
+    // resolution (GFX_EFB_SCALE), MSAA, SSAA and scaled EFB copies are no
+    // longer forced to native 1x here. Stock strict netplay pins them because
+    // the GPU's output can reach guest RAM; for NSR the only such paths are
+    // EFB/XFB copies to RAM (kept off: GFX_HACK_SKIP_*_COPY_TO_RAM stay at their
+    // default, true, above, so RAM gets Dolphin's fixed "uninitialized" fill),
+    // bounding box and perf queries (default off above), and CPU EFB peeks,
+    // which Prepare() makes canonical (EFBInterfaceBase::SetCanonicalPeeks).
+    // Two-peer runs at 1x vs 3x+MSAA with different texture sets compared
+    // equal (local/work/textures/REPORT.md). Revisit if a synced setting is
+    // added upstream or the game is found to read GPU results another way.
     for (const auto slot : ExpansionInterface::SLOTS)
       layer->Set(Config::GetInfoForEXIDevice(slot),
                  slot == ExpansionInterface::Slot::A || slot == ExpansionInterface::Slot::B ?
@@ -240,6 +244,8 @@ std::optional<std::map<std::string, std::string>> Prepare()
   if (s_card_root.empty())
     return std::nullopt;
   Config::AddLayer(std::make_unique<BootLayer>());
+  // GPU-independent EFB peeks for the whole netplay run (see BootLayer).
+  EFBInterfaceBase::SetCanonicalPeeks(true);
   auto layer = Config::GetLayer(Config::LayerType::Netplay);
   // CurrentRun outranks Netplay; remove inherited overrides only for our keys.
   for (const auto& [location, value] : layer->GetLayerMap())
@@ -273,6 +279,8 @@ std::optional<std::map<std::string, std::string>> Prepare()
   Config::OnConfigChanged();
   manifest["SRAM"] = fmt::format("{:016x}", XXH3_64bits(&GetDefaultSRAM(), sizeof(Sram)));
   manifest["BootProtocol"] = "1";
+  // Peers must agree how EFB peeks are answered (older builds asked the GPU).
+  manifest["EFBPeeks"] = "null-backend-v1";
   manifest["ForkBuild"] = Common::GetScmRevGitStr();
   manifest["RollbackProtocol"] = fmt::format("{}:{}", NSRNetplay::RollbackNet::VERSION,
                                             NSRNetplay::RollbackNet::HANDOFF_VERSION);
@@ -304,6 +312,7 @@ std::optional<std::map<std::string, std::string>> Prepare()
 // Called only after EXI's flushing threads stop, including failed-start cleanup.
 void Cleanup()
 {
+  EFBInterfaceBase::SetCanonicalPeeks(false);
   if (!s_card_root.empty())
   {
     File::DeleteDirRecursively(s_card_root);

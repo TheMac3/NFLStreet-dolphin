@@ -77,14 +77,24 @@ import nsr_gamestats as gamestats  # noqa: E402
 import nsr_content  # noqa: E402
 import nsr_lobby as lobby  # noqa: E402
 import nsr_patcher as patcher  # noqa: E402
+import nsr_textures as textures  # noqa: E402
 
 APP_TITLE = "NFLStreetRollback"  # window title; user-facing product name
 CONFIG_NAME = "nsr-launcher.json"
-# Rollback input delay in frames, the same for every player (the host's
-# choice is sent to all). 1 is the tested release value (release plan 2.3:
-# "playtest fixed setting" until automatic delay exists); 0..MAX_DELAY offered.
-DEFAULT_DELAY = 1
+# Rollback input delay, the same for every player (the host's choice is sent
+# to all). AUTO_DELAY (the default) lets the host's Dolphin choose 1..4 frames
+# at every match start from the measured connection (fork fix/audio2:
+# NSR_RB_DELAY=auto, chosen by player 0 from ENet RTT/jitter and adopted by
+# every peer in the entry handoff); 1..MAX_DELAY fixes it. On the lobby and
+# room-server wire Auto travels as delay 0 (the deployed room server only
+# relays integers; 0 = "no delay" is no longer offered).
+AUTO_DELAY = 0
+DEFAULT_DELAY = AUTO_DELAY
 MAX_DELAY = 4
+# Saved choice (nsr-launcher.json). "rb_delay" (written by older launchers at
+# every start, usually the old default 1) is migrated once: 2..4 means the
+# player picked it, so it is kept; anything else becomes Auto.
+DELAY_CONFIG_KEY = "rb_delay_choice"
 # Lockstep input delay for the menus around rollback matches (stage 4), the
 # fork's default and what every stage-4 gate ran with. Menus wait on real
 # input each frame, so a larger value only smooths them; the host's choice
@@ -121,6 +131,14 @@ NETPLAY_AUDIO_BUFFER_MS = 128
 NETPLAY_INPUT_ARGS = ["-C", "Dolphin.Input.BackgroundInput=True"]
 NETPLAY_AUDIO_ARGS = ["-C", "Dolphin.Core.AudioFillGaps=True",
                       "-C", f"Dolphin.Core.AudioBufferSize={NETPLAY_AUDIO_BUFFER_MS}"]
+# Internal resolution choices (Settings → Graphics). 0 = leave it to our
+# Dolphin's own GFX.ini (native 1x unless the player changed it there).
+# Presentation only: the fork answers EFB peeks canonically in netplay, so
+# peers may differ. Each step costs frame time because single-core Dolphin
+# renders on the emulation thread (OGL, k=2 misprediction, RTX 3070 Ti:
+# 14.5 ms per live frame at 1x vs 19.9 ms at 3x; local/work/textures/REPORT.md),
+# hence no higher default.
+RESOLUTIONS = (0, 1, 2, 3, 4)
 
 
 # --- pure helpers (tested without a GUI) --------------------------------------
@@ -178,7 +196,8 @@ def telemetry_env(folder: str, start: lobby.StartInfo, name: str, fingerprint: s
 
 def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: str | None,
                     open_ui: bool = False, name: str = "Player", fingerprint: str = "",
-                    telemetry: bool = True, quickstart: str = "manual") -> tuple[list[str], dict[str, str]]:
+                    telemetry: bool = True, quickstart: str = "manual", icons: str = "auto",
+                    resolution: int = 0) -> tuple[list[str], dict[str, str]]:
     """Command line and environment for the netplay Dolphin.
 
     start=None: practice offline. open_ui=True: just open Dolphin's window
@@ -198,14 +217,27 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     if open_ui:
         return args, env
     players = start.players if start else 1
-    load_path = controllers.reborn_load_path(reborn_install, os.environ) if reborn_install else None
-    if load_path:
-        # Reborn's composed texture tree (library + the player's mods), as its
-        # own Dolphin loads it; see controllers.reborn_load_path. Cached like
-        # Reborn's GFX.ini so textures don't stream in mid-match.
-        args += ["-C", f"Dolphin.General.LoadPath={load_path}",
-                 "-C", "GFX.Settings.HiresTextures=True",
-                 "-C", "GFX.Settings.CacheHiresTextures=True"]
+    pad = controllers.controller_kind(os.path.join(folder, "User"))
+    # Reborn's HD textures, composed by reference (nsr_textures): its pristine
+    # library (menus, real-player headshots), the mods the player turned on in
+    # Reborn, and the button icons for this player's controller (or the
+    # setting), listed for the fork's ordered texture overlay. Before
+    # 2026-10-23 this passed -C GFX.Settings.*, which Dolphin ignores (the -C
+    # system is "Graphics"), so HD textures never loaded and the game showed
+    # its "MISSING TEXTURES" placeholders. Not cached up front, as Reborn's
+    # own GN7E69 game INI: prefetching the ~8 GB library costs ~15 GB of RAM.
+    tex = textures.compose(reborn_install, icons, pad.kind, os.environ)
+    try:
+        textures.write_list(os.path.join(folder, "User"), tex)
+    except OSError as e:
+        tex.warnings.append(f"could not write the texture list: {e}")
+    env["NSR_TEXTURES"] = tex.summary()  # logged by the launcher; the fork ignores it
+    if tex.warnings:
+        env["NSR_TEXTURES_WARNING"] = " ".join(tex.warnings)
+    args += ["-C", "Graphics.Settings.HiresTextures=True",
+             "-C", "Graphics.Settings.CacheHiresTextures=False"]
+    if resolution in RESOLUTIONS[1:]:
+        args += ["-C", f"Graphics.Settings.InternalResolution={resolution}"]
     # Some Quick Play paths make Reborn's own code read through a null pointer
     # (harmless under Dolphin, which returns 0); keep those warnings out of
     # popup dialogs during a match. They still go to Dolphin's log.
@@ -221,7 +253,7 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     # port 1's input instead of switching the port to the adapter device (12),
     # which the game can tell apart (see controller_kind). NSR_PAD_KIND/DEVICE
     # are only logged, so "my controller isn't recognized" is diagnosable.
-    env.update(controllers.controller_kind(os.path.join(folder, "User")).env())
+    env.update(pad.env())
     # Per-match RNG seed: agreed in the lobby for netplay; fresh per launch
     # offline, so Quick Play differs every time either way.
     env["NSR_SEED"] = str(start.seed if start else secrets.randbits(32))
@@ -238,7 +270,7 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
             "NSR_PLAYERS": str(start.players),
             "NSR_PORT": str(lobby.PORT),
             "NSR_TOPOLOGY": "star",
-            "NSR_DELAY": str(start.delay),
+            "NSR_DELAY": str(start.delay or MENU_LOCKSTEP_DELAY),  # lockstep mode: Auto = 2
             "NSR_LOG": os.path.join(folder, f"nsr-p{start.player}.log"),
         })
         if start.mode == "rollback":
@@ -246,7 +278,7 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
             # the frame-keyed channel, so an operator-supplied epoch is both
             # unnecessary and unsafe here.
             env.update(ROLLBACK_ENV)
-            env["NSR_RB_DELAY"] = str(start.delay)
+            env["NSR_RB_DELAY"] = "auto" if start.delay == AUTO_DELAY else str(start.delay)
             env["NSR_DELAY"] = str(MENU_LOCKSTEP_DELAY)
             args += ["-C", "Dolphin.Core.FastDiscSpeed=True"]
         args += NETPLAY_AUDIO_ARGS
@@ -475,9 +507,9 @@ class Launcher:
             "telemetry": bool(cfg.get("telemetry", True)),
             "game_stats": {"enabled": bool(cfg.get("game_stats", True)), "state": "idle",
                            "text": "", "sent": 0, "pending": 0},
-            # "rb_delay", not the lockstep-era "delay" (2 by default), so an old
-            # config doesn't carry a lockstep value into rollback.
-            "delay": self._clamp_delay(cfg.get("rb_delay", DEFAULT_DELAY)),
+            # Not the lockstep-era "delay" (2 by default), so an old config
+            # doesn't carry a lockstep value into rollback. 0 = Auto.
+            "delay": self._saved_delay(cfg),
             "quickstart": (cfg.get("quickstart") if isinstance(cfg.get("quickstart"), str)
                            and cfg["quickstart"] in lobby.QUICKSTARTS else "manual"),
             "game_modes": lobby.QUICKSTARTS,
@@ -496,6 +528,11 @@ class Launcher:
             "join": {"state": "idle", "info": "", "players": [], "quickstart": "manual"},
             "controllers": {"state": "checking", "message": "", "source": "",
                             "port1": controllers.port1_summary(self.user_dir), "backup": ""},
+            # Button icons (nsr_textures): the setting (auto|gamecube|playstation|
+            # xbox), what a launch would use now, and the texture source summary.
+            "textures": {"icons": self._icons_setting(), "effective": "", "why": "",
+                         "base_kind": "", "base": "", "packages": [], "warning": ""},
+            "resolution": self._resolution_setting(),
             "notice": None,
         }
 
@@ -506,10 +543,18 @@ class Launcher:
 
     @staticmethod
     def _clamp_delay(value) -> int:
+        """0 (Auto) or 1..MAX_DELAY; "auto" and anything unreadable mean Auto."""
         try:
             return max(0, min(int(value), MAX_DELAY))
         except (TypeError, ValueError):
             return DEFAULT_DELAY
+
+    @classmethod
+    def _saved_delay(cls, cfg: dict) -> int:
+        if DELAY_CONFIG_KEY in cfg:
+            return cls._clamp_delay(cfg[DELAY_CONFIG_KEY])
+        old = cls._clamp_delay(cfg.get("rb_delay", AUTO_DELAY))  # pre-Auto launchers
+        return old if old >= 2 else AUTO_DELAY
 
     def _set(self, section: str | None = None, **kw) -> None:
         with self._lock:
@@ -555,6 +600,43 @@ class Launcher:
 
     def set_delay(self, delay) -> None:
         self._set(delay=self._clamp_delay(delay))
+
+    def _icons_setting(self) -> str:
+        v = self.cfg.get("button_icons", "auto")
+        return v if v in textures.ICON_CHOICES else "auto"
+
+    def _resolution_setting(self) -> int:
+        try:
+            v = int(self.cfg.get("resolution", 0))
+        except (TypeError, ValueError):
+            return 0
+        return v if v in RESOLUTIONS else 0
+
+    def set_button_icons(self, choice: str) -> None:
+        """Button icons: auto (from the controller) or a fixed set. Per PC only."""
+        self.cfg["button_icons"] = choice if choice in textures.ICON_CHOICES else "auto"
+        self._save()
+        self._set("textures", icons=self._icons_setting())
+        self._spawn(self.refresh_textures)
+
+    def set_resolution(self, value) -> None:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = 0
+        self.cfg["resolution"] = value if value in RESOLUTIONS else 0
+        self._save()
+        self._set(resolution=self._resolution_setting())
+
+    def refresh_textures(self) -> textures.TextureSet:
+        """What the next launch will show (nothing is written here)."""
+        pad = controllers.controller_kind(self.user_dir)
+        ts = textures.compose(self.reborn_install(), self._icons_setting(), pad.kind, self._env)
+        self._set("textures", icons=self._icons_setting(), effective=ts.icons, why=ts.icons_why,
+                  base_kind=ts.base_kind, base=ts.base or "",
+                  packages=[f"{p.id} {p.version}" for p in ts.packages],
+                  warning=" ".join(ts.warnings))
+        return ts
 
     def need_game(self) -> bool:
         if not self.state["game"]["fingerprint"]:
@@ -696,6 +778,10 @@ class Launcher:
         self._set("controllers", state=CONTROLLER_STATES.get(res.action, res.action), message=res.message,
                   source=source.gcpad if source else "", backup=res.backup or "",
                   port1=controllers.port1_summary(self.user_dir))
+        try:  # Auto button icons follow the (possibly just imported) controller
+            self.refresh_textures()
+        except Exception as e:  # noqa: BLE001
+            log(self.folder, f"texture refresh failed: {e!r}")
         return res
 
     def sync_controllers(self, force: bool = False) -> None:
@@ -884,12 +970,20 @@ class Launcher:
             self._stats_wake.set()
         args, env = dolphin_command(self.folder, start, self.reborn_install(), open_ui=open_ui,
                                     name=self.state["name"], fingerprint=self.state["game"]["fingerprint"],
-                                    telemetry=self.state["telemetry"], quickstart=self.state["quickstart"])
+                                    telemetry=self.state["telemetry"], quickstart=self.state["quickstart"],
+                                    icons=self._icons_setting(), resolution=self._resolution_setting())
         if not open_ui:  # same values the fork logs in nsr-p*.log ("local pad:")
             adapter = env.get("NSR_PAD_ADAPTER")
             log(self.folder, f"controller ({'netplay' if start else 'offline'}): "
                 f"kind={env.get('NSR_PAD_KIND', '?')} device={env.get('NSR_PAD_DEVICE') or '-'}"
                 + (f" usb-adapter-port={int(adapter) + 1}" if adapter else ""))
+            # Which texture folders and button icons this launch shows, so a
+            # "MISSING TEXTURES"/wrong-icons report is diagnosable from the log.
+            log(self.folder, f"{env.get('NSR_TEXTURES', 'textures ?')} "
+                f"resolution={self._resolution_setting() or 'dolphin'}")
+            if env.get("NSR_TEXTURES_WARNING"):
+                log(self.folder, f"textures warning: {env['NSR_TEXTURES_WARNING']}")
+                self.notify(env["NSR_TEXTURES_WARNING"], "error")
         try:
             # The fork truncates this per-player log at connection setup. Clear
             # it here too so a failed launch cannot surface an older mismatch.
@@ -1025,7 +1119,7 @@ class Launcher:
                 self._set("host", state="open")
                 self.notify(str(e), "error")
                 return
-            self.cfg["rb_delay"] = delay
+            self.cfg[DELAY_CONFIG_KEY] = delay
             self._save()
             self._host = None
             self._set("host", state="idle", mode="", code="", players=[], can_start=False,
@@ -1202,6 +1296,8 @@ class WebApi:
     def check_updates(self): self._l.check_updates()
     def set_delay(self, delay): self._l.set_delay(delay)
     def set_quickstart(self, selected): self._l.set_quickstart(selected)
+    def set_button_icons(self, choice): self._l.set_button_icons(str(choice))
+    def set_resolution(self, value): self._l.set_resolution(value)
     def find_game(self): self._l.find_game()
     def host_room(self): self._l.host_room()
     def host_ip(self): self._l.host_ip()
@@ -1316,11 +1412,19 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     b_ip = ttk.Button(hp, text="Host by IP address (advanced)", command=launcher.host_ip)
     for i, b in enumerate((b_open, b_start, b_close, b_ip)):
         b.grid(row=3, column=i, sticky="w", padx=(0, 6))
-    delay_var = tk.IntVar(value=launcher.state["delay"])
-    ttk.Label(hp, text="Input delay for everyone (frames; 1 suits most games, try 2 if it stutters):",
+    delay_names = ["Auto"] + [str(d) for d in range(1, MAX_DELAY + 1)]
+    delay_text = tk.StringVar(value=delay_names[launcher.state["delay"]])
+
+    class _DelayVar:  # start_game(delay_var.get()): 0 = Auto, else frames
+        @staticmethod
+        def get() -> int:
+            return delay_names.index(delay_text.get()) if delay_text.get() in delay_names else AUTO_DELAY
+    delay_var = _DelayVar()
+    ttk.Label(hp, text="Input delay for everyone (Auto picks 1-4 frames from the connection):",
               style="Muted.TLabel").grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
-    ttk.Spinbox(hp, from_=0, to=MAX_DELAY, textvariable=delay_var, width=4,
-                command=lambda: launcher.set_delay(delay_var.get())).grid(row=4, column=3, sticky="w", pady=(10, 0))
+    delay_box = ttk.Combobox(hp, values=delay_names, textvariable=delay_text, width=6, state="readonly")
+    delay_box.bind("<<ComboboxSelected>>", lambda _e: launcher.set_delay(delay_var.get()))
+    delay_box.grid(row=4, column=3, sticky="w", pady=(10, 0))
     ttk.Button(hp, text="Practice offline", command=launcher.play_offline).grid(row=5, column=0, sticky="w", pady=8)
 
     # Native fallback exposes the same selection; a created room locks it.
@@ -1331,9 +1435,9 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     mode_picker.grid(row=6, column=1, columnspan=3, sticky="w")
     mode_picker.bind("<<ComboboxSelected>>", lambda e: launcher.set_quickstart(
         next(k for k, v in lobby.QUICKSTARTS.items() if v == mode_var.get())))
-    ttk.Label(hp, text="Quickstart: host vs joiners; pick teams or draft when menus finish.\n"
+    ttk.Label(hp, text="Quick Play or Pickup Game goes straight to Select Controller (pick sides, first pick / ball first).\n"
                        "Practice uses this choice too. Manual keeps offline saves.",
-              style="Muted.TLabel").grid(row=7, column=0, columnspan=4, sticky="w", pady=6)
+              style="Muted.TLabel", wraplength=650).grid(row=7, column=0, columnspan=4, sticky="w", pady=6)
 
     # Join
     jp = pages["Join"]

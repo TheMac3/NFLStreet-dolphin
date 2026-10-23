@@ -134,6 +134,8 @@ add_library(core
   HLE/HLE_Misc.cpp
   HLE/HLE_Misc.h
   HLE/HLE_OS.cpp
+  NSR/NSRAudio.cpp
+  NSR/NSRAudio.h
   NSR/NSRTelemetry.cpp
   NSR/NSRTelemetry.h
   NSR/NSRTelemetryLogic.h

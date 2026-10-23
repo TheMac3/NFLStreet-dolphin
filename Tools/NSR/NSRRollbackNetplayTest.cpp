@@ -85,6 +85,26 @@ static void TestHandoffPhaseRelay()
   assert(!host.Accept(invalid) && !host.Proposal(1));
 }
 
+// lifecycle3 x fix/audio2: a relayed entry proposal must carry its own
+// author's input-delay fields. Rebuilding it from the relay's local tuple
+// gave player 1's id player 0's delay, which a leaf that had already seen
+// player 1's real proposal rejected as a conflicting retransmission.
+static void TestHandoffRelayKeepsAuthorDelay()
+{
+  RN::HandoffAgreement host(3, 0, RN::HandoffKind::EnterRollback, 2, 11337, 0x55, {}, 100, 10, 3,
+                            360, 40);
+  RN::HandoffAgreement leaf(3, 2, RN::HandoffKind::EnterRollback, 2, 11337, 0x55, {}, 101, 11, 2,
+                            0, 0);
+  const RN::HandoffPacket one{1, 3, RN::HandoffKind::EnterRollback, 2, 11337, 0x55, {}, 102, 12,
+                              4, 0, 0};
+  assert(host.Accept(one) && leaf.Accept(one));
+  const auto relayed = RN::DecodeHandoff(RN::EncodeHandoff(*host.Proposal(1)));
+  assert(relayed && relayed->sender == 1 && relayed->input_delay == 4);
+  assert(leaf.Accept(*relayed) && !leaf.Mismatched());
+  assert(leaf.Accept(*host.Proposal(0)) && leaf.Complete());
+  assert(leaf.HostProposal() && leaf.HostProposal()->input_delay == 3);
+}
+
 // Match entry/leave proposals are independently encoded and require the same
 // transition kind, absolute lockstep frame, and deterministic-state hash from
 // every peer. Per-peer clocks may differ, player 0's survives wire encoding,
@@ -1856,8 +1876,8 @@ static void TestQuickstartNavigation()
   {
     Navigator nav(mode);
     std::uint32_t frame = 1;
-    const std::array<std::uint32_t, 10> screens{3, 0x10003, 0x10003, 0x10003,
-        1, 1, 1, 0x11, 0x11, mode == Mode::Pickup ? 0xfU : 7U};
+    const std::array<std::uint32_t, 8> screens{3, 0x10003, 0x10003, 0x10003,
+        1, 1, 1, 0x11};
     for (std::uint32_t step = 0; step < screens.size(); ++step)
     {
       for (int i = 0; i < 75; ++i)
@@ -1867,25 +1887,43 @@ static void TestQuickstartNavigation()
         assert(nav.StepIndex() == step);
         ++frame;
       }
+      // A transient controller screen must not finish the macro. Stability
+      // restarts after an unrelated screen; every waiting pad remains neutral.
+      if (step == 7)
+      {
+        for (std::uint32_t elapsed = 0; elapsed < 60; ++elapsed)
+        {
+          const auto result = nav.Poll(frame++, screens[step]);
+          assert(nav.Active() && result && (*result == std::array<std::uint16_t, 4>{}));
+        }
+        nav.Poll(frame++, 0xffffffff);
+        assert(nav.Active());
+      }
       const auto begin = frame;
-      for (std::uint32_t elapsed = 0; elapsed <= (step == 9 ? 60U : 120U); ++elapsed)
+      for (std::uint32_t elapsed = 0; elapsed <= (step == 7 ? 60U : 120U); ++elapsed)
       {
         // A different next screen acknowledges START without reissuing it.
         const auto screen = step == 0 && elapsed >= 70 ? 0x10003U : screens[step];
         const auto result = nav.Poll(frame, screen);
         assert(nav.Poll(frame, screen) == result);
         assert(result);
-        if (elapsed < 60 || elapsed >= 66)
+        if (step == 7)
+          assert(nav.Active() == (elapsed < 60));
+        if (step == 7 || elapsed < 60 || elapsed >= 66)
           assert((*result == std::array<std::uint16_t, 4>{}));
-        else if (step == 7)
-          assert((*result == std::array<std::uint16_t, 4>{0, 2, 2, 2}));
-        else if (step == 8)
-          assert((*result == std::array<std::uint16_t, 4>{0x100, 0x100, 0x100, 0x100}));
+        else
+        {
+          const std::array<std::uint16_t, 7> presses{0x1000, 4, 4, 0x100,
+              static_cast<std::uint16_t>(mode == Mode::Pickup ? 0 : 0x200),
+              static_cast<std::uint16_t>(mode == Mode::Pickup ? 8 : 1), 0x100};
+          assert((*result == std::array<std::uint16_t, 4>{presses[step], 0, 0, 0}));
+        }
         ++frame;
       }
       assert(frame > begin);
     }
     assert(!nav.Active() && !nav.Failed());
+    assert(!nav.Poll(frame, 0x11));  // humans own the still-visible controller screen
     assert(!nav.Poll(frame + 100, 3));
   }
   Navigator slow(Mode::QuickPlay);
@@ -1897,8 +1935,52 @@ static void TestQuickstartNavigation()
   assert(stalled.Failed());
 }
 
+// fix/audio2: player 0's entry proposal carries the match input delay and
+// the link it was chosen from; it survives the wire, every peer can read it,
+// and a sender may not change it in a retransmission.
+static void TestHandoffInputDelay()
+{
+  RN::HandoffPacket host{0, 2, RN::HandoffKind::EnterRollback, 2, 1234, 0x77, {}, 5, 6, 3, 365,
+                         102};
+  const auto decoded = RN::DecodeHandoff(RN::EncodeHandoff(host));
+  assert(decoded && decoded->input_delay == 3 && decoded->delay_one_way_dms == 365 &&
+         decoded->delay_jitter_dms == 102);
+  RN::HandoffAgreement joiner(2, 1, RN::HandoffKind::EnterRollback, 2, 1234, 0x77, {}, 7, 8);
+  assert(!joiner.HostProposal());
+  assert(joiner.Accept(*decoded));
+  assert(joiner.Complete());
+  assert(joiner.HostProposal()->input_delay == 3);
+  RN::HandoffPacket changed = host;
+  changed.input_delay = 2;
+  assert(!joiner.Accept(changed));
+  assert(joiner.Mismatched());
+  RN::HandoffAgreement me0(2, 0, RN::HandoffKind::EnterRollback, 2, 1234, 0x77, {}, 5, 6, 2);
+  assert(me0.HostProposal()->input_delay == 2);
+}
+
+// The automatic delay rule on ENet readings: ceil((one-way - 8 + jitter) /
+// frame) - 1, in [1, 4]. Values are the proxy sweep's (2026-10-23) and
+// Mason's 2026-10-22 session (ENet RTT 72, variance ~8).
+static void TestAutoInputDelay()
+{
+  assert(RN::AutoInputDelay(0.0, 0.0) == 1);
+  assert(RN::AutoInputDelay(27.5, 9.0) == 1);    // 20 ms path
+  assert(RN::AutoInputDelay(36.5, 15.0) == 2);   // 40 ms path
+  assert(RN::AutoInputDelay(41.0, 9.0) == 2);    // 70 ms path
+  assert(RN::AutoInputDelay(36.0, 8.0) == 2);    // Mason's 73 ms link
+  assert(RN::AutoInputDelay(56.0, 8.0) == 3);    // 110 ms path, calm
+  assert(RN::AutoInputDelay(59.5, 16.0) == 4);   // 110 ms path, jittery
+  assert(RN::AutoInputDelay(79.0, 9.0) == 4);    // 150 ms path
+  assert(RN::AutoInputDelay(500.0, 50.0) == 4);  // clamped
+  RN::AutoDelayRule strict;
+  strict.predict_frames = 0.0;
+  assert(RN::AutoInputDelay(41.0, 9.0, strict) == 3);
+}
+
 int main()
 {
+  TestHandoffInputDelay();
+  TestAutoInputDelay();
   TestPadSourceAdapter();
   TestDraftLog();
   TestQuickstartNavigation();
@@ -1907,6 +1989,7 @@ int main()
   TestGameStatsIdentity();
   TestHandoffAgreement();
   TestHandoffPhaseRelay();
+  TestHandoffRelayKeepsAuthorDelay();
   TestPredictionAndCorrection();
   TestPredictionWindowAndAcks();
   TestLongLossRecovery();

@@ -162,6 +162,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
 .bind span:last-child { color: #d9d9e2; font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .bind.none span:last-child { color: var(--faint); }
 .note { font-size: 13px; color: var(--muted); margin-top: 12px; }
+.note.warnline { color: #ffb067; } .note.warnline:empty { display: none; }
 .path { font-size: 12px; color: var(--faint); word-break: break-all; margin-top: 6px; user-select: text; }
 
 /* settings */
@@ -248,14 +249,14 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
             <select id="gameMode" style="margin:8px 0;padding:10px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:8px">
               <option value="quick-play">Quick Play</option><option value="pickup">Pickup Game</option><option value="manual">Manual (menus)</option>
             </select>
-            <div class="note">Quickstart puts the host against the joiners, then you pick teams or draft. Practice uses this choice too. Manual keeps offline saves.</div>
+            <div class="note">Quick Play or Pickup Game goes straight to Select Controller (pick sides, first pick / ball first). Practice uses this choice too. Manual keeps offline saves.</div>
           </div>
           <div class="row" style="margin-top:18px">
-            <div><div class="label" style="margin-bottom:6px">Input delay (frames, for everyone)</div><div class="seg" id="delaySeg"></div></div>
+            <div><div class="label" style="margin-bottom:6px">Input delay (for everyone)</div><div class="seg" id="delaySeg"></div></div>
             <div class="grow"></div>
             <button class="btn red big" id="btnStart" disabled>Start game</button>
           </div>
-          <div class="note">1 suits most games; try 2 if it stutters. The host's choice applies to everyone.</div>
+          <div class="note">Auto picks 1–4 frames from the connection at every match. Pick a number to fix it. The host's choice applies to everyone.</div>
           <div class="info" id="hostInfo"></div>
         </div>
         <div class="card players"><div class="ph"><h3>Players</h3><span class="faint" id="hostSlots">0 / 4</span></div><ol id="hostPlayers"></ol></div>
@@ -298,6 +299,12 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
         <div class="card"><div class="label">Port 1 buttons</div><div class="binds" id="binds"></div>
           <div class="note">Change these in Reborn's Controllers page, then click “Use my Reborn controller settings”. Or use “Set up controllers…” to map them in NFLStreetRollback's own Dolphin; that mapping is then kept until you re-import.</div></div>
       </div>
+      <div class="card" style="margin-top:20px"><div class="label" style="margin-bottom:8px">Button icons in the game</div>
+        <div class="seg" id="iconSeg"></div>
+        <div class="note" id="iconNote"></div>
+        <div class="path" id="texSource"></div>
+        <div class="note warnline" id="texWarn"></div>
+        <div class="note">Only your screen changes: each player sees their own icons and HD textures, and the match stays identical.</div></div>
     </section>
 
     <!-- SETTINGS -->
@@ -316,6 +323,9 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
             <div class="note" style="margin-top:4px">For the shared Stats page: final scores and box-score stats of the games you finish in NFL Street Reborn (the files its Dolphin saves after the Game Stats/MVP screens), your name and a random ID for this install. Never other files, folder paths, or your PC's name. Off: nothing is uploaded.</div>
             <div class="note" id="gameStatsText" style="margin-top:4px"></div></div></div>
         </div>
+        <div class="card"><div class="label" style="margin-bottom:8px">Graphics: internal resolution</div>
+          <div class="seg" id="resSeg"></div>
+          <div class="note">Sharper at 2× or 3×, but every step costs frame time during rollback. If the game slows down, go back to Dolphin's setting (native unless you changed it). Only your screen changes.</div></div>
         <details class="card advanced">
           <summary class="label">Advanced: game files</summary>
           <div class="fp mono" id="gameFp">–</div>
@@ -454,7 +464,7 @@ function render(s) {
   renderPlayers("hostPlayers", "hostSlots", h.players, 4);
   const seg = $("delaySeg");
   if (!seg.children.length) for (let d = 0; d <= s.max_delay; d++) {
-    const b = document.createElement("button"); b.textContent = String(d); b.dataset.d = d;
+    const b = document.createElement("button"); b.textContent = d === 0 ? "Auto" : String(d); b.dataset.d = d;
     b.onclick = () => { S.delay = d; call("set_delay", d); renderDelay(d); }; seg.append(b);
   }
   renderDelay(S.delay != null ? S.delay : s.delay);
@@ -487,6 +497,15 @@ function render(s) {
       row.append(a, v); binds.append(row);
     }
   }
+
+  // button icons (nsr_textures) and resolution
+  const tx = s.textures || {}, labels = { auto: "Auto", gamecube: "GameCube", playstation: "PlayStation", xbox: "Xbox" };
+  renderSeg("iconSeg", Object.keys(labels).map((k) => [k, labels[k]]), tx.icons || "auto", (k) => call("set_button_icons", k));
+  setText("iconNote", tx.effective ? "Showing " + labels[tx.effective] + " icons" +
+    (String(tx.why || "").startsWith("auto") ? " (matched to your controller)." : ".") : "");
+  setText("texSource", tx.base ? "HD textures from: " + tx.base + (tx.packages && tx.packages.length ? " + " + tx.packages.join(", ") : "") : "");
+  setText("texWarn", tx.warning || "");
+  renderSeg("resSeg", [[0, "Dolphin's"], [1, "1×"], [2, "2×"], [3, "3×"], [4, "4×"]], s.resolution || 0, (k) => call("set_resolution", k));
 
   // settings
   setValue("nameIn", s.name || "");
@@ -559,6 +578,19 @@ async function start() {
 }
 
 // --- demo mode (design/screenshots only; see header comment) ---
+// A row of choice buttons; rebuilt only when the choices change.
+function renderSeg(id, items, current, pick) {
+  const seg = $(id), sig = JSON.stringify(items);
+  if (seg.dataset.sig !== sig) {
+    seg.dataset.sig = sig; seg.textContent = "";
+    for (const [key, label] of items) {
+      const b = document.createElement("button");
+      b.textContent = label; b.dataset.key = String(key); b.onclick = () => pick(key); seg.append(b);
+    }
+  }
+  for (const b of seg.children) b.classList.toggle("on", b.dataset.key === String(current));
+}
+
 function demoApi(page) {
   const names = { host: ["Mason", "Tuna", "wolfspeedy"], join: ["Marcus", "Mason"] };
   const base = { rev: 1, name: "Mason", telemetry: true, delay: 1,
@@ -577,6 +609,9 @@ function demoApi(page) {
           ["L","Button 6"],["R","Button 7"],["Stick up","Axis Y-"],["Stick down","Axis Y+"],["Stick left","Axis X-"],["Stick right","Axis X+"],
           ["C up","Axis Zr-"],["C down","Axis Zr+"],["C left","Axis Z-"],["C right","Axis Z+"],["D-pad up","Hat 0 N"],["D-pad down","Hat 0 S"],
           ["D-pad left","Hat 0 W"],["D-pad right","Hat 0 E"]].map(([control, input]) => ({ control, input })) } },
+    textures: { icons: "auto", effective: "playstation", why: "auto:playstation", base_kind: "library",
+      base: "C:\\Users\\mason\\AppData\\Roaming\\NFL Street Reborn\\library\\textures\\GN7E69", packages: [], warning: "" },
+    resolution: 0,
     notice: null };
   if (page === "host") Object.assign(base.host, { state: "open", mode: "room", code: "NSRB-4K7QX", players: names.host, can_start: true,
     info: "Room open. Give your friends this code; click Start when everyone's listed." });

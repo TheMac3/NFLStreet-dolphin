@@ -221,14 +221,15 @@ GAME_ID = "GN7E69"
 def reborn_load_path(install: str | None, env=os.environ) -> str | None:
     """Dolphin LoadPath with the textures Reborn's own Dolphin really shows.
 
-    Reborn's launcher composes its texture library (content/textures) plus the
-    player's enabled mods (button-prompt packs, footballs, ...) into the user
-    folder's Load/Textures/<gameid>; its Dolphin loads that composed tree. The
-    raw library alone has placeholder "MISSING TEXTURES" art where a mod is
-    expected to supply the real texture (menus with controller prompts), which
-    is what our netplay Dolphin showed when it pointed at content/. Prefer the
-    newest composed tree; fall back to the raw library. Read only: textures are
-    host-side and never affect netplay state.
+    Reborn's launcher composes its texture library plus the player's enabled
+    mods (button-prompt packs, footballs, ...) into the user folder's
+    Load/Textures/<gameid> (e.g. %APPDATA%\\NFL Street Reborn\\dolphin-users\\
+    fresh\\Load). Prefer the newest composed tree; fall back to the raw
+    library. Since 2026-10-23 the launcher composes its own set by reference
+    (nsr_textures) and uses this only as a last-resort base: the composed tree
+    carries Reborn's own button-icon choice. (The "MISSING TEXTURES" art seen
+    in netplay came from HD textures never being enabled, -C GFX.* instead of
+    -C Graphics.*, not from the raw library.) Read only.
     """
     best = None
     for i, user_dir in enumerate(candidate_user_dirs(install, env)):

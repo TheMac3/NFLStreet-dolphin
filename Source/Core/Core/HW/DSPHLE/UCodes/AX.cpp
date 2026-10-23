@@ -21,6 +21,7 @@
 #include "Core/HW/DSPHLE/DSPHLE.h"
 #include "Core/HW/DSPHLE/MailHandler.h"
 #include "Core/HW/DSPHLE/UCodes/AXStructs.h"
+#include "Core/NSR/NSRAudio.h"  // NFLStreet rollback audio
 
 #define AX_GC
 #include "Core/HW/DSPHLE/UCodes/AXVoice.h"
@@ -118,6 +119,10 @@ void AXUCode::HandleCommandList()
   u16 size;
 
   u32 pb_addr = 0;
+
+  // NFLStreet rollback audio: one AX frame (re-simulation pacing counts them;
+  // NSR_AUDIO_DIAG diagnostics).
+  NSRAudio::AXFrameBegin();
 
   u32 curr_idx = 0;
   bool end = false;
@@ -283,6 +288,8 @@ void AXUCode::HandleCommandList()
       break;
     }
   }
+  if (NSRAudio::g_diag)
+    NSRAudio::AXFrameEnd();
 }
 
 AXMixControl AXUCode::ConvertMixerControl(u32 mixer_control)
@@ -471,6 +478,12 @@ void AXUCode::ProcessPBList(u32 pb_addr)
                           m_samples_auxB_left, m_samples_auxB_right, m_samples_auxB_surround}};
 
     ReadPB(memory, pb_addr, pb);
+    if (NSRAudio::g_diag)  // NFLStreet rollback audio diagnostics
+    {
+      NSRAudio::AXVoice(pb_addr, pb.running, pb.is_stream, pb.audio_addr.sample_format,
+                        HILO_TO_32(pb.audio_addr.loop_addr), HILO_TO_32(pb.audio_addr.end_addr),
+                        HILO_TO_32(pb.audio_addr.cur_addr));
+    }
 
     PBUpdateData updates = LoadPBUpdates(memory, pb);
 

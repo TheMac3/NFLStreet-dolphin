@@ -106,6 +106,9 @@
 #include "InputCommon/InputConfig.h"                 // NSR local pad log
 #include "Core/NSR/NSRTelemetryLogic.h"  // NSR telemetry: lockstep hash with region digests
 #include "Common/FileUtil.h"             // NSR telemetry: desync bundle directory
+#include "AudioCommon/Mixer.h"        // NSR mixer underrun gauges (fix/audio2)
+#include "AudioCommon/SoundStream.h"  // NSR mixer underrun gauges (fix/audio2)
+#include "Core/NSR/NSRAudio.h"  // NSR host audio under rollback
 #include "VideoCommon/CommandProcessor.h"
 #include "VideoCommon/Fifo.h"
 
@@ -1535,6 +1538,11 @@ constexpr std::array<std::pair<u32, u32>, 10> AUDIO_KEEP{{
 }};
 constexpr u32 AUDIO_THREAD = 0x803AA828;
 constexpr u32 AUDIO_THREAD_QUEUE = 0x803AAB40;  // where it sleeps between audio frames
+// The middleware's sound start (bank r3, sound r4, parameters r5, f1),
+// called from the game's fn_801F4050; the one default audio gate entry.
+constexpr u32 SOUND_START_ENTRY = 0x8026AAF0;
+// NSR_RB_DELAY=auto before any link was measured (fix/audio2).
+constexpr u32 AUTO_DELAY_FALLBACK = 2;
 
 // Per-frame counters that live outside the sim but are read by it. They
 // advance between sim calls (tick loop bookkeeping) or in the frame tail, so
@@ -1641,6 +1649,7 @@ struct Rollback
   // the absolute-frame exchange with prediction disabled instead.
   bool menu_frame_lockstep = false;
   u32 net_delay = 1;         // local samples apply this many frames later
+  bool net_delay_auto = false;  // NSR_RB_DELAY=auto (fix/audio2)
   u32 max_prediction = 7;    // host-stall beyond this remote-confirmed window
   bool time_sync = true;     // the frame-ahead peer yields up to one frame
   u64 net_stalls = 0;
@@ -1665,16 +1674,20 @@ struct Rollback
     u32 entry = 0, r3 = 0, r4 = 0;
     u64 f1 = 0;
     bool done = false;
+    u32 a3 = 0, a4 = 0;  // arguments r3/r4 at the call (fix/audio2: replay only the same call)
+    u64 af1 = 0;         // argument f1
   };
   std::map<u32, std::vector<GateCall>> gate_log;
   struct GatePending
   {
     u32 lr, tick;
     size_t index;
+    bool rerun = false;  // re-simulated sound start run for real: return the recorded results
   };
   std::vector<GatePending> gate_pending;
   size_t gate_index = 0;  // gated calls so far in the running re-simulated tick
   u64 gate_replayed = 0, gate_mismatched = 0, gate_recorded = 0;
+  u64 gate_rerun = 0, gate_rerun_differs = 0;  // fix/audio2, see AudioGateHook
   u32 tick_running = 0;   // index of the tick currently running
   u64 vtime_base = 0;     // real time base at live tick vtime_from
   bool vtime_on = false;
@@ -3090,6 +3103,12 @@ void RbInit(Core::System& system)
   r.net_enabled = !Env("NSR_RB_NET").empty();
   r.auto_handoff = r.net_enabled && Env("NSR_RB_VTIME_FROM").empty();
   r.net_delay = std::min<u32>(ParseU32(Env("NSR_RB_DELAY")).value_or(1), 8);
+  // fix/audio2: NSR_RB_DELAY=auto lets player 0 choose the delay from the
+  // measured links at every match entry (see ProposeInputDelay); until then
+  // (and if nothing was measured) the fallback is AUTO_DELAY_FALLBACK.
+  r.net_delay_auto = Env("NSR_RB_DELAY") == "auto";
+  if (r.net_delay_auto)
+    r.net_delay = AUTO_DELAY_FALLBACK;
   r.max_prediction = std::min<u32>(ParseU32(Env("NSR_RB_MAX_PRED")).value_or(7), 60);
   r.time_sync = Env("NSR_RB_TIME_SYNC", "1") != "0";
   if (r.net_enabled)
@@ -3906,6 +3925,7 @@ bool IsIoIdle(const u8* ram)
 
 void RbRestore(Core::System& system, u8* ram, const std::vector<u8>& slot)
 {
+  NSRAudio::Restore(system);  // host audio: crossfade capture, pacing (fix/audio2)
   // Restore the game state, then put the live OS objects back as they are now.
   // Copy page by page and tell the JIT about every page whose bytes changed:
   // restored memory can hold code (e.g. code the audio engine generates in the
@@ -4390,8 +4410,11 @@ static void ApplyQuickstart(const Core::CPUThreadGuard& guard, u32 frame,
     StopForRollbackTransportFailure();
   }
   else if (!s.quickstart.Active())
+  {
+    Log("quickstart: handed off at Select Controller");
     Log("quickstart COMPLETE frame {} screen {}/{}; human pads enabled", frame,
         screen >> 16, screen & 0xffff);
+  }
 }
 
 // Run milestone-1 raw-pad lockstep for one poll.  Keeping this independent
@@ -6378,6 +6401,93 @@ static void ResendHandoffInputs()
     SendLatest(s_session.local_pads.rbegin()->first);
 }
 
+// ---------------------------------------------------------------------------
+// Automatic rollback input delay (fix/audio2).
+//
+// With a fixed delay of 1 at ~73 ms RTT (Mason's 2026-10-22 session) remote
+// input arrived ~2 frames late, so the match rolled back ~13 times a second;
+// every rollback costs host time and (before fix/audio2) audio. A little more
+// delay removes most rollbacks; too much makes controls feel heavy. Player 0
+// measures each link during the lockstep menus (ENet RTT and RTT variance,
+// refreshed by ENet's pings and the reliable boot/handoff traffic) and
+// proposes RollbackNet::AutoInputDelay of the worst player-to-player path in
+// the entry barrier; every peer adopts player 0's value for the epoch, so all
+// players always run the same delay (a fixed NSR_RB_DELAY on player 0 is
+// proposed the same way). Delay is per-process netcode policy, not
+// simulation state: inputs carry their target frame, so this changes when
+// inputs apply, never how a frame simulates.
+// Deferred: re-tuning inside a match (would need a frame-keyed agreement);
+// revisit if links change a lot during matches (telemetry rtt_ms per window).
+// ---------------------------------------------------------------------------
+struct DelayProposal
+{
+  u8 delay = 0;
+  u16 one_way_dms = 0, jitter_dms = 0;
+};
+
+static DelayProposal ProposeInputDelay()
+{
+  const Session& s = s_session;
+  const Rollback& r = s_rb;
+  DelayProposal p;
+  // Worst one-way path between any two players and its jitter. Player 0
+  // holds every link in a star; a joiner-to-joiner input is relayed by it.
+  double one_way = 0.0, jitter = 0.0;
+  bool measured = false;
+  for (u32 i = 0; i < s.players; ++i)
+  {
+    if (i == s.me || !Linked(i))
+      continue;
+    const double rtt_i = s.peers[i]->roundTripTime;
+    const double var_i = s.peers[i]->roundTripTimeVariance;
+    measured = true;
+    one_way = std::max(one_way, rtt_i / 2.0);
+    jitter = std::max(jitter, var_i);
+    for (u32 j = i + 1; j < s.players; ++j)
+    {
+      if (j == s.me || !Linked(j))
+        continue;
+      one_way = std::max(one_way, (rtt_i + s.peers[j]->roundTripTime) / 2.0);
+      jitter = std::max(jitter, var_i + s.peers[j]->roundTripTimeVariance);
+    }
+  }
+  if (r.net_delay_auto && measured)
+  {
+    RollbackNet::AutoDelayRule rule;
+    if (const auto w = Env("NSR_RB_AUTO_DELAY_JITTER"); !w.empty())  // tuning
+      rule.jitter_weight = std::strtod(w.c_str(), nullptr);
+    if (const auto f = Env("NSR_RB_AUTO_DELAY_PREDICT"); !f.empty())
+      rule.predict_frames = std::strtod(f.c_str(), nullptr);
+    p.delay = RollbackNet::AutoInputDelay(one_way, jitter, rule);
+  }
+  else
+  {
+    p.delay = static_cast<u8>(std::clamp<u32>(r.net_delay, 1, 8));
+  }
+  p.one_way_dms = static_cast<u16>(std::clamp(one_way * 10.0, 0.0, 65535.0));
+  p.jitter_dms = static_cast<u16>(std::clamp(jitter * 10.0, 0.0, 65535.0));
+  return p;
+}
+
+static void AdoptInputDelay(const RollbackNet::HandoffPacket& host)
+{
+  Rollback& r = s_rb;
+  if (host.input_delay == 0)
+    return;  // an older proposal without a delay: keep ours
+  const u32 before = r.net_delay;
+  r.net_delay = std::min<u32>(host.input_delay, 8);
+  Log("input delay {} for this match, from player 0 (worst link: one-way {:.1f} ms, jitter "
+      "{:.1f} ms); local setting {}, was {}",
+      r.net_delay, host.delay_one_way_dms / 10.0, host.delay_jitter_dms / 10.0,
+      r.net_delay_auto ? "auto" : "fixed", before);
+  NSRTelemetry::Event(NSRTelemetry::EventKind::Note, s_rb.tick_running,
+                      {NSRTelemetry::Int("input_delay", r.net_delay),
+                       NSRTelemetry::Int("one_way_dms", host.delay_one_way_dms),
+                       NSRTelemetry::Int("jitter_dms", host.delay_jitter_dms),
+                       NSRTelemetry::Int("auto", r.net_delay_auto ? 1 : 0)},
+                      "match input delay");
+}
+
 // Exchange and compare the canonical state digest (RbStateDigest, a full
 // one-off hash of RAM here) and the config fingerprint at an agreed absolute
 // frame.  This is a host-side barrier: no guest time advances while waiting,
@@ -6418,8 +6528,13 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
                              s_rb.session_generation * 2 - 1;
   const u32 sync_clock = PowerPC::MMU::HostRead<u32>(guard, VI_POST_COUNTER);
   const u32 sync_aux_clock = PowerPC::MMU::HostRead<u32>(guard, TRANSITION_AUX_CLOCK);
+  // fix/audio2: player 0 proposes the epoch's input delay; everyone adopts it.
+  const DelayProposal delay = kind == RollbackNet::HandoffKind::EnterRollback && s.me == 0 ?
+                                  ProposeInputDelay() :
+                                  DelayProposal{};
   OpenHandoffBarrier({static_cast<u8>(s.players), static_cast<u8>(s.me), kind, transition, frame,
-                      semantic, config, sync_clock, sync_aux_clock});
+                      semantic, config, sync_clock, sync_aux_clock, delay.delay,
+                      delay.one_way_dms, delay.jitter_dms});
   SendHandoff();
   const auto start = std::chrono::steady_clock::now();
   auto last_send = start;
@@ -6478,6 +6593,8 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
   Log("handoff {} transition {} agreed at frame {} state digest {:016x} host clock {}",
       kind == RollbackNet::HandoffKind::EnterRollback ? "entry" : "leave", transition, frame,
       semantic, *agreed_clock);
+  if (kind == RollbackNet::HandoffKind::EnterRollback)
+    AdoptInputDelay(*s_rb_handoff->HostProposal());  // fix/audio2
   s_rb_previous_handoff = s_rb_handoff;
   s_rb_handoff.reset();
   return true;
@@ -6670,6 +6787,15 @@ static bool RbNetworkPreflight(u32 live)
     T::SetGauge(T::Gauge::FrameAdvantage, s_rb_exchange->FrameAdvantage(live));
     T::SetGauge(T::Gauge::InputDelay, r.net_delay);
     T::SetGauge(T::Gauge::MaxPrediction, r.max_prediction);
+    if (live % 60 == 0)  // fix/audio2: mixer underruns/overflows (audio thread counters)
+    {
+      if (const auto* stream = Core::System::GetInstance().GetSoundStream())
+      {
+        const auto a = stream->GetMixer()->GetNSRDMAStats();
+        T::SetGauge(T::Gauge::AudioGapFills, static_cast<double>(a[0]));
+        T::SetGauge(T::Gauge::AudioSkips, static_cast<double>(a[2]));
+      }
+    }
     if (const u32 confirmed = s_rb_exchange->ConfirmedThrough();
         confirmed != RollbackNet::NO_FRAME && confirmed <= live)
       T::Observe(T::Hist::PredictionFrames, live - confirmed);
@@ -7358,12 +7484,18 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
           static_cast<double>(s_digest.direct) / s_digest.digests,
           static_cast<double>(s_digest.reused) / s_digest.digests, s_digest.excluded.size());
     Log("tick {}: rollbacks {}, re-simulated {}, mismatched checks {}/{}; audio gate: "
-        "recorded {}, replayed {}, mismatched {}; load barriers {} (clamped {}, in re-sim {}); "
+        "recorded {}, replayed {}, mismatched {}, re-run {} (handle differs {}); load barriers {} "
+        "(clamped {}, in re-sim {}); "
         "io-idle skips {}; mispredictions {} (uncorrectable {}); net stalls {} sync waits {}",
         t, r.rollbacks, r.resim_ticks, r.mismatched_checks, r.checks, r.gate_recorded,
-        r.gate_replayed, r.gate_mismatched, r.barrier_events, r.clamped, r.barrier_resim,
+        r.gate_replayed, r.gate_mismatched, r.gate_rerun, r.gate_rerun_differs, r.barrier_events, r.clamped, r.barrier_resim,
         r.skipped_busy, r.mispredictions, r.uncorrectable, r.net_stalls, r.sync_waits);
     AramRingReport(fmt::format("tick {}", t).c_str());  // final-review M1
+    {
+      const NSRAudio::Stats a = NSRAudio::GetStats();  // fix/audio2
+      Log("host audio: re-simulated units {}, AX frames target {} achieved {}, crossfades {}",
+          a.resim_units, a.target_ax, a.achieved_ax, a.fades);
+    }
     if (r.mismatched_checks > 0)
       RbReport(15);  // Dolphin is usually killed, not shut down: report as we go
     // Revisit NSR_RB_VMEM_BYTES if the game ever uses fake VMEM past it.
@@ -7630,8 +7762,12 @@ void ResimSpeed(const Core::CPUThreadGuard& guard, bool resim)
     const std::string v = Env("NSR_RB_RESIM_AUDIO_SPEED");
     return v.empty() ? factor : std::max(1.0f, std::strtof(v.c_str(), nullptr));
   }();
+  // fix/audio2: per re-simulated frame, the factor that runs as many AX
+  // frames as the frame ran live (NSRAudio::ResimAudioFactor; NSR_AUDIO_PACE=0
+  // keeps the fixed factor).
   if (audio_factor != 1.0f)
-    guard.GetSystem().GetSystemTimers().SetNSRSpeedFactor(resim ? audio_factor : 1.0f);
+    guard.GetSystem().GetSystemTimers().SetNSRSpeedFactor(
+        resim ? NSRAudio::ResimAudioFactor(audio_factor) : 1.0f);
   // Host time: re-simulated frames are never shown, so the GPU skips their
   // primitives (vertex loading and the backend's draw path: ~3 ms of host time
   // per frame even with the Null backend). Command parsing, register state,
@@ -7762,6 +7898,8 @@ void RollbackFrameHook(const Core::CPUThreadGuard& guard)
   ppc_state.gpr[3] = RbStep(guard, RB_PAD_BUF);
   s_hp_phase = r.in_resim ? 2 : 1;
   AudioClockFrameLog(guard);
+  if (r.in_unit)  // host audio pacing / diagnostics (fix/audio2); before ResimSpeed
+    NSRAudio::UnitBegin(r.tick_running, r.in_resim);
   ResimSpeed(guard, r.in_unit && r.in_resim);
   CostFrameStart(guard, step_start);
   TelemetryUnitStart(step_start);  // NSR telemetry
@@ -7792,6 +7930,8 @@ void RollbackFrameEndHook(const Core::CPUThreadGuard& guard)
   TelemetryUnitEnd(guard);  // NSR telemetry
   s_hp_phase = 0;
   ResimSpeed(guard, false);
+  if (NSRAudio::g_diag)  // NSR host audio diagnostics
+    NSRAudio::UnitEnd();
   r.in_unit = false;
   if (!r.vtime_on)
   {
@@ -8159,11 +8299,29 @@ void AudioGateHook(const Core::CPUThreadGuard& guard)
     return;  // npc unchanged: run the function
   const u32 entry = s_hook_pc;
   // The sound-start path (0x8026AAF0, called from fn_801F4050) is gated by
-  // default. Reissuing it during re-simulation made the audio heap diverge
-  // and eventually corrupted both this middleware and frontend transitions.
-  // NSR_RB_AUDIO_GATE=0 disables it for diagnostics; =addr,... gates exactly
-  // those entries. Gating every entry crashes (some return pointers or fill
-  // out-parameters in game memory that a skipped call leaves unwritten).
+  // default: a re-simulated call returns exactly what the live call returned
+  // (handle in r3), so game state never depends on how the audio engine's
+  // own state evolved on this machine. NSR_RB_AUDIO_GATE=0 disables it for
+  // diagnostics; =addr,... gates exactly those entries. Gating every entry
+  // crashes (some return pointers or fill out-parameters in game memory that
+  // a skipped call leaves unwritten).
+  //
+  // Re-run, not skip, when audio rolls back (fix/audio2; netplay always
+  // rolls audio back). The restore rewinds the audio engine (middleware, AX
+  // voices) to the snapshot, so a sound started by a live frame inside the
+  // re-simulated window no longer exists afterwards. Skipping the call then
+  // meant it was never started again: the player heard 1..depth frames of it
+  // and then silence (Mason's 2026-10-22 session: 1,821 of 4,271 sound
+  // starts replayed this way; touchdown and other event sounds cut). Now the
+  // same call (same arguments) runs for real against the rewound engine, so
+  // the voice exists again and plays on from where it was heard, once; its
+  // recorded results are still what the game sees (AudioGateReturnHook), so
+  // game state is exactly as with a skip. A call whose arguments differ from
+  // the live tick's (the corrected inputs made a different sound) is a
+  // mismatch and runs normally, as before. With audio kept live
+  // (single-machine diagnostics without NSR_RB_AUDIO_ROLLBACK) the live voice
+  // survives the restore, so the call is still skipped there.
+  // NSR_RB_AUDIO_RERUN=0 restores the skip everywhere (diagnostics).
   const auto& only = r.config.audio_gate_only;
   const auto& effects = r.config.effect_gates;
   if (!only.empty() && std::find(only.begin(), only.end(), entry) == only.end() &&
@@ -8173,7 +8331,12 @@ void AudioGateHook(const Core::CPUThreadGuard& guard)
   {
     auto& log = r.gate_log[r.tick_running];
     r.gate_pending.push_back({LR(ppc), r.tick_running, log.size()});
-    log.push_back({entry});
+    Rollback::GateCall call;
+    call.entry = entry;
+    call.a3 = ppc.gpr[3];
+    call.a4 = ppc.gpr[4];
+    call.af1 = ppc.ps[1].PS0AsU64();
+    log.push_back(call);
     LR(ppc) = RB_GATE_RETURN;  // record the result when it returns
     ++r.gate_recorded;
     return;
@@ -8181,8 +8344,17 @@ void AudioGateHook(const Core::CPUThreadGuard& guard)
   const auto it = r.gate_log.find(r.tick_running);
   const size_t k = r.gate_index++;
   if (it != r.gate_log.end() && k < it->second.size() && it->second[k].entry == entry &&
-      it->second[k].done)
+      it->second[k].done && it->second[k].a3 == ppc.gpr[3] && it->second[k].a4 == ppc.gpr[4] &&
+      it->second[k].af1 == ppc.ps[1].PS0AsU64())
   {
+    static const bool rerun_on = Env("NSR_RB_AUDIO_RERUN") != "0";
+    if (entry == SOUND_START_ENTRY && r.audio_rollback && rerun_on)
+    {
+      r.gate_pending.push_back({LR(ppc), r.tick_running, k, true});
+      LR(ppc) = RB_GATE_RETURN;  // run it; the return hook restores the recorded results
+      ++r.gate_rerun;
+      return;
+    }
     const auto& c = it->second[k];
     ppc.gpr[3] = c.r3;
     ppc.gpr[4] = c.r4;
@@ -8205,7 +8377,18 @@ void AudioGateReturnHook(const Core::CPUThreadGuard& guard)
   }
   const auto p = r.gate_pending.back();
   r.gate_pending.pop_back();
-  if (const auto it = r.gate_log.find(p.tick); it != r.gate_log.end() && p.index < it->second.size())
+  if (const auto it = r.gate_log.find(p.tick);
+      p.rerun && it != r.gate_log.end() && p.index < it->second.size())
+  {
+    // Re-run sound start (see AudioGateHook): the game sees the live results.
+    const auto& c = it->second[p.index];
+    if (ppc.gpr[3] != c.r3)
+      ++r.gate_rerun_differs;
+    ppc.gpr[3] = c.r3;
+    ppc.gpr[4] = c.r4;
+    ppc.ps[1].SetPS0(c.f1);
+  }
+  else if (it != r.gate_log.end() && !p.rerun && p.index < it->second.size())
   {
     auto& c = it->second[p.index];
     c.r3 = ppc.gpr[3];
@@ -9593,6 +9776,8 @@ void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
   r.gate_index = 0;
   r.gate_replayed = 0;
   r.gate_mismatched = 0;
+  r.gate_rerun = 0;
+  r.gate_rerun_differs = 0;
   r.gate_recorded = 0;
   r.pads.clear();
   r.counters.clear();
@@ -9615,6 +9800,7 @@ void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
     RbDigestEpochKey((u64{s_rb_exchange->Session()} << 32) ^ s_rb_exchange->Config());
   }
   AramRingSession(guard.GetSystem(), true);  // ARAM replay ring (final-review M1)
+  NSRAudio::SessionReset();  // host audio pacing (fix/audio2)
   s_ac_pending.clear();
   s_ac_real.clear();
   s_ac_sfx_start = {};

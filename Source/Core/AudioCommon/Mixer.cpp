@@ -551,6 +551,7 @@ bool Mixer::MixerFifo::Dequeue(Granule* granule)
     // Jump the playhead to half the queue size behind the head.
     const std::size_t gap = (granule_queue_size >> 1) + 1;
     tail = (head - gap) & GRANULE_QUEUE_MASK;
+    m_nsr_skips.fetch_add(1, std::memory_order_relaxed);
   }
 
   // Checks to see if the queue is empty.
@@ -569,9 +570,11 @@ bool Mixer::MixerFifo::Dequeue(Granule* granule)
       bool looping = m_queue_looping.load(std::memory_order_relaxed);
       m_queue_fading.store(looping, std::memory_order_relaxed);
       m_queue_looping.store(true, std::memory_order_relaxed);
+      m_nsr_gap_fills.fetch_add(1, std::memory_order_relaxed);
     }
     else
     {
+      m_nsr_silent.fetch_add(1, std::memory_order_relaxed);
       std::fill(granule->begin(), granule->end(), StereoPair{0.0f, 0.0f});
       m_queue_fading.store(false, std::memory_order_relaxed);
       m_queue_looping.store(false, std::memory_order_relaxed);

@@ -16,7 +16,7 @@ namespace NSRNetplay::RollbackNet
 namespace
 {
 constexpr std::size_t HEADER_SIZE = 96;
-constexpr std::size_t HANDOFF_SIZE = 33 + 8 * CONFIG_FIELDS;
+constexpr std::size_t HANDOFF_SIZE = 38 + 8 * CONFIG_FIELDS;
 constexpr double FRAME_US = 16683.0;
 constexpr std::uint32_t MAX_TIMING_RTT_US = 2'000'000;
 constexpr std::size_t MIN_TIMING_SAMPLES = 6;
@@ -97,6 +97,9 @@ std::vector<std::uint8_t> EncodeHandoff(const HandoffPacket& packet)
     Put(out, value);
   Put(out, packet.sync_clock);
   Put(out, packet.sync_aux_clock);
+  Put(out, packet.input_delay);
+  Put(out, packet.delay_one_way_dms);
+  Put(out, packet.delay_jitter_dms);
   return out;
 }
 
@@ -129,7 +132,9 @@ std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes)
     if (!Get(bytes, at, &value))
       return std::nullopt;
   }
-  if (!Get(bytes, at, &packet.sync_clock) || !Get(bytes, at, &packet.sync_aux_clock))
+  if (!Get(bytes, at, &packet.sync_clock) || !Get(bytes, at, &packet.sync_aux_clock) ||
+      !Get(bytes, at, &packet.input_delay) || !Get(bytes, at, &packet.delay_one_way_dms) ||
+      !Get(bytes, at, &packet.delay_jitter_dms))
     return std::nullopt;
   packet.kind = static_cast<HandoffKind>(kind);
   return packet;
@@ -138,15 +143,19 @@ std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes)
 HandoffAgreement::HandoffAgreement(std::uint8_t players, std::uint8_t me, HandoffKind kind,
                                    std::uint32_t transition, std::uint32_t frame,
                                    std::uint64_t semantic_hash, const ConfigFingerprint& config,
-                                   std::uint32_t sync_clock, std::uint32_t sync_aux_clock)
+                                   std::uint32_t sync_clock, std::uint32_t sync_aux_clock,
+                                   std::uint8_t input_delay, std::uint16_t delay_one_way_dms,
+                                   std::uint16_t delay_jitter_dms)
     : m_players(std::clamp<std::uint8_t>(players, 2, static_cast<std::uint8_t>(MAX_PLAYERS))),
       m_me(std::min<std::uint8_t>(me, m_players - 1)),
-      m_local{m_me, m_players, kind, transition, frame, semantic_hash, config, sync_clock,
-              sync_aux_clock}
+      m_local{m_me,       m_players,      kind,           transition,        frame,
+              semantic_hash, config,      sync_clock,     sync_aux_clock,    input_delay,
+              delay_one_way_dms, delay_jitter_dms}
 {
   m_seen[m_me] = true;
   m_sync_clocks[m_me] = sync_clock;
   m_sync_aux_clocks[m_me] = sync_aux_clock;
+  m_proposals[m_me] = m_local;
 }
 
 bool HandoffAgreement::Accept(const HandoffPacket& packet)
@@ -175,7 +184,8 @@ bool HandoffAgreement::Accept(const HandoffPacket& packet)
   // different player-0 baselines after reordering.
   if (m_seen[packet.sender] &&
       (m_sync_clocks[packet.sender] != packet.sync_clock ||
-       m_sync_aux_clocks[packet.sender] != packet.sync_aux_clock))
+       m_sync_aux_clocks[packet.sender] != packet.sync_aux_clock ||
+       m_proposals[packet.sender].input_delay != packet.input_delay))
   {
     if (!m_mismatch)
       m_mismatch = packet;
@@ -184,7 +194,27 @@ bool HandoffAgreement::Accept(const HandoffPacket& packet)
   m_seen[packet.sender] = true;
   m_sync_clocks[packet.sender] = packet.sync_clock;
   m_sync_aux_clocks[packet.sender] = packet.sync_aux_clock;
+  m_proposals[packet.sender] = packet;
   return true;
+}
+
+std::optional<HandoffPacket> HandoffAgreement::HostProposal() const
+{
+  if (!m_seen[0])
+    return std::nullopt;
+  return m_proposals[0];
+}
+
+std::uint8_t AutoInputDelay(double one_way_ms, double jitter_ms, const AutoDelayRule& rule)
+{
+  const double frame_ms = FRAME_US / 1000.0;
+  const double need = (std::max(0.0, one_way_ms - rule.one_way_bias_ms) +
+                       rule.jitter_weight * std::max(0.0, jitter_ms)) /
+                      frame_ms;
+  const double frames = std::ceil(need - rule.predict_frames - 1e-9);
+  const double clamped =
+      std::clamp(frames, static_cast<double>(rule.min_delay), static_cast<double>(rule.max_delay));
+  return static_cast<std::uint8_t>(clamped);
 }
 
 bool HandoffAgreement::Complete() const
@@ -222,11 +252,10 @@ std::optional<HandoffPacket> HandoffAgreement::Proposal(std::uint8_t player) con
 {
   if (Mismatched() || player >= m_players || !m_seen[player])
     return std::nullopt;
-  HandoffPacket packet = m_local;
-  packet.sender = player;
-  packet.sync_clock = m_sync_clocks[player];
-  packet.sync_aux_clock = m_sync_aux_clocks[player];
-  return packet;
+  // The stored packet is the participant's exact proposal, including its
+  // own input-delay fields (handoff v5, fix/audio2); rebuilding it from the
+  // local tuple would relay player 0's delay under another sender's id.
+  return m_proposals[player];
 }
 
 std::vector<std::uint8_t> Encode(const Packet& packet)

@@ -29,13 +29,15 @@ constexpr std::uint32_t HANDOFF_MAGIC = 0x4E535248;  // 'NSRH'
 // carry the full ConfigFingerprint.  HANDOFF_VERSION 3 (rc1regress): proposals
 // also carry the sender's VI retrace counter (sync_clock). HANDOFF_VERSION 4
 // adds the second retrace-derived clock needed to normalize a completed
-// match's teardown state before the next entry digest. Mixed builds
+// match's teardown state before the next entry digest. HANDOFF_VERSION 5
+// (fix/audio2): entry proposals carry player 0's rollback input delay
+// (automatic or fixed) and the link RTT it was chosen from. Mixed builds
 // therefore fail to parse each other instead of comparing values that mean
 // different things.  VERSION 6 keeps frame-driven time, DVD completion and
 // audio modeling active during post-match lockstep; an older peer would run
 // that transition with incompatible lifecycle semantics.
 constexpr std::uint8_t VERSION = 6;
-constexpr std::uint8_t HANDOFF_VERSION = 4;
+constexpr std::uint8_t HANDOFF_VERSION = 5;
 constexpr std::size_t MAX_PLAYERS = 4;
 constexpr std::size_t PAD_SIZE = 12;
 constexpr std::size_t MAX_HISTORY = 64;
@@ -166,10 +168,47 @@ struct HandoffPacket
   // the same lockstep frame with host-scheduling-dependent counter values.
   std::uint32_t sync_clock = 0;
   std::uint32_t sync_aux_clock = 0;
+  // Rollback input delay for the epoch this entry starts (fix/audio2). Only
+  // player 0's value is used: every peer adopts it (HostInputDelay), so all
+  // players run the same delay whether it was set by hand or chosen
+  // automatically from the measured links (AutoInputDelay). 0 = no proposal
+  // (leave/clock barriers). Like the clocks, not part of agreement equality.
+  std::uint8_t input_delay = 0;
+  // The worst link the delay was chosen from (diagnostics, logged by every
+  // peer): one-way latency estimate and jitter, in tenths of a millisecond.
+  std::uint16_t delay_one_way_dms = 0;
+  std::uint16_t delay_jitter_dms = 0;
 };
 
 std::vector<std::uint8_t> EncodeHandoff(const HandoffPacket& packet);
 std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes);
+
+// Automatic rollback input delay (fix/audio2), chosen by player 0 before
+// each rollback epoch from the links it measured during the lockstep menus.
+// `one_way_ms`: the worst one-way input latency between any two players as
+// ENet reports it (half its smoothed RTT for a direct link; in a star, a
+// joiner's input reaches another joiner through the host, so half the sum of
+// both RTTs); `jitter_ms`: the worst ENet RTT variation of those links.
+//
+//   delay = clamp(ceil((one_way - bias + jitter_weight x jitter) / frame)
+//                 - predict_frames, min_delay, max_delay)
+//
+// bias: ENet acknowledges on its next host service, which NSR runs once per
+// frame on both ends, so its RTT reads ~16-20 ms above the path (proxy sweep
+// 2026-10-23: 20/40/70/110/150 ms paths read 40/60/90/128/170) and its
+// variance about twice the configured jitter; hence bias 8 ms one-way and
+// weight 1. predict_frames 1: one frame of latency is left to prediction, so
+// rollbacks stay ~1 frame deep (shallow and cheap with fix/audio2's audio)
+// while the delay stays at 1-2 frames up to ~70 ms RTT. Tuning table: NFLStreet
+// docs/research-log.md (2026-10-23).
+struct AutoDelayRule
+{
+  double one_way_bias_ms = 8.0;  // ENet scheduling overestimate, one way
+  double jitter_weight = 1.0;    // margin = weight x ENet RTT variance
+  double predict_frames = 1.0;   // latency rollback is allowed to absorb
+  std::uint8_t min_delay = 1, max_delay = 4;
+};
+std::uint8_t AutoInputDelay(double one_way_ms, double jitter_ms, const AutoDelayRule& rule = {});
 
 // HandoffAgreement is deliberately transport-free.  Each peer proposes the
 // same kind/frame/hash tuple and accepts duplicate, reordered announcements;
@@ -185,7 +224,9 @@ public:
   HandoffAgreement(std::uint8_t players, std::uint8_t me, HandoffKind kind,
                    std::uint32_t transition, std::uint32_t frame,
                    std::uint64_t semantic_hash, const ConfigFingerprint& config = {},
-                   std::uint32_t sync_clock = 0, std::uint32_t sync_aux_clock = 0);
+                   std::uint32_t sync_clock = 0, std::uint32_t sync_aux_clock = 0,
+                   std::uint8_t input_delay = 0, std::uint16_t delay_one_way_dms = 0,
+                   std::uint16_t delay_jitter_dms = 0);
 
   bool Accept(const HandoffPacket& packet);
   bool Complete() const;
@@ -201,6 +242,8 @@ public:
   // may retain a completed agreement to repair delivery to a lagging leaf
   // while the relay itself waits in the following barrier.
   std::optional<HandoffPacket> Proposal(std::uint8_t player) const;
+  // Player 0's proposal (input delay, link estimate) once seen.
+  std::optional<HandoffPacket> HostProposal() const;
 
 private:
   std::uint8_t m_players;
@@ -209,6 +252,7 @@ private:
   std::array<bool, MAX_PLAYERS> m_seen{};
   std::array<std::uint32_t, MAX_PLAYERS> m_sync_clocks{};
   std::array<std::uint32_t, MAX_PLAYERS> m_sync_aux_clocks{};
+  std::array<HandoffPacket, MAX_PLAYERS> m_proposals{};
   std::optional<HandoffPacket> m_mismatch;
   std::optional<HandoffPacket> m_config_mismatch;
 };
