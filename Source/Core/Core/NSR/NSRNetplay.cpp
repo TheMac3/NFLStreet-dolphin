@@ -760,7 +760,12 @@ void HandleBootPacket(const ENetPacket* packet, u32 source)
 void AcceptHandoff(const RollbackNet::HandoffPacket& decoded, std::span<const u8> bytes)
 {
   Session& s = s_session;
-  if (!s_rb_handoff || !s_rb_handoff->Accept(decoded))
+  if (!s_rb_handoff)
+    return;
+  // lifecycle3: relay a proposal only the first time it is accepted; ENet
+  // delivers that reliable relay, and duplicates must not re-flood it.
+  const bool fresh = (s_rb_handoff->SeenMask() & (1U << decoded.sender)) == 0;
+  if (!s_rb_handoff->Accept(decoded) || !fresh)
     return;
   if (s.star && s.me == 0)
   {
@@ -1251,21 +1256,34 @@ void SendRollbackLatest(u32 live_frame)
 // Broadcast the current transition and the one completed phase retained for
 // lagging peers. Reliable delivery plus application retransmission lets a
 // star leaf recover relayed proposals while the hub waits in the next phase.
-void SendHandoff()
+//
+// lifecycle3: only the first announcement of the current proposal is
+// reliable; the 8 ms repeats and the previous-phase repair copies are
+// unsequenced datagrams.  Every repeat used to be another reliable packet
+// (and every accepted duplicate another reliable relay from the hub), so a
+// barrier queued hundreds of reliable packets per second on channel 0.  With
+// the post-match RTT estimates inflated to ~0.6-1.2 s, one lost datagram
+// held that whole ordered backlog for ENet's backed-off retransmission:
+// four-player seed 3918529284, the leaf that completed the entry barrier
+// had its proposal stuck behind it and the hub timed out (heard 0xd).
+// Unsequenced repeats cannot be blocked behind a lost one.
+void SendHandoff(bool repeat)
 {
   Session& s = s_session;
   if (!s_rb_handoff || !s.host)
     return;
-  const auto send = [&](const RollbackNet::HandoffPacket& proposal) {
+  const auto send = [&](const RollbackNet::HandoffPacket& proposal, bool reliable) {
     const std::vector<u8> bytes = RollbackNet::EncodeHandoff(proposal);
     for (u32 i = 0; i < s.players; ++i)
     {
       if (i != s.me && i != proposal.sender && Linked(i))
         enet_peer_send(s.peers[i], 0,
-                       enet_packet_create(bytes.data(), bytes.size(), ENET_PACKET_FLAG_RELIABLE));
+                       enet_packet_create(bytes.data(), bytes.size(),
+                                          reliable ? ENET_PACKET_FLAG_RELIABLE :
+                                                     ENET_PACKET_FLAG_UNSEQUENCED));
     }
   };
-  send(s_rb_handoff->Local());
+  send(s_rb_handoff->Local(), !repeat);
   if (s_rb_previous_handoff)
   {
     // A star host must keep forwarding *all* accepted previous proposals,
@@ -1276,11 +1294,11 @@ void SendHandoff()
     {
       for (u8 player = 0; player < s.players; ++player)
         if (const auto proposal = s_rb_previous_handoff->Proposal(player))
-          send(*proposal);
+          send(*proposal, false);
     }
     else
     {
-      send(s_rb_previous_handoff->Local());
+      send(s_rb_previous_handoff->Local(), false);
     }
   }
   enet_host_flush(s.host);
@@ -6535,7 +6553,7 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
   OpenHandoffBarrier({static_cast<u8>(s.players), static_cast<u8>(s.me), kind, transition, frame,
                       semantic, config, sync_clock, sync_aux_clock, delay.delay,
                       delay.one_way_dms, delay.jitter_dms});
-  SendHandoff();
+  SendHandoff(false);
   const auto start = std::chrono::steady_clock::now();
   auto last_send = start;
   while (!s_rb_handoff->Complete() && !s_rb_handoff->Mismatched() && !s.failed)
@@ -6544,7 +6562,7 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
     const auto now = std::chrono::steady_clock::now();
     if (now - last_send >= std::chrono::milliseconds(8))
     {
-      SendHandoff();
+      SendHandoff(true);
       // fix/lifecycle: keep re-sending the input history too.  A peer still
       // one frame short of this barrier needs the last inputs; they travel
       // unreliably, and a barrier host wait used to stop their redundancy
@@ -6619,7 +6637,7 @@ static bool HandoffClockBarrier(const Core::CPUThreadGuard& guard, u32 frame, u3
   OpenHandoffBarrier({static_cast<u8>(s.players), static_cast<u8>(s.me),
                       RollbackNet::HandoffKind::SyncClocks, transition, frame, 0, config,
                       sync_clock, sync_aux_clock});
-  SendHandoff();
+  SendHandoff(false);
   const auto start = std::chrono::steady_clock::now();
   auto last_send = start;
   while (!s_rb_handoff->Complete() && !s_rb_handoff->Mismatched() && !s.failed)
@@ -6628,7 +6646,7 @@ static bool HandoffClockBarrier(const Core::CPUThreadGuard& guard, u32 frame, u3
     const auto now = std::chrono::steady_clock::now();
     if (now - last_send >= std::chrono::milliseconds(8))
     {
-      SendHandoff();
+      SendHandoff(true);
       // fix/lifecycle: keep re-sending the input history too.  A peer still
       // one frame short of this barrier needs the last inputs; they travel
       // unreliably, and a barrier host wait used to stop their redundancy
