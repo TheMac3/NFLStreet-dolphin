@@ -837,8 +837,19 @@ class Launcher:
             self._stats_wake.wait(gamestats.INTERVAL_S)
             self._stats_wake.clear()
 
-    def startup(self) -> None:
+    def _startup_checks(self) -> None:
         self.check_game()
+        # One-click start: a missing or outdated game copy is built right away
+        # from the Reborn install we can find (what "Find Reborn automatically"
+        # does), so players never need to run the separate patcher first. If
+        # Reborn can't be found, the Game card still asks them to browse.
+        game = self.state["game"]
+        if game.get("state") in ("missing", "stale") and not game.get("busy"):
+            log(self.folder, f"startup: game copy {game.get('state')}; building it automatically")
+            self.find_game()
+
+    def startup(self) -> None:
+        self._spawn(self._startup_checks)
         self.sync_controllers()
         self._loop_spawn(self._stats_loop)
 
