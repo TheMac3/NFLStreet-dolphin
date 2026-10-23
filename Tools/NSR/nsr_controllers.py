@@ -20,6 +20,12 @@ axes. This module:
     local port 0");
   * copies Reborn's GCPad profiles into User/Config/Profiles/GCPad so they show
     up in our Dolphin's controller window;
+  * carries the port device choice (SIDevice0-3: standard controller 6, or
+    12 = GameCube controllers on a Wii U / Mayflash USB adapter) into our
+    Dolphin.ini, and controller_kind() turns it plus the [GCPad1] mapping into
+    the player's controller kind (gc-adapter, xbox, playstation, keyboard,
+    ...) for the launcher; see controller_kind for why an adapter player still
+    boots a standard controller;
   * carries [SDL_Hints] and the input-related Dolphin.ini keys into our
     Dolphin.ini. Upstream Dolphin (our fork) hard-codes its SDL hints and has
     no [SDL_Hints] section, but SDL3 lets an environment variable override a
@@ -57,9 +63,15 @@ BACKUP_SUFFIX = ".before-reborn-import"
 PORTS = 4
 
 # Dolphin.ini keys that only affect input, copied from Reborn's Dolphin.ini.
-# [SDL_Hints] is copied whole (only SDL_* names; see sdl_hint_env).
+# [SDL_Hints] is copied whole (only SDL_* names; see sdl_hint_env). SIDevice0-3
+# record which port uses the USB adapter; game launches still pass every
+# port's device explicitly (nsr_launcher.dolphin_command), so the stored value
+# only feeds controller_kind and our Dolphin's controller window.
 INPUT_KEYS = [("Input", "BackgroundInput")] + [
-    ("Core", f"{name}{port}") for port in range(PORTS) for name in ("AdapterRumble", "SimulateKonga")]
+    ("Core", f"{name}{port}") for port in range(PORTS)
+    for name in ("SIDevice", "AdapterRumble", "SimulateKonga")]
+SI_STANDARD = 6       # SerialInterface::SIDEVICE_GC_CONTROLLER
+SI_WIIU_ADAPTER = 12  # SerialInterface::SIDEVICE_WIIU_ADAPTER
 SDL_SECTION = "SDL_Hints"
 _SDL_NAME = re.compile(r"^SDL_[A-Z0-9_]{1,64}$")
 
@@ -362,6 +374,30 @@ def _copy_profiles(source: RebornSource, our_user_dir: str, overwrite: bool) -> 
     return copied
 
 
+def input_digest(dolphin_ini_text: str | None) -> str | None:
+    """Hash of the INPUT_KEYS values in a Dolphin.ini (what the sync manages)."""
+    sections = parse_ini(dolphin_ini_text or "")
+    values = [f"{sec}.{key}={get_value(get_section(sections, sec), key)}" for sec, key in INPUT_KEYS]
+    return text_hash("\n".join(values))
+
+
+def _merge_dolphin_ini(our_user_dir: str, source: RebornSource, record: dict, force: bool) -> None:
+    """Carry Reborn's input keys into our Dolphin.ini, under the same
+    don't-overwrite rule as the mapping: if the player changed them in our
+    Dolphin since the last sync (e.g. set Port 1 to the USB adapter in our
+    controller window), keep theirs unless forced. record["input_written"]
+    remembers what we wrote."""
+    dini_path = os.path.join(our_user_dir, "Config", DOLPHIN_INI)
+    ours = read_text(dini_path)
+    written = record.get("input_written")
+    if not force and written and input_digest(ours) != written:
+        return
+    merged = merge_input_settings(ours, read_text(source.dolphin_ini) if source.dolphin_ini else None)
+    if merged is not None and merged != ours:
+        write_text(dini_path, merged)
+    record["input_written"] = input_digest(merged if merged is not None else ours)
+
+
 def sync_controllers(our_user_dir: str, source: RebornSource | None, record: dict | None,
                      force: bool = False) -> SyncResult:
     """Bring Reborn's controller setup into our Dolphin (see module docstring).
@@ -389,6 +425,12 @@ def sync_controllers(our_user_dir: str, source: RebornSource | None, record: dic
         return SyncResult("kept-yours", record,
                           "Using the mapping you made in NFLStreetRollback's controller setup.")
     elif ours_hash == wanted_hash:
+        # Same mapping, but the port device (e.g. switching to the USB adapter,
+        # which needs no mapping) lives in Dolphin.ini: keep that in step too.
+        try:
+            _merge_dolphin_ini(our_user_dir, source, record, force)
+        except OSError as e:
+            return SyncResult("error", record, f"Couldn't write the controller settings: {e}")
         return SyncResult("up-to-date", record, "Using your Reborn controller settings.")
     else:
         action = "updated"
@@ -399,11 +441,7 @@ def sync_controllers(our_user_dir: str, source: RebornSource | None, record: dic
             backup = ours_path + BACKUP_SUFFIX
             write_text(backup, ours)
         write_text(ours_path, wanted)
-        dini_path = os.path.join(our_user_dir, "Config", DOLPHIN_INI)
-        merged = merge_input_settings(read_text(dini_path),
-                                      read_text(source.dolphin_ini) if source.dolphin_ini else None)
-        if merged is not None:
-            write_text(dini_path, merged)
+        _merge_dolphin_ini(our_user_dir, source, record, force)
     except OSError as e:
         return SyncResult("error", record, f"Couldn't write the controller settings: {e}")
     profiles = _copy_profiles(source, our_user_dir, overwrite=force or action == "first-import")
@@ -421,9 +459,9 @@ BINDINGS = [("Buttons/A", "A"), ("Buttons/B", "B"), ("Buttons/X", "X"), ("Button
             ("C-Stick/Right", "C right"), ("D-Pad/Up", "D-pad up"), ("D-Pad/Down", "D-pad down"),
             ("D-Pad/Left", "D-pad left"), ("D-Pad/Right", "D-pad right")]
 
-_FAMILIES = [("wireless controller", "PlayStation 4 controller"), ("ps4", "PlayStation 4 controller"),
+_FAMILIES = [("xbox", "Xbox controller"), ("xinput", "Xbox controller"),  # before "wireless controller"
+             ("wireless controller", "PlayStation 4 controller"), ("ps4", "PlayStation 4 controller"),
              ("dualsense", "PlayStation 5 controller"), ("ps5", "PlayStation 5 controller"),
-             ("xbox", "Xbox controller"), ("xinput", "Xbox controller"),
              ("pro controller", "Switch Pro controller"), ("switch", "Switch Pro controller"),
              ("gamecube", "GameCube controller"), ("keyboard", "Keyboard")]
 
@@ -440,6 +478,75 @@ def describe_device(device: str | None) -> dict:
     return {"device": device, "backend": backend, "name": name, "family": family}
 
 
+# --- the player's controller kind (what port 1 reads) -----------------------------
+# Kinds, by the mapping's device string (backend/index/name as Dolphin writes it):
+# first match wins ("Xbox Wireless Controller" is an Xbox pad, plain "Wireless
+# Controller" is how DInput names a DualShock 4 / DualSense).
+_KINDS = [("xbox", "xbox"), ("xinput", "xbox"), ("dualsense", "playstation"),
+          ("ps5", "playstation"), ("dualshock", "playstation"), ("ps4", "playstation"),
+          ("ps3", "playstation"), ("playstation", "playstation"),
+          ("wireless controller", "playstation"), ("pro controller", "switch"),
+          ("switch", "switch"), ("keyboard", "keyboard"), ("gamecube", "gamecube-pc")]
+
+
+@dataclass
+class PadKind:
+    kind: str                  # gc-adapter | xbox | playstation | switch | keyboard | gamecube-pc | gamepad | none
+    device: str                # [GCPad1] Device, or "GCAdapter/<port>" for the adapter
+    adapter_channel: int | None = None  # adapter port 0-3 (gc-adapter only)
+
+    def env(self) -> dict[str, str]:
+        """Environment for the fork: NSR_PAD_ADAPTER turns on its adapter
+        source; NSR_PAD_KIND/NSR_PAD_DEVICE are only logged (nsr-p*.log)."""
+        env = {"NSR_PAD_KIND": self.kind,
+               "NSR_PAD_DEVICE": "".join(c for c in self.device if c.isprintable())[:96]}
+        if self.adapter_channel is not None:
+            env["NSR_PAD_ADAPTER"] = str(self.adapter_channel)
+        return env
+
+
+def kind_of_device(device: str | None) -> str:
+    if not device:
+        return "none"
+    backend, _, rest = device.partition("/")
+    low = f"{backend} {rest}".lower()
+    return next((k for key, k in _KINDS if key in low), "gamepad")
+
+
+def _si_device(core: list | None, port: int) -> int | None:
+    try:
+        return int(get_value(core, f"SIDevice{port}") or "")
+    except ValueError:
+        return None
+
+
+def controller_kind(our_user_dir: str) -> PadKind:
+    """The player's controller for port 1, from our (imported) Dolphin.ini and
+    GCPadNew.ini, in Reborn's precedence: port 1's adapter, else port 1's
+    mapping, else the first other port set to the adapter.
+
+    An adapter player is still booted as a standard controller (SIDevice 6):
+    the stock adapter device (12) is visible to the game (it answers "no
+    controller" while the adapter port is empty and makes the game re-read the
+    pad's resting position into its own memory on one PC only), so netplay
+    peers would no longer run identical games. The fork instead reads the
+    adapter host-side as port 1's input (NSR_PAD_ADAPTER; fork
+    Core/NSR/NSRPadSource.h), the same way it reads a mapped Xbox pad."""
+    config = os.path.join(our_user_dir, "Config")
+    core = get_section(parse_ini(read_text(os.path.join(config, DOLPHIN_INI)) or ""), "Core")
+    pads = parse_ini(read_text(os.path.join(config, GCPAD_INI)) or "")
+    first = get_section(pads, "GCPad1")
+    device = get_value(first, "Device") or ""
+    if _si_device(core, 0) == SI_WIIU_ADAPTER:
+        return PadKind("gc-adapter", "GCAdapter/0", 0)
+    if _is_mapped(first):
+        return PadKind(kind_of_device(device), device)
+    for port in range(1, PORTS):
+        if _si_device(core, port) == SI_WIIU_ADAPTER:
+            return PadKind("gc-adapter", f"GCAdapter/{port}", port)
+    return PadKind(kind_of_device(device) if device else "none", device)
+
+
 def port1_summary(our_user_dir: str) -> dict:
     """What our Dolphin will use for port 1: device and the main bindings."""
     items = get_section(parse_ini(read_text(os.path.join(our_user_dir, "Config", GCPAD_INI)) or ""),
@@ -448,4 +555,10 @@ def port1_summary(our_user_dir: str) -> dict:
     info["bindings"] = [{"control": label, "input": (get_value(items, key) or "").replace("`", "")}
                         for key, label in BINDINGS]
     info["mapped"] = _is_mapped(items)
+    pad = controller_kind(our_user_dir)
+    info["kind"] = pad.kind
+    if pad.adapter_channel is not None:  # the adapter needs no mapping
+        info.update({"device": pad.device, "backend": "GCAdapter", "mapped": True,
+                     "name": f"USB adapter port {pad.adapter_channel + 1}",
+                     "family": f"GameCube controller (USB adapter port {pad.adapter_channel + 1})"})
     return info

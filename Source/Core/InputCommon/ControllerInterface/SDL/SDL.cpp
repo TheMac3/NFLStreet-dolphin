@@ -24,6 +24,7 @@
 
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
 #include "InputCommon/ControllerInterface/SDL/SDLGamepad.h"
+#include "InputCommon/GCAdapter.h"
 
 namespace ciface::SDL
 {
@@ -150,7 +151,8 @@ InputBackend::InputBackend(ControllerInterface* controller_interface)
   SDL_SetHint(SDL_HINT_JOYSTICK_DIRECTINPUT, "0");
 
   // Disable SDL's GC Adapter handling when we want to handle it ourselves.
-  bool is_gc_adapter_configured = false;
+  // NSR: also when the adapter feeds a standard controller (GCAdapter::NSRSourceChannel).
+  bool is_gc_adapter_configured = GCAdapter::NSRSourceChannel().has_value();
   for (int i = 0; i != SerialInterface::MAX_SI_CHANNELS; ++i)
   {
     if (Config::Get(Config::GetInfoForSIDevice(i)) == SerialInterface::SIDEVICE_WIIU_ADAPTER)
