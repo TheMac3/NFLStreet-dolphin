@@ -1809,8 +1809,52 @@ static void TestQuickstartNavigation()
   assert(stalled.Failed());
 }
 
+// fix/audio2: player 0's entry proposal carries the match input delay and
+// the link it was chosen from; it survives the wire, every peer can read it,
+// and a sender may not change it in a retransmission.
+static void TestHandoffInputDelay()
+{
+  RN::HandoffPacket host{0, 2, RN::HandoffKind::EnterRollback, 2, 1234, 0x77, {}, 5, 6, 3, 365,
+                         102};
+  const auto decoded = RN::DecodeHandoff(RN::EncodeHandoff(host));
+  assert(decoded && decoded->input_delay == 3 && decoded->delay_one_way_dms == 365 &&
+         decoded->delay_jitter_dms == 102);
+  RN::HandoffAgreement joiner(2, 1, RN::HandoffKind::EnterRollback, 2, 1234, 0x77, {}, 7, 8);
+  assert(!joiner.HostProposal());
+  assert(joiner.Accept(*decoded));
+  assert(joiner.Complete());
+  assert(joiner.HostProposal()->input_delay == 3);
+  RN::HandoffPacket changed = host;
+  changed.input_delay = 2;
+  assert(!joiner.Accept(changed));
+  assert(joiner.Mismatched());
+  RN::HandoffAgreement me0(2, 0, RN::HandoffKind::EnterRollback, 2, 1234, 0x77, {}, 5, 6, 2);
+  assert(me0.HostProposal()->input_delay == 2);
+}
+
+// The automatic delay rule on ENet readings: ceil((one-way - 8 + jitter) /
+// frame) - 1, in [1, 4]. Values are the proxy sweep's (2026-10-23) and
+// Mason's 2026-10-22 session (ENet RTT 72, variance ~8).
+static void TestAutoInputDelay()
+{
+  assert(RN::AutoInputDelay(0.0, 0.0) == 1);
+  assert(RN::AutoInputDelay(27.5, 9.0) == 1);    // 20 ms path
+  assert(RN::AutoInputDelay(36.5, 15.0) == 2);   // 40 ms path
+  assert(RN::AutoInputDelay(41.0, 9.0) == 2);    // 70 ms path
+  assert(RN::AutoInputDelay(36.0, 8.0) == 2);    // Mason's 73 ms link
+  assert(RN::AutoInputDelay(56.0, 8.0) == 3);    // 110 ms path, calm
+  assert(RN::AutoInputDelay(59.5, 16.0) == 4);   // 110 ms path, jittery
+  assert(RN::AutoInputDelay(79.0, 9.0) == 4);    // 150 ms path
+  assert(RN::AutoInputDelay(500.0, 50.0) == 4);  // clamped
+  RN::AutoDelayRule strict;
+  strict.predict_frames = 0.0;
+  assert(RN::AutoInputDelay(41.0, 9.0, strict) == 3);
+}
+
 int main()
 {
+  TestHandoffInputDelay();
+  TestAutoInputDelay();
   TestPadSourceAdapter();
   TestDraftLog();
   TestQuickstartNavigation();

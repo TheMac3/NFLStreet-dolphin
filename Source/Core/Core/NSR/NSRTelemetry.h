@@ -117,6 +117,12 @@ enum class Gauge : std::uint8_t
   InputDelay,          // configured local input delay (frames)
   MaxPrediction,       // configured prediction window (frames)
   RingSlots,           // snapshot ring size
+  // fix/audio2: the mixer's game-audio fifo since start (cumulative; a
+  // window's growth = last - min): granules replayed because emulation fell
+  // behind real time (Fill Audio Gaps; heard as stutter/"crunch") and queue
+  // overflows where audio was dropped.
+  AudioGapFills,
+  AudioSkips,
   Count
 };
 

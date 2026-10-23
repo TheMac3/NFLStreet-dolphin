@@ -81,11 +81,20 @@ import nsr_textures as textures  # noqa: E402
 
 APP_TITLE = "NFLStreetRollback"  # window title; user-facing product name
 CONFIG_NAME = "nsr-launcher.json"
-# Rollback input delay in frames, the same for every player (the host's
-# choice is sent to all). 1 is the tested release value (release plan 2.3:
-# "playtest fixed setting" until automatic delay exists); 0..MAX_DELAY offered.
-DEFAULT_DELAY = 1
+# Rollback input delay, the same for every player (the host's choice is sent
+# to all). AUTO_DELAY (the default) lets the host's Dolphin choose 1..4 frames
+# at every match start from the measured connection (fork fix/audio2:
+# NSR_RB_DELAY=auto, chosen by player 0 from ENet RTT/jitter and adopted by
+# every peer in the entry handoff); 1..MAX_DELAY fixes it. On the lobby and
+# room-server wire Auto travels as delay 0 (the deployed room server only
+# relays integers; 0 = "no delay" is no longer offered).
+AUTO_DELAY = 0
+DEFAULT_DELAY = AUTO_DELAY
 MAX_DELAY = 4
+# Saved choice (nsr-launcher.json). "rb_delay" (written by older launchers at
+# every start, usually the old default 1) is migrated once: 2..4 means the
+# player picked it, so it is kept; anything else becomes Auto.
+DELAY_CONFIG_KEY = "rb_delay_choice"
 # Lockstep input delay for the menus around rollback matches (stage 4), the
 # fork's default and what every stage-4 gate ran with. Menus wait on real
 # input each frame, so a larger value only smooths them; the host's choice
@@ -261,7 +270,7 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
             "NSR_PLAYERS": str(start.players),
             "NSR_PORT": str(lobby.PORT),
             "NSR_TOPOLOGY": "star",
-            "NSR_DELAY": str(start.delay),
+            "NSR_DELAY": str(start.delay or MENU_LOCKSTEP_DELAY),  # lockstep mode: Auto = 2
             "NSR_LOG": os.path.join(folder, f"nsr-p{start.player}.log"),
         })
         if start.mode == "rollback":
@@ -269,7 +278,7 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
             # the frame-keyed channel, so an operator-supplied epoch is both
             # unnecessary and unsafe here.
             env.update(ROLLBACK_ENV)
-            env["NSR_RB_DELAY"] = str(start.delay)
+            env["NSR_RB_DELAY"] = "auto" if start.delay == AUTO_DELAY else str(start.delay)
             env["NSR_DELAY"] = str(MENU_LOCKSTEP_DELAY)
             args += ["-C", "Dolphin.Core.FastDiscSpeed=True"]
         args += NETPLAY_AUDIO_ARGS
@@ -498,9 +507,9 @@ class Launcher:
             "telemetry": bool(cfg.get("telemetry", True)),
             "game_stats": {"enabled": bool(cfg.get("game_stats", True)), "state": "idle",
                            "text": "", "sent": 0, "pending": 0},
-            # "rb_delay", not the lockstep-era "delay" (2 by default), so an old
-            # config doesn't carry a lockstep value into rollback.
-            "delay": self._clamp_delay(cfg.get("rb_delay", DEFAULT_DELAY)),
+            # Not the lockstep-era "delay" (2 by default), so an old config
+            # doesn't carry a lockstep value into rollback. 0 = Auto.
+            "delay": self._saved_delay(cfg),
             "quickstart": (cfg.get("quickstart") if isinstance(cfg.get("quickstart"), str)
                            and cfg["quickstart"] in lobby.QUICKSTARTS else "manual"),
             "game_modes": lobby.QUICKSTARTS,
@@ -534,10 +543,18 @@ class Launcher:
 
     @staticmethod
     def _clamp_delay(value) -> int:
+        """0 (Auto) or 1..MAX_DELAY; "auto" and anything unreadable mean Auto."""
         try:
             return max(0, min(int(value), MAX_DELAY))
         except (TypeError, ValueError):
             return DEFAULT_DELAY
+
+    @classmethod
+    def _saved_delay(cls, cfg: dict) -> int:
+        if DELAY_CONFIG_KEY in cfg:
+            return cls._clamp_delay(cfg[DELAY_CONFIG_KEY])
+        old = cls._clamp_delay(cfg.get("rb_delay", AUTO_DELAY))  # pre-Auto launchers
+        return old if old >= 2 else AUTO_DELAY
 
     def _set(self, section: str | None = None, **kw) -> None:
         with self._lock:
@@ -1102,7 +1119,7 @@ class Launcher:
                 self._set("host", state="open")
                 self.notify(str(e), "error")
                 return
-            self.cfg["rb_delay"] = delay
+            self.cfg[DELAY_CONFIG_KEY] = delay
             self._save()
             self._host = None
             self._set("host", state="idle", mode="", code="", players=[], can_start=False,
@@ -1395,11 +1412,19 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     b_ip = ttk.Button(hp, text="Host by IP address (advanced)", command=launcher.host_ip)
     for i, b in enumerate((b_open, b_start, b_close, b_ip)):
         b.grid(row=3, column=i, sticky="w", padx=(0, 6))
-    delay_var = tk.IntVar(value=launcher.state["delay"])
-    ttk.Label(hp, text="Input delay for everyone (frames; 1 suits most games, try 2 if it stutters):",
+    delay_names = ["Auto"] + [str(d) for d in range(1, MAX_DELAY + 1)]
+    delay_text = tk.StringVar(value=delay_names[launcher.state["delay"]])
+
+    class _DelayVar:  # start_game(delay_var.get()): 0 = Auto, else frames
+        @staticmethod
+        def get() -> int:
+            return delay_names.index(delay_text.get()) if delay_text.get() in delay_names else AUTO_DELAY
+    delay_var = _DelayVar()
+    ttk.Label(hp, text="Input delay for everyone (Auto picks 1-4 frames from the connection):",
               style="Muted.TLabel").grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
-    ttk.Spinbox(hp, from_=0, to=MAX_DELAY, textvariable=delay_var, width=4,
-                command=lambda: launcher.set_delay(delay_var.get())).grid(row=4, column=3, sticky="w", pady=(10, 0))
+    delay_box = ttk.Combobox(hp, values=delay_names, textvariable=delay_text, width=6, state="readonly")
+    delay_box.bind("<<ComboboxSelected>>", lambda _e: launcher.set_delay(delay_var.get()))
+    delay_box.grid(row=4, column=3, sticky="w", pady=(10, 0))
     ttk.Button(hp, text="Practice offline", command=launcher.play_offline).grid(row=5, column=0, sticky="w", pady=8)
 
     # Native fallback exposes the same selection; a created room locks it.

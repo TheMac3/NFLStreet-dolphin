@@ -53,6 +53,12 @@ public:
 
   void StartLogDSPAudio(const std::string& filename);
   void StopLogDSPAudio();
+  // NFLStreet: the DMA (game audio) fifo's {gap fills, silent, skips}.
+  std::array<u64, 3> GetNSRDMAStats() const
+  {
+    return {m_dma_mixer.m_nsr_gap_fills.load(), m_dma_mixer.m_nsr_silent.load(),
+            m_dma_mixer.m_nsr_skips.load()};
+  }
 
   // 54000000 doesn't work here as it doesn't evenly divide with 32000, but 108000000 does
   static constexpr u64 FIXED_SAMPLE_RATE_DIVIDEND = 54000000 * 2;
@@ -112,6 +118,12 @@ private:
     u32 GetInputSampleRateDivisor() const;
     void SetVolume(u32 lvolume, u32 rvolume);
     std::pair<s32, s32> GetVolume() const;
+
+    // NFLStreet netplay audio diagnostics (NSRAudio, NullSound's
+    // NSR_AUDIO_TAP): granules played again because the queue ran dry
+    // (Fill Audio Gaps), silent granules (gap fill off/paused), and queue
+    // overflows where the playhead jumped forward (audio dropped).
+    std::atomic<u64> m_nsr_gap_fills{0}, m_nsr_silent{0}, m_nsr_skips{0};
 
   private:
     Mixer* m_mixer;

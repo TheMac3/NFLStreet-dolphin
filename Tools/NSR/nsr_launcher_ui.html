@@ -252,11 +252,11 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
             <div class="note">Quickstart puts the host against the joiners, then you pick teams or draft. Practice uses this choice too. Manual keeps offline saves.</div>
           </div>
           <div class="row" style="margin-top:18px">
-            <div><div class="label" style="margin-bottom:6px">Input delay (frames, for everyone)</div><div class="seg" id="delaySeg"></div></div>
+            <div><div class="label" style="margin-bottom:6px">Input delay (for everyone)</div><div class="seg" id="delaySeg"></div></div>
             <div class="grow"></div>
             <button class="btn red big" id="btnStart" disabled>Start game</button>
           </div>
-          <div class="note">1 suits most games; try 2 if it stutters. The host's choice applies to everyone.</div>
+          <div class="note">Auto picks 1–4 frames from the connection at every match. Pick a number to fix it. The host's choice applies to everyone.</div>
           <div class="info" id="hostInfo"></div>
         </div>
         <div class="card players"><div class="ph"><h3>Players</h3><span class="faint" id="hostSlots">0 / 4</span></div><ol id="hostPlayers"></ol></div>
@@ -464,7 +464,7 @@ function render(s) {
   renderPlayers("hostPlayers", "hostSlots", h.players, 4);
   const seg = $("delaySeg");
   if (!seg.children.length) for (let d = 0; d <= s.max_delay; d++) {
-    const b = document.createElement("button"); b.textContent = String(d); b.dataset.d = d;
+    const b = document.createElement("button"); b.textContent = d === 0 ? "Auto" : String(d); b.dataset.d = d;
     b.onclick = () => { S.delay = d; call("set_delay", d); renderDelay(d); }; seg.append(b);
   }
   renderDelay(S.delay != null ? S.delay : s.delay);
