@@ -77,8 +77,8 @@ static void TestHandoffAgreement()
   assert(!agreement.Complete());
   assert(agreement.Accept(peer2));
   assert(agreement.Complete());
-  assert(agreement.HostClock() == 100);
-  assert(agreement.HostAuxClock() == 1000);
+  assert(agreement.HostClock() == 100u);
+  assert(agreement.HostAuxClock() == 1000u);
   // A retransmission may not change its sender's clock.
   RN::HandoffPacket moved = peer2;
   moved.sync_clock = 123;
@@ -89,8 +89,8 @@ static void TestHandoffAgreement()
                             122, 1220);
   assert(leaf.Accept(
       {0, 3, RN::HandoffKind::EnterRollback, 2, 1234, 0xaabbccdd, {}, 100, 1000}));
-  assert(leaf.HostClock() == 100);
-  assert(leaf.HostAuxClock() == 1000);
+  assert(leaf.HostClock() == 100u);
+  assert(leaf.HostAuxClock() == 1000u);
   assert(leaf.Accept(peer1));
   assert(leaf.Complete());
 
@@ -150,7 +150,7 @@ static void TestMispredictedPlayers()
   a.Assemble(101);
   assert(a.MispredictedPlayers(101) == 0);
   Deliver(b, &a, 101);
-  assert(a.PendingRollback() == 101 && a.MispredictedPlayers(101) == 0x2);
+  assert(a.PendingRollback() == 101u && a.MispredictedPlayers(101) == 0x2);
   assert(a.MispredictedPlayers(5) == 0);
 }
 
@@ -168,7 +168,7 @@ static void TestPredictionAndCorrection()
   a.Assemble(100);
   a.Assemble(101);  // player 1 is still predicted neutral
   Deliver(b, &a, 101);
-  assert(a.PendingRollback() == 101);
+  assert(a.PendingRollback() == 101u);
   a.BeginRollback();
   assert(!a.PendingRollback());
   assert(a.Assemble(101)[1] == right);
@@ -196,7 +196,7 @@ static void TestPredictionWindowAndAcks()
   const auto oldest = a.OldestUnackedLocal();
   assert(oldest && *oldest == 204);
   assert(a.Accept(stale));  // unsequenced delivery must not regress that ack
-  assert(a.OldestUnackedLocal() == 204);
+  assert(a.OldestUnackedLocal() == 204u);
 }
 
 // A receiver that misses more than one datagram's history must first receive
@@ -365,8 +365,8 @@ static void TestChecksumMismatch()
   b.UpdateFinalized();
   Deliver(a, &b, 301);
   Deliver(b, &a, 301);
-  assert(a.FirstDesync() == 301);
-  assert(b.FirstDesync() == 301);
+  assert(a.FirstDesync() == 301u);
+  assert(b.FirstDesync() == 301u);
 }
 
 // With local input delay, the confirmed input prefix can lead the most recent
@@ -387,7 +387,7 @@ static void TestDelayedChecksumFinalization()
   // history merely because the diagnostic window advanced.
   a.SubmitLocal(350, {});
   a.TrimBefore(1000);
-  assert(a.OldestUnackedLocal() == 350);
+  assert(a.OldestUnackedLocal() == 350u);
 }
 
 // Strict decoding rejects truncation and a forged player count before state
@@ -618,7 +618,7 @@ static void TestAckAdvanceTrimsRetransmission()
   assert(a.BuildPacket(107).pads.size() == 10);
   assert(b.Accept(a.BuildPacket(107)));
   assert(a.Accept(b.BuildPacket(100)));  // acknowledges 100..109
-  assert(a.OldestUnackedLocal() == 110);
+  assert(a.OldestUnackedLocal() == 110u);
   assert(a.BuildPacket(107).pads.empty());
   a.SubmitLocal(108, ValidationPad(0, 108));  // frame 110
   const RN::Packet next = a.BuildPacket(108);
@@ -890,11 +890,11 @@ static void TestEarliestCorrectionIsSticky()
   p1.SubmitLocal(104, one);
   p2.SubmitLocal(102, two);
   assert(local.Accept(p1.BuildPacket(104)));
-  assert(local.PendingRollback() == 104);
+  assert(local.PendingRollback() == 104u);
   assert(local.Accept(p2.BuildPacket(102)));
-  assert(local.PendingRollback() == 102);
+  assert(local.PendingRollback() == 102u);
   assert(local.Accept(p1.BuildPacket(104)));  // duplicate
-  assert(local.PendingRollback() == 102);
+  assert(local.PendingRollback() == 102u);
 }
 
 // Loss, reordered delivery, and duplicates may delay acknowledgement but
@@ -951,10 +951,10 @@ static void TestChecksumAgreementAndStickyDesync()
     Deliver(a, &b, frame);
     Deliver(b, &a, frame);
   }
-  assert(a.FirstDesync() == 903);
-  assert(b.FirstDesync() == 903);
+  assert(a.FirstDesync() == 903u);
+  assert(b.FirstDesync() == 903u);
   a.SetStateChecksum(905, 904);  // later agreement cannot clear it
-  assert(a.FirstDesync() == 903);
+  assert(a.FirstDesync() == 903u);
 }
 
 // Stage-4 transitions are independent generations. Reordered stale packets
@@ -1206,7 +1206,7 @@ static void TestPureRollbackHelpers()
   const auto target = RL::FindIdleTarget(96, 90, true, [&](std::uint32_t frame) {
     return idle.contains(frame);
   });
-  assert(target == 95);
+  assert(target == 95u);
   assert(!RL::FindIdleTarget(89, 90, true, [&](std::uint32_t) { return true; }));
   assert(!RL::FindIdleTarget(95, 90, false, [&](std::uint32_t) { return true; }));
 
@@ -1217,8 +1217,8 @@ static void TestPureRollbackHelpers()
     audited.push_back(*RL::NextRotatingAuditPage(pages, &cursor));
   assert((audited == std::vector<std::uint32_t>{4, 8, 12, 4, 8}));
   assert(cursor == 5);
-  assert(RL::NextRotatingAuditPage(pages, &cursor) == 12);
-  assert(RL::NextRotatingAuditPage(pages, &cursor) == 4);
+  assert(RL::NextRotatingAuditPage(pages, &cursor) == 12u);
+  assert(RL::NextRotatingAuditPage(pages, &cursor) == 4u);
   const std::span<const std::uint32_t> no_pages;
   assert(!RL::NextRotatingAuditPage(no_pages, &cursor));
 
