@@ -63,7 +63,7 @@ inline std::optional<std::map<std::uint32_t, std::uint32_t>> PlanDraft(
     *error = "invalid draft policy";
     return std::nullopt;
   }
-  if (view.Tag(0x80000000) != "GN7E" || view.UInt(0x80000004) != 0x36390000)
+  if (view.Tag(0x80000000) != "GN7E" || view.UInt(0x80000004) != 0x36390000u)
   {
     *error = "draft requires GN7E69 disc 0 revision 0";
     return std::nullopt;

@@ -105,7 +105,7 @@ Plan(const NSRGameStats::Memory& memory, const std::vector<Edit>& edits, std::st
     for (std::uint32_t i = 0; i < *memory.UInt(*table + 0x4a, 1); ++i)
     {
       const auto field = *table + 0x4c + i * 16;
-      if (memory.Tag(field + 8) == tag && memory.UInt(field) == 3)
+      if (memory.Tag(field + 8) == tag && memory.UInt(field) == 3u)
       {
         offset = *memory.UInt(field + 4);
         width = *memory.UInt(field + 12);
