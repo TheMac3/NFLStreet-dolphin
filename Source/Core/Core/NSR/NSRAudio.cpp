@@ -139,9 +139,12 @@ struct Pace
 };
 Pace s_p;
 // Audio speed factor for the rest of a re-simulated unit that reached its AX
-// frame goal: slower than real time, so (almost) no further AX frame starts
-// before the unit ends. Not 1.0: that value means "live, send to speakers".
-constexpr float THROTTLE_FACTOR = 0.25f;
+// frame goal: real time, so no further AX frame (5 ms of emulated time)
+// starts before the unit (well under 1 ms of emulated time at 16x) ends.
+// Not slower: the already scheduled next DMA event would then land units
+// later and starve the following re-simulated units. Not exactly 1.0: that
+// value means "live, send to speakers" (DSPManager::UpdateAudioDMA).
+constexpr float THROTTLE_FACTOR = 1.01f;
 Stats s_stats;
 
 // ---------------------------------------------------------------------------

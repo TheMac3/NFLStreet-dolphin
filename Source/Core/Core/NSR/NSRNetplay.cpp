@@ -106,6 +106,8 @@
 #include "InputCommon/InputConfig.h"                 // NSR local pad log
 #include "Core/NSR/NSRTelemetryLogic.h"  // NSR telemetry: lockstep hash with region digests
 #include "Common/FileUtil.h"             // NSR telemetry: desync bundle directory
+#include "AudioCommon/Mixer.h"        // NSR mixer underrun gauges (fix/audio2)
+#include "AudioCommon/SoundStream.h"  // NSR mixer underrun gauges (fix/audio2)
 #include "Core/NSR/NSRAudio.h"  // NSR host audio under rollback
 #include "VideoCommon/CommandProcessor.h"
 #include "VideoCommon/Fifo.h"
@@ -6685,6 +6687,15 @@ static bool RbNetworkPreflight(u32 live)
     T::SetGauge(T::Gauge::FrameAdvantage, s_rb_exchange->FrameAdvantage(live));
     T::SetGauge(T::Gauge::InputDelay, r.net_delay);
     T::SetGauge(T::Gauge::MaxPrediction, r.max_prediction);
+    if (live % 60 == 0)  // fix/audio2: mixer underruns/overflows (audio thread counters)
+    {
+      if (const auto* stream = Core::System::GetInstance().GetSoundStream())
+      {
+        const auto a = stream->GetMixer()->GetNSRDMAStats();
+        T::SetGauge(T::Gauge::AudioGapFills, static_cast<double>(a[0]));
+        T::SetGauge(T::Gauge::AudioSkips, static_cast<double>(a[2]));
+      }
+    }
     if (const u32 confirmed = s_rb_exchange->ConfirmedThrough();
         confirmed != RollbackNet::NO_FRAME && confirmed <= live)
       T::Observe(T::Hist::PredictionFrames, live - confirmed);
