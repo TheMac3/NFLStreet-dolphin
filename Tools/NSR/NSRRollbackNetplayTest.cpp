@@ -1809,8 +1809,48 @@ static void TestQuickstartNavigation()
   assert(stalled.Failed());
 }
 
+// fix/audio2: player 0's entry proposal carries the match input delay and
+// the link it was chosen from; it survives the wire, every peer can read it,
+// and a sender may not change it in a retransmission.
+static void TestHandoffInputDelay()
+{
+  RN::HandoffPacket host{0, 2, RN::HandoffKind::EnterRollback, 2, 1234, 0x77, {}, 5, 6, 3, 365,
+                         102};
+  const auto decoded = RN::DecodeHandoff(RN::EncodeHandoff(host));
+  assert(decoded && decoded->input_delay == 3 && decoded->delay_one_way_dms == 365 &&
+         decoded->delay_jitter_dms == 102);
+  RN::HandoffAgreement joiner(2, 1, RN::HandoffKind::EnterRollback, 2, 1234, 0x77, {}, 7, 8);
+  assert(!joiner.HostProposal());
+  assert(joiner.Accept(*decoded));
+  assert(joiner.Complete());
+  assert(joiner.HostProposal()->input_delay == 3);
+  RN::HandoffPacket changed = host;
+  changed.input_delay = 2;
+  assert(!joiner.Accept(changed));
+  assert(joiner.Mismatched());
+  RN::HandoffAgreement me0(2, 0, RN::HandoffKind::EnterRollback, 2, 1234, 0x77, {}, 5, 6, 2);
+  assert(me0.HostProposal()->input_delay == 2);
+}
+
+// The automatic delay rule: ceil((one-way + 2 x jitter) / frame) - 1, in [1, 4].
+static void TestAutoInputDelay()
+{
+  assert(RN::AutoInputDelay(0.0, 0.0) == 1);
+  assert(RN::AutoInputDelay(10.0, 2.0) == 1);    // LAN
+  assert(RN::AutoInputDelay(20.0, 4.0) == 1);    // 28 ms -> 1.7 frames
+  assert(RN::AutoInputDelay(36.5, 10.0) == 3);   // 56.5 ms -> 3.4 frames
+  assert(RN::AutoInputDelay(36.5, 3.0) == 2);    // 42.5 ms -> 2.5 frames
+  assert(RN::AutoInputDelay(75.0, 10.0) == 4);
+  assert(RN::AutoInputDelay(500.0, 50.0) == 4);  // clamped
+  RN::AutoDelayRule loose;
+  loose.jitter_weight = 1.0;
+  assert(RN::AutoInputDelay(36.5, 10.0, loose) == 2);
+}
+
 int main()
 {
+  TestHandoffInputDelay();
+  TestAutoInputDelay();
   TestPadSourceAdapter();
   TestDraftLog();
   TestQuickstartNavigation();

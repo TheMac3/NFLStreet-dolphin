@@ -40,6 +40,7 @@
 #include "Core/HW/MMIO.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/SystemTimers.h"
+#include "Core/NSR/NSRAudio.h"  // NFLStreet rollback audio
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
@@ -448,8 +449,20 @@ void DSPManager::UpdateAudioDMA()
     auto& memory = m_system.GetMemory();
     void* address = memory.GetPointerForRange(m_audio_dma.current_source_address, 32);
     // NFLStreet rollback: re-simulated frames' audio was heard live already.
-    if (m_system.GetSystemTimers().GetNSRSpeedFactor() == 1.0f)
-      AudioCommon::SendAIBuffer(m_system, static_cast<short*>(address), 8);
+    const bool nsr_send = m_system.GetSystemTimers().GetNSRSpeedFactor() == 1.0f;
+    const s16* nsr_out = static_cast<const s16*>(address);
+    s16 nsr_faded[16];
+    if (nsr_send && NSRAudio::g_fade_pending)
+    {
+      // First live samples after a rollback: crossfade from the abandoned
+      // timeline's next samples (see NSRAudio::FadeBlock).
+      NSRAudio::FadeBlock(nsr_out, nsr_faded);
+      nsr_out = nsr_faded;
+    }
+    if (NSRAudio::g_diag)
+      NSRAudio::AIBlock(nsr_out, nsr_send);
+    if (nsr_send)
+      AudioCommon::SendAIBuffer(m_system, nsr_out, 8);
 
     if (m_audio_dma.remaining_blocks_count != 0)
     {
@@ -469,6 +482,18 @@ void DSPManager::UpdateAudioDMA()
   {
     AudioCommon::SendAIBuffer(m_system, &zero_samples[0], 8);
   }
+}
+
+const u8* DSPManager::GetNSRPendingAI(u32* blocks) const
+{
+  *blocks = 0;
+  if (!m_audio_dma.AudioDMAControl.Enable || m_audio_dma.remaining_blocks_count == 0)
+    return nullptr;
+  const u32 n = m_audio_dma.remaining_blocks_count;
+  const u8* p = m_system.GetMemory().GetPointerForRange(m_audio_dma.current_source_address, n * 32);
+  if (p)
+    *blocks = n;
+  return p;
 }
 
 // NFLStreet rollback: report [address, address + length) of ARAM to the

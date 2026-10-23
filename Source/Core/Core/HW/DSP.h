@@ -121,6 +121,10 @@ public:
   using NSRARAMObserver = void (*)(DSPManager& dsp, u32 address, u32 length,
                                    NSRARAMAccess access);
   void SetNSRARAMObserver(NSRARAMObserver observer) { m_nsr_aram_observer = observer; }
+  // NFLStreet rollback audio (NSRAudio): the AI DMA blocks of the current
+  // output buffer not yet sent to the speakers (32 bytes each, big-endian
+  // stereo), or nullptr when none.
+  const u8* GetNSRPendingAI(u32* blocks) const;
   u32 GetARAMSize() const { return m_aram.size; }
 
 private:
