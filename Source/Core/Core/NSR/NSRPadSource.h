@@ -78,6 +78,32 @@ constexpr GCPadStatus NeutralPad()
   return pad;
 }
 
+// Netplay: every standard-controller port answers the guest as a connected
+// pad, a neutral one while no local device feeds it. Found by the emulated
+// controller permutation test (NFLStreet docs/controller-testing.md):
+//   * only port 1 maps this player's own controller; ports 2-4 carry the other
+//     players' exchanged pads and have no local device, so their SI ports
+//     answered "no controller" on every machine. The netplay exchange then
+//     writes those players' pads into PADStatus, but the game's controller
+//     registry never took the port: the joiner's pad moved nothing on Select
+//     Controller ("my friend's controller is never recognized"). The test
+//     harness bound an idle pipe device to every port, which hid this;
+//   * a local pad that appears after the game probed port 1 (a Bluetooth pad
+//     woken late, slow device enumeration) stayed unplugged to the guest for
+//     the whole session: the exchange always hands the game a connected pad,
+//     so it never sees the error that makes it re-probe the port. Meanwhile
+//     the other peers saw a connected port 1 there: a guest-visible difference
+//     (lockstep desyncs in the late-plug test);
+//   * a player's extra local mappings (Reborn's GCPad2-4, kept for offline
+//     couch play) no longer make one machine's SI ports differ from another's.
+// The exchanged pads are unchanged (an unplugged port was already sent as a
+// neutral, connected pad). Offline practice keeps Dolphin's normal behaviour,
+// where the game sees a missing controller and re-probes when it appears.
+constexpr GCPadStatus NetplayPad(const GCPadStatus& pad, bool netplay)
+{
+  return netplay && !pad.isConnected ? NeutralPad() : pad;
+}
+
 // Shift an axis so the pad's resting value becomes `center` (the guest's fixed
 // standard-controller origin). Same result as the SDK's origin clamp would give
 // for a real pad, but computed host-side so the guest never stores an origin.
