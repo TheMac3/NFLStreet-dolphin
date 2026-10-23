@@ -221,7 +221,7 @@ jobs:
           if exist "%~dp0nsr-reborn.txt" (
             set /p REBORN=<"%~dp0nsr-reborn.txt"
           )
-          if defined REBORN set TEXTURES=-C "Dolphin.General.LoadPath=%REBORN%\content" -C GFX.Settings.HiresTextures=True
+          if defined REBORN set TEXTURES=-C "Dolphin.General.LoadPath=%REBORN%\content" -C Graphics.Settings.HiresTextures=True -C Graphics.Settings.CacheHiresTextures=False
           "%~dp0Dolphin.exe" -u "%~dp0User" %TEXTURES% -C Dolphin.Interface.UsePanicHandlers=False -C Dolphin.Core.CPUThread=False -C Dolphin.Core.EnableCustomRTC=True -C Dolphin.Core.CustomRTCValue=0x30000000 -C Dolphin.Core.SIDevice0=6 -C Dolphin.Core.SIDevice1=%SI1% -C Dolphin.Core.SIDevice2=%SI2% -C Dolphin.Core.SIDevice3=%SI3% -C Dolphin.Core.FastDiscSpeed=True -b -e "%~dp0nsr-net.iso"
           endlocal
           '@ | Set-Content -Encoding ascii Binary/x64/NFLStreetRollback-debug.bat
