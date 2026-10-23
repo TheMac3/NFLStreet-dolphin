@@ -1667,6 +1667,19 @@ static void TestDraftLog()
 static void TestPadSourceAdapter()
 {
   using namespace NSRPadSource;
+  // Netplay ports never read as unplugged; a connected pad passes untouched;
+  // offline keeps the unplugged pad (the game re-probes when it appears).
+  GCPadStatus unplugged{};  // what GCPad::GetInput returns without its device
+  unplugged.isConnected = false;
+  const GCPadStatus held = NetplayPad(unplugged, true);
+  assert(held.isConnected && held.button == 0 && held.stickX == 0x80 && held.stickY == 0x80 &&
+         held.substickX == 0x80 && held.substickY == 0x80 && held.triggerLeft == 0);
+  assert(!NetplayPad(unplugged, false).isConnected);
+  GCPadStatus live = NeutralPad();
+  live.button = PAD_BUTTON_START;
+  live.stickX = 0xf0;
+  const GCPadStatus passed = NetplayPad(live, true);
+  assert(passed.button == PAD_BUTTON_START && passed.stickX == 0xf0 && passed.isConnected);
   assert(ParseChannel("0") == 0 && ParseChannel("3") == 3);
   assert(!ParseChannel("") && !ParseChannel("4") && !ParseChannel("off") && !ParseChannel("01"));
   assert(PickChannel(2, {false, true, true, false}) == 2);

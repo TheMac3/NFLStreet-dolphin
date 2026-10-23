@@ -3,10 +3,12 @@
 
 #include "Core/HW/GCPad.h"
 
+#include <cstdlib>
 #include <cstring>
 
 #include "Common/Common.h"
 #include "Core/HW/GCPadEmu.h"
+#include "Core/NSR/NSRPadSource.h"
 #include "InputCommon/ControllerEmu/ControlGroup/ControlGroup.h"
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
 #include "InputCommon/GCAdapter.h"
@@ -60,6 +62,7 @@ bool IsInitialized()
 // NSR: port 1 (the NSR local port) may read a USB GameCube adapter instead of
 // its GCPad mapping while staying a standard controller to the guest; see
 // Core/NSR/NSRPadSource.h. Without an adapter the mapping is used as usual.
+// In netplay no port reads as unplugged (NSRPadSource::NetplayPad).
 GCPadStatus GetStatus(int pad_num)
 {
   if (pad_num == 0 && GCAdapter::NSRSourceChannel())
@@ -67,7 +70,14 @@ GCPadStatus GetStatus(int pad_num)
     if (const auto adapter = GCAdapter::NSRStandardControllerInput())
       return *adapter;
   }
-  return static_cast<GCPad*>(s_config.GetController(pad_num))->GetInput();
+  // NSR netplay: ports never read as unplugged (NSRPadSource::NetplayPad). Same
+  // nonempty NSR_NETPLAY rule as NSRBootSync::Enabled; read once.
+  static const bool nsr_netplay = [] {
+    const char* value = std::getenv("NSR_NETPLAY");
+    return value != nullptr && *value != '\0';
+  }();
+  return NSRPadSource::NetplayPad(
+      static_cast<GCPad*>(s_config.GetController(pad_num))->GetInput(), nsr_netplay);
 }
 
 ControllerEmu::ControlGroup* GetGroup(int pad_num, PadGroup group)
