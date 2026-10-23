@@ -4326,8 +4326,11 @@ static void ApplyQuickstart(const Core::CPUThreadGuard& guard, u32 frame,
     StopForRollbackTransportFailure();
   }
   else if (!s.quickstart.Active())
+  {
+    Log("quickstart: handed off at Select Controller");
     Log("quickstart COMPLETE frame {} screen {}/{}; human pads enabled", frame,
         screen >> 16, screen & 0xffff);
+  }
 }
 
 // Run milestone-1 raw-pad lockstep for one poll.  Keeping this independent

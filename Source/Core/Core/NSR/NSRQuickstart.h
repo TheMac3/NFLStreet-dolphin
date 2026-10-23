@@ -13,7 +13,7 @@
 
 namespace NSRQuickstart
 {
-constexpr std::string_view VERSION = "1";
+constexpr std::string_view VERSION = "2";
 enum class Mode { Manual, QuickPlay, Pickup };
 
 // Strict parsing prevents a misspelled room selection becoming manual play.
@@ -51,15 +51,16 @@ public:
 
     const bool pickup = m_mode == Mode::Pickup;
     // The command-stack screen IDs were observed with the raw-pad hook on
-    // blank cards: title, training, help, modes, controllers, teams/draft.
-    const std::array<Step, 10> steps{{
+    // blank cards: title, training, modes, then Select Controller.
+    // Leave side/first-pick decisions to humans (and future draft policy).
+    // The final stable-screen step returns neutral pads on the handoff poll.
+    const std::array<Step, 8> steps{{
       {0x00000003, 0x1000, 1},
       {0x00010003, 0x0004, 1}, {0x00010003, 0x0004, 1},
       {0x00010003, 0x0100, 1},
       {0x00000001, static_cast<std::uint16_t>(pickup ? 0 : 0x0200), 1},
       {0x00000001, static_cast<std::uint16_t>(pickup ? 0x0008 : 0x0001), 1},
-      {0x00000001, 0x0100, 1}, {0x00000011, 0x0002, 14},
-      {0x00000011, 0x0100, 15}, {pickup ? 0x0000000fU : 0x00000007U, 0, 0}
+      {0x00000001, 0x0100, 1}, {0x00000011, 0, 0}
     }};
     const Step& step = steps[m_step];
     if (!m_pulse)
