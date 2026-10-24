@@ -2078,6 +2078,116 @@ static void TestAutoInputDelay()
   assert(RN::AutoInputDelay(41.0, 9.0, strict) == 3);
 }
 
+// Probe windows must forget barrier echoes, loss/duplicates, timestamp forgery,
+// old epochs and occasional service stalls without inheriting ENet's EWMA.
+static void TestLinkProbes()
+{
+  RN::LinkProbeWindow window;
+  std::uint32_t now = 0xffff0000U;  // exercise the monotonic timestamp wrap
+  auto ping = window.Start(now);
+  assert(ping && !window.Start(now + 249999));
+  auto pong = *ping;
+  pong.kind = RN::ProbeKind::Pong;
+  pong.sender = 1;
+  assert(!window.Accept(*ping, now + 20000));
+  auto forged = pong;
+  ++forged.sent_us;
+  assert(!window.Accept(forged, now + 20000));
+  assert(window.Accept(pong, now + 20000));
+  assert(!window.Accept(pong, now + 20000));
+  assert(!window.Quality(now + 20000));
+  for (std::uint32_t n = 1; n <= 48; ++n)
+  {
+    const auto sent = now + n * 250000;
+    auto next = *window.Start(sent);
+    next.kind = RN::ProbeKind::Pong;
+    // One 1.2-second service stall must not choose delay 4 for a 20 ms link.
+    assert(window.Accept(next, sent + (n == 20 ? 1200000U : 20000U)));
+  }
+  const auto quality = window.Quality(now + 48 * 250000 + 20000);
+  assert(quality && quality->samples == 48 && quality->rtt_ms == 20 && quality->jitter_ms == 0);
+  assert(RN::AutoInputDelay(quality->rtt_ms / 2, quality->jitter_ms) == 1);
+  assert(!window.Quality(now + 100 * 250000));
+  now += 101 * 250000;
+  auto busy = *window.Start(now);
+  busy.kind = RN::ProbeKind::Pong;
+  window.DiscardPending();
+  assert(!window.Accept(busy, now + 1200000));
+  auto late = *window.Start(now + 250000);
+  late.kind = RN::ProbeKind::Pong;
+  assert(!window.Accept(late, now + 2250001));
+  window.Reset();
+  assert(!window.Quality(now + 250000));
+  auto new_epoch = *window.Start(now + 250000);
+  assert(new_epoch.sequence != busy.sequence && new_epoch.sequence != late.sequence);
+  busy.sent_us = new_epoch.sent_us;
+  assert(!window.Accept(busy, now + 270000));
+
+  // Arrivals varying by +/- 8 ms yield nonzero jitter; delayed/out-of-order
+  // pongs are ignored, while a genuinely slower sustained link replaces the window.
+  for (std::uint32_t n = 1; n <= 48; ++n)
+  {
+    const auto sent = now + (n + 1) * 250000;
+    auto next = *window.Start(sent);
+    next.kind = RN::ProbeKind::Pong;
+    assert(window.Accept(next, sent + (n % 2 ? 78000 : 62000)));
+  }
+  const auto jittery = window.Quality(now + 49 * 250000 + 78000);
+  assert(jittery && jittery->rtt_ms == 78 && jittery->jitter_ms > 11 && jittery->jitter_ms < 12);
+  assert(RN::AutoInputDelay(jittery->rtt_ms / 2, jittery->jitter_ms) == 2);
+
+  RN::LinkProbeWindow reordered;
+  auto first = *reordered.Start(0);
+  auto second = *reordered.Start(250000);
+  first.kind = second.kind = RN::ProbeKind::Pong;
+  assert(reordered.Accept(second, 270000));
+  assert(!reordered.Accept(first, 280000));
+
+  // All three host legs at 20 ms stay low across a four-player star;
+  // a slow leaf-leaf mesh link must be included even with fast host legs.
+  RN::LinkMatrix links{};
+  for (std::uint8_t i = 1; i < 4; ++i)
+    links[0][i] = RN::LinkQuality{20, 0, 12};
+  const auto star = RN::WorstInputPath(links, 4, true);
+  assert(star && star->one_way_ms == 20 && RN::AutoInputDelay(star->one_way_ms, 0) == 1);
+  assert(!RN::WorstInputPath(links, 4, false));
+  links[1][2] = links[1][3] = RN::LinkQuality{20, 0, 12};
+  links[2][3] = RN::LinkQuality{150, 9, 12};
+  const auto mesh = RN::WorstInputPath(links, 4, false);
+  assert(mesh && mesh->one_way_ms == 75 && mesh->jitter_ms == 9);
+  assert(RN::AutoInputDelay(mesh->one_way_ms, mesh->jitter_ms) == 4);
+  links[0][3].reset();
+  assert(!RN::WorstInputPath(links, 4, true));
+
+  // The dedicated wire parser rejects every truncation, extension, bad version,
+  // illegal peer index and out-of-range quality instead of touching game logic.
+  RN::ProbePacket packet{RN::ProbeKind::Pong, 1, 0, 42, 123456, 70000, 8000};
+  const auto wire = RN::EncodeProbe(packet);
+  assert(wire.size() == 24 && RN::DecodeProbe(wire)->sequence == 42);
+  for (std::size_t len = 0; len < wire.size(); ++len)
+    assert(!RN::DecodeProbe(std::span(wire).first(len)));
+  auto invalid = wire;
+  invalid.push_back(0);
+  assert(!RN::DecodeProbe(invalid));
+  invalid = wire; invalid[4] = 2;
+  assert(!RN::DecodeProbe(invalid));
+  invalid = wire; invalid[5] = 0;
+  assert(!RN::DecodeProbe(invalid));
+  invalid = wire; invalid[6] = 4;
+  assert(!RN::DecodeProbe(invalid));
+  invalid = wire; invalid[7] = 1;
+  assert(!RN::DecodeProbe(invalid));
+  packet.rtt_us = 2000001;
+  assert(!RN::DecodeProbe(RN::EncodeProbe(packet)));
+  packet = {RN::ProbeKind::Quality, 0, 4, 1, 0, 75000, 8000};
+  assert(RN::DecodeProbe(RN::EncodeProbe(packet))->target == 4);
+  assert(std::string_view(RN::InputQualityLabel(1, 0)) == "Great");
+  assert(std::string_view(RN::InputQualityLabel(2, 0)) == "Good");
+  assert(std::string_view(RN::InputQualityLabel(3, 0)) == "OK");
+  assert(std::string_view(RN::InputQualityLabel(4, 0)) == "Poor");
+  assert(std::string_view(RN::InputQualityLabel(1, 24)) == "Poor");
+}
+
 // Runtime draft plans use synthetic MEM1 only: validate the full fixed recipe
 // before writes, reject changed native instructions and tolerate exact reloads.
 static void TestRuntimeDraft()
@@ -2118,6 +2228,7 @@ int main()
 {
   TestHandoffInputDelay();
   TestAutoInputDelay();
+  TestLinkProbes();
   TestPadSourceAdapter();
   TestDraftLog();
   TestQuickstartNavigation();

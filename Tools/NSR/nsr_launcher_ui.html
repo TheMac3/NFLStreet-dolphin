@@ -270,6 +270,8 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
             <button class="btn red big" id="btnStart" disabled>Start game</button>
           </div>
           <div class="note">Auto picks 1–4 frames from the connection at every match. Pick a number to fix it. The host's choice applies to everyone.</div>
+          <div class="info" id="hostQuality" aria-live="polite"></div>
+          <div class="note" id="hostDelayWarning" role="status" style="color:var(--red)"></div>
           <div class="note" id="hostDraft"></div>
           <div class="info" id="hostInfo"></div>
         </div>
@@ -288,6 +290,8 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
             <button class="btn red big" id="btnJoin">Join room</button>
             <button class="btn" id="btnLeave" disabled>Leave</button>
           </div>
+          <div class="info" id="joinQuality" aria-live="polite"></div>
+          <div class="note" id="joinDelayWarning" role="status" style="color:var(--red)"></div>
           <div class="info" id="joinInfo"></div><div class="note" id="joinGameMode"></div><div class="note" id="joinDraft"></div>
         </div>
         <div class="card players"><div class="ph"><h3>Players</h3><span class="faint" id="joinSlots">–</span></div><ol id="joinPlayers"></ol></div>
@@ -485,6 +489,13 @@ function render(s) {
     b.onclick = () => { S.delay = d; call("set_delay", d); renderDelay(d); }; seg.append(b);
   }
   renderDelay(S.delay != null ? S.delay : s.delay);
+
+  // The host measures the game link after Start; both lobby pages show it.
+  const quality = s.link_quality || {};
+  for (const side of ["host", "join"]) {
+    setText(side + "Quality", quality.text || "Connection quality is measured in the game menus after Start.");
+    setText(side + "DelayWarning", quality.warning || "");
+  }
 
   // join
   setValue("joinCode", S.joinTyped ? $("joinCode").value : (s.last_host || ""));
