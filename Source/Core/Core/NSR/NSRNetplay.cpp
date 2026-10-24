@@ -4609,11 +4609,12 @@ static void ApplyQuickstart(const Core::CPUThreadGuard& guard, u32 frame,
   }
 }
 
-// Run milestone-1 raw-pad lockstep for one poll.  Keeping this independent
-// from either game-side stub lets the rollback image use the same proven
-// ordering in menus: PADRead -> agreement -> Reborn remap/PADClamp.
+// Startup negotiation is implemented beside the other host-side barriers.
 static bool AgreeStartupMenuDelay(u32 frame);
 
+// Run milestone-1 raw-pad lockstep for one poll. Keeping this independent
+// from either game-side stub lets the rollback image use the same proven
+// ordering in menus: PADRead -> agreement -> Reborn remap/PADClamp.
 static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 frame)
 {
   auto& system = guard.GetSystem();
@@ -4629,7 +4630,7 @@ static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 fra
   if (!AllConnected() && !WaitForConnection())
     return false;
 
-  if (!s.menu_delay_agreed && !AgreeStartupMenuDelay(frame))
+  if (s_rb.net_enabled && !s.menu_delay_agreed && !AgreeStartupMenuDelay(frame))
     return false;
 
   // The pad poll can run more than once for the same retrace (the game also
@@ -4803,7 +4804,8 @@ bool PrepareBoot()
   if (const auto manifest = NSRBootSync::Prepare())
   {
     s.boot_manifest = *manifest;
-    s.boot_manifest["MenuDelay.Protocol"] = std::to_string(RollbackNet::HANDOFF_VERSION);
+    if (!Env("NSR_RB_NET").empty())
+      s.boot_manifest["MenuDelay.Protocol"] = std::to_string(RollbackNet::HANDOFF_VERSION);
     if (*mode != NSRQuickstart::Mode::Manual)
     {
       s.boot_manifest["Quickstart.Mode"] = Env("NSR_QUICKSTART");
@@ -6750,8 +6752,9 @@ static void AdoptInputDelay(const RollbackNet::HandoffPacket& host)
 // Prefer the quiet-menu timing probes and complete star/mesh path aggregate.
 // If no fresh probe window exists at exit (probes pause during matches), use
 // each link's recent median RTT/variance without pausing to gather samples.
-// Summing host legs bounds a mesh route conservatively in that fallback;
-// revisit the fallback if direct mesh paths can exceed that host route.
+// Mesh fallback estimates the path using host legs; arbitrary routing can
+// make a direct mesh path slower. Revisit all-pair live reports if mesh menu
+// stalls remain after a link changes during a match (launcher uses a star).
 struct MenuDelayProposal
 {
   u8 delay = 0;

@@ -226,7 +226,7 @@ std::uint8_t AutoInputDelay(double one_way_ms, double jitter_ms, const AutoDelay
 // the upper bound if supported links need more than about 180 ms one way.
 std::uint8_t MenuInputDelay(double one_way_ms, double jitter_ms);
 // Median over a bounded window rejects isolated ENet retransmission spikes.
-// No estimate until six fresh ACK observations exist; callers use fallback 2.
+// No estimate until six fresh ACKs exist; callers retain the previous delay.
 std::optional<std::uint32_t> MenuMedian(std::span<const std::uint32_t> samples);
 
 // Host-only timing probes never enter the input exchange or reliable queues.

@@ -142,7 +142,8 @@ std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes)
   if (!Get(bytes, at, &packet.sync_clock) || !Get(bytes, at, &packet.sync_aux_clock) ||
       !Get(bytes, at, &packet.input_delay) || !Get(bytes, at, &packet.delay_one_way_dms) ||
       !Get(bytes, at, &packet.delay_jitter_dms) || !Get(bytes, at, &packet.menu_delay) ||
-      !Get(bytes, at, &packet.menu_one_way_dms) || !Get(bytes, at, &packet.menu_jitter_dms) || !Get(bytes, at, &packet.menu_source) ||
+      !Get(bytes, at, &packet.menu_one_way_dms) || !Get(bytes, at, &packet.menu_jitter_dms) ||
+      !Get(bytes, at, &packet.menu_source) ||
       packet.menu_source > 3 ||
       (packet.menu_delay != 0 && (packet.menu_delay < 2 || packet.menu_delay > 12)))
     return std::nullopt;
@@ -162,7 +163,8 @@ HandoffAgreement::HandoffAgreement(std::uint8_t players, std::uint8_t me, Handof
       m_me(std::min<std::uint8_t>(me, m_players - 1)),
       m_local{m_me,       m_players,      kind,           transition,        frame,
               semantic_hash, config,      sync_clock,     sync_aux_clock,    input_delay,
-              delay_one_way_dms, delay_jitter_dms, menu_delay, menu_one_way_dms, menu_jitter_dms, menu_source}
+              delay_one_way_dms, delay_jitter_dms, menu_delay, menu_one_way_dms,
+              menu_jitter_dms, menu_source}
 {
   m_seen[m_me] = true;
   m_sync_clocks[m_me] = sync_clock;
