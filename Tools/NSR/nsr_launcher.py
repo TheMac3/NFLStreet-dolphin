@@ -225,9 +225,12 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     retail = (image_manifest.get("recipe") == patcher.ownimage_build.RECIPE and
               image_manifest.get("base_family") == patcher.ownimage_build.FAMILY)
     if retail:
+        # Refuse legacy/unknown receipts with an actionable error before boot.
+        patcher.retail_fingerprint(image_manifest["output_sha256"], image_manifest.get("variant", ""))
         reborn_install = None
         env.update({"NSR_IMAGE_FAMILY": image_manifest["base_family"],
                     "NSR_IMAGE_RECIPE": image_manifest["recipe"],
+                    "NSR_IMAGE_VARIANT": image_manifest["variant"],
                     "NSR_IMAGE_SHA256": image_manifest["output_sha256"]})
     # Preserve the newer launcher-owned asset store for Reborn. Retail
     # always uses an empty overlay and clears any previously imported list.
@@ -261,8 +264,8 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     env["NSR_SEED"] = str(start.seed if start else secrets.randbits(32))
     # Room selection wins on every peer; practice uses the same one-shot macro.
     selected = lobby.quickstart_id(start.quickstart if start else quickstart)
-    if retail and selected != "manual":
-        raise ValueError("Retail automatic navigation is not qualified yet; choose Manual navigation.")
+    if retail and selected == "pickup":
+        raise ValueError("Retail Pickup navigation is not qualified yet; choose Quick Play or Manual navigation.")
     if selected != "manual":
         env["NSR_QUICKSTART"] = selected
     if start:
@@ -703,7 +706,7 @@ class Launcher:
                       text="Not set up yet. Click “Find Reborn automatically”.")
         elif st.playable:
             self._source_sha = getattr(st, "source_sha256", "") or ""
-            self._ready(st.fingerprint, {"release": "", "content": st.note, "custom": st.note + "; compare fingerprints with friends."}.get(
+            self._ready(st.fingerprint, {"release": "", "retail": st.note, "content": st.note, "custom": st.note + "; compare fingerprints with friends."}.get(
                 st.kind, "Custom game copy (e.g. a ratings pack): everyone needs the identical copy."),
                 getattr(st, "content", None))
             try:
@@ -753,7 +756,7 @@ class Launcher:
         On failure the previous nsr-net.iso is untouched (prepare_image builds
         into a temporary file); with restore, the game state goes back to it
         too, because that copy is still playable."""
-        labels = {"check": "Checking Reborn's game file…",
+        labels = {"check": "Checking the game file…",
                   "build": "Building the netplay copy…" if not content else
                            f"Building the netplay copy with game content v{content.version}…",
                   "verify": "Fingerprinting…"}
@@ -778,6 +781,8 @@ class Launcher:
                  "Unrecognized Reborn version: compare fingerprints with friends.")
                 if r.matches_reference is None else
                 "WARNING: doesn't match the reference build; ask Mason before playing."))
+            if r.fingerprint.startswith("retail:"):
+                note = "Native rosters and controls; " + patcher.read_manifest(self.folder)["variant"]
             if runtime:
                 self._validate_runtime(runtime, r.fingerprint)
                 self._activate_runtime(runtime)

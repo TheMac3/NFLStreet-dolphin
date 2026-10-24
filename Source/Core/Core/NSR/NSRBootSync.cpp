@@ -290,7 +290,7 @@ std::optional<std::map<std::string, std::string>> Prepare()
   // local cost/dirty-tracking choices and per-peer delay/prediction are excluded.
   for (const char* key : {
       // ownimage: full output/family/recipe identity is agreed before guest boot.
-      "NSR_IMAGE_FAMILY", "NSR_IMAGE_SHA256", "NSR_IMAGE_RECIPE",
+      "NSR_IMAGE_FAMILY", "NSR_IMAGE_SHA256", "NSR_IMAGE_RECIPE", "NSR_IMAGE_VARIANT",
       "NSR_FINGERPRINT", "NSR_SEED", "NSR_DELAY", "NSR_RB_NET", "NSR_RB_VTIME_FROM",
       "NSR_RB_VTIME_BASE", "NSR_RB_VMEM_BYTES", "NSR_RB_RESIM_SPEED",
       "NSR_RB_RESIM_GPU_SPEED", "NSR_RB_RESIM_ARAM_SPEED", "NSR_RB_RESIM_AUDIO_SPEED",

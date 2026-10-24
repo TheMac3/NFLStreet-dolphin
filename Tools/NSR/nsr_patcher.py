@@ -267,9 +267,11 @@ def apply_content(image: str, build: dict, content: "nsr_content.Content") -> No
                                expect_sha256=build["template_sha256"])
 
 
-def retail_fingerprint(digest: str) -> str:
-    """Retail room identity uses a family prefix and the full output digest."""
-    return "retail:" + digest.lower()
+def retail_fingerprint(digest: str, variant: str = "retail") -> str:
+    """Agree the exact named variant and full output digest within the retail family."""
+    if variant not in ("retail", *ownimage.VARIANTS):
+        raise ValueError("unknown retail image variant; rebuild the image")
+    return "retail:" + variant + ":" + digest.lower()
 
 
 def is_retail_source(image: str) -> bool:
@@ -303,9 +305,9 @@ def prepare_retail_image(iso: str, out_dir: str, progress=None) -> Prepared:
         published_partial = True
         digest = result["output_sha256"]
         manifest = {**result, "base_family": ownimage_build.FAMILY, "mode": NETPLAY_MODE,
-                    "fingerprint": retail_fingerprint(digest), "patches": list(isopatch.ROLLBACK_SET),
+                    "fingerprint": retail_fingerprint(digest, result["variant"]), "patches": list(isopatch.ROLLBACK_SET),
                     "draft_order": "alternating", "draft_first": "stock", "content": None,
-                    "source_label": "NFL Street 2 USA rev 0 (native)",
+                    "source_label": "NFL Street 2 USA rev 0 (" + result["variant"] + ")",
                     "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         temporary_manifest = os.path.join(out_dir, MANIFEST_NAME + ".tmp")
         with open(temporary_manifest, "w") as stream:
@@ -315,7 +317,7 @@ def prepare_retail_image(iso: str, out_dir: str, progress=None) -> Prepared:
     finally:
         if published_partial and os.path.isfile(partial):
             os.unlink(partial)
-    return Prepared(out, retail_fingerprint(digest), manifest["source_label"], None, None,
+    return Prepared(out, retail_fingerprint(digest, result["variant"]), manifest["source_label"], None, None,
                     source_sha256=result["source_sha256"])
 
 
@@ -426,7 +428,7 @@ class ImageStatus:
 
     @property
     def playable(self) -> bool:
-        return self.kind != "legacy"
+        return self.kind not in {"legacy", "invalid-retail"}
 
 
 def image_status(out_dir: str, progress=None) -> ImageStatus | None:
@@ -441,9 +443,13 @@ def image_status(out_dir: str, progress=None) -> ImageStatus | None:
     manifest = read_manifest(out_dir)
     source = manifest.get("source_sha256") if isinstance(manifest.get("source_sha256"), str) else ""
     if (manifest.get("recipe") == ownimage_build.RECIPE and manifest.get("base_family") == ownimage_build.FAMILY
-            and manifest.get("output_sha256") == digest):
-        return ImageStatus(retail_fingerprint(digest), "retail", "Native retail rosters and controls; experimental recipe",
+            and manifest.get("output_sha256") == digest
+            and manifest.get("variant") in ("retail", *ownimage.VARIANTS)):
+        return ImageStatus(retail_fingerprint(digest, manifest["variant"]), "retail",
+                           "Native rosters and controls; " + manifest["variant"] + "; experimental recipe",
                            source_sha256=source)
+    if manifest.get("base_family") == ownimage_build.FAMILY or manifest.get("recipe") == ownimage_build.RECIPE:
+        return ImageStatus("", "invalid-retail", "an incomplete or stale retail manifest; rebuild the image")
     ours = manifest.get("recipe") == ROLLBACK_RECIPE and manifest.get("output_sha256") == digest
     applied = nsr_content.parse_descriptor(
         {k: (manifest.get("content") or {}).get(k) for k in ("version", "serial")}
@@ -475,8 +481,11 @@ def image_fingerprint(out_dir: str, progress=None) -> str | None:
     digest = sha256(path, progress=progress or (lambda d, t: None))
     manifest = read_manifest(out_dir)
     if (manifest.get("recipe") == ownimage_build.RECIPE and manifest.get("base_family") == ownimage_build.FAMILY
-            and manifest.get("output_sha256") == digest):
-        return retail_fingerprint(digest)
+            and manifest.get("output_sha256") == digest
+            and manifest.get("variant") in ("retail", *ownimage.VARIANTS)):
+        return retail_fingerprint(digest, manifest["variant"])
+    if manifest.get("base_family") == ownimage_build.FAMILY or manifest.get("recipe") == ownimage_build.RECIPE:
+        raise ValueError("incomplete or stale retail manifest; rebuild the image")
     return fingerprint(digest)
 
 

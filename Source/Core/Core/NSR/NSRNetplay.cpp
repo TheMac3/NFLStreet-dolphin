@@ -7431,6 +7431,16 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
       Log("wrote {}", path);
       WritePerMachineSidecar(system, ram, path);
       WriteAramRingSidecar(system, path);  // ARAM replay ring (final-review M1)
+      // ownimage: the ordinary gate dump must cover the same used fake VMEM
+      // as snapshots/digests. MEM1 equality alone missed database cursor state.
+      if (r.vmem_bytes)
+      {
+        if (FILE* v = std::fopen((path + ".vmem").c_str(), "wb"))
+        {
+          std::fwrite(r.vmem, 1, r.vmem_bytes, v);
+          std::fclose(v);
+        }
+      }
     }
   }
   if (r.hash_log && t % 60 == 0)

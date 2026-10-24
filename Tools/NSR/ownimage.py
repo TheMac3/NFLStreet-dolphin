@@ -5,7 +5,8 @@ No game bytes are emitted. `verify` distinguishes raw retail, scrubbed retail
 and modified dumps using executable, system and per-file references; `inventory` reports
 DOL sections. An optional local importer manifest supplies *reported* input
 metadata, not an independently verified retail baseline. See docs/ownimage.md.
-Known hash conflicts are never enrolled as new retail references.
+The one named loading-screen variant is allowlisted by exact size and hash;
+no other conflict is accepted or silently enrolled.
 """
 from __future__ import annotations
 
@@ -30,6 +31,14 @@ RETAIL = {
 }
 METADATA_URL = "https://redump.info/disc/11496"
 MAX_DOL = 16 << 20
+
+# Mason's 2026-10-24 provenance decision: the installer replaced only this
+# loading-screen payload. This is a named variant, never a generic bypass.
+# The retail reference remains unchanged and all other references stay exact.
+VARIANTS = {"retail+reborn-loaddata": {
+    "path": "loaddata.dat", "size": 4832256,
+    "sha256": "adeac68bab482a626182b2642f140135a3d79739aa7cf4427f2f78abe00e2857",
+}}
 
 
 def hashes(stream, size: int) -> dict:
@@ -127,8 +136,8 @@ def verify(image: str | Path, reference: dict | None = None) -> dict:
 
     Raw disc identity is authoritative. Scrubbed acceptance additionally needs
     the exact retail DOL, apploader, FST paths/sizes and every known file hash.
-    A missing per-file hash enrolls the observed hash with an explicit evidence
-    limitation; a conflicting reference always makes the image modified. The
+    Missing references and conflicting hashes fail closed. The only alternative
+    is an exact named loading-screen variant, retained in the receipt identity. The
     receipt is input evidence, never rollback qualification.
     """
     reference = retail_reference() if reference is None else reference
@@ -143,6 +152,7 @@ def verify(image: str | Path, reference: dict | None = None) -> dict:
         identity = hashes(stream, size)
     raw_match = all(identity[key] == RETAIL[key] for key in ("md5", "sha1"))
     conflicts, enrolled = [], []
+    variant = "retail"
     if audit["dol"]["sha1"] != RETAIL["dol_sha1"]:
         conflicts.append({"path": "main.dol", "reason": "retail DOL identity differs"})
     expected = {row["path"]: row for row in reference["files"]}
@@ -151,13 +161,16 @@ def verify(image: str | Path, reference: dict | None = None) -> dict:
         row, original = actual.get(name), expected.get(name)
         if row is None or original is None:
             conflicts.append({"path": name, "reason": "FST structure differs"})
+        elif any(all(row[k] == known[k] for k in ("path", "size", "sha256"))
+                 for known in VARIANTS.values()):
+            variant = next(name for name, known in VARIANTS.items()
+                           if all(row[k] == known[k] for k in ("path", "size", "sha256")))
         elif row["size"] != original["size"] or (original.get("sha256") and row["sha256"] != original["sha256"]):
             conflicts.append({"path": name, "reason": "file size/hash differs from reference",
                               "expected_size": original["size"], "actual_size": row["size"],
                               "expected_sha256": original.get("sha256"), "actual_sha256": row["sha256"]})
         elif not original.get("sha256"):
-            enrolled.append({"path": name, "size": row["size"], "sha256": row["sha256"],
-                             "evidence": "new per-file baseline; no independent reference"})
+            conflicts.append({"path": name, "reason": "missing exact file hash reference"})
     if list(actual) != reference.get("fst_order", list(expected)):
         conflicts.append({"path": "fst.bin", "reason": "FST entry order differs from baseline"})
     for name, original in reference["systems"].items():
@@ -172,11 +185,12 @@ def verify(image: str | Path, reference: dict | None = None) -> dict:
     count = struct.unpack_from(">I", fst, 8)[0]
     if count != len(actual) + 1:
         conflicts.append({"path": "fst.bin", "reason": "unexpected directory structure"})
-    classification = "retail" if raw_match and audit["dol"]["sha1"] == RETAIL["dol_sha1"] else (
-        "modified" if conflicts else "retail-scrubbed")
-    return {"format": "nsrb.ownimage-verification.v2", "disc_id": "GN7E69",
+    classification = ("modified" if conflicts else variant if variant != "retail" else
+                      "retail" if raw_match else "retail-scrubbed")
+    return {"format": "nsrb.ownimage-verification.v3", "disc_id": "GN7E69",
             "disc": 0, "revision": 0, "size": size, **identity,
-            "classification": classification, "accepted": classification != "modified",
+            "classification": classification, "variant": variant if not conflicts else None,
+            "accepted": classification != "modified",
             "dol_sha1": audit["dol"]["sha1"], "systems": systems,
             "conflicts": conflicts, "enrolled_files": enrolled,
             "files": [{k: row[k] for k in ("path", "size", "sha256")} for row in audit["files"]],

@@ -141,7 +141,7 @@ def build(source: str | Path, output: str | Path, progress=None) -> dict:
         if [{k: r[k] for k in ("path", "size", "sha256")} for r in audit["files"]] != receipt["files"]:
             raise pp.PatchError("retail payload verification failed")
         result = {**layout, "source_sha256": receipt["sha256"],
-                  "source_classification": receipt["classification"],
+                  "source_classification": receipt["classification"], "variant": receipt["variant"],
                   "output_sha256": discpatch.sha256(temporary), "rollback_qualified": False}
         os.link(temporary, output)
         return result
