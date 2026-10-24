@@ -4803,7 +4803,7 @@ bool PrepareBoot()
   if (const auto manifest = NSRBootSync::Prepare())
   {
     s.boot_manifest = *manifest;
-    s.boot_manifest["MenuDelay.Protocol"] = RollbackNet::HANDOFF_VERSION;
+    s.boot_manifest["MenuDelay.Protocol"] = std::to_string(RollbackNet::HANDOFF_VERSION);
     if (*mode != NSRQuickstart::Mode::Manual)
     {
       s.boot_manifest["Quickstart.Mode"] = Env("NSR_QUICKSTART");
