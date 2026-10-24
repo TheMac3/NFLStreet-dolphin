@@ -82,7 +82,7 @@ static void TestHandoffPhaseRelay()
     assert(leaf.Accept(*packet));
     assert(!next.Accept(*packet) && !next.Mismatched());
   }
-  assert(leaf.Complete() && leaf.HostClock() == 7875);
+  assert(leaf.Complete() && leaf.HostClock() == 7875u);
   auto invalid = *previous.Proposal(1);
   invalid.sync_clock++;
   assert(!host.Accept(invalid) && !host.Proposal(1));
@@ -2275,10 +2275,10 @@ static void TestPlaybooks()
   put(ram, 0x3eab60, 0x80000100); put(ram, 0x100, 0x80000200); put(ram, 0x104, 3, 1);
   put(ram, 0x2eacac, 1); put(ram, 0x2eacb0, 0); put(ram, 0x2eacb4, 2);
   put(ram, 0x200, 0, 1); put(ram, 0x20c, 1, 1); put(ram, 0x218, 0, 1);
-  assert(NSRContent::PlaybookCaptain(memory, 0, 3) == 1);
-  assert(NSRContent::PlaybookCaptain(memory, 1, 3) == 0);
+  assert(NSRContent::PlaybookCaptain(memory, 0, 3) == 1u);
+  assert(NSRContent::PlaybookCaptain(memory, 1, 3) == 0u);
   assert(!NSRContent::PlaybookCaptain(memory, 2, 3));
-  put(ram, 0x20c, 0, 1); assert(NSRContent::PlaybookCaptain(memory, 0, 3) == 0);
+  put(ram, 0x20c, 0, 1); assert(NSRContent::PlaybookCaptain(memory, 0, 3) == 0u);
   put(ram, 0x104, 11, 1); assert(!NSRContent::PlaybookCaptain(memory, 0, 3));
 }
 
