@@ -51,6 +51,10 @@ void ObserveTotals(const Core::CPUThreadGuard& guard);
 void ObserveFrame(const Core::CPUThreadGuard& guard, std::uint32_t frame, bool in_game,
                   std::optional<std::uint32_t> confirmed_through);
 
+// Observe the native snap on live AND replayed timelines; RAM reads only.
+void ObservePlayResult(const Core::CPUThreadGuard& guard, std::uint32_t frame);
+void ObserveEvent(const Core::CPUThreadGuard& guard, std::uint32_t frame);
+
 // Discard any staged observation on an abandoned timeline before restoring a
 // rollback snapshot. This updates host bookkeeping only, never guest state.
 void RollbackFrom(std::uint32_t frame);

@@ -26,6 +26,7 @@
 #include "Core/Core.h"
 #include "Core/HW/Memmap.h"
 #include "Core/NSR/NSRDraftLog.h"
+#include "Core/NSR/NSRPlayCalls.h"
 #include "Core/NSR/NSRGameStatsIdentity.h"
 #include "Core/NSR/NSRGameStatsRead.h"
 #include "Core/PowerPC/PowerPC.h"
@@ -68,6 +69,7 @@ struct State
   // Pickup draft history (NSRDraftLog.h). Kept across "play again" rematches,
   // which reuse the drafted rosters; a new draft restarts it at zero picks.
   DraftLog draft;
+  PlayCalls play_calls;
 };
 State s;
 
@@ -180,6 +182,162 @@ Object PlayerStats(const Row* offense, const Row* defense)
         {"forced_fumbles", "fflg"}, {"fumble_rec", "rflg"}, {"tackles", "atdg"},
         {"sacks", "kslg"}})
     copy(defense, key, column);
+  return result;
+}
+
+// Called-play identity includes the native resource name and its visible label.
+Json CallJson(const std::optional<PlayCall>& call, std::uint32_t side, int pad)
+{
+  Object result{{"side", Json(double(side))}, {"pad", pad >= 0 ? Json(double(pad)) : Json()},
+                {"book_id", Json()}, {"slot_id", Json()}, {"raw_play_name", Json()},
+                {"raw_formation_name", Json()}, {"category_id", Json()}, {"category_name", Json()},
+                {"play_id", Json()}, {"play_name", Json()}, {"formation_id", Json()},
+                {"formation_name", Json()}, {"audible", Json()}, {"flipped", Json()}};
+  if (call)
+  {
+    result["play_id"] = Json(double(call->play_id));
+    result["slot_id"] = Json(double(call->slot_id));
+    result["book_id"] = Json(call->book);
+    result["play_name"] = Json(CP1252ToUTF8(PlayScreenName(call->play_name)));
+    result["raw_play_name"] = Json(CP1252ToUTF8(call->play_name));
+    if (call->formation_id)
+      result["formation_id"] = Json(double(*call->formation_id));
+    if (call->formation_name)
+    {
+      result["formation_name"] = Json(CP1252ToUTF8(*call->formation_name));
+      result["raw_formation_name"] = Json(CP1252ToUTF8(*call->formation_name));
+    }
+    if (call->category_id)
+      result["category_id"] = Json(double(*call->category_id));
+    if (call->category_name)
+      result["category_name"] = Json(CP1252ToUTF8(*call->category_name));
+    if (call->flipped)
+      result["flipped"] = Json(*call->flipped);
+  }
+  return Json(std::move(result));
+}
+
+// Resolve native actor handles only through this play's observed roster.
+Json RosterIndex(const Snap& snap, std::uint32_t id)
+{
+  for (std::size_t i = 0; i < snap.roster.size(); ++i)
+    if (snap.roster[i].id == id)
+      return Json(double(i));
+  return Json(-1.0);
+}
+
+// The native result classifier returns pass=1/run=2. An interception event
+// takes precedence. A pass-classified play with no throw and a tackle is a
+// native sack (the event evaluator's explicit sack path also returns 1).
+// Missing result/spot observations stay unknown, never become zero-yard plays.
+Json SummaryJson(const Snap& snap)
+{
+  if (!snap.result || snap.events_dropped_from)
+    return Json();
+  const auto& result = *snap.result;
+  bool thrown = false, caught = false, incomplete = false, intercepted = false;
+  unsigned changes = 0;
+  Json passer(-1.0), receiver(-1.0), rusher(-1.0), interceptor(-1.0);
+  bool tackled = false;
+  for (const auto& event : snap.events)
+  {
+    switch (event.code)
+    {
+    case 4: rusher = RosterIndex(snap, event.actor); break;
+    case 5: thrown = true; passer = RosterIndex(snap, event.actor); break;
+    case 6: caught = true; receiver = RosterIndex(snap, event.actor); break;
+    case 8: rusher = RosterIndex(snap, event.actor); break;
+    case 20: intercepted = true; interceptor = RosterIndex(snap, event.actor); break;
+    case 21: incomplete = true; break;
+    case 28: tackled = true; if (!thrown) rusher = RosterIndex(snap, event.actor); break;
+    case 30: ++changes; break;
+    default: break;
+    }
+  }
+  const bool turnover = (changes & 1) != 0;
+  const bool touchdown = result.result == 6 && snap.down != 0;
+  const bool first_down = (result.kind == 1 || result.kind == 2) && result.result == 1 &&
+                          !(result.flags & 4) && !(result.state_flags & 1) && snap.down != 0;
+  const bool known = snap.z && result.z && !incomplete && !intercepted && changes == 0 &&
+                     (result.kind == 2 || caught || tackled);
+  Json kind;
+  if (snap.down == 0)
+    kind = Json(std::string("conversion"));
+  else if (intercepted)
+    kind = Json(std::string("interception"));
+  else if (thrown)
+    kind = Json(std::string("pass"));
+  else if (result.kind == 1 && tackled)
+    kind = Json(std::string("sack"));
+  else if (result.kind == 2)
+    kind = Json(std::string("run"));
+  auto end = result.z;
+  if (touchdown && snap.goal)
+    end = snap.goal;
+  return Json(Object{{"kind", kind}, {"yards_known", Json(known)},
+                     {"yards", known && end ? Json(double(*end - *snap.z)) : Json()},
+                     {"touchdown", Json(touchdown)}, {"first_down", Json(first_down)},
+                     {"turnover", Json(turnover)}, {"safety", Json(result.scoring == -2)},
+                     {"complete", Json(caught)},
+                     {"conversion_good", snap.down == 0 ? Json(result.scoring == 2) : Json()},
+                     {"passer", passer}, {"receiver", receiver},
+                     {"rusher", rusher}, {"interceptor", interceptor},
+                     {"native_kind", Json(double(result.kind))},
+                     {"native_result", Json(double(result.result))}});
+}
+
+// Capture runs only on a confirmed result frame. The journal has already had
+// abandoned events/results removed and corrected observations replayed.
+Array PlaysJson(std::uint32_t through, const Array& players)
+{
+  Array result;
+  const auto number = [](const std::optional<float>& value) {
+    return value ? Json(double(*value)) : Json();
+  };
+  for (const auto& snap : s.play_calls.Snaps())
+  {
+    if (snap.frame > through || (snap.result && snap.result->frame > through))
+      continue;
+    const auto off = snap.offense;
+    Object calls{{"schema", Json(std::string("nsr.play_calls.v1"))},
+                 {"offense", CallJson(snap.calls[off], off, snap.pads[off])},
+                 {"defense", CallJson(snap.calls[1 - off], 1 - off, snap.pads[1 - off])}};
+    Array roster, events;
+    for (const auto& entry : snap.roster)
+    {
+      Json name;
+      for (const auto& player : players)
+        if (player.get("digp").get<double>() == entry.digp &&
+            player.get("side").get<double>() == entry.side)
+          name = player.get("name");
+      roster.emplace_back(Object{{"name", name}, {"side", Json(double(entry.side))},
+                                  {"slot", Json(double(entry.slot))},
+                                  {"digp", Json(double(entry.digp))}});
+    }
+    unsigned changes = 0;
+    for (const auto& event : snap.events)
+    {
+      if (event.frame > through)
+        continue;
+      changes += event.code == 30;
+      events.emplace_back(Object{{"frame", Json(double(event.frame))},
+                                 {"code", Json(double(event.code))}, {"sub", Json(double(event.sub))},
+                                 {"actor", RosterIndex(snap, event.actor)},
+                                 {"other", RosterIndex(snap, event.other)},
+                                 {"x", number(event.x)}, {"z", number(event.z)}});
+    }
+    result.emplace_back(Object{
+        {"schema", Json(std::string("nsr.play.v1"))}, {"seq", Json(double(result.size() + 1))},
+        {"snap_frame", Json(double(snap.frame))}, {"offense_side", Json(double(off))},
+        {"end_side", Json(double(off ^ (changes & 1)))}, {"down", Json(double(snap.down))},
+        {"conversion", Json(snap.down == 0)},
+        {"score", Json(Array{Json(double(snap.score[0])), Json(double(snap.score[1]))})},
+        {"snap", Json(Object{{"x", number(snap.x)}, {"z", number(snap.z)}})},
+        {"line_z", number(snap.line)}, {"goal_z", number(snap.goal)},
+        {"events_complete", Json(!snap.events_dropped_from)},
+        {"summary", SummaryJson(snap)}, {"roster", Json(std::move(roster))},
+        {"events", Json(std::move(events))}, {"play_calls", Json(std::move(calls))}});
+  }
   return result;
 }
 
@@ -368,14 +526,18 @@ std::optional<Object> Capture(const Memory& memory, std::uint32_t frame)
                   {"session_id", Json(Environment("NSR_TELEMETRY_SESSION"))},
                   {"seed", Json(Environment("NSR_SEED"))},
                   {"match_frame", Json(double(s.match_frame))}, {"capture_frame", Json(double(frame))},
-                  {"match_ordinal", Json(double(s.ordinal))}, {"pads", Json(std::move(pads))}};
+                  {"match_ordinal", Json(double(s.ordinal))},
+                  {"play_calls_complete", Json(s.play_calls.Complete())},
+                  {"pads", Json(std::move(pads))}};
   auto draft = DraftJson(memory, player_json);
+  auto plays = PlaysJson(frame, player_json);
   Object result{{"schema", Json(std::string("nsr.game.v1"))},
                 {"source", Json(std::string("nsr-netplay"))}, {"teams", Json(std::move(team_json))},
                 {"style", Json(std::move(style_json))}, {"team_totals", Json(std::move(total_json))},
                 {"sides_verified", Json(true)}, {"per_player_matched", Json(true)},
                 {"reborn_match", Json(std::move(reborn))}, {"players", Json(std::move(player_json))},
                 {"nsr_netplay", Json(std::move(metadata))}};
+  result.emplace("plays", Json(std::move(plays)));
   if (draft)
     result.emplace("draft", Json(std::move(*draft)));
   return result;
@@ -616,6 +778,7 @@ void ObserveFrame(const Core::CPUThreadGuard& guard, std::uint32_t frame, bool i
     // selector after a completed capture is a new game even without leave.
     if (!s.was_in_game || (s.stats_seen && screen == std::pair{3u, 2u}))
     {
+      s.play_calls = PlayCalls{};
       s.match_frame = frame;
       ++s.ordinal;
       s.saved = false;
@@ -704,8 +867,50 @@ void ObserveFrame(const Core::CPUThreadGuard& guard, std::uint32_t frame, bool i
   PublishConfirmed(confirmed_through);
 }
 
+// Both HLE Start observations preserve registers/instructions and replay after
+// rollback. Events are copied at the native commit, not at a guessed UI frame.
+void ObserveEvent(const Core::CPUThreadGuard& guard, std::uint32_t frame)
+{
+  if (!s.was_in_game || s.stats_seen || s.saved)
+    return;
+  const auto memory = View(guard);
+  const auto& ppc = guard.GetSystem().GetPPCState();
+  const auto event = ReadPlayEvent(memory, ppc.gpr[3], frame);
+  if (!event)
+    return;
+  if (event->code == 3)
+  {
+    auto snap = ReadSnap(memory, frame);
+    if (!snap)
+      return;
+    // The event itself is the authoritative snap spot.
+    snap->x = event->x;
+    snap->z = event->z;
+    s.play_calls.Observe(std::move(*snap));
+  }
+  s.play_calls.ObserveEvent(*event);
+  if (s.trace && (event->code == 3 || event->code == 2))
+    std::fprintf(stderr, "[NSR stats] play event %u frame %u\n", event->code, frame);
+}
+
+// Final native result already contains the game's outcome classification.
+void ObservePlayResult(const Core::CPUThreadGuard& guard, std::uint32_t frame)
+{
+  if (!s.was_in_game || s.stats_seen || s.saved)
+    return;
+  const auto& ppc = guard.GetSystem().GetPPCState();
+  if (auto result = ReadPlayResult(View(guard), ppc.gpr[3], ppc.gpr[4], frame))
+  {
+    if (s.trace)
+      std::fprintf(stderr, "[NSR stats] play result frame %u kind %u result %u flags %x score %d\n",
+                   frame, result->kind, result->result, result->flags, result->scoring);
+    s.play_calls.ObserveResult(std::move(*result));
+  }
+}
+
 void RollbackFrom(std::uint32_t frame)
 {
+  s.play_calls.RollbackFrom(frame);
   if (!s.ready || s.ready->observed_frame < frame)
     return;
   if (s.ready->ordinal == s.ordinal)

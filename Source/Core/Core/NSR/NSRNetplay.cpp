@@ -8028,8 +8028,20 @@ void ContentDatabaseHook(const Core::CPUThreadGuard& guard)
   NSRContent::DatabaseLoaded(guard, s_rb.in_resim, s_rb.live);
 }
 
-// Observational HLE Start hook at GN7E69 rev-0 MVP calculation completion.
-// It preserves the original instruction, PPC registers and all guest state.
+// Passive native event reader. Re-simulation rebuilds observations after
+// RollbackFrom removes the abandoned timeline; no guest state is written.
+void GameStatsEventHook(const Core::CPUThreadGuard& guard)
+{
+  NSRGameStats::ObserveEvent(guard, s_rb.tick_running);
+}
+
+// Read the native finalized play result; re-simulation rebuilds this journal.
+void GameStatsPlayResultHook(const Core::CPUThreadGuard& guard)
+{
+  NSRGameStats::ObservePlayResult(guard, s_rb.tick_running);
+}
+
+// Observe MVP calculation completion, preserving the native instruction/state.
 void GameStatsMvpHook(const Core::CPUThreadGuard& guard)
 {
   if (!s_rb.in_resim)
