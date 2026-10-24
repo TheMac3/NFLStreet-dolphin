@@ -624,8 +624,12 @@ def check_patch_set(patches: set[str]) -> None:
             raise PatchError(f"{by} needs {need}")
 
 
-def apply_patches(iso, patches: set[str]) -> None:
-    """Patch an already-copied image file (opened r+b) in place."""
+def apply_patches(iso, patches: set[str], *, poll_original: int = REBORN_REMAP, retail: bool = False) -> None:
+    """Patch a private copy; retail supplies its separately guarded native poll target.
+
+    The generated poll still calls the agreed adapter address. The retail
+    bootstrap owns that adapter; the Reborn recipe retains its exact guard.
+    """
     check_patch_set(patches)
     if "freeze" in patches:
         routine = freeze_routine()
@@ -676,7 +680,13 @@ def apply_patches(iso, patches: set[str]) -> None:
         write_words(iso, MAIN_ITER_SITE, [b(MAIN_ITER_SITE, RB_FRAME_CODE, link=True)],
                     expect=[b(MAIN_ITER_SITE, MAIN_ITER, link=True)])
         for site in MFTB_SITES:
-            write_words(iso, site, [b(site, RB_TIME_STUB, link=True)], expect=[MFTB_R3])
+            if retail:
+                # GN7E69-r0 retail calls GX here; only Reborn replaced that
+                # call with mftb. Preserve native graphics behavior exactly.
+                native = b(site, 0x802520E0, link=True)
+                write_words(iso, site, [native], expect=[native])
+            else:
+                write_words(iso, site, [b(site, RB_TIME_STUB, link=True)], expect=[MFTB_R3])
         for addr, words in ((RB_POLL_CODE, rollback_poll_routine()),
                             (RB_TICK_CODE, rollback_tick_routine())):
             write_words(iso, addr, words, expect=[0] * len(words))
@@ -685,7 +695,7 @@ def apply_patches(iso, patches: set[str]) -> None:
         write_words(iso, tail, [b(tail, RB_POLL_CODE, link=True)] + [nop()] * 5,
                     expect=[buf, b(tail + 4, POLL_CLEAR, link=True), buf,
                             b(tail + 12, PAD_READ, link=True), buf,
-                            b(tail + 20, REBORN_REMAP, link=True)])
+                            b(tail + 20, poll_original, link=True)])
         write_words(iso, SIM1_SITE, [b(SIM1_SITE, RB_TICK_CODE, link=True)],
                     expect=[b(SIM1_SITE, SIM1, link=True)])
         write_words(iso, SIM2_SITE, [nop()], expect=[b(SIM2_SITE, SIM2, link=True)])

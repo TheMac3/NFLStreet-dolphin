@@ -186,7 +186,7 @@ def room_fingerprint(image_fingerprint, order, first):
     if not image_fingerprint or (order, first) == ("alternating", "stock"):
         return image_fingerprint
     digest = hashlib.sha256((image_fingerprint + ':' + order + ':' + first + ':draft-v1').encode()).hexdigest()
-    return ip_fingerprint(digest)
+    return "retail:" + digest if image_fingerprint.startswith("retail:") else ip_fingerprint(digest)
 
 
 def ip_fingerprint(digest):

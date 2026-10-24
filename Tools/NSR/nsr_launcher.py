@@ -221,16 +221,22 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
         return args, env
     players = start.players if start else 1
     pad = controllers.controller_kind(os.path.join(folder, "User"))
-    # Imported presentation assets only. This launch path never resolves or
-    # opens a Reborn source; both prompt sets were captured during setup.
-    tex = textures.compose(folder, icons, pad.kind)
-    # Never launch through a stale list: an older launcher may have recorded
-    # Reborn paths there. The caller surfaces write failures before starting.
+    image_manifest = patcher.read_manifest(folder)
+    retail = (image_manifest.get("recipe") == patcher.ownimage_build.RECIPE and
+              image_manifest.get("base_family") == patcher.ownimage_build.FAMILY)
+    if retail:
+        reborn_install = None
+        env.update({"NSR_IMAGE_FAMILY": image_manifest["base_family"],
+                    "NSR_IMAGE_RECIPE": image_manifest["recipe"],
+                    "NSR_IMAGE_SHA256": image_manifest["output_sha256"]})
+    # Preserve the newer launcher-owned asset store for Reborn. Retail
+    # always uses an empty overlay and clears any previously imported list.
+    tex = textures.TextureSet() if retail else textures.compose(folder, icons, pad.kind)
     textures.write_list(os.path.join(folder, "User"), tex)
     env["NSR_TEXTURES"] = tex.summary()  # logged by the launcher; the fork ignores it
     if tex.warnings:
         env["NSR_TEXTURES_WARNING"] = " ".join(tex.warnings)
-    args += ["-C", "Graphics.Settings.HiresTextures=True",
+    args += ["-C", f"Graphics.Settings.HiresTextures={not retail}",
              "-C", "Graphics.Settings.CacheHiresTextures=False"]
     if resolution in RESOLUTIONS[1:]:
         args += ["-C", f"Graphics.Settings.InternalResolution={resolution}"]
@@ -255,6 +261,8 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     env["NSR_SEED"] = str(start.seed if start else secrets.randbits(32))
     # Room selection wins on every peer; practice uses the same one-shot macro.
     selected = lobby.quickstart_id(start.quickstart if start else quickstart)
+    if retail and selected != "manual":
+        raise ValueError("Retail automatic navigation is not qualified yet; choose Manual navigation.")
     if selected != "manual":
         env["NSR_QUICKSTART"] = selected
     if start:
@@ -635,7 +643,8 @@ class Launcher:
     def refresh_textures(self) -> textures.TextureSet:
         """What the next launch will show (nothing is written here)."""
         pad = controllers.controller_kind(self.user_dir)
-        ts = textures.compose(self.folder, self._icons_setting(), pad.kind)
+        retail = patcher.read_manifest(self.folder).get("base_family") == patcher.ownimage_build.FAMILY
+        ts = textures.TextureSet() if retail else textures.compose(self.folder, self._icons_setting(), pad.kind)
         self._set("textures", icons=self._icons_setting(), effective=ts.icons, why=ts.icons_why,
                   base_kind=ts.base_kind, base=ts.base or "",
                   packages=[f"{p.id} {p.version}" for p in ts.packages],
@@ -795,9 +804,8 @@ class Launcher:
             else:
                 self._set("game", state="error", fingerprint="", progress=None, text=str(e))
             log(self.folder, f"local texture import: {e}")
-        except isopatch.PatchError:
-            self._fail_build(restore, "This Reborn version isn't supported yet (the game code changed). "
-                                      "Nothing was written. Ask Mason for an updated launcher.")
+        except isopatch.PatchError as exc:
+            self._fail_build(restore, f"Could not build this source: {exc}. Your previous image was kept.")
         except nsr_content.ContentError as e:
             log(self.folder, f"content build failed: {e}")
             self._fail_build(restore, f"The game content update didn't apply: {e}", recheck=built)
@@ -838,6 +846,8 @@ class Launcher:
     def reborn_install(self, search: bool = False) -> str | None:
         """Reborn's install folder: from the last image build, else (search=True)
         found on disk like NFLStreetRollback-Patcher does."""
+        if patcher.read_manifest(self.folder).get("base_family") == patcher.ownimage_build.FAMILY:
+            return None
         install = self.cfg.get("reborn_install") or self._patcher.saved_reborn_install(self.folder)
         if not install and self.cfg.get("reborn_iso"):
             install = self._patcher.reborn_install_of(self.cfg["reborn_iso"])
@@ -851,7 +861,11 @@ class Launcher:
         # Only the explicit import button may read Reborn again.
         record = self.cfg.get("controllers") or {}
         own_pad = os.path.join(self.user_dir, "Config", "GCPadNew.ini")
-        if not force and (record.get("written") or os.path.isfile(own_pad)
+        retail = patcher.read_manifest(self.folder).get("base_family") == patcher.ownimage_build.FAMILY
+        if retail:
+            source = None
+            res = controllers.SyncResult("kept-yours", record, "Using native Dolphin controller settings.")
+        elif not force and (record.get("written") or os.path.isfile(own_pad)
                           or textures.read_store(self.folder, validate=False)):
             source = None
             synced = record.get("written") == controllers.text_hash(controllers.read_text(own_pad) or "")
@@ -1113,6 +1127,14 @@ class Launcher:
             self.uploader.remember_server(start.telemetry_url, start.telemetry_token)
             self._stats_wake.set()
         selected_draft = lobby.draft_settings(start.draft) if start else self.draft_settings()
+        if (not open_ui and patcher.read_manifest(self.folder).get("base_family") == patcher.ownimage_build.FAMILY
+                and selected_draft != {"order": "alternating", "first": "stock"}):
+            self.notify("Retail v1 currently supports Alternating / Stock draft settings only.", "error")
+            return
+        if (not open_ui and patcher.read_manifest(self.folder).get("base_family") == patcher.ownimage_build.FAMILY
+                and (start.quickstart if start else self.state["quickstart"]) != "manual"):
+            self.notify("Retail automatic navigation is not qualified yet. Choose Manual navigation.", "error")
+            return
         try:
             args, env = dolphin_command(self.folder, start, None, open_ui=open_ui,
                                         name=self.state["name"], fingerprint=self.room_fingerprint(selected_draft),
@@ -1404,6 +1426,8 @@ class Launcher:
     # -- local presentation import (serialized by the existing setup busy flag) --
     def _ensure_assets(self, force: bool = False, install: str | None = None) -> None:
         """Metadata-check or import inside setup; normal composition is local only."""
+        if patcher.read_manifest(self.folder).get("base_family") == patcher.ownimage_build.FAMILY:
+            return  # Native retail has no Reborn presentation import dependency.
         old = textures.read_store(self.folder)
         install = install or old.get("install") or self.reborn_install(search=True)
         if not install and not old and not force:

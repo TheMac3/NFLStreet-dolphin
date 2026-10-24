@@ -4346,6 +4346,31 @@ bool ValidateRollbackImage(Core::System& system)
   // footprint.  Treat the complete footprint as the patch signature: a
   // mismatch rejects every invasive NSR hook rather than installing a
   // partial fixed-address set into an unknown executable.
+  // ownimage: the retail bootstrap has its own marker, bounded arena setter
+  // and native PADClamp adapter. Reborn keeps its existing footprint. This is
+  // checked once at hook installation; no family test enters the frame path.
+  const auto& memory = system.GetMemory();
+  const bool retail = memory.Read_U32(0x80410000) == 0x4E53524F;
+  if (retail)
+  {
+    constexpr std::pair<u32, u32> retail_signature[] = {
+        {0x80410004, 1}, {0x80411400, 0x4BE351BC},
+        {0x80239A10, 0x481D75F0}, {0x80411000, 0x3D808041},
+        {0x80411004, 0x618C7000}, {0x80411008, 0x7C036040},
+        {0x8041100C, 0x40800008}, {0x80411010, 0x7D836378},
+        {0x80411014, 0x906D9EB8}, {0x80411018, 0x4E800020},
+        {0x80198924, 0x480B97BD},
+    };
+    for (const auto& [address, expected] : retail_signature)
+    {
+      if (memory.Read_U32(address) != expected)
+      {
+        Log("retail bootstrap signature mismatch at {:08x}; hooks disabled", address);
+        return false;
+      }
+    }
+    Log("rollback image family gn7e69-r0-retail; authored bootstrap ABI 1, native PADClamp");
+  }
   constexpr std::pair<u32, u32> signature[] = {
       {0x80416900, 0x4E800020}, {0x80416904, 0x4E800020}, {0x80416908, 0x4E800020},
       {0x8041690C, 0x4E800020}, {0x80416910, 0x4E800020}, {0x80416914, 0x4E800020},
@@ -4359,9 +4384,10 @@ bool ValidateRollbackImage(Core::System& system)
       {0x80416AA8, 0x4082FFE8}, {0x80416AAC, 0x83E1001C}, {0x80416AB0, 0x80010024},
       {0x80416AB4, 0x7C0803A6}, {0x80416AB8, 0x38210020}, {0x80416ABC, 0x4E800020},
   };
-  const auto& memory = system.GetMemory();
   for (const auto& [address, expected] : signature)
   {
+    if (retail && address == 0x80198924)
+      continue;  // The retail graphics call was checked above, not replaced by a time hook.
     const u32 actual = memory.Read_U32(address);
     if (actual != expected)
     {
@@ -4994,7 +5020,16 @@ namespace
 // are found from their static roots instead: words in .data/.sbss that point
 // at (or into) them. Measured in Quick Play; the roots are fixed addresses in
 // the DOL, the blocks move with the mode.
-constexpr std::array<u32, 5> IO_ROOT_WORDS{0x803EBC24, 0x803EBC28, 0x803ED628, 0x803D55E8, 0x803D55EC};
+// ownimage: 803ED62C is the stream request pool, created at 801C953C with
+// 0x24-byte records by 801C68FC and consumed by 801C9008/801CA1A4. It was
+// missing beside the worker root at 803ED628. Native-content watch evidence
+// (ownimage2, GN7E69-r0) attributes the disputed records to stream allocation,
+// issue and completion on the audio/disc/boot threads, not gameplay objects.
+// Treat the structurally bounded enclosing block like the other boot-time I/O
+// roots; sidecar v2 still requires both peers to agree its owner/boundaries.
+// No fixed address window or generic heap exclusion is introduced.
+constexpr std::array<u32, 6> IO_ROOT_WORDS{
+    0x803EBC24, 0x803EBC28, 0x803ED628, 0x803ED62C, 0x803D55E8, 0x803D55EC};
 constexpr std::pair<u32, u32> IO_ROOT_TABLE{0x802C8840, 0x802C89E0};  // stream source request table
 
 // The allocated heap block containing p: scan back for a header whose heap
@@ -5547,7 +5582,8 @@ namespace
 {
 // Version of the exclusion rules; part of the config fingerprint, so peers
 // with different rules refuse to play instead of reporting false desyncs.
-constexpr u32 STATE_DIGEST_RANGES_VERSION = 10;  // 6: Crush padding; 7: stable small audio-heap metadata
+// ownimage v11 adds the bounded native stream-request pool I/O root.
+constexpr u32 STATE_DIGEST_RANGES_VERSION = 11;  // 6: Crush padding; 7: stable small audio-heap metadata
 // 8 (fix/lifecycle): the loading-screen icon (fn_80194060) position/velocity.
 // 9 (fix/lifecycle): heap-1's InGame allocation-name padding (four bytes).
 // 10 (lifecycle3): no new exclusion; the hash state is initialized (XXH3_INITSTATE)

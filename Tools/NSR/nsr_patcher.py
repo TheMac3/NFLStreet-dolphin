@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """nsr_patcher.py: one-click builder of the NFLStreet rollback netplay game image.
 
+Retail sources with the exact native DOL route to ownimage_build's separately
+verified recipe. Native builds currently require an output under local/ and
+stock content/draft policy; see docs/ownimage.md for unresolved provenance and
+runtime qualification. Conflicting file references fail closed.
+
 For friends testing the POC. Double-click NFLStreetRollback-Patcher.exe (built from this file
 with PyInstaller) inside the NFLStreet netplay Dolphin folder, and it:
 
@@ -47,6 +52,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import isopatch  # noqa: E402
 import draftmodes  # noqa: E402
+import ownimage  # local retail metadata verification
+import ownimage_build  # independently authored retail recipe
 import nsr_content  # noqa: E402  (content updates: our ratings packs, docs/content-updates.md)
 
 OUTPUT_NAME = "nsr-net.iso"
@@ -128,7 +135,7 @@ def ask_for_iso() -> str | None:
         root = tkinter.Tk()
         root.withdraw()
         path = filedialog.askopenfilename(
-            title="Find NFL Street Reborn's NSR.iso (in the Reborn install: content\\games)",
+            title="Choose your NFL Street 2 retail ISO or Reborn NSR.iso",
             filetypes=[("Reborn game image", "NSR.iso"), ("GameCube image", "*.iso")])
         root.destroy()
         return path or None
@@ -260,6 +267,58 @@ def apply_content(image: str, build: dict, content: "nsr_content.Content") -> No
                                expect_sha256=build["template_sha256"])
 
 
+def retail_fingerprint(digest: str) -> str:
+    """Retail room identity uses a family prefix and the full output digest."""
+    return "retail:" + digest.lower()
+
+
+def is_retail_source(image: str) -> bool:
+    """Route exact retail executables to the strict retail builder, never a fallback."""
+    try:
+        with open(image, "rb") as stream:
+            size = stream.seek(0, 2)
+            data = ownimage.header(stream, size)
+            return ownimage.dol_metadata(stream, data, size)["sha1"] == ownimage.RETAIL["dol_sha1"]
+    except (OSError, ValueError):
+        return False
+
+
+def prepare_retail_image(iso: str, out_dir: str, progress=None) -> Prepared:
+    """Build a separate retail recipe; refuse conflicting references transactionally.
+
+    Use a separate launcher directory under local/ for this experimental family.
+    Retail has native rosters, controls and presentation. Signed Reborn content
+    and nonstock draft policies need their own retail qualification first.
+    """
+    out = os.path.join(out_dir, OUTPUT_NAME)
+    partial = out + ".retail-partial"
+    if os.path.exists(partial) or os.path.islink(partial):
+        raise isopatch.PatchError("a retail partial output already exists; inspect it before retrying")
+    if os.path.exists(out) and os.path.samefile(iso, out):
+        raise isopatch.PatchError("the retail source aliases the output")
+    published_partial = False
+    try:
+        result = ownimage_build.build(iso, partial,
+            progress=(lambda d, t: progress("build", d, t)) if progress else None)
+        published_partial = True
+        digest = result["output_sha256"]
+        manifest = {**result, "base_family": ownimage_build.FAMILY, "mode": NETPLAY_MODE,
+                    "fingerprint": retail_fingerprint(digest), "patches": list(isopatch.ROLLBACK_SET),
+                    "draft_order": "alternating", "draft_first": "stock", "content": None,
+                    "source_label": "NFL Street 2 USA rev 0 (native)",
+                    "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        temporary_manifest = os.path.join(out_dir, MANIFEST_NAME + ".tmp")
+        with open(temporary_manifest, "w") as stream:
+            json.dump(manifest, stream, indent=1)
+        os.replace(partial, out)
+        os.replace(temporary_manifest, os.path.join(out_dir, MANIFEST_NAME))
+    finally:
+        if published_partial and os.path.isfile(partial):
+            os.unlink(partial)
+    return Prepared(out, retail_fingerprint(digest), manifest["source_label"], None, None,
+                    source_sha256=result["source_sha256"])
+
+
 def prepare_image(iso: str, out_dir: str, progress=None, content: "nsr_content.Content | None" = None,
                   content_strict: bool = True, *,
                   draft_order: str = "alternating", draft_first: str = "stock") -> Prepared:
@@ -284,6 +343,10 @@ def prepare_image(iso: str, out_dir: str, progress=None, content: "nsr_content.C
     if install and Path(out_dir).resolve().is_relative_to(Path(install).resolve()):
         raise ValueError("Keep NFLStreetRollback in its own folder outside Reborn before building/importing.")
     choices = draftmodes.patch_names(draft_order, draft_first)
+    if is_retail_source(iso):
+        if content or choices:
+            raise isopatch.PatchError("retail v1 supports native content and stock draft policy only")
+        return prepare_retail_image(iso, out_dir, progress)
     step = (lambda st: (lambda d, t: progress(st, d, t))) if progress else (lambda st: None)
     digest_in = sha256(iso, progress=step("check")) if progress else sha256(iso, "checking Reborn image")
     known = KNOWN_INPUTS.get(digest_in)
@@ -377,6 +440,10 @@ def image_status(out_dir: str, progress=None) -> ImageStatus | None:
     fp = fingerprint(digest)
     manifest = read_manifest(out_dir)
     source = manifest.get("source_sha256") if isinstance(manifest.get("source_sha256"), str) else ""
+    if (manifest.get("recipe") == ownimage_build.RECIPE and manifest.get("base_family") == ownimage_build.FAMILY
+            and manifest.get("output_sha256") == digest):
+        return ImageStatus(retail_fingerprint(digest), "retail", "Native retail rosters and controls; experimental recipe",
+                           source_sha256=source)
     ours = manifest.get("recipe") == ROLLBACK_RECIPE and manifest.get("output_sha256") == digest
     applied = nsr_content.parse_descriptor(
         {k: (manifest.get("content") or {}).get(k) for k in ("version", "serial")}
@@ -405,7 +472,12 @@ def image_fingerprint(out_dir: str, progress=None) -> str | None:
     path = os.path.join(out_dir, OUTPUT_NAME)
     if not os.path.isfile(path):
         return None
-    return fingerprint(sha256(path, progress=progress or (lambda d, t: None)))
+    digest = sha256(path, progress=progress or (lambda d, t: None))
+    manifest = read_manifest(out_dir)
+    if (manifest.get("recipe") == ownimage_build.RECIPE and manifest.get("base_family") == ownimage_build.FAMILY
+            and manifest.get("output_sha256") == digest):
+        return retail_fingerprint(digest)
+    return fingerprint(digest)
 
 
 def run(iso: str | None, out_dir: str, draft_order="alternating", draft_first="stock") -> int:
@@ -418,16 +490,16 @@ def run(iso: str | None, out_dir: str, draft_order="alternating", draft_first="s
         print("Couldn't find Reborn's NSR.iso. Run this again with its path, e.g.\n"
               '  NFLStreetRollback-Patcher.exe "C:\\...\\NFL Street Reborn\\content\\games\\NSR.iso"')
         return 1
-    print(f"Reborn image: {iso}\n")
+    print(f"Source image: {iso}\n")
     started = time.time()
     try:
         r = prepare_image(iso, out_dir, draft_order=draft_order, draft_first=draft_first)
     except isopatch.PatchError as e:
-        print(f"\n\nFAILED: {e}\nThis Reborn version needs updated patches. Nothing was written.")
+        print(f"\n\nFAILED: {e}\nYour source and previous image were kept.")
         return 1
     print(f"  {r.reborn_label or 'unknown Reborn version (patches applied cleanly)'}; "
           f"done in {time.time() - started:.0f}s")
-    print(f"\nRecipe: {ROLLBACK_RECIPE}")
+    print(f"\nRecipe: {ownimage_build.RECIPE if r.fingerprint.startswith('retail:') else ROLLBACK_RECIPE}")
     print(f"Pickup draft: {draft_order}; first: {draft_first}")
     print(f"Your netplay image fingerprint:  {r.fingerprint}")
     if r.matches_reference:
@@ -438,7 +510,7 @@ def run(iso: str | None, out_dir: str, draft_order="alternating", draft_first="s
         print("Compare this fingerprint with everyone you play with: it must be identical.")
     if r.reborn_install:
         print("The launcher will import textures locally from your Reborn install on first start.")
-    print("\nYour Reborn install was only read, never changed.")
+    print("\nYour source image was only read, never changed.")
     print(f"Next: start a game with the NFLStreetRollback launcher (it uses {OUTPUT_NAME} from this folder).")
     return 0
 
@@ -446,7 +518,7 @@ def run(iso: str | None, out_dir: str, draft_order="alternating", draft_first="s
 def main(argv=None) -> int:
     """Accept explicit image setup choices for CLI and packaged patcher users."""
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("iso", nargs="?", help="path to Reborn's NSR.iso (default: find it)")
+    ap.add_argument("iso", nargs="?", help="your retail ISO or Reborn NSR.iso (default: find Reborn)")
     default_out = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False)
                                                   else __file__))
     ap.add_argument("--out", default=default_out, help="folder for nsr-net.iso (default: next to this program)")
