@@ -140,9 +140,16 @@ constexpr u16 DEFAULT_PORT = 51515;
 //     uses 0x80384DE0 + chan * 0xA000): per-mount card values.
 //   - SDK raw SI controller input (before PADRead): each machine's own pads.
 //   - NFLStreet patch area: test scripts, freeze/loop words.
-constexpr std::array<std::pair<u32, u32>, 3> HASH_SKIP{{
+//   - The audio thread's saved register context (OSContext at 0x803AA828,
+//     0x2C8 bytes; thread state/queue words after it stay hashed): it holds
+//     whatever registers the thread had when the host preempted it, which
+//     varies with host timing. The canonical rollback digest already excludes
+//     it; without this the menu lockstep hash raised a false DESYNC on 4 bytes
+//     at 0x803AAA5C (fix/delayprobe report, seed 0x2a20f935).
+constexpr std::array<std::pair<u32, u32>, 4> HASH_SKIP{{
     {0x00384C00, 0x00398E00},
     {0x003A69C0, 0x003A6A00},
+    {0x003AA828, 0x003AAAF0},
     {0x00411A00, 0x00412000},
 }};
 
