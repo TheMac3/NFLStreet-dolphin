@@ -158,9 +158,10 @@ def load(path: str) -> list[tuple[int, dict[str, Table] | None]]:
 ATTRIBUTES = {
     "POVR": "Overall", "PSPD": "Speed", "PAGI": "Agility", "PCTH": "Catching",
     "PTAK": "Tackling", "PBLK": "Blocking", "PBTK": "Break tackle",
-    "PCEL": "Acceleration", "PJUM": "Jumping", "PPSS": "Passing",
+    "PCEL": "Acceleration (runtime edit; 0 inherit)", "PJUM": "Jumping", "PPSS": "Passing accuracy / decisions",
     "PCOV": "Coverage", "PWGT": "Weight (stored pounds minus 160)",
     "PHGT": "Height (inches)",
+    "PPVL": "Pass velocity (0 inherit; 1–99 native curve)",
 }
 PACK_COLUMNS = ("first_name", "last_name", "field", "value", "expected",
                 "template_sha256", "base_sha256")
@@ -214,6 +215,21 @@ def roster_tables(buf: bytes, entry: int = 2) -> dict[str, Table]:
     for table in tables.values():
         table.records_offset += off
         table.header_offset += off
+    # Our virtual PPVL field uses seven of the ten unclaimed trailing bits.
+    # Require layout anchors and a disjoint range; future DB revisions must not
+    # silently reinterpret an EA field. See docs/ratingsplit.md for the loader.
+    table = tables.get("PLAY")
+    anchors = {f.name: (f.bit_offset, f.bits) for f in table.fields} if table else {}
+    if (table and table.record_bytes == 100
+            and all(anchors.get(k) == v for k, v in {
+                "PGID": (461, 15), "PPSS": (708, 7), "PCOV": (763, 7),
+                "PRTY": (788, 2)}.items())
+            and not any(f.bit_offset + f.bits > 790 for f in table.fields)):
+        velocity = Field("PPVL", 3, 790, 7)
+        table.fields.append(velocity)
+        for i, row in enumerate(table.records):
+            start = table.records_offset + i * table.record_bytes
+            row[velocity.name] = _extract(buf[start:start + table.record_bytes], velocity)
     return tables
 
 
@@ -221,6 +237,8 @@ def field_range(f: Field) -> tuple[int, int]:
     """Return storage bounds; signed fields use the parser's two's complement."""
     if f.type not in (2, 3) or not f.bits:
         raise ValueError(f"{f.name}: unsupported numeric field type")
+    if f.name in ("PPVL", "PCEL"):
+        return 0, 99
     return (-(1 << (f.bits - 1)), (1 << (f.bits - 1)) - 1) if f.type == 2 else (0, (1 << f.bits) - 1)
 
 

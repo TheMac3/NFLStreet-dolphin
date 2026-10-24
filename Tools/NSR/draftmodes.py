@@ -175,7 +175,7 @@ def runtime_bytes(content=None, order="alternating", first="stock"):
     if (order, first) == ("alternating", "stock"):
         return content.runtime_bytes() if content else None
     obj = json.loads(content.runtime_bytes()) if content else {"version": 0, "packs": []}
-    obj.update(format="nsrb.runtime-content.v2", draft={"order": order, "first": first, "policy": 1})
+    obj.update(format="nsrb.runtime-content.v3" if obj.get("format") == "nsrb.runtime-content.v3" else "nsrb.runtime-content.v2", draft={"order": order, "first": first, "policy": 1})
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 

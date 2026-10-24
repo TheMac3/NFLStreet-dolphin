@@ -596,7 +596,7 @@ def write_words(iso, va: int, words: list[int], expect: list[int] | None = None)
 
 
 PATCHES = {"freeze", "seed", "seedlog", "input", "profile", "stress", "netplay", "trace",
-           "rollback", "draft-snake", "draft-cocky", "draft-first-team-one", "draft-first-team-two"}
+           "rollback", "ratingsplit", "draft-snake", "draft-cocky", "draft-first-team-one", "draft-first-team-two"}
 # Milestone-1 delay-based lockstep image (superseded for friends; kept so the
 # lockstep path and its tests stay reproducible).
 LOCKSTEP_SET = ("freeze", "seed", "input", "netplay")
@@ -606,6 +606,75 @@ LOCKSTEP_SET = ("freeze", "seed", "input", "netplay")
 ROLLBACK_SET = ("freeze", "seed", "rollback")
 NETPLAY_SET = ROLLBACK_SET  # what friends' netplay images use (nsr_patcher)
 
+# Optional ratingsplit-v1: GN7E69 rev 0. PPSS keeps its native accuracy
+# consumers. The normal throw velocity consumer reads PPVL independently.
+# Match setup rekeys PGID, so use an exact first/last-name hash, collision-checked
+# against every roster row by the builder. Reuse the audited trace cave; trace
+# and ratingsplit are mutually exclusive. Reborn has live code after 0x80413E00.
+RATINGSPLIT_SITE = 0x80103544  # lha r0,0xBC4(r31): normal throw speed penalty
+RATINGSPLIT_CODE = 0x804132C0
+RATINGSPLIT_TABLE = 0x804133C0
+RATINGSPLIT_CAPACITY = 320
+RATINGSPLIT_MAGIC = 0x52535631  # RSV1
+
+
+def ratingsplit_routine() -> list[int]:
+    """Read a separate velocity rating into r0, preserving all other registers.
+
+    The displaced PPSS load remains the fallback when PPVL is zero/unset.
+    Exact name bytes come from player+0xB6F / +0xB84; all inputs are image-owned
+    or rollback-owned MEM1. The existing native speed formula remains intact.
+    """
+    code, labels, jumps = [], {}, []
+
+    def emit(*words):
+        """Append encoded words at the next cave address."""
+        code.extend(words)
+
+    def jump(label, condition=None):
+        """Resolve a local branch after laying out the routine."""
+        jumps.append((len(code), label, condition))
+        emit(0)
+
+    emit(stwu(1, -32, 1), stw(9, 8, 1),
+         stw(10, 12, 1), stw(11, 16, 1), stw(12, 20, 1),
+         0x7C000026, stw(0, 24, 1))
+    emit(lis(9, 0x811C), ori(9, 9, 0x9DC5), lis(12, 0x0100), ori(12, 12, 0x0193))
+    for index, offset in enumerate((0xB6F, 0xB84)):
+        emit(addi(10, 31, offset))
+        labels[f"hash{index}"] = len(code)
+        emit(lbz(0, 0, 10), cmpwi(0, 0))
+        jump(f"hashed{index}", (12, 2))
+        emit((31 << 26) | (9 << 21) | (9 << 16) | (0 << 11) | (316 << 1),
+             mullw(9, 9, 12), addi(10, 10, 1))  # xor r9,r9,r0
+        jump(f"hash{index}")
+        labels[f"hashed{index}"] = len(code)
+        if index == 0:
+            emit((26 << 26) | (9 << 21) | (9 << 16) | 255, mullw(9, 9, 12))
+    emit(lis(10, RATINGSPLIT_TABLE >> 16), ori(10, 10, RATINGSPLIT_TABLE & 65535), lwz(11, 4, 10))
+    labels["loop"] = len(code)
+    emit(cmpwi(11, 0))
+    jump("done", (12, 2))
+    emit(lwz(12, 8, 10), cmpw(12, 9))
+    jump("found", (12, 2))
+    emit(addi(10, 10, 8), addi(11, 11, -1))
+    jump("loop")
+    labels["found"] = len(code)
+    emit(lwz(12, 12, 10))
+    jump("return")
+    labels["done"] = len(code)
+    emit((42 << 26) | (12 << 21) | (31 << 16) | 0xBC4)  # fallback lha r12,0xBC4(r31)
+    labels["return"] = len(code)
+    emit(lwz(0, 24, 1), 0x7C0FF120, mr(0, 12),
+         lwz(9, 8, 1), lwz(10, 12, 1), lwz(11, 16, 1), lwz(12, 20, 1),
+         addi(1, 1, 32))
+    emit(b(RATINGSPLIT_CODE + len(code) * 4, RATINGSPLIT_SITE + 4))
+    for i, label, condition in jumps:
+        src, dst = RATINGSPLIT_CODE + 4 * i, RATINGSPLIT_CODE + 4 * labels[label]
+        code[i] = bc(src, dst, *condition) if condition else b(src, dst)
+    assert RATINGSPLIT_CODE + len(code) * 4 <= RATINGSPLIT_TABLE
+    return code
+
 
 def check_patch_set(patches: set[str]) -> None:
     """Reject unknown/conflicting patches before copying or mutating an image."""
@@ -614,7 +683,7 @@ def check_patch_set(patches: set[str]) -> None:
     # Draft choices are baked into the rollback image, never host-only runtime state.
     import draftmodes
     draftmodes.validate_patches(patches)
-    for a, b_ in (("seed", "seedlog"), ("profile", "stress"), ("rollback", "input"),
+    for a, b_ in (("seed", "seedlog"), ("profile", "stress"), ("trace", "ratingsplit"), ("rollback", "input"),
                   ("rollback", "profile"), ("rollback", "stress")):
         if {a, b_} <= patches:
             raise PatchError(f"{a} and {b_} can't be combined")
@@ -627,6 +696,17 @@ def check_patch_set(patches: set[str]) -> None:
 def apply_patches(iso, patches: set[str]) -> None:
     """Patch an already-copied image file (opened r+b) in place."""
     check_patch_set(patches)
+    if "ratingsplit" in patches:
+        iso.seek(0)
+        header = iso.read(8)
+        if header[:6] != b"GN7E69" or header[7] != 0:
+            raise PatchError("ratingsplit requires GN7E69 revision 0")
+        words = ratingsplit_routine()
+        write_words(iso, RATINGSPLIT_CODE, words, expect=[0] * len(words))
+        table = [RATINGSPLIT_MAGIC, 0] + [0] * (2 * RATINGSPLIT_CAPACITY)
+        write_words(iso, RATINGSPLIT_TABLE, table, expect=[0] * len(table))
+        write_words(iso, RATINGSPLIT_SITE, [b(RATINGSPLIT_SITE, RATINGSPLIT_CODE)],
+                    expect=[(42 << 26) | (31 << 16) | 0xBC4])
     if "freeze" in patches:
         routine = freeze_routine()
         write_words(iso, FREEZE_CODE, routine, expect=[0] * len(routine))

@@ -48,6 +48,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import isopatch  # noqa: E402
 import draftmodes  # noqa: E402
 import nsr_content  # noqa: E402  (content updates: our ratings packs, docs/content-updates.md)
+import ratingsplit  # noqa: E402  (runtime split policy and legacy PPVL image compatibility)
 
 OUTPUT_NAME = "nsr-net.iso"
 MANIFEST_NAME = "nsr-image.json"  # sidecar describing nsr-net.iso (no paths)
@@ -213,8 +214,8 @@ def write_manifest(out_dir: str, digest_in: str, label: str | None, digest_out: 
     or Reborn content (release plan 3.1). "content" records the applied
     content update (version, manifest serial, pack digests) or is null."""
     packs = [p["sha256"] for p in content.release["packs"]] if content else []
-    manifest = {"recipe": ROLLBACK_RECIPE, "mode": NETPLAY_MODE,
-                "patches": sorted(set(isopatch.NETPLAY_SET) | draftmodes.patch_names(draft_order, draft_first)),
+    manifest = {"recipe": content.release["recipe"] if content else ROLLBACK_RECIPE, "mode": NETPLAY_MODE,
+                "patches": sorted(set(isopatch.NETPLAY_SET) | draftmodes.patch_names(draft_order, draft_first) | ({"ratingsplit"} if content and content.release["recipe"] == ratingsplit.RECIPE else set())),
                 "draft_order": draft_order, "draft_first": draft_first,
                 "draft_recipe": "gn7e69-r0-draft-v1",
                 "source_label": label, "source_sha256": digest_in,
@@ -244,7 +245,8 @@ def apply_content(image: str, build: dict, content: "nsr_content.Content") -> No
     unpublished build (the .partial file). The roster file must hash to the
     release's template_sha256 first; eadb validates every edit (player
     present, original values as expected, per-field storage range) before any
-    byte changes. CRC words are preserved exactly as the editor does
+    byte changes. PPVL also compiles its image-owned table and normal-throw
+    hook. CRC words are preserved exactly as the editor does
     (docs/roster-editing.md), so this matches the publisher's prediction."""
     import discpatch  # noqa: PLC0415  (only content builds need the FST/DB tooling)
     import eadb  # noqa: PLC0415
@@ -256,8 +258,10 @@ def apply_content(image: str, build: dict, content: "nsr_content.Content") -> No
         replacement, _ = eadb.apply_edits(template, content.edits)
     except ValueError as exc:
         raise nsr_content.ContentError(f"the update's ratings don't fit this game copy: {exc}") from None
+    patches = ratingsplit.plan(image, template, replacement) if ratingsplit.enabled(content.edits) else []
     discpatch.replace_in_place(image, build["roster_file"], replacement,
                                expect_sha256=build["template_sha256"])
+    ratingsplit.apply_plan(image, patches)
 
 
 def prepare_image(iso: str, out_dir: str, progress=None, content: "nsr_content.Content | None" = None,
@@ -283,6 +287,10 @@ def prepare_image(iso: str, out_dir: str, progress=None, content: "nsr_content.C
     install = reborn_install_of(iso)
     if install and Path(out_dir).resolve().is_relative_to(Path(install).resolve()):
         raise ValueError("Keep NFLStreetRollback in its own folder outside Reborn before building/importing.")
+    if content and (ratingsplit.requires_runtime(content.edits) or
+                    content.release["recipe"] == ratingsplit.RUNTIME_RECIPE):
+        raise nsr_content.ContentError(
+            "Acceleration splits require Apply ratings at game start; enable it and check for updates.")
     choices = draftmodes.patch_names(draft_order, draft_first)
     step = (lambda st: (lambda d, t: progress(st, d, t))) if progress else (lambda st: None)
     digest_in = sha256(iso, progress=step("check")) if progress else sha256(iso, "checking Reborn image")
@@ -292,7 +300,8 @@ def prepare_image(iso: str, out_dir: str, progress=None, content: "nsr_content.C
         if content_strict:
             raise nsr_content.ContentError(f"content v{content.version} doesn't support this Reborn version")
         content = None
-    if build and content.release["recipe"] != ROLLBACK_RECIPE:
+    expected_recipe = ratingsplit.RECIPE if content and ratingsplit.enabled(content.edits) else ROLLBACK_RECIPE
+    if build and content.release["recipe"] != expected_recipe:
         raise nsr_content.ContentError("this update is for a different NFLStreetRollback version")
     if build and known and known[1] != build["base_sha256"]:
         raise nsr_content.ContentError("this update was made for a different patch build")
@@ -377,7 +386,8 @@ def image_status(out_dir: str, progress=None) -> ImageStatus | None:
     fp = fingerprint(digest)
     manifest = read_manifest(out_dir)
     source = manifest.get("source_sha256") if isinstance(manifest.get("source_sha256"), str) else ""
-    ours = manifest.get("recipe") == ROLLBACK_RECIPE and manifest.get("output_sha256") == digest
+    ours = (manifest.get("recipe") in (ROLLBACK_RECIPE, ratingsplit.RECIPE)
+            and manifest.get("output_sha256") == digest)
     applied = nsr_content.parse_descriptor(
         {k: (manifest.get("content") or {}).get(k) for k in ("version", "serial")}
         if isinstance(manifest.get("content"), dict) else None)

@@ -468,6 +468,7 @@ void PlaybookMenu(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t f
 // untouched; the same immutable lookup runs for live and restored frames.
 namespace
 {
+// Select r0 from restored guest metadata and the immutable agreed boot policy.
 void SelectRating(const Core::CPUThreadGuard& guard, bool velocity, std::uint32_t continuation)
 {
   auto& system = guard.GetSystem();
@@ -508,6 +509,7 @@ void AccelerationFirstHook(const Core::CPUThreadGuard& guard)
   SelectRating(guard, false, 0x8016d1bc);
 }
 
+// Continue the ordinary movement branch after its displaced PSPD load.
 void AccelerationSecondHook(const Core::CPUThreadGuard& guard)
 {
   SelectRating(guard, false, 0x8016d270);

@@ -177,6 +177,7 @@ Plan(const NSRGameStats::Memory& memory, const std::vector<Edit>& edits, std::st
 // history. An absent/zero split inherits the live native cache (and modifiers).
 using SplitRatings = std::map<std::pair<std::string, std::string>, std::array<std::uint32_t, 2>>;
 
+// Collect only requested split fields; validation remains atomic in Plan.
 inline SplitRatings Splits(const std::vector<Edit>& edits)
 {
   SplitRatings result;
