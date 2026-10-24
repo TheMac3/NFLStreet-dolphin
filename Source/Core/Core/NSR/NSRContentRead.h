@@ -6,6 +6,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -44,6 +45,8 @@ inline std::string Name(std::string value)
 // The same allowlist/ranges as nsr_content.py. Storage bounds are checked too.
 inline std::pair<std::uint32_t, std::uint32_t> Limits(const std::string& field)
 {
+  if (field == "PPVL" || field == "PCEL")
+    return {0, 99};
   if (field == "PHGT")
     return {48, 96};
   if (field == "PWGT")
@@ -111,6 +114,27 @@ Plan(const NSRGameStats::Memory& memory, const std::vector<Edit>& edits, std::st
         width = *memory.UInt(field + 12);
       }
     }
+    // PPVL is virtual: accept only the audited GN7E69-r0 packed padding.
+    // Native descriptors, record size, and anchors must still match exactly.
+    if (edit.field == "PPVL")
+    {
+      bool pgid = false, ppss = false, pcov = false, prty = false, disjoint = true;
+      for (std::uint32_t i = 0; i < *memory.UInt(*table + 0x4a, 1); ++i)
+      {
+        const auto f = *table + 0x4c + i * 16;
+        const auto off = *memory.UInt(f + 4), bits = *memory.UInt(f + 12);
+        const auto name = memory.Tag(f + 8);
+        pgid |= name == "DIGP" && off == 461 && bits == 15;
+        ppss |= name == "SSPP" && off == 708 && bits == 7;
+        pcov |= name == "VOCP" && off == 763 && bits == 7;
+        prty |= name == "YTRP" && off == 788 && bits == 2;
+        disjoint &= off <= 790 && bits <= 790 - off;
+      }
+      if (stride != 100 || !pgid || !ppss || !pcov || !prty || !disjoint)
+        return reject("unsupported PPVL padding layout");
+      offset = 790;
+      width = 7;
+    }
     if (!width || width > 16 || edit.value >= (std::uint32_t{1} << width))
       return reject("missing or unsupported rating descriptor");
     std::set<std::uint32_t> originals;
@@ -123,7 +147,14 @@ Plan(const NSRGameStats::Memory& memory, const std::vector<Edit>& edits, std::st
       // Blank unused identities cannot match a requested player.
       if (Name(*row_first) != first || Name(*row_last) != last)
         continue;
-      const auto value = Integer(row, tag);
+      auto value = Integer(row, tag);
+      if (edit.field == "PPVL")
+      {
+        const auto bytes = *memory.Bytes(buffer + physical[i] * stride, stride);
+        value = 0;
+        for (std::uint32_t bit = 0; bit < width; ++bit)
+          *value = (*value << 1) | ((bytes[(offset + bit) / 8] >> (7 - (offset + bit) % 8)) & 1);
+      }
       if (!value || *value < 0)
         return reject("invalid original rating");
       originals.insert(static_cast<std::uint32_t>(*value));
@@ -142,4 +173,39 @@ Plan(const NSRGameStats::Memory& memory, const std::vector<Edit>& edits, std::st
   }
   return writes;
 }
+// Immutable, agreed boot overrides; host lookup never depends on simulation
+// history. An absent/zero split inherits the live native cache (and modifiers).
+using SplitRatings = std::map<std::pair<std::string, std::string>, std::array<std::uint32_t, 2>>;
+
+inline SplitRatings Splits(const std::vector<Edit>& edits)
+{
+  SplitRatings result;
+  for (const auto& edit : edits)
+    if (edit.field == "PPVL" || edit.field == "PCEL")
+      result[{Name(edit.first), Name(edit.last)}][edit.field == "PPVL" ? 0 : 1] = edit.value;
+  return result;
+}
+
+// GN7E69-r0 player names are fixed-size NUL-terminated metadata. Bounded reads
+// make bad pointers harmless; exact normalized names avoid hash collisions.
+inline std::uint32_t SplitValue(const NSRGameStats::Memory& view, std::uint32_t player,
+                                bool velocity, const SplitRatings& splits,
+                                std::uint32_t fallback)
+{
+  if (!view.Bytes(player, 0xbcc))
+    return fallback;
+  const auto text = [&](std::uint32_t offset, std::uint32_t size) {
+    const auto bytes = *view.Bytes(player + offset, size);
+    const auto end = std::find(bytes.begin(), bytes.end(), 0);
+    return end == bytes.end() ? std::string{} : Name(std::string(bytes.begin(), end));
+  };
+  const auto found = splits.find({text(0xb6f, 21), text(0xb84, 25)});
+  if (found == splits.end() || found->second[velocity ? 0 : 1] == 0)
+    return fallback;
+  // PCEL is read from the live native metadata cache, not from PSPD. The
+  // immutable map only opts this player in; unedited stock PCEL stays inert.
+  const auto rating = velocity ? found->second[0] : view.UInt(player + 0xb65, 1).value_or(0);
+  return std::min(rating, 99u) * 255 / 99;
+}
+
 }

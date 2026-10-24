@@ -19,6 +19,7 @@
 #include "Common/StringUtil.h"
 #include "Core/Core.h"
 #include "Core/HW/Memmap.h"
+#include "Core/HLE/HLE.h"
 #include "Core/NSR/NSRContentRead.h"
 #include "Core/NSR/NSRDraft.h"
 #include "Core/NSR/NSRPlaybooks.h"
@@ -37,7 +38,8 @@ struct State
   std::array<std::uint64_t, 6> fingerprint{};
   std::vector<Edit> edits;
   std::uint32_t draft_order = 0, draft_first = 0;
-  bool draft = false;
+  bool draft = false, split_policy = false;
+  SplitRatings splits;
   std::vector<Playbook> playbooks;
 };
 State s;
@@ -131,12 +133,14 @@ std::string Load(const std::string& path, const std::string& expected)
   if (!draft && !Keys(root, {"format", "version", "packs"}))
     return "invalid content object shape";
   bool valid = true;
-  if (Text(root.get("format"), 64, valid) !=
-          (books ? "nsrb.runtime-content.v3" : draft ? "nsrb.runtime-content.v2" : "nsrb.runtime-content.v1") ||
+  const auto format = Text(root.get("format"), 64, valid);
+  s.split_policy = format == "nsrb.runtime-content.v3";
+  if ((!s.split_policy && format !=
+          (books ? "nsrb.runtime-content.v3" : draft ? "nsrb.runtime-content.v2" : "nsrb.runtime-content.v1")) ||
       !root.get("packs").is<picojson::array>())
     return "unsupported content format";
   s.fingerprint[4] = Number(root.get("version"), 0x7fffffff, valid);
-  s.fingerprint[5] = books ? 3 : draft ? 2 : 1;  // exact hook/application policy is part of M2
+  s.fingerprint[5] = s.split_policy ? 3 : books ? 3 : draft ? 2 : 1;  // exact hook/application policy is part of M2
   if (draft)
   {
     const auto& settings = root.get("draft");
@@ -252,9 +256,13 @@ std::string Load(const std::string& path, const std::string& expected)
         edit.expected.push_back(Number(original, 255, valid));
       if (edit.expected == std::vector<std::uint32_t>{edit.value})
         return "no-op content edit";
+      if (edit.field == "PPVL" && !s.split_policy)
+        return "PPVL requires split policy v3";
       s.edits.push_back(std::move(edit));
     }
   }
+  if (s.split_policy)
+    s.splits = Splits(s.edits);
   return valid ? "" : "invalid content value";
 }
 
@@ -331,6 +339,19 @@ void DatabaseLoaded(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t
   {
     if (!s.playbooks.empty() && view.UInt(0x80057d8c) != 0x7f23cb78u)
       error = "playbook native instruction guard mismatch";
+    // Install no gameplay hooks for an unchanged roster. Validate all sites
+    // before committing ratings/draft writes or publishing any HLE mapping.
+    if (!s.splits.empty())
+    {
+      const bool velocity = std::any_of(s.splits.begin(), s.splits.end(),
+          [](const auto& entry) { return entry.second[0] != 0; });
+      const bool acceleration = std::any_of(s.splits.begin(), s.splits.end(),
+          [](const auto& entry) { return entry.second[1] != 0; });
+      if ((velocity && view.UInt(0x80103544) != 0xa81f0bc4u) ||
+          (acceleration && (view.UInt(0x8016d1b8) != 0xa81e0bc0u ||
+                            view.UInt(0x8016d26c) != 0xa81e0bc0u)))
+        error = "split consumer instruction mismatch";
+    }
     if (s.draft && error.empty())
       draft_words = PlanDraft(view, s.draft_order, s.draft_first, &error);
     if (error.empty())
@@ -357,6 +378,22 @@ void DatabaseLoaded(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t
     system.GetPPCState().iCache.Reset(system.GetJitInterface());
     std::fprintf(stderr, "[NSR] draft applied: order %u first %u policy 1 words %zu frame %u\n",
                  s.draft_order, s.draft_first, draft_words->size(), frame);
+  }
+  if (!s.splits.empty())
+  {
+    const bool velocity = std::any_of(s.splits.begin(), s.splits.end(),
+        [](const auto& entry) { return entry.second[0] != 0; });
+    const bool acceleration = std::any_of(s.splits.begin(), s.splits.end(),
+        [](const auto& entry) { return entry.second[1] != 0; });
+    if (velocity)
+      HLE::Patch(system, 0x80103544, "NSR_SplitRating");
+    if (acceleration)
+    {
+      HLE::Patch(system, 0x8016d1b8, "NSR_SplitRating");
+      HLE::Patch(system, 0x8016d26c, "NSR_SplitRating");
+    }
+    std::fprintf(stderr, "[NSR] splits applied: velocity %u acceleration %u names %zu policy 3\n",
+                 velocity ? 1u : 0u, acceleration ? 1u : 0u, s.splits.size());
   }
   s.applied = true;
   const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -422,6 +459,23 @@ void PlaybookMenu(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t f
   ppc.npc = 0x80057ee4;
   std::fprintf(stderr, "[NSR] playbook applied: pad %u team %u entry %u category %u slots %zu first_index %u frame %u\n",
                *captain, side, entry, *category, indices->size(), unsigned(indices->front()), frame);
+}
+
+// Replace exactly one signed halfword load. Other registers/CR/FPRs are
+// untouched; the same immutable lookup runs for live and restored frames.
+void RatingHook(const Core::CPUThreadGuard& guard)
+{
+  auto& system = guard.GetSystem();
+  auto& ppc = system.GetPPCState();
+  auto& memory = system.GetMemory();
+  const NSRGameStats::Memory view{{memory.GetRAM(), memory.GetRamSizeReal()}, {}};
+  const bool velocity = ppc.pc == 0x80103544;
+  const auto player = ppc.gpr[velocity ? 31 : 30];
+  const auto native = view.UInt(player + (velocity ? 0xbc4u : 0xbc0u), 2).value_or(0);
+  const auto fallback = static_cast<std::uint32_t>(static_cast<std::int32_t>(
+      static_cast<std::int16_t>(native)));
+  ppc.gpr[0] = SplitValue(view, player, velocity, s.splits, fallback);
+  ppc.npc = ppc.pc + 4;
 }
 
 void Reset()

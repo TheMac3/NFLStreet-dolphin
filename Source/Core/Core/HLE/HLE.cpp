@@ -18,6 +18,7 @@
 #include "Core/HLE/HLE_Misc.h"
 #include "Core/HLE/HLE_OS.h"
 #include "Core/NSR/NSRNetplay.h"
+#include "Core/NSR/NSRContent.h"
 #include "Core/HW/Memmap.h"
 #include "Core/Host.h"
 #include "Core/IOS/ES/ES.h"
@@ -31,7 +32,7 @@ namespace HLE
 static std::map<u32, u32> s_hooked_addresses;
 
 // clang-format off
-constexpr std::array<Hook, 57> os_patches{{
+constexpr std::array<Hook, 58> os_patches{{
     // Placeholder, os_patches[0] is the "non-existent function" index
     {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
 
@@ -76,6 +77,7 @@ constexpr std::array<Hook, 57> os_patches{{
     {"NSR_RollbackFrameEnd",         NSRNetplay::RollbackFrameEndHook,      HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: frame end
     {"NSR_InGame",                   NSRNetplay::InGameHook,                 HookType::Start,   HookFlag::Fixed}, // NFLStreet POC rollback: match lifecycle
     {"NSR_PlaybookMenu",             NSRNetplay::PlaybookMenuHook,         HookType::Replace, HookFlag::Fixed}, // existing-play side/pad ordering
+    {"NSR_SplitRating",              NSRContent::RatingHook,               HookType::Replace, HookFlag::Fixed}, // opt-in split consumer
     {"NSR_ContentDatabase",          NSRNetplay::ContentDatabaseHook,      HookType::Start,   HookFlag::Fixed}, // native database registration complete
     {"NSR_GameStatsPlayResult",       NSRNetplay::GameStatsPlayResultHook,    HookType::Start,   HookFlag::Fixed}, // passive native play-result observation
     {"NSR_GameStatsEvent",            NSRNetplay::GameStatsEventHook,          HookType::Start,   HookFlag::Fixed}, // passive native play-event observation

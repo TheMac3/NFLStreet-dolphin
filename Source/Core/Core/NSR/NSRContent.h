@@ -21,6 +21,8 @@ std::array<std::uint64_t, 6> Fingerprint();
 void DatabaseLoaded(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t frame);
 // Existing-play order boundary; HookType::Replace preserves the stock instruction.
 void PlaybookMenu(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t frame);
+// Replaces only an audited lha r0 at an enabled split consumer.
+void RatingHook(const Core::CPUThreadGuard& guard);
 // A supplied bundle must have been applied before any rollback epoch starts.
 bool Ready();
 // Forget host state on emulation shutdown, including a failed boot.

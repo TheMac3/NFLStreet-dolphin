@@ -1714,6 +1714,67 @@ static void TestRuntimeContent()
   }
 }
 
+// Synthetic split records exercise audited virtual padding and opt-in native
+// cache selection, including unchanged rosters and malformed layouts.
+static void TestRuntimeSplitRatings()
+{
+  namespace C = NSRContent;
+  std::vector<std::uint8_t> ram(0x400000), vmem(0x1000);
+  const auto put = [&](std::uint32_t off, std::uint32_t value, unsigned size = 4) {
+    for (unsigned i = 0; i < size; ++i)
+      vmem[off + i] = static_cast<std::uint8_t>(value >> ((size - i - 1) * 8));
+  };
+  const auto tag = [&](std::uint32_t off, std::string_view text) {
+    std::copy(text.begin(), text.end(), vmem.begin() + off);
+  };
+  ram[0x3ebe88] = 0x7e;
+  ram[0x3ebe8a] = 1;
+  put(0x104, 0x7e000200); tag(0x108, "TATS"); tag(0x21c, "YALP");
+  put(0x214, 0x7e000400); put(0x220, 100); put(0x224, 799);
+  put(0x240, 2, 2); put(0x242, 2, 2); put(0x244, 2, 2); put(0x24a, 6, 1);
+  const std::array<std::string_view, 6> tags{{"ANFP", "ANLP", "DIGP", "SSPP", "VOCP", "YTRP"}};
+  const std::array<std::uint32_t, 6> offsets{{0, 64, 461, 708, 763, 788}};
+  const std::array<std::uint32_t, 6> widths{{64, 64, 15, 7, 7, 2}};
+  for (unsigned i = 0; i < 6; ++i)
+  {
+    put(0x24c + i * 16, i < 2 ? 0 : 3);
+    put(0x250 + i * 16, offsets[i]); tag(0x254 + i * 16, tags[i]);
+    put(0x258 + i * 16, widths[i]);
+  }
+  tag(0x400, "Ada"); tag(0x408, "Test");
+  tag(0x464, "Ada"); tag(0x46c, "Test");
+  vmem[0x463] = 4; vmem[0x4c7] = 4;  // adjacent spare bit must survive
+  const NSRGameStats::Memory view{ram, vmem};
+  const std::vector<C::Edit> edits{{"Ada", "Test", "PPVL", 99, {0}}};
+  const auto before = vmem;
+  const auto plan = C::Plan(view, edits);
+  assert(plan && vmem == before && plan->size() == 4);
+  for (const auto& [address, value] : *plan)
+    vmem[address - 0x7e000000] = value;
+  assert(vmem[0x462] == 3 && vmem[0x463] == 0x1c);
+  assert(vmem[0x4c6] == 3 && vmem[0x4c7] == 0x1c);
+  assert(!C::Plan(view, edits));  // originals must be checked, including virtual bits
+  vmem = before; put(0x250 + 5 * 16, 789);  // wrong PRTY anchor/overlap
+  assert(!C::Plan(view, edits));
+  assert(vmem[0x462] == 0 && vmem[0x463] == 4);
+  // Runtime metadata is separate from the DB; no pointer cache survives frames.
+  const std::uint32_t player = 0x80001000;
+  std::copy_n("Ada", 3, ram.begin() + 0x1b6f);
+  std::copy_n("Test", 4, ram.begin() + 0x1b84);
+  ram[0x1b65] = 99;
+  assert(C::SplitValue(view, player, true, {}, 87) == 87);
+  const auto splits = C::Splits({{" ada ", "TEST", "PPVL", 1, {0}},
+                                  {"Ada", "Test", "PCEL", 99, {70}}});
+  assert(C::SplitValue(view, player, true, splits, 87) == 2);
+  assert(C::SplitValue(view, player, false, splits, 87) == 255);
+  ram[0x1b65] = 1;
+  assert(C::SplitValue(view, player, false, splits, 87) == 2);
+  assert(C::SplitValue(view, player + 1, false, splits, 87) == 87);
+  assert(C::SplitValue(view, 0xffffffff, true, splits, 87) == 87);
+  assert(C::SplitValue(view, player, true,
+      C::Splits({{"Ada", "Test", "PPVL", 0, {99}}}), 87) == 87);
+}
+
 // Identity validation is independent of sockets; attribution to the established
 // connection remains the adapter's existing PacketSenderMatchesPeer contract.
 static void TestGameStatsIdentity()
@@ -2472,6 +2533,7 @@ int main()
   TestQuickstartNavigation();
   TestBootAgreementWire();
   TestRuntimeContent();
+  TestRuntimeSplitRatings();
   TestRuntimeDraft();
   TestPlaybooks();
   TestGameStatsMemoryReader();
