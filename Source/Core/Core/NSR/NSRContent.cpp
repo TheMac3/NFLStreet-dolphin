@@ -256,7 +256,10 @@ std::string Load(const std::string& path, const std::string& expected)
         return "rating edit limit";
       for (const auto& original : originals)
         edit.expected.push_back(Number(original, 255, valid));
-      if (edit.expected == std::vector<std::uint32_t>{edit.value})
+      // An explicit nonzero PCEL entry activates a new consumer even when
+      // its packed bits already equal that value. Only v3 grants that meaning.
+      const bool activation = s.split_policy && edit.field == "PCEL" && edit.value != 0;
+      if (edit.expected == std::vector<std::uint32_t>{edit.value} && !activation)
         return "no-op content edit";
       if (edit.field == "PPVL" && !s.split_policy)
         return "PPVL requires split policy v3";

@@ -217,7 +217,7 @@ def validate_pack(obj) -> dict:
             raise ContentError(f"{where}: expected must be 1..8 sorted distinct original values")
         for v in expected:
             _int(v, f"{where} expected value", *EXPECTED_LIMIT)
-        if expected == [e["value"]]:
+        if expected == [e["value"]] and not (field == "PCEL" and e["value"] > 0):
             raise ContentError(f"{where}: no-op edit")
         key = (first.casefold(), last.casefold(), field)
         if key in seen:
