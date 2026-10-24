@@ -77,7 +77,9 @@ constexpr std::array<Hook, 58> os_patches{{
     {"NSR_RollbackFrameEnd",         NSRNetplay::RollbackFrameEndHook,      HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: frame end
     {"NSR_InGame",                   NSRNetplay::InGameHook,                 HookType::Start,   HookFlag::Fixed}, // NFLStreet POC rollback: match lifecycle
     {"NSR_PlaybookMenu",             NSRNetplay::PlaybookMenuHook,         HookType::Replace, HookFlag::Fixed}, // existing-play side/pad ordering
-    {"NSR_SplitRating",              NSRContent::RatingHook,               HookType::Replace, HookFlag::Fixed}, // opt-in split consumer
+    {"NSR_SplitVelocity",            NSRContent::VelocityHook,             HookType::Replace, HookFlag::Fixed}, // opt-in normal-pass velocity
+    {"NSR_SplitAccelFirst",          NSRContent::AccelerationFirstHook,    HookType::Replace, HookFlag::Fixed}, // opt-in acceleration consumer
+    {"NSR_SplitAccelSecond",         NSRContent::AccelerationSecondHook,   HookType::Replace, HookFlag::Fixed}, // opt-in acceleration consumer
     {"NSR_ContentDatabase",          NSRNetplay::ContentDatabaseHook,      HookType::Start,   HookFlag::Fixed}, // native database registration complete
     {"NSR_GameStatsPlayResult",       NSRNetplay::GameStatsPlayResultHook,    HookType::Start,   HookFlag::Fixed}, // passive native play-result observation
     {"NSR_GameStatsEvent",            NSRNetplay::GameStatsEventHook,          HookType::Start,   HookFlag::Fixed}, // passive native play-event observation

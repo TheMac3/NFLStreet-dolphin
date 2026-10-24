@@ -41,6 +41,8 @@ struct State
   bool draft = false, split_policy = false;
   SplitRatings splits;
   std::vector<Playbook> playbooks;
+  bool measure_splits = false;
+  std::array<std::uint64_t, 2> split_calls{}, split_ns{};
 };
 State s;
 
@@ -276,6 +278,7 @@ void Configure()
   if (path.empty() && expected.empty())
     return;
   s.enabled = true;
+  s.measure_splits = !Env("NSR_RB_COST").empty();
   const auto error = Load(path, expected);
   s.failed = !error.empty();
   if (s.failed)
@@ -386,11 +389,11 @@ void DatabaseLoaded(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t
     const bool acceleration = std::any_of(s.splits.begin(), s.splits.end(),
         [](const auto& entry) { return entry.second[1] != 0; });
     if (velocity)
-      HLE::Patch(system, 0x80103544, "NSR_SplitRating");
+      HLE::Patch(system, 0x80103544, "NSR_SplitVelocity");
     if (acceleration)
     {
-      HLE::Patch(system, 0x8016d1b8, "NSR_SplitRating");
-      HLE::Patch(system, 0x8016d26c, "NSR_SplitRating");
+      HLE::Patch(system, 0x8016d1b8, "NSR_SplitAccelFirst");
+      HLE::Patch(system, 0x8016d26c, "NSR_SplitAccelSecond");
     }
     std::fprintf(stderr, "[NSR] splits applied: velocity %u acceleration %u names %zu policy 3\n",
                  velocity ? 1u : 0u, acceleration ? 1u : 0u, s.splits.size());
@@ -463,23 +466,59 @@ void PlaybookMenu(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t f
 
 // Replace exactly one signed halfword load. Other registers/CR/FPRs are
 // untouched; the same immutable lookup runs for live and restored frames.
-void RatingHook(const Core::CPUThreadGuard& guard)
+namespace
+{
+void SelectRating(const Core::CPUThreadGuard& guard, bool velocity, std::uint32_t continuation)
 {
   auto& system = guard.GetSystem();
   auto& ppc = system.GetPPCState();
   auto& memory = system.GetMemory();
   const NSRGameStats::Memory view{{memory.GetRAM(), memory.GetRamSizeReal()}, {}};
-  const bool velocity = ppc.pc == 0x80103544;
   const auto player = ppc.gpr[velocity ? 31 : 30];
   const auto native = view.UInt(player + (velocity ? 0xbc4u : 0xbc0u), 2).value_or(0);
   const auto fallback = static_cast<std::uint32_t>(static_cast<std::int32_t>(
       static_cast<std::int16_t>(native)));
+  // Optional host-only attribution shares NSR_RB_COST's diagnostic switch.
+  // Counts/timings never choose simulation data and are intentionally not rolled back.
+  const auto started = s.measure_splits ? std::chrono::steady_clock::now() :
+                                        std::chrono::steady_clock::time_point{};
   ppc.gpr[0] = SplitValue(view, player, velocity, s.splits, fallback);
-  ppc.npc = ppc.pc + 4;
+  if (s.measure_splits)
+  {
+    const auto lane = velocity ? 0u : 1u;
+    ++s.split_calls[lane];
+    s.split_ns[lane] += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count());
+  }
+  ppc.npc = continuation;
+}
+}
+
+// JIT may call an HLE in the middle of a block without updating ppc.pc.
+// Separate fixed continuations avoid using stale block-start CPU state.
+void VelocityHook(const Core::CPUThreadGuard& guard)
+{
+  SelectRating(guard, true, 0x80103548);
+}
+
+// The two native acceleration branches have distinct return instructions.
+void AccelerationFirstHook(const Core::CPUThreadGuard& guard)
+{
+  SelectRating(guard, false, 0x8016d1bc);
+}
+
+void AccelerationSecondHook(const Core::CPUThreadGuard& guard)
+{
+  SelectRating(guard, false, 0x8016d270);
 }
 
 void Reset()
 {
+  if (s.measure_splits)
+    std::fprintf(stderr, "[NSR] split cost: velocity calls %llu ns %llu acceleration calls %llu ns %llu\n",
+        static_cast<unsigned long long>(s.split_calls[0]), static_cast<unsigned long long>(s.split_ns[0]),
+        static_cast<unsigned long long>(s.split_calls[1]), static_cast<unsigned long long>(s.split_ns[1]));
   s = {};
 }
 }
