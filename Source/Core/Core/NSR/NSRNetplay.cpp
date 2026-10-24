@@ -216,7 +216,10 @@ struct Session
   u32 delay = 2;
   // At most 64 recent fresh ACK observations per physical host link. Delays
   // are derived at boundaries only; collection never changes simulation.
-  struct MenuLinkSample { u32 time_us, rtt_ms, jitter_ms; };
+  struct MenuLinkSample
+  {
+    u32 time_us, rtt_ms, jitter_ms;
+  };
   std::array<std::deque<MenuLinkSample>, MAX_PLAYERS> menu_links;
   std::array<u32, MAX_PLAYERS> menu_last_ack{};
   FILE* log = stderr;
@@ -2008,6 +2011,7 @@ void TelemetrySessionEnter();
 void TelemetrySessionLeave(const char* reason);
 void TelemetryShutdown();
 void TelemetryLinkGauges();
+void TelemetryAudioGauges();
 void TelemetryStateDesyncSummary();
 void TelemetryHandoffDesyncSummary(u32 frame, u32 player, u64 local, u64 remote, bool leave);
 
@@ -6743,11 +6747,11 @@ static void AdoptInputDelay(const RollbackNet::HandoffPacket& host)
 }
 
 // Menu delay is selected only with the guest stopped at a stream boundary.
-// Startup collects fresh ACK observations before the first input. Later
-// transitions use recent observations without pausing. The median of each link's RTT
-// and variance avoids an isolated retransmission selecting the whole epoch.
-// The host owns all star links; summing the two worst host legs also safely
-// bounds mesh paths until direct all-pair timing probes are available.
+// Prefer the quiet-menu timing probes and complete star/mesh path aggregate.
+// If no fresh probe window exists at exit (probes pause during matches), use
+// each link's recent median RTT/variance without pausing to gather samples.
+// Summing host legs bounds a mesh route conservatively in that fallback;
+// revisit the fallback if direct mesh paths can exceed that host route.
 struct MenuDelayProposal
 {
   u8 delay = 0;
@@ -6812,7 +6816,7 @@ static MenuDelayProposal ProposeMenuDelay()
 // inputs for its delay prefix, so increasing/decreasing cannot create holes.
 static bool AdoptMenuDelay(const RollbackNet::HandoffPacket& host, u32 frame)
 {
-  if (host.menu_delay < 2 || host.menu_delay > 12)
+  if (host.menu_delay < 2 || host.menu_delay > 12 || host.menu_source > 3)
     return FailHandoff("missing or invalid player 0 menu delay");
   const u32 before = s_session.delay;
   s_session.delay = host.menu_delay;
@@ -6933,7 +6937,8 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
                                   ProposeMenuDelay() : MenuDelayProposal{};
   OpenHandoffBarrier({static_cast<u8>(s.players), static_cast<u8>(s.me), kind, transition, frame,
                       semantic, config, sync_clock, sync_aux_clock, delay.delay,
-                      delay.one_way_dms, delay.jitter_dms, menu.delay, menu.one_way_dms, menu.jitter_dms, menu.source});
+                      delay.one_way_dms, delay.jitter_dms, menu.delay, menu.one_way_dms,
+                      menu.jitter_dms, menu.source});
   SendHandoff(false);
   const auto start = std::chrono::steady_clock::now();
   auto last_send = start;
@@ -7190,15 +7195,8 @@ static bool RbNetworkPreflight(u32 live)
     T::SetGauge(T::Gauge::FrameAdvantage, s_rb_exchange->FrameAdvantage(live));
     T::SetGauge(T::Gauge::InputDelay, r.menu_frame_lockstep ? s_session.delay : r.net_delay);
     T::SetGauge(T::Gauge::MaxPrediction, r.menu_frame_lockstep ? 0 : r.max_prediction);
-    if (live % 60 == 0)  // fix/audio2: mixer underruns/overflows (audio thread counters)
-    {
-      if (const auto* stream = Core::System::GetInstance().GetSoundStream())
-      {
-        const auto a = stream->GetMixer()->GetNSRDMAStats();
-        T::SetGauge(T::Gauge::AudioGapFills, static_cast<double>(a[0]));
-        T::SetGauge(T::Gauge::AudioSkips, static_cast<double>(a[2]));
-      }
-    }
+    if (live % 60 == 0)
+      TelemetryAudioGauges();
     if (const u32 confirmed = s_rb_exchange->ConfirmedThrough();
         confirmed != RollbackNet::NO_FRAME && confirmed <= live)
       T::Observe(T::Hist::PredictionFrames, live - confirmed);
@@ -10609,6 +10607,7 @@ void TelemetrySessionEnter()
   if (!NSRTelemetry::Enabled())
     return;
   const Rollback& r = s_rb;
+  TelemetryAudioGauges();
   NSRTelemetry::SetPhase(NSRTelemetry::Phase::RollbackMatch, r.vtime_from);
   s_tm.have_lockstep_end = false;
   TelemetryBaseline();
@@ -10639,6 +10638,7 @@ void TelemetrySessionLeave(const char* reason)
   if (!T::Enabled())
     return;
   const Rollback& r = s_rb;
+  TelemetryAudioGauges();
   T::SessionLeave(r.tick_running, reason ? reason : "",
                   {T::Int("generation", r.session_generation),
                    T::Int("rollbacks", static_cast<s64>(r.rollbacks)),
@@ -10662,6 +10662,7 @@ void TelemetryShutdown()
   // telemetry call would then be a no-op: report the leave first.
   if (s_rb.vtime_on && T::Enabled())
     TelemetrySessionLeave("core shutdown");
+  TelemetryAudioGauges();
   T::Shutdown(s.failed ? "netplay failure (NSR stopped the core)" : "core stop",
               {T::Int("failed", s.failed), T::Int("netplay", s.enabled),
                T::Int("exchanged", s.exchanged_once),
@@ -10737,6 +10738,22 @@ void TelemetryLinkGauges()
   }
 }
 
+// Snapshot cumulative mixer counters at phase boundaries and once a second.
+// Closing a phase with its final sample attributes every underrun to the
+// menu/match interval that produced it, rather than the next periodic sample.
+void TelemetryAudioGauges()
+{
+  namespace T = NSRTelemetry;
+  if (!T::Enabled())
+    return;
+  if (const auto* stream = Core::System::GetInstance().GetSoundStream())
+  {
+    const auto audio = stream->GetMixer()->GetNSRDMAStats();
+    T::SetGauge(T::Gauge::AudioGapFills, static_cast<double>(audio[0]));
+    T::SetGauge(T::Gauge::AudioSkips, static_cast<double>(audio[2]));
+  }
+}
+
 // One lockstep frame done (pre-match retrace lockstep, or post-match frame
 // lockstep when `wait_start` is default).  Host time only.
 void TelemetryLockstepFrame(u32 frame, std::chrono::steady_clock::time_point wait_start)
@@ -10752,14 +10769,7 @@ void TelemetryLockstepFrame(u32 frame, std::chrono::steady_clock::time_point wai
   s_tm.lockstep_frame = frame;
   T::SetGauge(T::Gauge::MenuInputDelay, s_session.delay);
   if (frame % 60 == 0 || !s_tm.have_lockstep_end)
-  {
-    if (const auto* stream = Core::System::GetInstance().GetSoundStream())
-    {
-      const auto audio = stream->GetMixer()->GetNSRDMAStats();
-      T::SetGauge(T::Gauge::AudioGapFills, static_cast<double>(audio[0]));
-      T::SetGauge(T::Gauge::AudioSkips, static_cast<double>(audio[2]));
-    }
-  }
+    TelemetryAudioGauges();
   if (wait_start != std::chrono::steady_clock::time_point{})
   {
     T::Observe(T::Hist::LockstepWaitUs, us(now - wait_start));

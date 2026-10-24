@@ -46,7 +46,7 @@ constexpr std::size_t MAX_HISTORY = 64;
 constexpr std::uint32_t NO_FRAME = UINT32_MAX;
 // Extra frames of remote input/checksum lookahead tolerated beyond what this
 // peer's own delay and prediction settings permit.  Delay and prediction are
-// per-process settings (the adapter clamps them to <= 8 and <= 60), so a
+// per-process settings (match delay <= 8, menu delay <= 12, prediction <= 60), so a
 // legitimate peer may be configured more permissively than we are.  Two
 // datagram windows cover that whole clamp range while still bounding how much
 // attacker-chosen future input a single sender can make us retain.
