@@ -262,6 +262,7 @@
     <ClInclude Include="Core\NSR\NSRQuickstart.h" />
     <ClInclude Include="Core\NSR\NSRBootAgreement.h" />
     <ClInclude Include="Core\NSR\NSRContent.h" />
+    <ClInclude Include="Core\NSR\NSRPlaybooks.h" />
     <ClInclude Include="Core\NSR\NSRDraft.h" />
     <ClInclude Include="Core\NSR\NSRContentRead.h" />
     <ClInclude Include="Core\NSR\NSRNetplay.h" />

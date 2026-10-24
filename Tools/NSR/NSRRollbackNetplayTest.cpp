@@ -26,6 +26,7 @@
 #include "Core/NSR/NSRPadSource.h"
 #include "Core/NSR/NSRContentRead.h"
 #include "Core/NSR/NSRDraft.h"
+#include "Core/NSR/NSRPlaybooks.h"
 #include "Core/NSR/NSRGameStatsIdentity.h"
 
 #include <algorithm>
@@ -2224,6 +2225,63 @@ static void TestRuntimeDraft()
   assert(!NSRContent::PlanDraft(memory, 0, 0, &error));
 }
 
+// Synthetic native PBPL plus controller registry. Both cross-side ownership
+// and subset order must resolve without mutating database bytes or neighbors.
+static void TestPlaybooks()
+{
+  std::vector<std::uint8_t> ram(0x400000), vmem(0x1000);
+  const auto put = [&](std::vector<std::uint8_t>& region, std::uint32_t offset,
+                       std::uint32_t value, unsigned size = 4) {
+    for (unsigned i = 0; i < size; ++i)
+      region[offset + i] = static_cast<std::uint8_t>(value >> ((size - i - 1) * 8));
+  };
+  const auto tag = [&](std::uint32_t offset, std::string_view name) {
+    std::copy(name.begin(), name.end(), vmem.begin() + offset);
+  };
+  put(ram, 0x3ebe88, 0x7e000100);
+  put(vmem, 0x104, 0x7e000200);
+  tag(0x108, "1TBP"); tag(0x21c, "LPBP");
+  put(vmem, 0x214, 0x7e000400); put(vmem, 0x220, 16); put(vmem, 0x224, 127);
+  for (const auto offset : {0x240u, 0x242u, 0x244u}) put(vmem, offset, 3, 2);
+  put(vmem, 0x24a, 3, 1);
+  for (unsigned i = 0; i < 3; ++i)
+  {
+    put(vmem, 0x24c + i * 16, 3); put(vmem, 0x250 + i * 16, i * 16);
+    put(vmem, 0x258 + i * 16, 16);
+  }
+  tag(0x254, "LPBP"); tag(0x264, "TSBP"); tag(0x274, "_dro");
+  for (unsigned i = 0; i < 3; ++i)
+  {
+    put(vmem, 0x400 + i * 16, 20 + i, 2);
+    put(vmem, 0x402 + i * 16, 7, 2);
+    put(vmem, 0x404 + i * 16, i + 1, 2);
+  }
+  const NSRGameStats::Memory memory{ram, vmem};
+  NSRContent::PlaybookGroup group{2, 7, {20, 21, 22}, {22, 20}};
+  std::string error;
+  const auto before = vmem;
+  assert(NSRContent::PlanPlaybook(memory, group, 3, &error) ==
+         std::optional<std::vector<std::uint8_t>>({{2, 0}}));
+  assert(vmem == before);
+  assert(!NSRContent::PlanPlaybook(memory, group, 2, &error));
+  group.slots = {22, 22}; assert(!NSRContent::PlanPlaybook(memory, group, 3, &error));
+  group.slots = {23}; assert(!NSRContent::PlanPlaybook(memory, group, 3, &error));
+  group.slots = {20}; group.library = {21, 20, 22};
+  assert(!NSRContent::PlanPlaybook(memory, group, 3, &error));
+  group.library = {20, 21, 22};
+  put(vmem, 0x414, 1, 2); assert(!NSRContent::PlanPlaybook(memory, group, 3, &error));
+  vmem = before;
+  put(vmem, 0x214, 0x7e000ffc); assert(!NSRContent::PlanPlaybook(memory, group, 3, &error));
+  put(ram, 0x3eab60, 0x80000100); put(ram, 0x100, 0x80000200); put(ram, 0x104, 3, 1);
+  put(ram, 0x2eacac, 1); put(ram, 0x2eacb0, 0); put(ram, 0x2eacb4, 2);
+  put(ram, 0x200, 0, 1); put(ram, 0x20c, 1, 1); put(ram, 0x218, 0, 1);
+  assert(NSRContent::PlaybookCaptain(memory, 0, 3) == 1);
+  assert(NSRContent::PlaybookCaptain(memory, 1, 3) == 0);
+  assert(!NSRContent::PlaybookCaptain(memory, 2, 3));
+  put(ram, 0x20c, 0, 1); assert(NSRContent::PlaybookCaptain(memory, 0, 3) == 0);
+  put(ram, 0x104, 11, 1); assert(!NSRContent::PlaybookCaptain(memory, 0, 3));
+}
+
 int main()
 {
   TestHandoffInputDelay();
@@ -2235,6 +2293,7 @@ int main()
   TestBootAgreementWire();
   TestRuntimeContent();
   TestRuntimeDraft();
+  TestPlaybooks();
   TestGameStatsMemoryReader();
   TestGameStatsIdentity();
   TestHandoffAgreement();

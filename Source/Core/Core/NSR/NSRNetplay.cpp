@@ -8216,6 +8216,12 @@ void InGameHook(const Core::CPUThreadGuard& guard)
 }
 
 // Native load completion, outside frame-dependent caches and rollback history.
+// Existing-play menu setup is outside the per-frame simulation path.
+void PlaybookMenuHook(const Core::CPUThreadGuard& guard)
+{
+  NSRContent::PlaybookMenu(guard, s_rb.in_resim, s_rb.live);
+}
+
 void ContentDatabaseHook(const Core::CPUThreadGuard& guard)
 {
   NSRContent::DatabaseLoaded(guard, s_rb.in_resim, s_rb.live);

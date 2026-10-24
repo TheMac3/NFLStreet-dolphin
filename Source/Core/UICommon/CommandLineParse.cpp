@@ -85,7 +85,7 @@ std::unique_ptr<optparse::OptionParser> CreateParser(ParserOptions options)
 
   // The launcher requires this option for runtime packs. Older binaries reject
   // it before boot instead of silently ignoring NSR_CONTENT_* and playing stock.
-  parser->add_option("--nsr-runtime-content").choices({"1"})
+  parser->add_option("--nsr-runtime-content").choices({"1", "2"})
       .help("Require NSR runtime content protocol [%choices]");
   parser->add_option("-u", "--user").action("store").help("User folder path");
   parser->add_option("-m", "--movie").action("store").help("Play a movie file");

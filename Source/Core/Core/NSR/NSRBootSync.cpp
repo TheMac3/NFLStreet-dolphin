@@ -9,6 +9,7 @@
 // stay local.
 #include "Core/NSR/NSRBootSync.h"
 #include "Core/NSR/NSRQuickstart.h"
+#include "Core/NSR/NSRContent.h"
 
 #include <algorithm>
 #include <array>
@@ -303,6 +304,11 @@ std::optional<std::map<std::string, std::string>> Prepare()
     const std::string text = value ? value : "";
     manifest[key] = fmt::format("{:016x}", XXH3_64bits(text.data(), text.size()));
   }
+  // The complete combined pad/user set must agree before any guest menu runs,
+  // as well as at M2. Local file paths never enter the manifest.
+  const auto content = NSRContent::Fingerprint();
+  for (std::size_t i = 0; i < content.size(); ++i)
+    manifest[fmt::format("RuntimeContent.{}", i)] = fmt::format("{:016x}", content[i]);
   const auto bytes = EncodeBoot({BootKind::Settings, 0, 2, manifest});
   manifest["ManifestDigest"] = fmt::format("{:016x}",
       XXH3_64bits(bytes.data() + 8, bytes.size() - 8));

@@ -532,11 +532,18 @@ class Cache:
             return None
         return self.load(verify_manifest(raw, self.keys))
 
-    def runtime_env(self, content: Content | None, draft_order="alternating", draft_first="stock") -> dict[str, str]:
+    def runtime_env(self, content: Content | None, draft_order="alternating", draft_first="stock", playbooks=None) -> dict[str, str]:
         """Write an immutable ratings/settings bundle for Dolphin.
         Dolphin re-hashes these bytes once before accepting the native load."""
         import draftmodes
         raw = draftmodes.runtime_bytes(content, draft_order, draft_first)
+        if playbooks:
+            bundle = strict_loads(raw) if raw else {"version": 0, "packs": [],
+                "draft": {"order": draft_order, "first": draft_first, "policy": 1}}
+            bundle["format"] = "nsrb.runtime-content.v3"
+            bundle.setdefault("draft", {"order": draft_order, "first": draft_first, "policy": 1})
+            bundle["playbooks"] = {"policy": 1, "captain": "lowest-pad", "users": playbooks}
+            raw = canonical(bundle)
         if raw is None:
             return {}
         if len(raw) > 4 * 1024 * 1024:

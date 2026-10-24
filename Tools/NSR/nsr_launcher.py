@@ -78,6 +78,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import isopatch  # noqa: E402
 import nsr_controllers as controllers  # noqa: E402
 import nsr_gamestats as gamestats  # noqa: E402
+import nsr_playbooks as books
 import nsr_content  # noqa: E402
 import nsr_lobby as lobby  # noqa: E402
 import nsr_patcher as patcher  # noqa: E402
@@ -512,6 +513,7 @@ class Launcher:
         # injectable so tests run the whole flow against a fake server.
         self._content_fetch = content_fetch or nsr_content.http_get
         self._content_keys = content_keys
+        self._book_cache = books.Cache(self.folder, content_keys, self._content_fetch)
         self._content_cache = nsr_content.Cache(self.folder, content_keys)
         self._clock = clock
         self._checked_at = None   # clock() of the last successful manifest check
@@ -549,6 +551,7 @@ class Launcher:
             "content": {"state": "idle", "text": "", "version": None, "latest": None, "changelog": "",
                         "auto": bool(cfg.get("content_auto", True)), "busy": False,
                         "runtime": bool(cfg.get("content_runtime", True))},
+            "playbook": {"text": books.label([cfg.get("playbook")]), "link_code": ""},
             "host": {"state": "idle", "mode": "", "code": "", "players": [], "can_start": False,
                      "info": "" if self.rv_server else "Room codes aren't set up in this download "
                              "(no room server). Use “Host by IP”."},
@@ -1116,6 +1119,8 @@ class Launcher:
     def _preflight_update(self) -> None:
         """Before hosting/joining with auto updates on: catch an update published
         since the last check, so the room doesn't have to reject us."""
+        if self.cfg.get("playbook"):
+            self._refresh_playbook_now()
         if not self.state["content"]["auto"] or not self.content_base():
             return
         if self._checked_at is not None and self._clock() - self._checked_at < CONTENT_RECHECK_S:
@@ -1124,6 +1129,68 @@ class Launcher:
 
     def _content_descriptor(self) -> dict | None:
         return self.state["game"].get("content")
+
+    def show_playbook_link(self) -> None:
+        """Show the private one-time pairing capability only inside Settings."""
+        path = os.path.join(self.folder, "nsr-playbook-link.txt")
+        try:
+            try:
+                with open(path, encoding="ascii") as stream:
+                    code = stream.read(65).strip()
+                books.owner_id(code)
+            except FileNotFoundError:
+                code = books.new_code()
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w", encoding="ascii") as stream:
+                    stream.write(code)
+            self._set("playbook", link_code=code)
+        except (OSError, ValueError):
+            self.notify("Could not read/create your private launcher link code.", "error")
+
+    def refresh_playbook(self) -> None:
+        """Fetch this installation's signed book before creating another room."""
+        if self.state["host"]["state"] != "idle" or self.state["join"]["state"] != "idle":
+            self.notify("Leave your room before changing playbooks.", "error")
+            return
+        self._spawn(self._refresh_playbook_now)
+
+    def _refresh_playbook_now(self) -> None:
+        """A failed refresh keeps the last verified revision, never silent stock."""
+        try:
+            path = os.path.join(self.folder, "nsr-playbook-link.txt")
+            with open(path, encoding="ascii") as stream:
+                owner = books.owner_id(stream.read(65).strip())
+            base = self.content_base()
+            if not base:
+                raise ValueError("The content server is not configured in this download.")
+            ref = self._book_cache.current(base, owner)
+            previous = self.cfg.get("playbook")
+            if previous and (ref["owner"] != previous["owner"] or ref["revision"] < previous["revision"] or
+                             (ref["revision"] == previous["revision"] and ref != previous)):
+                raise ValueError("The server returned an older or different playbook; keeping the installed revision.")
+            self.cfg["playbook"] = ref
+            self._save()
+            self._set("playbook", text=books.label([ref]), link_code="")
+        except FileNotFoundError:
+            self._set("playbook", text="Show your private link code, link it on the editor website, then publish and fetch your book.")
+        except OSError as exc:
+            why = ("No published playbook found. Link this launcher and publish on the editor website."
+                   if str(exc) == "HTTP 404" else "Could not reach the playbook server. Keeping your installed choice.")
+            self._set("playbook", text=why + " " + books.label([self.cfg.get("playbook")]))
+        except ValueError as exc:
+            self._set("playbook", text=f"{exc} " + books.label([self.cfg.get("playbook")]))
+
+    def use_default_playbook(self) -> None:
+        """Explicitly choose stock for future rooms while keeping account linkage."""
+        if self.state["host"]["state"] != "idle" or self.state["join"]["state"] != "idle":
+            return
+        self.cfg.pop("playbook", None)
+        self._save()
+        self._set("playbook", text="Game default", link_code="")
+
+    def _room_books(self, target: str, refs: list) -> None:
+        """Show the entire pad-ordered frozen set, including default books."""
+        self._set(target, playbooks=books.label(refs))
 
     # -- launching --
     def launch(self, start, open_ui: bool = False) -> bool:
@@ -1171,12 +1238,17 @@ class Launcher:
                 order, first = selected_draft["order"], selected_draft["first"]
                 if active:
                     self._validate_runtime(active)
-                if active or draftmodes.patch_names(order, first):
+                refs = start.playbooks if start else [self.cfg.get("playbook")]
+                combined = self._book_cache.runtime(self.content_base(), refs,
+                    os.path.join(self.folder, patcher.OUTPUT_NAME)) if any(refs) else []
+                if start and self.cfg.get("playbook") and (not refs or refs[start.player] != self.cfg["playbook"]):
+                    raise nsr_content.ContentError("The room did not retain your playbook. Reopen it with an updated service.")
+                if active or draftmodes.patch_names(order, first) or combined:
                     if draftmodes.patch_names(order, first) and self.state["game"]["fingerprint"] not in {
                             patcher.fingerprint(digest) for _, digest in patcher.KNOWN_INPUTS.values()}:
                         raise nsr_content.ContentError("Runtime draft settings need the stock rollback base. Rebuild your game copy once.")
-                    env.update(self._content_cache.runtime_env(active, order, first))
-                    args += ["--nsr-runtime-content=1"]
+                    env.update(self._content_cache.runtime_env(active, order, first, combined))
+                    args += ["--nsr-runtime-content=" + ("2" if combined else "1")]
             self._proc = self._popen(args, env=env, cwd=self.folder)
         except (OSError, nsr_content.ContentError) as e:
             self.notify(f"Couldn't start Dolphin ({args[0]}): {e}", "error")
@@ -1304,7 +1376,8 @@ class Launcher:
             h = self._lobby.RoomHost(self.rv_server, self.state["name"], self.state["game"]["fingerprint"],
                                      on_change=self._roster, on_error=lambda why: self._set("host", info=why),
                                      content=self._content_descriptor(), quickstart=self.state["quickstart"],
-                                     draft=self.draft_settings())
+                                     draft=self.draft_settings(), playbook=self.cfg.get("playbook"),
+                                     on_playbooks=lambda refs: self._room_books("host", refs))
             try:
                 code = h.open()
             except ConnectionError as e:
@@ -1325,7 +1398,8 @@ class Launcher:
                                       on_change=self._roster,
                                       on_reject=lambda who, why: self._set("host", info=f"Refused {who}: {why}"),
                                       content=self._content_descriptor(), quickstart=self.state["quickstart"],
-                                      draft=self.draft_settings())
+                                      draft=self.draft_settings(), playbook=self.cfg.get("playbook"),
+                                     on_playbooks=lambda refs: self._room_books("host", refs))
             h.open()
         except OSError as e:
             self._set("host", state="idle", mode="")
@@ -1404,7 +1478,9 @@ class Launcher:
         def attempt():
             kw = {"on_lobby": on_lobby, "cancel": cancel, "content": self._content_descriptor(),
                   "on_game_mode": lambda selected: self._set("join", quickstart=selected),
-                  "on_draft": lambda selected: self._set("join", draft_label=lobby.draft_label(selected))}
+                  "on_draft": lambda selected: self._set("join", draft_label=lobby.draft_label(selected)),
+                  "playbook": self.cfg.get("playbook"),
+                  "on_playbooks": lambda refs: self._room_books("join", refs)}
             if direct:
                 return self._lobby.join(target, self.state["name"], self.state["game"]["fingerprint"], **kw)
             return self._lobby.join_room(self.rv_server, target, self.state["name"],
@@ -1607,6 +1683,9 @@ class WebApi:
     def set_button_icons(self, choice): self._l.set_button_icons(str(choice))
     def set_resolution(self, value): self._l.set_resolution(value)
     # Both manual and signed-content rebuilds preserve these image choices.
+    def show_playbook_link(self): self._l.show_playbook_link()
+    def refresh_playbook(self): self._l.refresh_playbook()
+    def use_default_playbook(self): self._l.use_default_playbook()
     def set_draft(self, order, first): self._l.set_draft(order, first)
     def find_game(self): self._l.find_game()
     def host_room(self): self._l.host_room()
@@ -1705,7 +1784,7 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     tabs = ttk.Notebook(outer)
     tabs.pack(fill="both", expand=True)
     pages = {k: ttk.Frame(tabs, style="Panel.TFrame", padding=12) for k in
-             ("Host", "Join", "Controllers", "Settings")}
+             ("Host", "Join", "Controllers", "My playbook", "Settings")}
     for k, f in pages.items():
         tabs.add(f, text=k)
 
@@ -1772,6 +1851,18 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
                command=launcher.import_controllers).grid(row=4, column=0, sticky="w", pady=8)
     ttk.Button(cp, text="Set up controllers…", command=launcher.setup_controllers).grid(row=4, column=1, sticky="w", padx=6)
     ctl_binds = label(cp, 5, style="Muted.TLabel")
+
+    # Native fallback keeps pairing/fetch/stock recovery available without WebView2.
+    bp = pages["My playbook"]
+    ttk.Label(bp, text="Link this launcher on the editor website, publish your choices, then fetch them here. "
+                       "Keep the linking code private. Reopen your room after publishing.",
+              wraplength=560).grid(row=0, column=0, columnspan=4, sticky="w", pady=8)
+    book_text = label(bp, 1)
+    book_code = tk.StringVar()
+    ttk.Entry(bp, textvariable=book_code, width=64, state="readonly").grid(row=2, column=0, columnspan=4, sticky="we", pady=8)
+    for column, (text, action) in enumerate((("Show private link code", launcher.show_playbook_link),
+            ("Fetch my playbook", launcher.refresh_playbook), ("Use game default", launcher.use_default_playbook))):
+        ttk.Button(bp, text=text, command=action).grid(row=3, column=column, sticky="w", padx=4)
 
     # Settings
     sp = pages["Settings"]
@@ -1854,7 +1945,9 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
             quality = s["link_quality"]
             quality_text = quality["text"] + ("\n" + quality["warning"] if quality["warning"] else "")
             host_info.configure(text=h["info"] + "\n" + lobby.draft_label(launcher.draft_settings())
-                                + "\n" + quality_text)
+                                + "\n" + quality_text + "\n" + h.get("playbooks", ""))
+            book_text.configure(text=s["playbook"]["text"])
+            book_code.set(s["playbook"]["link_code"])
             mode_var.set(lobby.QUICKSTARTS[s["quickstart"]])
             mode_picker.configure(state="readonly" if h["state"] == "idle" else "disabled")
             set_list(host_roster, h["players"])
@@ -1862,7 +1955,7 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
             enable(b_open, idle and s["rooms"]); enable(b_ip, idle)
             enable(b_close, not idle); enable(b_start, h["state"] == "open" and h["can_start"])
             join_info.configure(text=j["info"] + "\nGame mode: " + lobby.QUICKSTARTS[j["quickstart"]]
-                                + "\n" + j.get("draft_label", "") + "\n" + quality_text)
+                                + "\n" + j.get("draft_label", "") + "\n" + quality_text + "\n" + j.get("playbooks", ""))
             set_list(join_roster, j["players"])
             enable(b_join, j["state"] == "idle"); enable(b_leave, j["state"] == "waiting")
             p1 = c["port1"]

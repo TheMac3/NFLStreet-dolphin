@@ -31,7 +31,7 @@ namespace HLE
 static std::map<u32, u32> s_hooked_addresses;
 
 // clang-format off
-constexpr std::array<Hook, 54> os_patches{{
+constexpr std::array<Hook, 55> os_patches{{
     // Placeholder, os_patches[0] is the "non-existent function" index
     {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
 
@@ -75,6 +75,7 @@ constexpr std::array<Hook, 54> os_patches{{
     {"NSR_RollbackFrame",            NSRNetplay::RollbackFrameHook,         HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: frame start
     {"NSR_RollbackFrameEnd",         NSRNetplay::RollbackFrameEndHook,      HookType::Replace, HookFlag::Fixed}, // NFLStreet POC rollback: frame end
     {"NSR_InGame",                   NSRNetplay::InGameHook,                 HookType::Start,   HookFlag::Fixed}, // NFLStreet POC rollback: match lifecycle
+    {"NSR_PlaybookMenu",             NSRNetplay::PlaybookMenuHook,         HookType::Replace, HookFlag::Fixed}, // existing-play side/pad ordering
     {"NSR_ContentDatabase",          NSRNetplay::ContentDatabaseHook,      HookType::Start,   HookFlag::Fixed}, // native database registration complete
     {"NSR_GameStatsMvp",             NSRNetplay::GameStatsMvpHook,           HookType::Start,   HookFlag::Fixed}, // passive native MVP observation
     {"NSR_GameStatsTotals",          NSRNetplay::GameStatsTotalsHook,        HookType::Start,   HookFlag::Fixed}, // passive native totals observation
@@ -151,6 +152,8 @@ void PatchFixedFunctions(Core::System& system)
   if (SConfig::GetInstance().GetGameID() == "GN7E69" &&
       SConfig::GetInstance().GetRevision() == 0 && NSRNetplay::ValidateRollbackImage(system))
   {
+    if (system.GetMemory().Read_U32(0x80057d8c) == 0x7f23cb78)
+      Patch(system, 0x80057d8c, "NSR_PlaybookMenu");
     // GN7E69 rev 0: immediately after fn_801F9134 registers a loaded DB.
     if (system.GetMemory().Read_U32(0x8020d334) == 0x7c7e1b78)
       Patch(system, 0x8020d334, "NSR_ContentDatabase");
