@@ -174,6 +174,9 @@ void PatchFixedFunctions(Core::System& system)
     Patch(system, NSRNetplay::GX_ENABLE_BREAKPT, "NSR_Present");
     Patch(system, NSRNetplay::VI_POST_COUNTER_FN, "NSR_Present");
     Patch(system, NSRNetplay::PEEK_Z_FN, "NSR_PeekZ");
+    if (system.GetMemory().Read_U32(NSRNetplay::STREAM_START_WAIT_FN) ==
+        NSRNetplay::STREAM_START_WAIT_FIRST)
+      Patch(system, NSRNetplay::STREAM_START_WAIT_FN, "NSR_Present");
     Patch(system, NSRNetplay::VI_PRE_CB, "NSR_ViCallback");
     // Functions skipped in re-simulated frames: NSR_RB_SKIP_RESIM=addr,...
     // (default: none, re-simulated frames draw fully); NSR_RB_RENDER_RESIM forces none.

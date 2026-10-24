@@ -250,6 +250,16 @@ std::optional<std::uint32_t> HandoffAgreement::HostAuxClock() const
   return m_sync_aux_clocks[0];
 }
 
+std::optional<HandoffPacket> HandoffAgreement::Proposal(std::uint8_t player) const
+{
+  if (Mismatched() || player >= m_players || !m_seen[player])
+    return std::nullopt;
+  // The stored packet is the participant's exact proposal, including its
+  // own input-delay fields (handoff v5, fix/audio2); rebuilding it from the
+  // local tuple would relay player 0's delay under another sender's id.
+  return m_proposals[player];
+}
+
 std::vector<std::uint8_t> Encode(const Packet& packet)
 {
   const std::size_t count = std::min(packet.pads.size(), MAX_HISTORY);
