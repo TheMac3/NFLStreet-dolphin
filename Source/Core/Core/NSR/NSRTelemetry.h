@@ -123,6 +123,7 @@ enum class Gauge : std::uint8_t
   // overflows where audio was dropped.
   AudioGapFills,
   AudioSkips,
+  MenuInputDelay,      // agreed delay of the current or next lockstep menu stream
   Count
 };
 

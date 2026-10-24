@@ -38,7 +38,8 @@ constexpr std::uint32_t HANDOFF_MAGIC = 0x4E535248;  // 'NSRH'
 // that transition with incompatible lifecycle semantics. HANDOFF_VERSION 5
 // includes the full runtime-content SHA-256, content version and hook policy.
 constexpr std::uint8_t VERSION = 6;
-constexpr std::uint8_t HANDOFF_VERSION = 5;
+// Version 6 agrees menu delay before the first poll and at match leave.
+constexpr std::uint8_t HANDOFF_VERSION = 6;
 constexpr std::size_t MAX_PLAYERS = 4;
 constexpr std::size_t PAD_SIZE = 12;
 constexpr std::size_t MAX_HISTORY = 64;
@@ -159,6 +160,7 @@ enum class HandoffKind : std::uint8_t
   EnterRollback = 1,
   LeaveRollback = 2,
   SyncClocks = 3,
+  StartMenus = 4,
 };
 
 struct HandoffPacket
@@ -185,6 +187,11 @@ struct HandoffPacket
   // peer): one-way latency estimate and jitter, in tenths of a millisecond.
   std::uint16_t delay_one_way_dms = 0;
   std::uint16_t delay_jitter_dms = 0;
+  // Immutable host policy for the menu stream created after this barrier.
+  // Zero means this barrier creates no menu stream. Bounds are wire-validated.
+  std::uint8_t menu_delay = 0;
+  std::uint16_t menu_one_way_dms = 0, menu_jitter_dms = 0;
+  std::uint8_t menu_source = 0;  // 0 fallback, 1 ENet median, 2 timing probes, 3 fixed diagnostic
 };
 
 std::vector<std::uint8_t> EncodeHandoff(const HandoffPacket& packet);
@@ -217,6 +224,15 @@ struct AutoDelayRule
 };
 std::uint8_t AutoInputDelay(double one_way_ms, double jitter_ms, const AutoDelayRule& rule = {});
 
+// Menus cannot predict: budget the full one-way path plus measured variation
+// and one frame for service/relay scheduling. 2..12 frames bounds both local
+// responsiveness and history use (legacy redundancy is 32 frames). Revisit
+// the upper bound if supported links need more than about 180 ms one way.
+std::uint8_t MenuInputDelay(double one_way_ms, double jitter_ms);
+// Median over a bounded window rejects isolated ENet retransmission spikes.
+// No estimate until six fresh ACK observations exist; callers use fallback 2.
+std::optional<std::uint32_t> MenuMedian(std::span<const std::uint32_t> samples);
+
 // HandoffAgreement is deliberately transport-free.  Each peer proposes the
 // same kind/frame/hash tuple and accepts duplicate, reordered announcements;
 // the first conflicting tuple is sticky so the adapter can abort loudly.
@@ -233,7 +249,9 @@ public:
                    std::uint64_t semantic_hash, const ConfigFingerprint& config = {},
                    std::uint32_t sync_clock = 0, std::uint32_t sync_aux_clock = 0,
                    std::uint8_t input_delay = 0, std::uint16_t delay_one_way_dms = 0,
-                   std::uint16_t delay_jitter_dms = 0);
+                   std::uint16_t delay_jitter_dms = 0, std::uint8_t menu_delay = 0,
+                   std::uint16_t menu_one_way_dms = 0, std::uint16_t menu_jitter_dms = 0,
+                   std::uint8_t menu_source = 0);
 
   bool Accept(const HandoffPacket& packet);
   bool Complete() const;
