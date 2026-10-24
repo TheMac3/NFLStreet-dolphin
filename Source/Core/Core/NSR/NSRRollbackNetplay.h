@@ -199,26 +199,22 @@ std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes);
 
 // Automatic rollback input delay (fix/audio2), chosen by player 0 before
 // each rollback epoch from the links it measured during the lockstep menus.
-// `one_way_ms`: the worst one-way input latency between any two players as
-// ENet reports it (half its smoothed RTT for a direct link; in a star, a
-// joiner's input reaches another joiner through the host, so half the sum of
-// both RTTs); `jitter_ms`: the worst ENet RTT variation of those links.
+// `one_way_ms`: worst player-to-player input path from p75 dedicated-probe
+// RTT (half RTT direct; half the sum of two host legs in a star). `jitter_ms`:
+// robust inter-arrival variation, summed for a relayed path. The original
+// fix/audio2 rule/curve remains; the 8 ms bias accounts for next-frame host
+// servicing at both ends. Revisit only if probe sweeps shift the tuning table
+// in NFLStreet docs/research-log.md (2026-10-23).
 //
 //   delay = clamp(ceil((one_way - bias + jitter_weight x jitter) / frame)
 //                 - predict_frames, min_delay, max_delay)
 //
-// bias: ENet acknowledges on its next host service, which NSR runs once per
-// frame on both ends, so its RTT reads ~16-20 ms above the path (proxy sweep
-// 2026-10-23: 20/40/70/110/150 ms paths read 40/60/90/128/170) and its
-// variance about twice the configured jitter; hence bias 8 ms one-way and
-// weight 1. predict_frames 1: one frame of latency is left to prediction, so
-// rollbacks stay ~1 frame deep (shallow and cheap with fix/audio2's audio)
-// while the delay stays at 1-2 frames up to ~70 ms RTT. Tuning table: NFLStreet
-// docs/research-log.md (2026-10-23).
+// One frame is left to cheap shallow prediction, keeping 1-2 frames of input
+// delay up to ~70 ms direct RTT. Probes never enter the simulation state.
 struct AutoDelayRule
 {
   double one_way_bias_ms = 8.0;  // ENet scheduling overestimate, one way
-  double jitter_weight = 1.0;    // margin = weight x ENet RTT variance
+  double jitter_weight = 1.0;    // margin = weight x measured RTT jitter
   double predict_frames = 1.0;   // latency rollback is allowed to absorb
   std::uint8_t min_delay = 1, max_delay = 4;
 };
@@ -232,6 +228,58 @@ std::uint8_t MenuInputDelay(double one_way_ms, double jitter_ms);
 // Median over a bounded window rejects isolated ENet retransmission spikes.
 // No estimate until six fresh ACK observations exist; callers use fallback 2.
 std::optional<std::uint32_t> MenuMedian(std::span<const std::uint32_t> samples);
+
+// Host-only timing probes never enter the input exchange or reliable queues.
+// The origin's monotonic timestamp is echoed verbatim (no clock sync needed).
+// Reports carry mesh links to player 0; Quality carries the host's worst path
+// (target = chosen delay, rtt_us = one-way us). All fields are little endian.
+constexpr std::uint32_t PROBE_MAGIC = 0x5052534e;  // "NSRP"
+enum class ProbeKind : std::uint8_t { Ping = 1, Pong, Report, Quality };
+struct ProbePacket
+{
+  ProbeKind kind = ProbeKind::Ping;
+  std::uint8_t sender = 0, target = 0;
+  std::uint32_t sequence = 0, sent_us = 0, rtt_us = 0, jitter_us = 0;
+};
+std::vector<std::uint8_t> EncodeProbe(const ProbePacket& packet);
+std::optional<ProbePacket> DecodeProbe(std::span<const std::uint8_t> bytes);
+
+struct LinkQuality
+{
+  double rtt_ms = 0, jitter_ms = 0;
+  std::size_t samples = 0;
+};
+// Player 0 aggregates every physical link; mesh reports must be fresh before
+// calling. A missing link yields no estimate, preserving the previous choice.
+using LinkMatrix = std::array<std::array<std::optional<LinkQuality>, MAX_PLAYERS>, MAX_PLAYERS>;
+struct InputPath { double one_way_ms = 0, jitter_ms = 0; };
+std::optional<InputPath> WorstInputPath(const LinkMatrix& links, std::uint8_t players, bool star);
+
+// A 12-second / 48-sample sliding window: p75 RTT resists occasional stalls;
+// p75 absolute inter-arrival variation / sqrt(2) estimates RTT jitter without
+// allowing one barrier/burst to poison an EWMA for the following match.
+// The adapter invalidates outstanding probes whenever either end is busy.
+class LinkProbeWindow
+{
+public:
+  // Start at most four probes/second; all arithmetic tolerates u32 clock wrap.
+  std::optional<ProbePacket> Start(std::uint32_t now_us);
+  // Only an outstanding exact (sequence,timestamp) echo can add one sample.
+  bool Accept(const ProbePacket& pong, std::uint32_t now_us);
+  std::optional<LinkQuality> Quality(std::uint32_t now_us) const;
+  void DiscardPending();
+  // A leave starts a fresh window; sequence numbers intentionally never reset.
+  void Reset();
+private:
+  struct Sample { std::uint32_t sent_us, received_us, rtt_us; };
+  std::vector<ProbePacket> m_pending;
+  std::vector<Sample> m_samples;
+  std::uint32_t m_sequence = 0, m_last_send = 0;
+  bool m_started = false;
+};
+
+// Great/Good/OK/Poor reflect the chosen delay plus measured RTT jitter.
+const char* InputQualityLabel(std::uint8_t delay, double jitter_ms);
 
 // HandoffAgreement is deliberately transport-free.  Each peer proposes the
 // same kind/frame/hash tuple and accepts duplicate, reordered announcements;

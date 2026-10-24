@@ -8,7 +8,8 @@
 //     higher-numbered ones),
 //   - the per-retrace exchange (send our pad for frame f + delay to everyone
 //     with redundancy; block until every other player's pad for frame f is in),
-//   - periodic whole-MEM1 hashes, compared with every peer, to detect desyncs.
+//   - periodic whole-MEM1 hashes, compared with every peer, to detect desyncs,
+//   - dedicated menu timing probes and host-agreed per-match input delay.
 
 #include "Core/NSR/NSRNetplay.h"
 #include "Core/NSR/NSRBootSync.h"
@@ -115,6 +116,8 @@
 
 namespace NSRNetplay
 {
+// Defined with the delay policy; the transport services it only in menus.
+static void TickTimingProbes();
 // Defined with the state digest; refuses a differently configured peer (M2).
 static void FailConfigMismatch(u32 player, const RollbackNet::ConfigFingerprint* local,
                                const RollbackNet::ConfigFingerprint* remote, u64 local_digest,
@@ -137,9 +140,16 @@ constexpr u16 DEFAULT_PORT = 51515;
 //     uses 0x80384DE0 + chan * 0xA000): per-mount card values.
 //   - SDK raw SI controller input (before PADRead): each machine's own pads.
 //   - NFLStreet patch area: test scripts, freeze/loop words.
-constexpr std::array<std::pair<u32, u32>, 3> HASH_SKIP{{
+//   - The audio thread's saved register context (OSContext at 0x803AA828,
+//     0x2C8 bytes; thread state/queue words after it stay hashed): it holds
+//     whatever registers the thread had when the host preempted it, which
+//     varies with host timing. The canonical rollback digest already excludes
+//     it; without this the menu lockstep hash raised a false DESYNC on 4 bytes
+//     at 0x803AAA5C (fix/delayprobe report, seed 0x2a20f935).
+constexpr std::array<std::pair<u32, u32>, 4> HASH_SKIP{{
     {0x00384C00, 0x00398E00},
     {0x003A69C0, 0x003A6A00},
+    {0x003AA828, 0x003AAAF0},
     {0x00411A00, 0x00412000},
 }};
 
@@ -214,6 +224,17 @@ struct Session
   bool enet_initialized = false;
   std::array<ENetPeer*, MAX_PLAYERS> peers{};  // by player index (ours unused)
   bool failed = false;
+  // delayprobe: CPU-thread-only, host-time measurements outside the simulation.
+  std::array<RollbackNet::LinkProbeWindow, MAX_PLAYERS> link_probes;
+  struct ReportedLink
+  {
+    std::optional<RollbackNet::LinkQuality> quality;
+    u32 received_us = 0, sent_us = 0;
+  };
+  std::array<std::array<ReportedLink, MAX_PLAYERS>, MAX_PLAYERS> link_reports{};
+  bool probe_menus = false;
+  u32 probe_resume_frame = 0, probe_quiet_us = 0, quality_log_us = 0;
+  bool quality_logged = false;
 
   std::map<u32, Pad> local_pads;                          // by frame they apply to
   std::array<std::map<u32, Pad>, MAX_PLAYERS> remote_pads;  // by player, frame
@@ -623,6 +644,108 @@ bool AllConnected()
   return true;
 }
 
+// Probes are unsequenced and connection-local: never relayed as game input.
+void SendTimingProbe(u32 player, const RollbackNet::ProbePacket& packet)
+{
+  if (!Linked(player))
+    return;
+  const auto bytes = RollbackNet::EncodeProbe(packet);
+  enet_peer_send(s_session.peers[player], 0,
+                 enet_packet_create(bytes.data(), bytes.size(), ENET_PACKET_FLAG_UNSEQUENCED));
+  enet_host_flush(s_session.host);
+}
+
+// Exclude both ends of a barrier/reliable burst plus a 500 ms quiet period.
+// Queue state is checked on send AND receive, so a probe crossing a busy
+// interval is discarded even when ENet's eventual reliable ACK looks fast.
+bool TimingProbeReady()
+{
+  auto& s = s_session;
+  bool busy = !s.probe_menus || s.boot_pending || s.failed;
+  for (u32 i = 0; i < s.players; ++i)
+  {
+    if (!Linked(i))
+      continue;
+    const auto* peer = s.peers[i];
+    // ENet keepalive/control commands have no payload. They recur every
+    // ~500 ms even with pad traffic; treating those as bursts would keep the
+    // quiet-period filter closed forever. Count only reliable application data.
+    busy = busy || peer->reliableDataInTransit != 0 ||
+           !enet_list_empty(&peer->outgoingSendReliableCommands);
+  }
+  const u32 now = HostNowUs();
+  if (busy)
+  {
+    s.probe_quiet_us = now;
+    for (auto& window : s.link_probes)
+      window.DiscardPending();
+  }
+  return !busy && now - s.probe_quiet_us >= 500'000;
+}
+
+// Called before barriers and throughout matches; no guest frame is affected.
+void PauseTimingProbes()
+{
+  s_session.probe_menus = false;
+  TimingProbeReady();
+}
+
+// Machine-readable local log record used by both launcher views. Reports are
+// previews in menus; entry publishes the agreed choice on every participant.
+void LogInputQuality(const RollbackNet::ProbePacket& packet)
+{
+  Log("link quality: delay={} one_way_dms={} jitter_dms={} chosen={} label={}", packet.target,
+      packet.rtt_us / 100, packet.jitter_us / 100, packet.sequence != 0 ? 1 : 0,
+      RollbackNet::InputQualityLabel(packet.target, packet.jitter_us / 1000.0));
+  if (packet.sequence != 0 && packet.target == 4)
+    Log("WARNING: input delay 4 chosen; connection quality is Poor; controls may feel slower");
+}
+
+// Validate probe identities against the physical connection, including at
+// star leaves (the game protocol's broader relay identity rule does not apply).
+void HandleTimingProbe(std::span<const u8> bytes, u32 source)
+{
+  auto& s = s_session;
+  const auto decoded = RollbackNet::DecodeProbe(bytes);
+  if (!decoded || source >= s.players || decoded->sender != source || source == s.me)
+    return;
+  auto packet = *decoded;
+  if (packet.kind == RollbackNet::ProbeKind::Quality)
+  {
+    if (source == 0 && s.me != 0 && s.probe_menus)
+      LogInputQuality(packet);
+    return;
+  }
+  if (!TimingProbeReady())
+    return;
+  if (packet.kind == RollbackNet::ProbeKind::Report)
+  {
+    // A mesh participant reports only links it originates (lower -> higher).
+    if (s.me != 0 || s.star || packet.target <= source || packet.target >= s.players)
+      return;
+    auto& report = s.link_reports[source][packet.target];
+    if (report.quality && (packet.sent_us == report.sent_us ||
+                           packet.sent_us - report.sent_us >= 0x80000000U))
+      return;
+    report = {RollbackNet::LinkQuality{packet.rtt_us / 1000.0, packet.jitter_us / 1000.0, 6},
+              HostNowUs(), packet.sent_us};
+    return;
+  }
+  if (packet.target != s.me)
+    return;
+  if (packet.kind == RollbackNet::ProbeKind::Ping)
+  {
+    packet.kind = RollbackNet::ProbeKind::Pong;
+    packet.sender = static_cast<u8>(s.me);
+    packet.target = static_cast<u8>(source);
+    SendTimingProbe(source, packet);
+  }
+  else if (packet.kind == RollbackNet::ProbeKind::Pong)
+  {
+    s.link_probes[source].Accept(packet, HostNowUs());
+  }
+}
+
 void DumpSnapshot(u32 frame)
 {
   Session& s = s_session;
@@ -813,9 +936,21 @@ void OpenHandoffBarrier(const RollbackNet::HandoffAgreement& agreement)
 void HandlePacket(const ENetPacket* packet, u32 source)
 {
   Session& s = s_session;
+  // Receiving a reliable burst is as unsuitable for timing as sending one.
+  if ((packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0)
+  {
+    s.probe_quiet_us = HostNowUs();
+    for (auto& window : s.link_probes)
+      window.DiscardPending();
+  }
   if (packet->dataLength >= 4 && std::memcmp(packet->data, "NSRC", 4) == 0)
   {
     HandleBootPacket(packet, source);
+    return;
+  }
+  if (packet->dataLength >= 4 && std::memcmp(packet->data, "NSRP", 4) == 0)
+  {
+    HandleTimingProbe({packet->data, packet->dataLength}, source);
     return;
   }
   // No pad/handoff packet may get ahead of the connection agreement.
@@ -877,6 +1012,10 @@ void HandlePacket(const ENetPacket* packet, u32 source)
     {
       return;
     }
+    // A peer already at a barrier makes in-flight timing samples unusable.
+    s.probe_quiet_us = HostNowUs();
+    for (auto& window : s.link_probes)
+      window.DiscardPending();
     const std::span<const u8> handoff_bytes(
         static_cast<const u8*>(packet->data), packet->dataLength);
     if (!s_rb_handoff || s_rb_handoff->Local().transition != decoded->transition)
@@ -1144,6 +1283,8 @@ void Service(int timeout_ms)
         samples.pop_front();
     }
   }
+
+  TickTimingProbes();
   NSRTelemetry::Poll();  // Includes preboot and input waits with zero live frames.
   // One small host-only results announcement per completed stats snapshot.
   // It never stalls simulation; only file publication waits for this metadata.
@@ -4495,6 +4636,10 @@ static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 fra
     return true;
   }
 
+  // delayprobe: service once per menu frame even when every input is cached.
+  s.probe_menus = frame >= s.probe_resume_frame;
+  Service(0);
+
   // 1. Our controller is always local port 0 (raw, straight from PADRead;
   //    remap/PADClamp run in-game on the agreed pads afterwards), or the test
   //    script if one is loaded. Record it for frame + delay.
@@ -6471,8 +6616,7 @@ static void ResendHandoffInputs()
 // input arrived ~2 frames late, so the match rolled back ~13 times a second;
 // every rollback costs host time and (before fix/audio2) audio. A little more
 // delay removes most rollbacks; too much makes controls feel heavy. Player 0
-// measures each link during the lockstep menus (ENet RTT and RTT variance,
-// refreshed by ENet's pings and the reliable boot/handoff traffic) and
+// measures each link with dedicated unreliable probes in quiet lockstep menus and
 // proposes RollbackNet::AutoInputDelay of the worst player-to-player path in
 // the entry barrier; every peer adopts player 0's value for the epoch, so all
 // players always run the same delay (a fixed NSR_RB_DELAY on player 0 is
@@ -6486,6 +6630,7 @@ struct DelayProposal
 {
   u8 delay = 0;
   u16 one_way_dms = 0, jitter_dms = 0;
+  bool measured = false;
 };
 
 static DelayProposal ProposeInputDelay()
@@ -6493,27 +6638,22 @@ static DelayProposal ProposeInputDelay()
   const Session& s = s_session;
   const Rollback& r = s_rb;
   DelayProposal p;
-  // Worst one-way path between any two players and its jitter. Player 0
-  // holds every link in a star; a joiner-to-joiner input is relayed by it.
-  double one_way = 0.0, jitter = 0.0;
-  bool measured = false;
-  for (u32 i = 0; i < s.players; ++i)
+  const u32 now = HostNowUs();
+  RollbackNet::LinkMatrix links{};
+  for (u32 i = 1; i < s.players; ++i)
   {
-    if (i == s.me || !Linked(i))
-      continue;
-    const double rtt_i = s.peers[i]->roundTripTime;
-    const double var_i = s.peers[i]->roundTripTimeVariance;
-    measured = true;
-    one_way = std::max(one_way, rtt_i / 2.0);
-    jitter = std::max(jitter, var_i);
+    links[0][i] = s.link_probes[i].Quality(now);
     for (u32 j = i + 1; j < s.players; ++j)
     {
-      if (j == s.me || !Linked(j))
-        continue;
-      one_way = std::max(one_way, (rtt_i + s.peers[j]->roundTripTime) / 2.0);
-      jitter = std::max(jitter, var_i + s.peers[j]->roundTripTimeVariance);
+      const auto& report = s.link_reports[i][j];
+      if (report.quality && now - report.received_us <= 12'000'000)
+        links[i][j] = report.quality;
     }
   }
+  const auto path = RollbackNet::WorstInputPath(links, static_cast<u8>(s.players), s.star);
+  const bool measured = path.has_value();
+  const double one_way = measured ? path->one_way_ms : 0.0;
+  const double jitter = measured ? path->jitter_ms : 0.0;
   if (r.net_delay_auto && measured)
   {
     RollbackNet::AutoDelayRule rule;
@@ -6527,9 +6667,55 @@ static DelayProposal ProposeInputDelay()
   {
     p.delay = static_cast<u8>(std::clamp<u32>(r.net_delay, 1, 8));
   }
+  p.measured = measured;
   p.one_way_dms = static_cast<u16>(std::clamp(one_way * 10.0, 0.0, 65535.0));
   p.jitter_dms = static_cast<u16>(std::clamp(jitter * 10.0, 0.0, 65535.0));
   return p;
+}
+
+// Four 24-byte probes per second per physical link, only in quiet menus.
+// Mesh links not attached to player 0 are summarized by their originating peer.
+static void TickTimingProbes()
+{
+  auto& s = s_session;
+  if (!s.host || !s.probe_menus || !TimingProbeReady())
+    return;
+  const u32 now = HostNowUs();
+  for (u32 i = s.me + 1; i < s.players; ++i)
+  {
+    if (!Linked(i) || (s.star && s.me != 0))
+      continue;
+    auto packet = s.link_probes[i].Start(now);
+    if (!packet)
+      continue;
+    packet->sender = static_cast<u8>(s.me);
+    packet->target = static_cast<u8>(i);
+    SendTimingProbe(i, *packet);
+    if (s.me != 0)
+    {
+      if (const auto quality = s.link_probes[i].Quality(now))
+      {
+        packet->kind = RollbackNet::ProbeKind::Report;
+        packet->rtt_us = static_cast<u32>(quality->rtt_ms * 1000.0);
+        packet->jitter_us = static_cast<u32>(quality->jitter_ms * 1000.0);
+        SendTimingProbe(0, *packet);
+      }
+    }
+  }
+  if (s.me == 0 && (!s.quality_logged || now - s.quality_log_us >= 1'000'000))
+  {
+    const auto proposal = ProposeInputDelay();
+    if (!proposal.measured)
+      return;
+    s.quality_logged = true;
+    s.quality_log_us = now;
+    const RollbackNet::ProbePacket quality{RollbackNet::ProbeKind::Quality, 0, proposal.delay,
+                                          0, now, static_cast<u32>(proposal.one_way_dms) * 100,
+                                          static_cast<u32>(proposal.jitter_dms) * 100};
+    LogInputQuality(quality);
+    for (u32 i = 1; i < s.players; ++i)
+      SendTimingProbe(i, quality);
+  }
 }
 
 static void AdoptInputDelay(const RollbackNet::HandoffPacket& host)
@@ -6538,11 +6724,16 @@ static void AdoptInputDelay(const RollbackNet::HandoffPacket& host)
   if (host.input_delay == 0)
     return;  // an older proposal without a delay: keep ours
   const u32 before = r.net_delay;
+  const bool first_choice = r.session_generation == 0;
   r.net_delay = std::min<u32>(host.input_delay, 8);
   Log("input delay {} for this match, from player 0 (worst link: one-way {:.1f} ms, jitter "
-      "{:.1f} ms); local setting {}, was {}",
+      "{:.1f} ms); local setting {}, {}",
       r.net_delay, host.delay_one_way_dms / 10.0, host.delay_jitter_dms / 10.0,
-      r.net_delay_auto ? "auto" : "fixed", before);
+      r.net_delay_auto ? "auto" : "fixed",
+      first_choice ? std::string("first entry") : fmt::format("was {}", before));
+  LogInputQuality({RollbackNet::ProbeKind::Quality, 0, static_cast<u8>(r.net_delay), 1,
+                   HostNowUs(), static_cast<u32>(host.delay_one_way_dms) * 100,
+                   static_cast<u32>(host.delay_jitter_dms) * 100});
   NSRTelemetry::Event(NSRTelemetry::EventKind::Note, s_rb.tick_running,
                       {NSRTelemetry::Int("input_delay", r.net_delay),
                        NSRTelemetry::Int("one_way_dms", host.delay_one_way_dms),
@@ -6564,35 +6755,16 @@ struct MenuDelayProposal
   u8 source = 0;
 };
 
-static MenuDelayProposal ProposeMenuDelay(bool startup = false)
+static MenuDelayProposal ProposeMenuDelay()
 {
   // An explicit host-only diagnostic override makes paired fixed/adaptive
   // proxy measurements possible. Production launchers sanitize NSR_* inputs.
   if (const auto fixed = ParseU32(Env("NSR_MENU_DELAY")))
     return {static_cast<u8>(std::clamp<u32>(*fixed, 2, 12)), 0, 0, 3};
   auto& s = s_session;
-  if (startup)
-  {
-    const auto start = std::chrono::steady_clock::now();
-    auto last_ping = start - std::chrono::milliseconds(50);
-    while (!s.failed && std::chrono::steady_clock::now() - start < std::chrono::milliseconds(1600))
-    {
-      const auto now = std::chrono::steady_clock::now();
-      if (now - last_ping >= std::chrono::milliseconds(50))
-      {
-        for (u32 i = 1; i < s.players; ++i)
-          if (Linked(i))
-            enet_peer_ping(s.peers[i]);
-        enet_host_flush(s.host);
-        last_ping = now;
-      }
-      Service(1);
-      // Discard connection/reliable warmup; retain only the last 800 ms.
-      if (now - start < std::chrono::milliseconds(800))
-        for (auto& samples : s.menu_links)
-          samples.clear();
-    }
-  }
+  if (const auto probe = ProposeInputDelay(); probe.measured)
+    return {RollbackNet::MenuInputDelay(probe.one_way_dms / 10.0, probe.jitter_dms / 10.0),
+            probe.one_way_dms, probe.jitter_dms, 2};
   std::array<std::vector<u32>, MAX_PLAYERS> rtts, variances;
   const u32 now = HostNowUs();
   for (u32 i = 1; i < s.players; ++i)
@@ -6665,7 +6837,26 @@ static bool AdoptMenuDelay(const RollbackNet::HandoffPacket& host, u32 frame)
 static bool AgreeStartupMenuDelay(u32 frame)
 {
   auto& s = s_session;
-  const MenuDelayProposal menu = s.me == 0 ? ProposeMenuDelay(true) : MenuDelayProposal{};
+  // Collect six probes at 250 ms spacing plus the quiet filter, before
+  // opening any agreement (which invalidates outstanding timing probes).
+  // Every peer participates, even when player 0 selected a fixed diagnostic.
+  s.probe_menus = true;
+  const auto warmup = std::chrono::steady_clock::now();
+  auto last_ping = warmup - std::chrono::milliseconds(100);
+  while (!s.failed && std::chrono::steady_clock::now() - warmup < std::chrono::milliseconds(2500))
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (s.me == 0 && now - last_ping >= std::chrono::milliseconds(100))
+    {
+      for (u32 i = 1; i < s.players; ++i)
+        if (Linked(i))
+          enet_peer_ping(s.peers[i]);
+      enet_host_flush(s.host);
+      last_ping = now;
+    }
+    Service(1);
+  }
+  const MenuDelayProposal menu = s.me == 0 ? ProposeMenuDelay() : MenuDelayProposal{};
   OpenHandoffBarrier({static_cast<u8>(s.players), static_cast<u8>(s.me),
                       RollbackNet::HandoffKind::StartMenus, 0x7fffffff, frame, 0, {},
                       0, 0, 0, 0, 0, menu.delay, menu.one_way_dms, menu.jitter_dms, menu.source});
@@ -6703,6 +6894,7 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
                            u32 frame, u32* host_clock = nullptr,
                            u32* host_aux_clock = nullptr)
 {
+  PauseTimingProbes();
   Session& s = s_session;
   if (!s.enabled || s.failed || (!AllConnected() && !WaitForConnection()))
     return FailHandoff(fmt::format("transport is not connected at frame {}", frame));
@@ -6819,6 +7011,7 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
 static bool HandoffClockBarrier(const Core::CPUThreadGuard& guard, u32 frame, u32* host_clock,
                                 u32* host_aux_clock)
 {
+  PauseTimingProbes();
   Session& s = s_session;
   if (!s.enabled || s.failed || (!AllConnected() && !WaitForConnection()))
     return FailHandoff(fmt::format("transport is not connected at clock sync frame {}", frame));
@@ -7252,6 +7445,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
       // rollback histories intentionally differ.  MAX_PRED=0 turns the same
       // absolute-frame exchange into delay-based lockstep: this host wait
       // completes only after every player's input for t is confirmed.
+      s_session.probe_menus = t >= s_session.probe_resume_frame;
       if (!RbNetworkPreflight(t))
         return 0;
       pass_pads = FromNetPads(s_rb_exchange->Assemble(t));
@@ -9927,6 +10121,7 @@ namespace
 // no correction can cross a prior match or menu transition.
 void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame)
 {
+  PauseTimingProbes();
   if (!NSRContent::Ready())
   {
     Log("content was not applied: refusing rollback session");
@@ -10083,6 +10278,11 @@ void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason)
     s_sim_waits = 0;
   }
 
+  PauseTimingProbes();
+  for (auto& window : s_session.link_probes)
+    window.Reset();
+  s_session.link_reports = {};
+  s_session.probe_resume_frame = r.live + 120;  // two seconds of frame-driven menus
   r.vtime_on = false;
   if (s_rb_exchange)
     s_rb_retired_session = s_rb_exchange->Session();
