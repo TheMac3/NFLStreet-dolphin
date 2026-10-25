@@ -108,6 +108,8 @@
 
 #pragma once
 
+#include <string>
+
 #include <array>
 #include <cstddef>
 #include <span>
@@ -364,4 +366,8 @@ bool IsReplayCatchingUp();
 // hook set only when every signature word matches.
 bool ValidateRollbackImage(Core::System& system);
 void Shutdown(const Core::CPUThreadGuard& guard);
+// Append one line to this process's NSR log (nsr-p*.log) as "[NSR] <line>".
+// For other NSR modules (game stats) whose notices players need in bug reports;
+// a no-op before the log opens.
+void LogLine(const std::string& line);
 }  // namespace NSRNetplay

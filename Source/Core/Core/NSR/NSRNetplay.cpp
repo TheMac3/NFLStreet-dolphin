@@ -298,6 +298,15 @@ void Log(fmt::format_string<Args...> format, Args&&... args)
   std::fflush(s_session.log);
 }
 
+// Shared with other NSR modules (NSRNetplay.h LogLine).
+void LogLineToSession(const std::string& line)
+{
+  if (!s_session.log)
+    return;
+  std::fprintf(s_session.log, "[NSR] %s\n", line.c_str());
+  std::fflush(s_session.log);
+}
+
 std::string Env(const char* name, const char* fallback = "")
 {
   const char* v = std::getenv(name);
@@ -10993,5 +11002,10 @@ void TelemetryHandoffDesyncSummary(u32 frame, u32 player, u64 local, u64 remote,
   T::DesyncSummary(info);
 }
 }  // namespace
+void LogLine(const std::string& line)
+{
+  LogLineToSession(line);
+}
+
 }  // namespace NSRNetplay
 // ===== end NSR telemetry glue =====

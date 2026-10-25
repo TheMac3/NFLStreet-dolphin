@@ -7,6 +7,10 @@
 // nsr.game.v1 file per match.
 #include "Core/NSR/NSRGameStats.h"
 
+#include "Core/NSR/NSRNetplay.h"
+
+#include <cstdarg>
+
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -37,6 +41,26 @@ namespace NSRGameStats
 {
 namespace
 {
+// Game-stats notices go to stderr (headless tests) and the NSR log, so a
+// player's nsr-p*.log shows whether a capture was saved, skipped or failed.
+// Per-frame trace output (s.trace) stays stderr-only.
+[[maybe_unused]] void StatsNote(const char* format, ...)
+{
+  char buffer[512];
+  va_list args;
+  va_start(args, format);
+  std::vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+  std::fputs(buffer, stderr);
+  static unsigned s_notes = 0;  // bound the log if a reason alternates per frame
+  if (++s_notes > 200)
+    return;
+  std::string line(buffer);
+  while (!line.empty() && line.back() == '\n')
+    line.pop_back();
+  NSRNetplay::LogLine(line);
+}
+
 using Object = picojson::object;
 using Array = picojson::array;
 using Json = picojson::value;
@@ -376,8 +400,7 @@ std::optional<Object> DraftJson(const Memory& memory, const Array& players)
   }
   if (!roster)
   {
-    if (s.trace)
-      std::fprintf(stderr, "[NSR stats] draft omitted: drafted PGIDs not in a roster table\n");
+    StatsNote("[NSR stats] draft omitted: drafted PGIDs not in a roster table\n");
     return std::nullopt;
   }
   Array result;
@@ -403,8 +426,7 @@ std::optional<Object> DraftJson(const Memory& memory, const Array& players)
     }
     if (!match || !used.insert(*match).second)
     {
-      if (s.trace)
-        std::fprintf(stderr, "[NSR stats] draft omitted: pick %u is not in this match\n", pick.pick);
+      StatsNote("[NSR stats] draft omitted: pick %u is not in this match\n", pick.pick);
       return std::nullopt;
     }
     const bool pad_known = pick.pad >= 0 && static_cast<std::uint32_t>(pick.pad) < s.players &&
@@ -434,10 +456,10 @@ std::optional<Object> Capture(const Memory& memory, std::uint32_t frame)
   // Trace a changed validation failure once; do not flood a friend's result
   // screen or silently substitute guessed totals when native data is missing.
   const auto unavailable = [frame](const char* reason) -> std::optional<Object> {
-    if (s.trace && s.last_capture_failure != reason)
+    if (s.last_capture_failure != reason)  // once per distinct reason
     {
       s.last_capture_failure = reason;
-      std::fprintf(stderr, "[NSR stats] capture unavailable frame %u: %s (totals %08x %08x/%08x)\n",
+      StatsNote("[NSR stats] capture unavailable frame %u: %s (totals %08x %08x/%08x)\n",
                    frame, reason, s.totals_team_ids, s.totals_arrays[0], s.totals_arrays[1]);
     }
     return std::nullopt;
@@ -602,7 +624,7 @@ void Save(Object object, std::uint32_t frame)
   const std::string folder = File::GetUserPath(D_USER_IDX) + "GameStats/";
   if (!File::CreateFullPath(folder))
   {
-    std::fprintf(stderr, "[NSR stats] FAILED to create %s\n", folder.c_str());
+    StatsNote("[NSR stats] FAILED to create %s\n", folder.c_str());
     return;
   }
   for (unsigned index = 1; index <= 999999; ++index)
@@ -616,7 +638,7 @@ void Save(Object object, std::uint32_t frame)
     {
       if (File::Exists(temporary))
         continue;
-      std::fprintf(stderr, "[NSR stats] FAILED to create %s\n", temporary.c_str());
+      StatsNote("[NSR stats] FAILED to create %s\n", temporary.c_str());
       return;
     }
     // A second emulator can acquire this temporary name just after the first
@@ -630,16 +652,16 @@ void Save(Object object, std::uint32_t frame)
     const auto text = Json(std::move(object)).serialize(true) + "\n";
     const bool ok = output.WriteBytes(text.data(), text.size()) && output.Close();
     if (ok && File::Rename(temporary, path))
-      std::fprintf(stderr, "[NSR stats] saved %s\n", path.c_str());
+      StatsNote("[NSR stats] saved %s\n", path.c_str());
     else
     {
       output.Close();
       File::Delete(temporary);
-      std::fprintf(stderr, "[NSR stats] FAILED to write %s\n", path.c_str());
+      StatsNote("[NSR stats] FAILED to write %s\n", path.c_str());
     }
     return;
   }
-  std::fprintf(stderr, "[NSR stats] filename sequence exhausted in %s\n", folder.c_str());
+  StatsNote("[NSR stats] filename sequence exhausted in %s\n", folder.c_str());
 }
 
 // Publish a frozen live observation only after that specific frame survives
@@ -825,8 +847,8 @@ void ObserveFrame(const Core::CPUThreadGuard& guard, std::uint32_t frame, bool i
   if (confirmed && s.stats_seen && !s.capture)
   {
     s.capture = Capture(memory, frame);
-    if (s.capture && s.trace)
-      std::fprintf(stderr, "[NSR stats] confirmed stats snapshot match %u frame %u\n", s.ordinal,
+    if (s.capture)
+      StatsNote("[NSR stats] confirmed stats snapshot match %u frame %u\n", s.ordinal,
                    frame);
     if (s.capture && (s.me == 0 || !s.netplay))
     {
@@ -878,8 +900,7 @@ void ObserveFrame(const Core::CPUThreadGuard& guard, std::uint32_t frame, bool i
   s.capture->emplace("mvps", Json(std::move(mvps)));
   s.saved = true;
   s.ready = ReadyResult{std::move(*s.capture), frame, s.ordinal};
-  if (s.trace)
-    std::fprintf(stderr, "[NSR stats] staged native MVPs match %u frame %u\n", s.ordinal, frame);
+  StatsNote("[NSR stats] staged native MVPs match %u frame %u\n", s.ordinal, frame);
   s.capture.reset();
   PublishConfirmed(confirmed_through);
 }
