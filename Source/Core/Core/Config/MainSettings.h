@@ -242,6 +242,9 @@ extern const Info<int> MAIN_NETWORK_TIMEOUT;
 extern const Info<bool> MAIN_USE_HIGH_CONTRAST_TOOLTIPS;
 extern const Info<bool> MAIN_USE_PANIC_HANDLERS;
 extern const Info<bool> MAIN_ABORT_ON_PANIC_ALERT;
+// Host presentation only; deliberately excluded from netplay boot agreement.
+extern const Info<bool> MAIN_NSR_HIDE_OPPONENT_PLAY_CALLS;
+extern const Info<bool> MAIN_NSR_HIDE_SPECTATOR_PLAY_CALLS;
 extern const Info<bool> MAIN_OSD_MESSAGES;
 extern const Info<int> MAIN_OSD_FONT_SIZE;
 extern const Info<bool> MAIN_SKIP_NKIT_WARNING;

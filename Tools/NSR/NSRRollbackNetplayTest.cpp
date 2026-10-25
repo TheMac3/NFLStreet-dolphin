@@ -24,6 +24,7 @@
 #include "Core/NSR/NSRGameStatsRead.h"
 #include "Core/NSR/NSRDraftLog.h"
 #include "Core/NSR/NSRPlayCalls.h"
+#include "Core/NSR/NSRPlayCover.h"
 #include "Core/NSR/NSRPadSource.h"
 #include "Core/NSR/NSRContentRead.h"
 #include "Core/NSR/NSRDraft.h"
@@ -2460,8 +2461,83 @@ static void TestPlayCalls()
   assert(bounded.Snaps().back().events.size() == 127);
 }
 
+// Synthetic GN7E69-r0 RAM exercises ownership independent of pad order,
+// possession, teammate count, malformed pointers and the locked/snap boundary.
+static void TestPlayCover()
+{
+  namespace PC = NSRPlayCover;
+  std::vector<std::uint8_t> ram(0x1800000);
+  const auto put = [&](std::uint32_t address, std::uint32_t value, unsigned size = 4) {
+    for (unsigned i = 0; i < size; ++i)
+      ram.at(address - 0x80000000 + i) = static_cast<std::uint8_t>(value >> ((size - i - 1) * 8));
+  };
+  const NSRGameStats::Memory memory{ram, {}};
+  put(0x803eab60, 0x80400000);
+  put(0x80400000, 0x80400100);
+  put(0x80400004, 4, 1);
+  // p0 and p2 share native side 1 (left); p1 and p3 side 0 (right).
+  for (std::uint32_t i = 0; i < 4; ++i)
+  {
+    put(0x80400100 + i * 12, (i % 2) ^ 1, 1);
+    put(0x802eacac + i * 4, i);
+  }
+  assert(PC::LocalSides(memory, 1) == 2);
+  assert(PC::LocalSides(memory, 2) == 1);
+  assert(PC::LocalSides(memory, 5) == 2);
+  assert(PC::LocalSides(memory, 3) == 3);  // couch humans on both sides
+  assert(PC::LocalSides(memory, 0) == 0);  // spectator
+  put(0x803eaad4, 0x80401000);
+  put(0x80401000, 1);
+  put(0x803ea58c, 0x80402000);
+  assert((PC::Read(memory, 1) == PC::State{1, 0}));
+  assert((PC::Read(memory, 2) == PC::State{2, 0}));
+  assert(PC::Read(memory, 3).hidden == 0);
+  assert(PC::Read(memory, 0).hidden == 3);
+  put(0x80402042, 1, 1);
+  assert((PC::Read(memory, 1) == PC::State{1, 1}));
+  put(0x8040204a, 1, 1);  // flipped calls stay covered
+  assert(PC::Read(memory, 1).hidden == 1);
+  put(0x80401004, 1);
+  put(0x80401000, 5);  // native lock-in animation still exposes call cards
+  assert(PC::Read(memory, 1).hidden == 1);
+  for (const auto flow : {0U, 2U, 3U, 4U, 0xffffffffU})
+  {
+    put(0x80401000, flow);
+    assert(PC::Read(memory, 1).hidden == 0);
+  }
+  // Same-side co-op uses a full-width panel, including for a remote spectator.
+  put(0x80401000, 1);
+  put(0x80400004, 2, 1);
+  put(0x8040010c, 1, 1);
+  put(0x8040204e, 4, 1);
+  assert(PC::Read(memory, 1).hidden == 0);
+  assert(PC::Read(memory, 2).hidden == 0);
+  assert(PC::Read(memory, 0).hidden == 3);
+  put(0x8040204e, 2, 1);
+  put(0x80400004, 4, 1);
+  put(0x8040010c, 0, 1);
+  put(0x80401000, 2);
+  put(0x803eb48c, 1, 1);  // remote audible/flip menu during lineup
+  assert(PC::Read(memory, 1).hidden == 1);
+  assert(PC::Read(memory, 2).hidden == 0);
+  put(0x80401000, 3);  // stale menu flag never covers a live play
+  assert(PC::Read(memory, 1).hidden == 0);
+  put(0x80401000, 1);
+  put(0x803ea58c, 0x817ffff0);
+  assert(PC::Read(memory, 1).hidden == 0);
+  put(0x80400004, 11, 1);
+  assert(PC::LocalSides(memory, 1) == 0);
+  put(0x803eab60, 0xfffffff0);
+  assert(PC::LocalSides(memory, 1) == 0);
+  const auto left = PC::SideRegion(1);
+  const auto right = PC::SideRegion(0);
+  assert(left.left == 0 && left.right == right.left && right.right == 1);
+  assert(left.top == 0 && left.bottom == 1 && right.top == 0 && right.bottom == 1);
+}
+
 int main()
 {
+  TestPlayCover();
   TestMenuDelay();
   TestPlayCalls();
   TestHandoffInputDelay();

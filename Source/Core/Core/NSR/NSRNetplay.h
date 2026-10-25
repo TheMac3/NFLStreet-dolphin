@@ -108,6 +108,11 @@
 
 #pragma once
 
+namespace NSRPlayCover
+{
+struct State;
+}
+
 #include <string>
 
 #include <array>
@@ -125,6 +130,9 @@ class System;
 
 namespace NSRNetplay
 {
+// CPU-thread read-only snapshot for the corresponding queued XFB presentation.
+NSRPlayCover::State CapturePlayCover();
+
 // Install canonical settings/cards and agree all peers before Core::Init executes
 // any guest boot code. Returns false with a named diagnostic on incompatibility.
 bool PrepareBoot();

@@ -23,6 +23,7 @@
 #include "Core/DolphinAnalytics.h"
 #include "Core/HW/SystemTimers.h"
 #include "Core/HW/VideoInterface.h"
+#include "Core/NSR/NSRNetplay.h"
 #include "Core/System.h"
 
 // TODO: ugly
@@ -101,13 +102,23 @@ void VideoBackendBase::Video_OutputXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride
   auto& system = Core::System::GetInstance();
   auto& core_timing = system.GetCoreTiming();
 
+  // Capture on the CPU thread; never read guest RAM from the video thread.
+  const auto play_cover = NSRNetplay::CapturePlayCover();
+
   if (!g_ActiveConfig.bImmediateXFB)
   {
     system.GetFifo().SyncGPU(Fifo::SyncGPUReason::Swap);
 
     const TimePoint presentation_time = core_timing.GetTargetHostTime(ticks);
     AsyncRequests::GetInstance()->PushEvent([=] {
+      g_presenter->SetPlayCover(play_cover);
       g_presenter->ViSwap(xfb_addr, fb_width, fb_stride, fb_height, ticks, presentation_time);
+    });
+  }
+  else
+  {
+    AsyncRequests::GetInstance()->PushEvent([play_cover] {
+      g_presenter->SetPlayCover(play_cover);
     });
   }
 

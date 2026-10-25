@@ -343,6 +343,10 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
             <div class="note" style="margin-top:4px">For the shared Stats page: final scores and box-score stats of the games you finish in NFLStreetRollback (saved after the Game Stats/MVP screens), your name and a random ID for this install. Never other files, folder paths, or your PC's name. Off: nothing is uploaded.</div>
             <div class="note" id="gameStatsText" style="margin-top:4px"></div></div></div>
         </div>
+        <div class="card"><div class="label">Play-call privacy</div>
+          <div class="toggle" id="playCoverToggle"><div class="switch"></div><div><b>Hide opponent's play calls</b>
+            <div class="note">Covers the opposing team’s choices during netplay. Teammates share their own choices. Couch play and spectators stay uncovered.</div></div></div>
+        </div>
         <div class="card"><div class="label">My playbook</div>
           <div class="note">On the editor website, open My playbooks and link this launcher once. Publish your choices, then fetch them here before opening a room. Teammates use the lowest-numbered pad’s book.</div>
           <div class="info" id="bookText"></div><code id="bookLink" style="display:block;overflow-wrap:anywhere;user-select:all"></code>
@@ -552,6 +556,7 @@ function render(s) {
   setText("texWarn", tx.warning || "");
   renderSeg("resSeg", [[0, "Dolphin's"], [1, "1×"], [2, "2×"], [3, "3×"], [4, "4×"]], s.resolution || 0, (k) => call("set_resolution", k));
   renderSeg("volSeg", [[25, "25%"], [40, "40%"], [60, "60%"], [80, "80%"], [100, "100%"]], s.volume || 40, (k) => call("set_volume", k));
+  $("playCoverToggle").classList.toggle("on", s.hide_play_calls !== false);
   $("fullscreenToggle").classList.toggle("on", s.fullscreen !== false);
 
   // settings
@@ -621,6 +626,7 @@ function wire() {
   $("btnBookFetch").onclick = () => call("refresh_playbook");
   $("btnBookDefault").onclick = () => call("use_default_playbook");
   $("gameStats").onclick = () => call("set_game_stats", !(S.snap && S.snap.game_stats && S.snap.game_stats.enabled));
+  $("playCoverToggle").onclick = () => call("set_hide_play_calls", !(S.snap && S.snap.hide_play_calls !== false));
   $("fullscreenToggle").onclick = () => call("set_fullscreen", !(S.snap && S.snap.fullscreen !== false));
   // Stage both choices together; the backend clears readiness until rebuilt.
   $("draftOrder").onchange = $("draftFirst").onchange = () => call("set_draft", $("draftOrder").value, $("draftFirst").value);
@@ -679,7 +685,7 @@ function demoApi(page) {
           ["D-pad left","Hat 0 W"],["D-pad right","Hat 0 E"]].map(([control, input]) => ({ control, input })) } },
     textures: { icons: "auto", effective: "playstation", why: "auto:playstation", base_kind: "library",
       base: "C:\\Users\\mason\\AppData\\Roaming\\NFL Street Reborn\\library\\textures\\GN7E69", packages: [], warning: "" },
-    resolution: 0, fullscreen: true, volume: 40,
+    resolution: 0, fullscreen: true, volume: 40, hide_play_calls: true,
     notice: null };
   if (page === "host") Object.assign(base.host, { state: "open", mode: "room", code: "NSRB-4K7QX", players: names.host, can_start: true,
     info: "Room open. Give your friends this code; click Start when everyone's listed." });

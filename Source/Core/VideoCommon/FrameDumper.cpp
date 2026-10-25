@@ -55,13 +55,22 @@ void FrameDumper::DumpCurrentFrame(const AbstractTexture* src_texture,
 
   // We only need to render a copy if we need to stretch/scale the XFB copy.
   MathUtil::Rectangle<int> copy_rect = src_rect;
-  if (source_width != target_width || source_height != target_height)
+  if (source_width != target_width || source_height != target_height ||
+      g_presenter->GetPlayCover().hidden != 0)
   {
     if (!CheckFrameDumpRenderTexture(target_width, target_height))
       return;
 
     g_gfx->ScaleTexture(m_frame_dump_render_framebuffer.get(),
                         m_frame_dump_render_framebuffer->GetRect(), src_texture, src_rect);
+    if (g_presenter->GetPlayCover().hidden != 0)
+    {
+      g_gfx->BeginUtilityDrawing();
+      g_gfx->SetFramebuffer(m_frame_dump_render_framebuffer.get());
+      g_presenter->DrawPlayCoverForDump(static_cast<u32>(target_width),
+                                       static_cast<u32>(target_height));
+      g_gfx->EndUtilityDrawing();
+    }
     src_texture = m_frame_dump_render_texture.get();
     copy_rect = src_texture->GetRect();
   }
