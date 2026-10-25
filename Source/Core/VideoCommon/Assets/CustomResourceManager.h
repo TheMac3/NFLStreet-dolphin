@@ -39,6 +39,14 @@ public:
 
   void XFBTriggered();
 
+  // NSR's multi-GB pack must not consume half physical RAM in each peer.
+  // Only reduces the normal budget; two in-flight decoder assets may overshoot.
+  void LimitTextureMemory(u64 bytes);
+
+  // Check hot reload without requesting decoded pixels for a GPU-resident
+  // texture. Evicted CPU data stays evicted until an actual upload needs it.
+  CustomAsset::TimeType GetTextureLoadTime(const CustomAssetLibrary::AssetID& asset_id);
+
   using TextureTimePair = std::pair<std::shared_ptr<CustomTextureData>, CustomAsset::TimeType>;
 
   // Returns a pair with the custom texture data and the time it was last loaded
@@ -48,6 +56,9 @@ public:
                                           std::shared_ptr<VideoCommon::CustomAssetLibrary> library);
 
 private:
+  // Socket/renderer-free synthetic tests inspect metadata and LRU ownership.
+  friend struct NSRHiresCacheTestAccess;
+
   // A generic interface to describe an assets' type
   // and load state
   struct AssetData

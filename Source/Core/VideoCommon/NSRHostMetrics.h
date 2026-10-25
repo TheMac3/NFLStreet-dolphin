@@ -19,6 +19,7 @@ enum Kind : size_t { Present, TextureRequest, TextureUpload, TextureDecode, Netw
 inline std::atomic<bool> enabled{false};
 inline std::array<std::atomic<u64>, Count> ns{};
 inline std::atomic<u64> texture_count{0};
+inline std::atomic<u64> texture_ram_bytes{0}, texture_budget_bytes{0};
 
 // Capture monotonically increasing totals; consumers own their baselines.
 inline std::array<u64, Count> Read()

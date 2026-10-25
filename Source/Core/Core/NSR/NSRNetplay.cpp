@@ -8102,9 +8102,11 @@ void HostPerformanceEnd()
   if (p.window_frames == 300)
   {
     Log("performance window: live_frames={} host_work_us={} gpu_us={} present_us={} "
-        "save_us={} resim_us={} texture_load_us={} texture_decode_us={} emulation_us={}",
+        "save_us={} resim_us={} texture_load_us={} texture_decode_us={} emulation_us={} texture_ram_bytes={} texture_budget_bytes={}",
         p.window_frames, p.work_us, p.window[0], p.window[1], p.window[2], p.window[3],
-        p.window[4], p.window[5], p.window[6]);
+        p.window[4], p.window[5], p.window[6],
+        H::texture_ram_bytes.load(std::memory_order_relaxed),
+        H::texture_budget_bytes.load(std::memory_order_relaxed));
     p.window = {};
     p.window_frames = 0;
     p.work_us = 0;

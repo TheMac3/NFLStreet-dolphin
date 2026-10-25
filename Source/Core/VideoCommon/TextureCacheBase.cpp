@@ -268,7 +268,7 @@ bool TextureCacheBase::DidLinkedAssetsChange(const TCacheEntry& entry)
   if (!entry.hires_texture)
     return false;
 
-  const auto [texture_data, load_time] = entry.hires_texture->LoadTexture();
+  const auto load_time = entry.hires_texture->GetLoadTime();
 
   return load_time > entry.last_load_time;
 }

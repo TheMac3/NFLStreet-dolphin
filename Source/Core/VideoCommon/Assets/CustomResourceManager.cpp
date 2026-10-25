@@ -3,6 +3,10 @@
 
 #include "VideoCommon/Assets/CustomResourceManager.h"
 
+#include <algorithm>
+
+#include "VideoCommon/NSRHostMetrics.h"
+
 #include "Common/Logging/Log.h"
 #include "Common/MemoryUtil.h"
 
@@ -23,6 +27,7 @@ void CustomResourceManager::Initialize()
   const size_t keep_unused_mem = std::max(sys_mem / 2, std::min(sys_mem, must_keep_unused));
 
   m_max_ram_available = sys_mem - keep_unused_mem;
+  NSRHostMetrics::texture_budget_bytes.store(m_max_ram_available, std::memory_order_relaxed);
 
   if (m_max_ram_available == 0)
     ERROR_LOG_FMT(VIDEO, "Not enough system memory for custom resources.");
@@ -51,6 +56,36 @@ void CustomResourceManager::Reset()
   m_texture_data_asset_cache.clear();
   m_dirty_assets.clear();
   m_ram_used = 0;
+  NSRHostMetrics::texture_ram_bytes.store(0, std::memory_order_relaxed);
+}
+
+// Cap decoded CPU pixels, while retaining the upstream asynchronous loader and
+// priority eviction. GPU entries own their uploaded textures independently.
+void CustomResourceManager::LimitTextureMemory(u64 bytes)
+{
+  m_max_ram_available = std::min(m_max_ram_available, bytes);
+  NSRHostMetrics::texture_budget_bytes.store(m_max_ram_available, std::memory_order_relaxed);
+}
+
+// A warm GPU entry needs only the timestamp of a completed reload, not another
+// decode of pixels evicted from the RAM cache. File watches still schedule
+// PendingReload assets; LoadFinished becomes visible at the normal XFB boundary.
+CustomAsset::TimeType CustomResourceManager::GetTextureLoadTime(
+    const CustomAssetLibrary::AssetID& asset_id)
+{
+  AssetData* data = nullptr;
+  if (const auto it = m_texture_data_asset_cache.find(asset_id);
+      it != m_texture_data_asset_cache.end())
+    data = it->second.asset_data;
+  else if (const auto handle = m_asset_id_to_handle.find(asset_id);
+           handle != m_asset_id_to_handle.end())
+    data = &m_asset_handle_to_data.at(handle->second);
+  if (!data || data->has_load_error ||
+      (data->load_status != AssetData::LoadStatus::LoadFinished &&
+       data->load_status != AssetData::LoadStatus::ResourceDataAvailable))
+    return {};
+  m_active_assets.MakeAssetHighestPriority(data->asset->GetHandle(), data->asset.get());
+  return data->asset->GetLastLoadedTime();
 }
 
 void CustomResourceManager::MarkAssetDirty(const CustomAssetLibrary::AssetID& asset_id)
@@ -78,6 +113,11 @@ CustomResourceManager::TextureTimePair CustomResourceManager::GetTextureDataFrom
   LoadTextureDataAsset(asset_id, std::move(library), &resource);
   m_active_assets.MakeAssetHighestPriority(resource.asset->GetHandle(), resource.asset);
 
+  // A completed reload is ready now. Returning an empty pair after promoting
+  // it would replace the old GPU image with a native fallback for one frame
+  // when the metadata-only check above announces the new timestamp.
+  if (resource.asset_data->load_status == AssetData::LoadStatus::ResourceDataAvailable)
+    return {resource.texture_data, resource.asset->GetLastLoadedTime()};
   return {};
 }
 
@@ -117,6 +157,7 @@ void CustomResourceManager::XFBTriggered()
     RemoveAssetsUntilBelowMemoryLimit();
   }
 
+  NSRHostMetrics::texture_ram_bytes.store(m_ram_used, std::memory_order_relaxed);
   if (m_pending_assets.IsEmpty())
     return;
 
