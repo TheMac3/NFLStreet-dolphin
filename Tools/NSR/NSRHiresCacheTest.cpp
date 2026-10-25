@@ -5,10 +5,32 @@
 // pixels again, completed file reloads must remain visible, and LRU touches
 // must retain their node. No renderer, sockets, game data or worker threads.
 #include <cassert>
+#include <atomic>
+#include <cstdlib>
+#include <new>
 #include <cstdio>
 #include <memory>
 
 #include "VideoCommon/Assets/CustomResourceManager.h"
+
+namespace
+{
+std::atomic<size_t> s_allocations{0};
+}
+
+// Count actual allocations so a deallocate/reallocate touch cannot pass merely
+// because the system allocator happens to return the same node address.
+void* operator new(std::size_t size)
+{
+  s_allocations.fetch_add(1, std::memory_order_relaxed);
+  if (void* memory = std::malloc(size ? size : 1))
+    return memory;
+  std::abort();
+}
+
+// Match both ordinary and sized deletes used by the standard library.
+void operator delete(void* memory) noexcept { std::free(memory); }
+void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
 
 namespace VideoCommon
 {
@@ -16,14 +38,17 @@ namespace VideoCommon
 class SyntheticAsset final : public CustomAsset
 {
 public:
+  // Construct metadata only; decoding is simulated by LoadImpl.
   explicit SyntheticAsset(u64 handle) : CustomAsset(nullptr, "synthetic", handle) {}
   u32 loads = 0;
 private:
+  // Record a synthetic completed decode without filesystem access.
   CustomAssetLibrary::LoadInfo LoadImpl(const CustomAssetLibrary::AssetID&) override
   {
     ++loads;
     return {16};
   }
+  // No pixel storage belongs to the synthetic asset.
   void UnloadImpl() override {}
 };
 
@@ -53,6 +78,10 @@ struct NSRHiresCacheTestAccess
     const auto* node = &*manager.m_active_assets.Elements().begin();
     assert(manager.GetTextureLoadTime("synthetic") == first);
     assert(node == &*manager.m_active_assets.Elements().begin());
+    const size_t before = s_allocations.load(std::memory_order_relaxed);
+    for (u32 i = 0; i < 1000; ++i)
+      assert(manager.GetTextureLoadTime("synthetic") == first);
+    assert(s_allocations.load(std::memory_order_relaxed) == before);
     assert(raw->loads == 1);
 
     // Eviction preserves the GPU entry's old pixels without requesting CPU
