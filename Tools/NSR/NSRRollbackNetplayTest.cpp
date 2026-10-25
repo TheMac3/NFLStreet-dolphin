@@ -2606,6 +2606,12 @@ static void TestPlayCover()
   put(0x803eb48c, 1, 1);  // remote audible/flip menu during lineup
   assert(PC::Read(memory, 1).hidden == 1);
   assert(PC::Read(memory, 2).hidden == 0);
+  put(0x803eb48c, 0, 1);
+  put(0x803eb490, 1, 1);  // R opens the defense prediction submenu
+  assert(PC::Read(memory, 1).hidden == 1);
+  assert(PC::Read(memory, 2).hidden == 0);
+  put(0x803eb491, 1, 1);
+  assert(PC::Read(memory, 0).hidden == 3);
   put(0x80401000, 3);  // stale menu flag never covers a live play
   assert(PC::Read(memory, 1).hidden == 0);
   put(0x80401000, 1);
