@@ -192,7 +192,7 @@ inline std::optional<Snap> ReadSnap(const Memory& memory, std::uint32_t frame)
   if (players && memory.Bytes(*players, 12))
   {
     const auto base = *memory.UInt(*players);
-    if (memory.UInt(*players + 8, 2) == 7 && memory.UInt(*players + 10, 2) == 14 &&
+    if (memory.UInt(*players + 8, 2) == 7u && memory.UInt(*players + 10, 2) == 14u &&
         memory.Bytes(base, 14 * 0x14d8))
     {
       for (std::uint32_t i = 0; i < 14; ++i)
