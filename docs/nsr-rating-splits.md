@@ -77,3 +77,13 @@ This work does not establish other throw families, campaigns, Windows or
 real two-PC qualification. No game image, roster records or dumps belong in
 this repository. Revisit broader balancing after those cases have matched
 controls, rather than changing every native rating consumer at once.
+
+Linux qualification on 2026-10-24: stock and full-roster both-split forced
+rollback pass RNG/whole-RAM/ARAM checks; both two-human proxy runs pass with
+zero differing game bytes at the requested live checkpoints. Quick regression
+passes 7 cases (2 expected skips), 445 Python tests pass, and the strict C++20
+socket-free suite passes. A matched normal throw changes velocity while
+preserving its target/error. An isolated native-motion control holds PSPD,
+rest state and native cap fixed: PCEL 1/99 reaches 95% of the same cap in
+46/23 native steps. This controlled function-level experiment is separate
+from the unmodified-image gameplay gates and broader AI/platform testing.
