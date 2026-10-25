@@ -213,7 +213,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
         <div class="logo">
           <div class="nsr">NFLSTREET</div>
           <div class="np"><span>ROLLBACK</span></div>
-          <div class="tagline">Play NFL Street Reborn online with friends: 2 to 4 players, rollback netcode, room codes. Your Reborn install is never changed.</div>
+          <div class="tagline">Play NFL Street 2 online with friends: 2 to 4 players, rollback netcode, room codes. Use your own disc or Reborn.</div>
         </div>
         <div class="cta">
           <button class="btn red big" id="playHost"><svg viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg>Host a game</button>
@@ -300,7 +300,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
 
     <!-- CONTROLLERS -->
     <section class="page" id="page-controllers">
-      <div class="head"><div class="grow"><h1>Controllers</h1><div class="sub">Your controller is always Port 1. NFLStreetRollback uses the setup from NFL Street Reborn's Controllers page.</div></div>
+      <div class="head"><div class="grow"><h1>Controllers</h1><div class="sub">Your controller is always Port 1. Map it in our Dolphin, or import your Reborn setup when using Reborn.</div></div>
         <span class="pill"><span class="dot" id="ctlDot"></span><span id="ctlState">Checking…</span></span></div>
       <div class="cgrid">
         <div class="card">
@@ -315,7 +315,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
           <div class="path" id="ctlSource"></div>
         </div>
         <div class="card"><div class="label">Port 1 buttons</div><div class="binds" id="binds"></div>
-          <div class="note">Change these in Reborn's Controllers page, then click “Use my Reborn controller settings”. Or use “Set up controllers…” to map them in NFLStreetRollback's own Dolphin; that mapping is then kept until you re-import.</div></div>
+          <div class="note">Click “Set up controllers…” to map Port 1 in NFLStreetRollback’s own Dolphin. Your mapping is kept. Reborn players can also import their existing setup.</div></div>
       </div>
       <div class="card" style="margin-top:20px"><div class="label" style="margin-bottom:8px">Button icons in the game</div>
         <div class="seg" id="iconSeg"></div>
@@ -346,16 +346,20 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
           <div class="note">Sharper at 2× or 3×, but every step costs frame time during rollback. If the game slows down, go back to Dolphin's setting (native unless you changed it). Only your screen changes.</div></div>
         <details class="card advanced">
           <summary class="label">Advanced: game files</summary>
+          <div class="label" style="margin-top:16px">Game source</div>
+          <select class="field" id="gameSource" aria-label="Game source">
+            <option value="reborn">Reborn install</option><option value="owned">My own disc image</option>
+          </select>
+          <div class="note" id="sourcePath"></div>
           <div class="fp mono" id="gameFp">–</div>
           <div class="info" id="gameText" style="margin-top:6px"></div>
           <div class="bar" id="gameBar" hidden><i id="gameProg"></i></div>
           <div class="row" style="margin-top:16px">
             <button class="btn red" id="btnFind">Locate Reborn automatically</button>
-            <button class="btn" id="btnBrowse">Browse for NSR.iso…</button>
+            <button class="btn" id="btnBrowse">Browse…</button>
             <button class="btn" id="btnReimport">Re-import from Reborn</button>
           </div>
-          <div class="note">Game and textures are imported locally from your own Reborn install; nothing is uploaded. Reborn is only needed again for a rebuild or re-import. Locate it here if Reborn
-            wasn't found or moved. Everyone you play with must show the same fingerprint.</div>
+          <div class="note">Use Reborn or your own NFL Street 2 USA revision 0 disc (ISO, CISO or RVZ). Your source stays unchanged. Friends must pick the same source. Own-disc players get the original game look; add optional packs under TexturePacks/GN7E69/&lt;pack&gt;/ and button icons under ButtonIcons/GN7E69/&lt;playstation or xbox&gt;/.</div>
         </details>
         <div class="card">
           <div class="label">Game updates</div>
@@ -378,15 +382,15 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
       <div class="head"><div class="grow"><h1>Help</h1><div class="sub">Getting a game going, and what to do when it doesn't.</div></div></div>
       <div class="sgrid help">
         <div class="card"><h3>Playing</h3><ol>
-          <li>Settings: type your name. The first start gets the game ready from your Reborn install by itself (about a minute).</li>
-          <li>Controllers: your Reborn controller setup is used automatically. Port 1 is you.</li>
+          <li>Settings: type your name. Advanced → Game source lets you choose Reborn or browse to your own disc. The first start gets the game ready automatically.</li>
+          <li>Controllers: set up Port 1 in our Dolphin. Reborn players can use their existing mapping.</li>
           <li>Host: Create room, send friends the NSRB-XXXXX code, Start when everyone is listed.</li>
           <li>Join: type the code, click Join, wait for the host to start.</li>
         </ol></div>
         <div class="card"><h3>If something's wrong</h3><ol>
           <li>Windows Firewall asks about Dolphin the first time: tick Private (and Public) networks and allow it.</li>
-          <li>“Fingerprints differ”: everyone needs the same download and Reborn version. Pickup draft settings come from the host.</li>
-          <li>Controller not responding: plug it in before starting, then Controllers → Use my Reborn controller settings.</li>
+          <li>“Fingerprints differ”: everyone needs the same download, source and game version. Pickup draft settings come from the host.</li>
+          <li>Controller not responding: plug it in before starting, then Controllers → Set up controllers….</li>
           <li>Send Mason the nsr-p*.log files from this folder if he asks.</li>
         </ol><div class="path" id="folderPath"></div></div>
       </div>
@@ -451,7 +455,7 @@ function statusOf(s) {
             " (first start only, about a minute)"];
   const ct = s.content || {};
   if (g.state === "ready" && ct.state === "available") return ["warn", "Game update available (Settings)"];
-  if (g.state === "stale" || g.state === "missing") return ["warn", "Couldn't find NFL Street Reborn. Settings → Advanced → Locate Reborn"];
+  if (g.state === "stale" || g.state === "missing") return ["warn", "Choose your game source in Settings → Advanced"];
   return ["err", g.text || "Game copy problem"];
 }
 
@@ -542,6 +546,13 @@ function render(s) {
   $("gameStats").classList.toggle("on", !!gs.enabled);
   setText("gameStatsText", gs.enabled ? (gs.text || "") : "");
   setText("gameFp", g.fingerprint || "–");
+  const source = s.source || {kind:"reborn", path:""};
+  $("gameSource").value = source.kind;
+  $("gameSource").disabled = !!g.busy || !!s.content.busy || h.state !== "idle" || j.state !== "idle";
+  setText("sourcePath", source.kind === "owned" ? (source.path || "Browse to your own disc image to get started.") : "");
+  $("btnReimport").hidden = source.kind === "owned";
+  $("btnImport").hidden = source.kind === "owned";
+  $("btnFind").hidden = source.kind === "owned";
   setText("gameText", (g.text || "") + (g.note ? "\n" + g.note : ""));
   show("gameBar", g.progress != null); $("gameProg").style.width = (g.progress || 0) + "%";
   const setupIdle = !g.busy && !(s.content && s.content.busy) && h.state === "idle" && j.state === "idle";
@@ -603,6 +614,7 @@ function wire() {
   $("btnUpdates").onclick = () => call("check_updates");
   $("runtimeContent").onclick = () => call("set_content_runtime", !(S.snap && S.snap.content && S.snap.content.runtime));
   $("autoUpdates").onclick = () => call("set_auto_updates", !(S.snap && S.snap.content && S.snap.content.auto));
+  $("gameSource").onchange = () => call("set_source", $("gameSource").value);
   $("btnBrowse").onclick = () => call("browse_iso");
   document.addEventListener("contextmenu", (e) => { if (!(e.target instanceof HTMLInputElement)) e.preventDefault(); });
 }

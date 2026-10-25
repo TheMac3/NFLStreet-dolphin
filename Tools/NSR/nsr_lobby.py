@@ -158,7 +158,44 @@ def _rejected(msg: dict, default: str) -> RoomRejected:
     return RoomRejected(str(msg.get("reason", default))[:400], str(msg.get("action", "")))
 
 
+REBORN_FAMILY = "gn7e69-r0-reborn"
+OWNED_FAMILY = "gn7e69-r0-retail"
+
+
+def image_family(fingerprint: str, declared=None) -> str:
+    """Keep protocol v2: infer legacy Reborn and existing owned identities when absent."""
+    inferred = OWNED_FAMILY if str(fingerprint).startswith("retail:") else REBORN_FAMILY
+    if declared is not None and declared != inferred:
+        raise ConnectionError("Unknown or inconsistent game source. Update NFLStreetRollback and rebuild your game copy.")
+    return inferred
+
+
+def family_reason(host: str | None, ours: str | None) -> str | None:
+    """Name the player-facing source before content or exact-image comparison."""
+    if host and ours and host != ours:
+        if host == REBORN_FAMILY and ours == OWNED_FAMILY:
+            return "Host uses Reborn's game; you use your own disc — pick the same source in Settings → Advanced."
+        if host == OWNED_FAMILY and ours == REBORN_FAMILY:
+            return "Host uses their own disc; you use Reborn's game — pick the same source in Settings → Advanced."
+        return "This room uses an unknown game source. Update NFLStreetRollback."
+    return None
+
+
+def _family_rejected(msg: dict, fingerprint: str) -> RoomRejected:
+    """Translate an old service's fingerprint rejection too, without changing its wire protocol."""
+    import re
+    reason = str(msg.get("reason", "Refused."))
+    match = re.search(r"yours is (.*?), the host's is (.*?)\.", reason)
+    if match:
+        why = family_reason(image_family(match[2]), image_family(fingerprint))
+        if why:
+            return RoomRejected(why)
+    return _rejected(msg, "Refused.")
+
+
 def _with_content(msg: dict, content: dict | None) -> dict:
+    if "fingerprint" in msg:
+        msg["image_family"] = image_family(msg["fingerprint"])
     if content is not None:
         msg["content"] = nsr_content.content_descriptor(content["version"], content["serial"])
     return msg
@@ -181,6 +218,7 @@ class StartInfo:
     telemetry_token: str = ""  # per-session/per-player token (docs/telemetry.md)
     quickstart: str = "manual"  # optional game-mode route, independent of netplay mode
     draft: dict = field(default_factory=draft_settings)
+    image_family: str = ""
 
 
 def _send(sock: socket.socket, msg: dict) -> None:
@@ -223,12 +261,14 @@ class LobbyHost:
     content: dict | None = None  # our nsr_content descriptor (None: don't compare)
     quickstart: str = "manual"
     draft: dict | None = None
+    image_family: str = ""
     _joiners: list[_Joiner] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _server: socket.socket | None = None
     _closed: bool = False
 
     def open(self) -> None:
+        self.image_family = image_family(self.fingerprint, self.image_family or None)
         self.quickstart = quickstart_id(self.quickstart)
         self.draft = draft_settings(self.draft)
         self._server = socket.create_server((self.bind, self.port), reuse_port=False)
@@ -246,7 +286,7 @@ class LobbyHost:
             joiners = list(self._joiners)
         for j in joiners:
             try:
-                message = _quickstart_message({"type": "lobby", "players": names}, self.quickstart)
+                message = _quickstart_message({"type": "lobby", "players": names, "image_family": self.image_family}, self.quickstart)
                 _send(j.sock, _draft_message(message, self.draft))
             except OSError:
                 pass
@@ -271,6 +311,14 @@ class LobbyHost:
             return
         name = str(hello.get("name") or "Player")[:24]
         reason, action = None, ""
+        try:
+            peer_family = image_family(hello.get("fingerprint", ""), hello.get("image_family"))
+        except ConnectionError as exc:
+            try:
+                _send(sock, {"type": "reject", "reason": str(exc)})
+            finally:
+                sock.close()
+            return
         content = nsr_content.room_content_reason(self.content, hello.get("content"))
         if hello.get("type") != "hello" or hello.get("version") != PROTOCOL_VERSION:
             reason = ("Your launcher is a different version from the host's. "
@@ -278,6 +326,9 @@ class LobbyHost:
         elif hello.get("mode", "lockstep") != self.mode:
             reason = (f"Your launcher plays {hello.get('mode', 'lockstep')} netplay; this lobby is "
                       f"{self.mode}. Everyone needs the same NFLStreetRollback download.")
+        elif why := family_reason(self.image_family or image_family(self.fingerprint),
+                                   peer_family):
+            reason = why
         elif self.quickstart != "manual" and hello.get("quickstart_version") != QUICKSTART_VERSION:
             reason = "This room uses quickstart. Update NFLStreetRollback or ask the host for Manual (menus)."
         elif self.draft != draft_settings() and hello.get("draft_version") != DRAFT_VERSION:
@@ -329,11 +380,12 @@ class LobbyHost:
         seed = secrets.randbits(32)  # per-match RNG seed, sent to everyone
         for k, j in enumerate(joiners, start=1):
             _send(j.sock, {"type": "start", "player": k, "players": players, "delay": delay,
-                           "seed": seed, "mode": mode, "quickstart": self.quickstart, "draft": self.draft})
+                           "seed": seed, "mode": mode, "quickstart": self.quickstart, "draft": self.draft,
+                           "image_family": self.image_family})
             j.sock.close()
         self._server.close()
         return StartInfo(0, players, delay, "", seed=seed, mode=mode,
-                         quickstart=self.quickstart, draft=draft_settings(self.draft))
+                         quickstart=self.quickstart, draft=draft_settings(self.draft), image_family=self.image_family)
 
     def close(self) -> None:
         self._closed = True
@@ -388,6 +440,10 @@ def join(host: str, name: str, fingerprint: str,
                 line, buf = buf.split(b"\n", 1)
                 msg = json.loads(line)
                 kind = msg.get("type")
+                if kind in ("lobby", "start"):
+                    why = family_reason(msg.get("image_family"), image_family(fingerprint))
+                    if why:
+                        raise RoomRejected(why)
                 if kind == "lobby":
                     on_lobby(list(msg["players"]))
                     on_game_mode(quickstart_id(msg.get("quickstart")))
@@ -397,7 +453,7 @@ def join(host: str, name: str, fingerprint: str,
                     shown_draft = current_draft
                     on_draft(current_draft)
                 elif kind == "reject":
-                    raise _rejected(msg, "Refused by the host.")
+                    raise _family_rejected(msg, fingerprint)
                 elif kind == "closed":
                     raise ConnectionError("The host closed the lobby.")
                 elif kind == "start":
@@ -408,7 +464,8 @@ def join(host: str, name: str, fingerprint: str,
                                      int(msg.get("delay", 2)), address,
                                      seed=int(msg.get("seed", 0x13579BDF)), mode=agreed,
                                      quickstart=quickstart_id(msg.get("quickstart")),
-                                     draft=draft_settings(msg.get("draft")))
+                                     draft=draft_settings(msg.get("draft")),
+                                     image_family=str(msg.get("image_family", "")))
     finally:
         sock.close()
 
@@ -445,6 +502,7 @@ class RoomHost:
     content: dict | None = None  # our nsr_content descriptor (sent with create)
     quickstart: str = "manual"
     draft: dict | None = None
+    image_family: str = ""
     code: str = ""
     _sock: socket.socket | None = None
     _start: StartInfo | None = None
@@ -452,6 +510,7 @@ class RoomHost:
     _started: threading.Event = field(default_factory=threading.Event)
 
     def open(self) -> str:
+        self.image_family = image_family(self.fingerprint, self.image_family or None)
         self.draft = draft_settings(self.draft)
         host, port = _split(self.rendezvous, RENDEZVOUS_PORT)
         try:
@@ -463,7 +522,7 @@ class RoomHost:
                                          "version": RENDEZVOUS_VERSION, "mode": _check_mode(self.mode),
                                          "quickstart": quickstart_id(self.quickstart),
                                          "quickstart_version": QUICKSTART_VERSION,
-                                         "draft": self.draft, "draft_version": DRAFT_VERSION},
+                                         "draft": self.draft, "draft_version": DRAFT_VERSION, "image_family": self.image_family},
                                         self.content))
         lines = _lines(self._sock)
         first = next(lines, None)
@@ -475,6 +534,9 @@ class RoomHost:
         if draft_settings(first.get("draft")) != self.draft:
             self.close()
             raise ConnectionError("This room server needs an update for Pickup drafting. Use Alternating / Stock for now.")
+        if first.get("image_family") and first["image_family"] != self.image_family:
+            self.close()
+            raise ConnectionError("The room server changed the game source; reopen the room.")
         self.code = first["code"]
         self._sock.settimeout(None)
         threading.Thread(target=self._read, args=(lines,), daemon=True).start()
@@ -491,6 +553,8 @@ class RoomHost:
                 elif kind == "start":
                     try:
                         self._start = _start_info(msg, self.rendezvous, self.mode)
+                        if self._start.image_family and self._start.image_family != self.image_family:
+                            raise ConnectionError("The room server changed the game source; reopen the room.")
                         if self._start.draft != self.draft:
                             raise ConnectionError("The room server changed the draft setup; reopen the room.")
                         if self._start.quickstart != self.quickstart:
@@ -543,7 +607,8 @@ def _start_info(msg: dict, rendezvous: str, expected_mode: str = RELEASE_MODE) -
                      mode=mode, room_code=str(msg.get("code", ""))[:16],
                      telemetry_url=str(telemetry.get("url", "")),
                      telemetry_token=str(telemetry.get("token", "")),
-                     quickstart=quickstart_id(msg.get("quickstart")), draft=draft_settings(msg.get("draft")))
+                     quickstart=quickstart_id(msg.get("quickstart")), draft=draft_settings(msg.get("draft")),
+                     image_family=str(msg.get("image_family", "")))
 
 
 def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
@@ -581,6 +646,10 @@ def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
                 line, buf = buf.split(b"\n", 1)
                 msg = json.loads(line)
                 kind = msg.get("type")
+                if kind in ("lobby", "start"):
+                    why = family_reason(msg.get("image_family"), image_family(fingerprint))
+                    if why:
+                        raise RoomRejected(why)
                 if kind == "lobby":
                     on_lobby(list(msg["players"]))
                     on_game_mode(quickstart_id(msg.get("quickstart")))
@@ -590,7 +659,7 @@ def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
                     shown_draft = current_draft
                     on_draft(current_draft)
                 elif kind == "reject":
-                    raise _rejected(msg, "Refused.")
+                    raise _family_rejected(msg, fingerprint)
                 elif kind == "closed":
                     raise ConnectionError(msg.get("reason", "Refused."))
                 elif kind == "start":

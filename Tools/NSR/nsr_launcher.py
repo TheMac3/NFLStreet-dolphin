@@ -6,9 +6,10 @@ nsr-*.json/.txt file names keep their old internal names on purpose).
 A window that replaces command lines and .bat files. It lives in the
 NFLStreet-dolphin folder (next to Dolphin.exe) and handles these workflows:
 
-  1. Game: find NFL Street Reborn's NSR.iso (or browse to it), build the
-     rollback netplay image (nsr_patcher.prepare_image), and show its
-     fingerprint. An image from an older (lockstep) download is detected and
+  1. Game: prefer an available Reborn install or accept the player's original
+     GN7E69 disc (ISO/CISO/RVZ). Strict verification and authored patches build
+     a private rollback copy. Settings → Advanced owns source selection;
+     each family keeps separate image/config/content paths and room identity. An image from an older (lockstep) download is detected and
      must be rebuilt.
   2. Play: Host (Create room: shows a code like NSRB-4K7QX, lists who joined,
      Start) or Join (type the code, wait for Start), via the rendezvous server
@@ -19,9 +20,9 @@ NFLStreet-dolphin folder (next to Dolphin.exe) and handles these workflows:
      input delay chosen by the host for everyone, and passive lag/rollback
      telemetry unless the player unticks it (then NSR_TELEMETRY=0).
   3. Practice offline, and "Set up controllers" (opens Dolphin's own window).
-  4. Controllers: the player's NFL Street Reborn controller setup is copied
-     into this Dolphin automatically (nsr_controllers.py), so a pad mapped in
-     Reborn's launcher works here without mapping it twice.
+  4. Controllers: Reborn players can import their existing setup. Owned-disc
+     players use our Dolphin's mapping UI and separate User/ configuration;
+     no Reborn controller or presentation discovery runs for that source.
   5. Game results: new per-game stats files our own Dolphin writes
      (User/GameStats/) are uploaded in the background to Mason's
      server for the shared Stats page (nsr_gamestats.py, docs/stats.md),
@@ -201,7 +202,7 @@ def telemetry_env(folder: str, start: lobby.StartInfo, name: str, fingerprint: s
 def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: str | None,
                     open_ui: bool = False, name: str = "Player", fingerprint: str = "",
                     telemetry: bool = True, quickstart: str = "manual", icons: str = "auto",
-                    resolution: int = 0) -> tuple[list[str], dict[str, str]]:
+                    resolution: int = 0, app_folder: str | None = None) -> tuple[list[str], dict[str, str]]:
     """Command line and environment for the netplay Dolphin.
 
     start=None: practice offline. open_ui=True: just open Dolphin's window
@@ -210,7 +211,7 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     settings with every peer before guest boot. These flags also document the
     launcher profile; local UI/game config cannot override the fork layer.
     """
-    exe = os.environ.get("NSR_DOLPHIN") or os.path.join(folder, "Dolphin.exe")
+    exe = os.environ.get("NSR_DOLPHIN") or os.path.join(app_folder or folder, "Dolphin.exe")
     args = [exe, "-u", os.path.join(folder, "User")]
     args += shlex.split(os.environ.get("NSR_DOLPHIN_ARGS", ""))
     env = {k: v for k, v in os.environ.items() if not k.startswith("NSR_")}
@@ -233,14 +234,15 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
                     "NSR_IMAGE_RECIPE": image_manifest["recipe"],
                     "NSR_IMAGE_VARIANT": image_manifest["variant"],
                     "NSR_IMAGE_SHA256": image_manifest["output_sha256"]})
-    # Preserve the newer launcher-owned asset store for Reborn. Retail
-    # always uses an empty overlay and clears any previously imported list.
-    tex = textures.TextureSet() if retail else textures.compose(folder, icons, pad.kind)
+    # Reborn uses its imported store. Owned discs use only player-dropped local
+    # packs; writing this list also clears disabled/stale overlays before boot.
+    tex = (textures.compose_owned(app_folder or folder, icons, pad.kind) if retail else
+           textures.compose(folder, icons, pad.kind))
     textures.write_list(os.path.join(folder, "User"), tex)
     env["NSR_TEXTURES"] = tex.summary()  # logged by the launcher; the fork ignores it
     if tex.warnings:
         env["NSR_TEXTURES_WARNING"] = " ".join(tex.warnings)
-    args += ["-C", f"Graphics.Settings.HiresTextures={not retail}",
+    args += ["-C", f"Graphics.Settings.HiresTextures={bool(tex.folders()) if retail else True}",
              "-C", "Graphics.Settings.CacheHiresTextures=False"]
     if resolution in RESOLUTIONS[1:]:
         args += ["-C", f"Graphics.Settings.InternalResolution={resolution}"]
@@ -302,7 +304,7 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
             env.pop("NSR_PORT", None)
         elif start.player > 0:
             env["NSR_PEERS"] = f"{start.host_address}:{lobby.PORT}"
-        env.update(telemetry_env(folder, start, name, fingerprint, telemetry))
+        env.update(telemetry_env(app_folder or folder, start, name, fingerprint, telemetry))
     if not os.environ.get("NSR_DOLPHIN"):
         args.append("-b")  # Dolphin closes when the game stops (Qt build)
     args += ["-e", os.path.join(folder, patcher.OUTPUT_NAME)]
@@ -523,7 +525,10 @@ class Launcher:
         # injectable so tests run the whole flow against a fake server.
         self._content_fetch = content_fetch or nsr_content.http_get
         self._content_keys = content_keys
-        self._content_cache = nsr_content.Cache(self.folder, content_keys)
+        self._source_kind = self.cfg.get("game_source", "reborn")
+        if self._source_kind not in ("reborn", "owned"):
+            self._source_kind = "reborn"
+        self._content_cache = nsr_content.Cache(self.game_dir, content_keys)
         self._clock = clock
         self._checked_at = None   # clock() of the last successful manifest check
         self._runtime_content = None  # installed, signed runtime release (also used offline)
@@ -534,11 +539,15 @@ class Launcher:
         self._notice_id = 0
         cfg = self.cfg
         import draftmodes
-        order, first = cfg.get("draft_order", "alternating"), cfg.get("draft_first", "stock")
+        order, first = (("alternating", "stock") if self._source_kind == "owned" else
+                        (cfg.get("draft_order", "alternating"), cfg.get("draft_first", "stock")))
+        mode_key = "owned_quickstart" if self._source_kind == "owned" else "quickstart"
+        default_mode = "quick-play" if self._source_kind == "owned" else "manual"
         order = order if order in draftmodes.ORDERS else "alternating"
         first = first if first in draftmodes.FIRSTS else "stock"
         self.state = {
             "app": APP_TITLE, "folder": self.folder,
+            "source": {"kind": self._source_kind, "path": self.cfg.get("owned_iso", "")},
             "name": str(cfg.get("name", env.get("USERNAME", "Player")))[:24],
             "telemetry": bool(cfg.get("telemetry", True)),
             "game_stats": {"enabled": bool(cfg.get("game_stats", True)), "state": "idle",
@@ -546,8 +555,8 @@ class Launcher:
             # Not the lockstep-era "delay" (2 by default), so an old config
             # doesn't carry a lockstep value into rollback. 0 = Auto.
             "delay": self._saved_delay(cfg),
-            "quickstart": (cfg.get("quickstart") if isinstance(cfg.get("quickstart"), str)
-                           and cfg["quickstart"] in lobby.QUICKSTARTS else "manual"),
+            "quickstart": (cfg.get(mode_key) if isinstance(cfg.get(mode_key), str) and cfg.get(mode_key) in lobby.QUICKSTARTS
+                           and not (self._source_kind == "owned" and cfg.get(mode_key) == "pickup") else default_mode),
             "game_modes": lobby.QUICKSTARTS,
             "max_delay": MAX_DELAY, "last_host": str(cfg.get("last_host", "")),
             "rooms": bool(self.rv_server),
@@ -580,7 +589,57 @@ class Launcher:
     # -- state plumbing --
     @property
     def user_dir(self) -> str:
-        return os.path.join(self.folder, "User")
+        return os.path.join(self.game_dir, "User")
+
+    @property
+    def game_dir(self) -> str:
+        """Keep legacy Reborn installs intact; owned images/config/content have a private root."""
+        return (os.path.join(self.folder, patcher.OWNED_REL)
+                if self._source_kind == "owned" else self.folder)
+
+    def _select_source(self, kind: str) -> None:
+        """Invalidate in-memory identity before touching a different family's cache."""
+        self._source_kind = kind
+        self._content_cache = nsr_content.Cache(self.game_dir, self._content_keys)
+        self._runtime_content, self._source_sha, self._checked_at = None, "", None
+        self._textures_logged = False
+        self._set("source", kind=kind, path=self.cfg.get("owned_iso", ""))
+        selected = self.cfg.get("owned_quickstart", "quick-play") if kind == "owned" else self.cfg.get("quickstart", "manual")
+        if not isinstance(selected, str) or selected not in lobby.QUICKSTARTS or (kind == "owned" and selected == "pickup"):
+            selected = "quick-play" if kind == "owned" else "manual"
+        self._set(quickstart=selected)
+        order, first = self.cfg.get("draft_order"), self.cfg.get("draft_first")
+        self._set("game", draft_order=order if kind == "reborn" and order in ("alternating", "snake", "cocky") else "alternating",
+                  draft_first=first if kind == "reborn" and first in ("stock", "team-one", "team-two") else "stock")
+        self._set("game", state="checking", fingerprint="", content=None, text="Getting the game ready…")
+        self._set("content", state="idle", version=None, latest=None, changelog="", text="")
+
+    def set_source(self, kind: str, image: str | None = None) -> None:
+        """Settings owns source changes; a room, build or running game freezes its source."""
+        if kind not in ("reborn", "owned"):
+            raise ValueError("Choose Reborn install or My own disc image.")
+        with self._lock:
+            if (self.state["game"]["busy"] or self.state["content"]["busy"] or self._dolphin_running()
+                    or self.state["host"]["state"] != "idle" or self.state["join"]["state"] != "idle"):
+                self.notify("Close the game, leave your room and wait for setup before changing source.", "error")
+                return
+            self.cfg["game_source"] = kind
+            if image and kind == "owned":
+                self.cfg["owned_iso"] = os.path.abspath(image)
+            self._save()
+            self._select_source(kind)
+            # Claim setup before scheduling so rapid source clicks cannot race builds.
+            self._set("game", busy=True)
+        def work():
+            try:
+                self._check_game_now()
+                self.sync_controllers_now(search=True)
+            finally:
+                self._set("game", busy=False)
+            if image or self.state["game"]["state"] in ("missing", "stale"):
+                self.find_game()
+            self.refresh_textures()
+        self._spawn(work)
 
     @staticmethod
     def _clamp_delay(value) -> int:
@@ -672,8 +731,10 @@ class Launcher:
     def refresh_textures(self) -> textures.TextureSet:
         """What the next launch will show (nothing is written here)."""
         pad = controllers.controller_kind(self.user_dir)
-        retail = patcher.read_manifest(self.folder).get("base_family") == patcher.ownimage_build.FAMILY
-        ts = textures.TextureSet() if retail else textures.compose(self.folder, self._icons_setting(), pad.kind)
+        retail = patcher.read_manifest(self.game_dir).get("base_family") == patcher.ownimage_build.FAMILY
+        ts = (textures.compose_owned(self.folder, self._icons_setting(), pad.kind)
+              if self._source_kind == "owned" or retail else
+              textures.compose(self.folder, self._icons_setting(), pad.kind))
         self._set("textures", icons=self._icons_setting(), effective=ts.icons, why=ts.icons_why,
                   base_kind=ts.base_kind, base=ts.base or "",
                   packages=[f"{p.id} {p.version}" for p in ts.packages],
@@ -713,6 +774,9 @@ class Launcher:
         """Persist the next host/practice room choice without rebuilding the base image."""
         import draftmodes
         draftmodes.patch_names(order, first)
+        if self._source_kind == "owned" and (order, first) != ("alternating", "stock"):
+            self.notify("Your own disc uses the original draft setup. Choose Reborn to use custom drafting.", "error")
+            return
         with self._lock:
             if (self.state["game"]["busy"] or self.state["content"]["busy"] or self._dolphin_running()
                     or self.state["host"]["state"] != "idle" or self.state["join"]["state"] != "idle"):
@@ -726,10 +790,14 @@ class Launcher:
 
     def _check_game_now(self) -> None:
         """Restore the real image identity, content and matching draft manifest."""
-        st = self._patcher.image_status(self.folder)
+        st = self._patcher.image_status(self.game_dir)
         if st is None:
             self._set("game", state="missing", fingerprint="", content=None,
-                      text="Not set up yet. Click “Find Reborn automatically”.")
+                      text="Choose your game source in Settings → Advanced, then browse to your disc image or locate Reborn.")
+        elif ((self._source_kind == "owned" and st.kind != "retail") or
+              (self._source_kind == "reborn" and st.kind in ("retail", "invalid-retail"))):
+            self._set("game", state="stale", fingerprint="", content=None,
+                      text="This game copy belongs to a different source or has an invalid receipt. Choose the matching source in Settings → Advanced and rebuild.")
         elif st.playable:
             self._source_sha = getattr(st, "source_sha256", "") or ""
             self._ready(st.fingerprint, {"release": "", "retail": st.note, "content": st.note, "custom": st.note + "; compare fingerprints with friends."}.get(
@@ -754,17 +822,25 @@ class Launcher:
         self._spawn(self._check_game_now)
 
     def find_game(self) -> None:
-        if self.state["game"]["busy"]:
-            return
-        self._set("game", text="Looking for NFL Street Reborn…")
-
+        """Claim setup before scheduling; never fall back across selected families."""
+        with self._lock:
+            if (self._dolphin_running() or self.state["content"]["busy"]
+                    or self.state["host"]["state"] != "idle" or self.state["join"]["state"] != "idle"):
+                self.notify("Close the game and leave your room before preparing a source.", "error")
+                return
+            before = self._claim_build("Getting the game ready…")
+            if before is None:
+                return
         def work():
-            iso = self._patcher.find_reborn_iso()
-            if iso:
-                self.prepare(iso)
-            else:
-                self._set("game", text="Couldn't find Reborn automatically. Click “Browse for "
-                                       "NSR.iso…” and pick content\\games\\NSR.iso in your Reborn folder.")
+            try:
+                iso = self.cfg.get("owned_iso") if self._source_kind == "owned" else self._reborn_iso()
+                if iso:
+                    self._run_build(iso, self._known_content(), strict=False, restore=before)
+                else:
+                    self._set("game", state="missing", fingerprint="", progress=None,
+                              text="Choose your game source in Settings → Advanced, then Browse to your disc image or locate Reborn.")
+            finally:
+                self._set("game", busy=False)
         self._spawn(work)
 
     def _claim_build(self, text: str) -> dict | None:
@@ -782,7 +858,7 @@ class Launcher:
         On failure the previous nsr-net.iso is untouched (prepare_image builds
         into a temporary file); with restore, the game state goes back to it
         too, because that copy is still playable."""
-        labels = {"check": "Checking the game file…",
+        labels = {"convert": "Reading your disc image…", "check": "Checking the game file…",
                   "build": "Building the netplay copy…" if not content else
                            f"Building the netplay copy with game content v{content.version}…",
                   "verify": "Fingerprinting…"}
@@ -791,11 +867,17 @@ class Launcher:
         extra = {"content": content, "content_strict": strict} if content and not runtime else {}
         order, first = self.state["game"]["draft_order"], self.state["game"]["draft_first"]
         try:
-            r = self._patcher.prepare_image(iso, self.folder, progress=lambda st, d, t: self._set(
+            if self._source_kind == "reborn" and patcher.is_retail_source(iso):
+                raise ValueError("This is your original disc. Select My own disc image in Settings → Advanced first.")
+            builder = self._patcher.prepare_owned_image if self._source_kind == "owned" else self._patcher.prepare_image
+            r = builder(iso, self.game_dir, progress=lambda st, d, t: self._set(
                 "game", text=labels.get(st, st), progress=round(d * 100 / max(t, 1))), **extra)
             built = True
-            self.cfg["reborn_iso"] = iso
-            self.cfg["reborn_install"] = r.reborn_install
+            if self._source_kind == "owned":
+                self.cfg["owned_iso"] = iso
+            else:
+                self.cfg["reborn_iso"] = iso
+                self.cfg["reborn_install"] = r.reborn_install
             self._save()
             self._source_sha = getattr(r, "source_sha256", "") or self._source_sha
             applied = getattr(r, "content", None)
@@ -808,7 +890,7 @@ class Launcher:
                 if r.matches_reference is None else
                 "WARNING: doesn't match the reference build; ask Mason before playing."))
             if r.fingerprint.startswith("retail:"):
-                note = "Native rosters and controls; " + patcher.read_manifest(self.folder)["variant"]
+                note = "Native rosters and controls; " + patcher.read_manifest(self.game_dir)["variant"]
             if runtime:
                 self._validate_runtime(runtime, r.fingerprint)
                 self._activate_runtime(runtime)
@@ -816,7 +898,8 @@ class Launcher:
                 note = "Ratings are applied when the game starts."
             else:
                 self._content_cache.clear_runtime()
-                self.cfg.pop("runtime_installed", None)
+                if self._source_kind != "owned":
+                    self.cfg.pop("runtime_installed", None)
                 self._save()
                 self._runtime_content = None
             if content and not applied and not runtime:
@@ -825,6 +908,8 @@ class Launcher:
             self.sync_controllers_now()
             self._ensure_assets(install=r.reborn_install)
             self._ready(r.fingerprint, note, descriptor)
+            if content and (applied or runtime):
+                self._content("current", f"Up to date: {nsr_content.describe(content.release)}")
             return True
         except textures.ImportError as e:
             # The ISO may already have been published. Retain it on disk, but
@@ -868,7 +953,7 @@ class Launcher:
                     or self.state["host"]["state"] != "idle" or self.state["join"]["state"] != "idle"):
                 self.notify("Close the game, leave your room and wait for updates before rebuilding.", "error")
                 return
-            before = self._claim_build("Checking Reborn's game file…")
+            before = self._claim_build("Getting the game ready…")
             if before is None:
                 return
         self._spawn(lambda: self._run_build(iso, self._known_content(), strict=False, restore=before))
@@ -877,7 +962,7 @@ class Launcher:
     def reborn_install(self, search: bool = False) -> str | None:
         """Reborn's install folder: from the last image build, else (search=True)
         found on disk like NFLStreetRollback-Patcher does."""
-        if patcher.read_manifest(self.folder).get("base_family") == patcher.ownimage_build.FAMILY:
+        if self._source_kind == "owned" or patcher.read_manifest(self.game_dir).get("base_family") == patcher.ownimage_build.FAMILY:
             return None
         install = self.cfg.get("reborn_install") or self._patcher.saved_reborn_install(self.folder)
         if not install and self.cfg.get("reborn_iso"):
@@ -892,8 +977,8 @@ class Launcher:
         # Only the explicit import button may read Reborn again.
         record = self.cfg.get("controllers") or {}
         own_pad = os.path.join(self.user_dir, "Config", "GCPadNew.ini")
-        retail = patcher.read_manifest(self.folder).get("base_family") == patcher.ownimage_build.FAMILY
-        if retail:
+        retail = patcher.read_manifest(self.game_dir).get("base_family") == patcher.ownimage_build.FAMILY
+        if self._source_kind == "owned" or retail:
             source = None
             res = controllers.SyncResult("kept-yours", record, "Using native Dolphin controller settings.")
         elif not force and (record.get("written") or os.path.isfile(own_pad)
@@ -949,6 +1034,8 @@ class Launcher:
     def _installed_runtime(self):
         """A separately persisted identity detects deletion or replacement of the
         signed installed pointer, including between room entry and launch."""
+        if self._source_kind == "owned":
+            return None  # Reborn signed pointers/config never apply to the owned family.
         active = self._content_cache.runtime_content()
         expected = self.cfg.get("runtime_installed")
         if expected:
@@ -1010,6 +1097,8 @@ class Launcher:
     def _known_content(self):
         """Newest verified content for a rebuild: the cached manifest with its
         packs (downloaded now if missing and online), else None (plain build)."""
+        if self._source_kind == "owned":
+            return None
         payload = self._content_cache.manifest()
         if not payload or not self._usable(payload):
             return None
@@ -1044,6 +1133,8 @@ class Launcher:
             self._set("content", busy=False)
 
     def _update(self, user: bool, before_play: bool) -> str:
+        if self._source_kind == "owned":
+            return self._content("off", "Using your disc’s original rosters. Reborn game updates apply only to the Reborn source.")
         base = self.content_base()
         if not base or not nsr_content.trusted_keys(self._content_keys):
             return self._content("off", "Automatic game updates aren't set up in this download.")
@@ -1148,6 +1239,11 @@ class Launcher:
     def launch(self, start, open_ui: bool = False) -> bool:
         if not open_ui and self.need_game():
             return False
+        if start and getattr(start, "image_family", ""):
+            why = lobby.family_reason(start.image_family, lobby.image_family(self.state["game"]["fingerprint"]))
+            if why:
+                self.notify(why, "error")
+                return False
         try:  # never let a controller-file problem block a match
             self.sync_controllers_now()
         except Exception as e:  # noqa: BLE001
@@ -1158,20 +1254,20 @@ class Launcher:
             self.uploader.remember_server(start.telemetry_url, start.telemetry_token)
             self._stats_wake.set()
         selected_draft = lobby.draft_settings(start.draft) if start else self.draft_settings()
-        if (not open_ui and patcher.read_manifest(self.folder).get("base_family") == patcher.ownimage_build.FAMILY
+        if (not open_ui and patcher.read_manifest(self.game_dir).get("base_family") == patcher.ownimage_build.FAMILY
                 and selected_draft != {"order": "alternating", "first": "stock"}):
             self.notify("Retail v1 currently supports Alternating / Stock draft settings only.", "error")
             return
-        if (not open_ui and patcher.read_manifest(self.folder).get("base_family") == patcher.ownimage_build.FAMILY
-                and (start.quickstart if start else self.state["quickstart"]) != "manual"):
-            self.notify("Retail automatic navigation is not qualified yet. Choose Manual navigation.", "error")
+        if (not open_ui and patcher.read_manifest(self.game_dir).get("base_family") == patcher.ownimage_build.FAMILY
+                and (start.quickstart if start else self.state["quickstart"]) == "pickup"):
+            self.notify("Own-disc Pickup navigation is not qualified yet. Choose Quick Play or Manual.", "error")
             return
         try:
-            args, env = dolphin_command(self.folder, start, None, open_ui=open_ui,
+            args, env = dolphin_command(self.game_dir, start, None, open_ui=open_ui,
                                         name=self.state["name"], fingerprint=self.room_fingerprint(selected_draft),
                                         telemetry=self.state["telemetry"], quickstart=self.state["quickstart"],
-                                        icons=self._icons_setting(), resolution=self._resolution_setting())
-        except OSError as e:
+                                        icons=self._icons_setting(), resolution=self._resolution_setting(), app_folder=self.folder)
+        except (OSError, ValueError) as e:
             self.notify(f"Couldn't prepare the local texture list: {e}. Close the game and retry.", "error")
             return False
         if not open_ui:  # same values the fork logs in nsr-p*.log ("local pad:")
@@ -1303,7 +1399,10 @@ class Launcher:
         except ConnectionError as e:
             self.notify(str(e), "error")
             return
-        self.cfg["quickstart"] = selected
+        if self._source_kind == "owned" and selected == "pickup":
+            self.notify("For your own disc, choose Quick Play or Manual. Automatic Pickup is not available yet.", "error")
+            return
+        self.cfg["owned_quickstart" if self._source_kind == "owned" else "quickstart"] = selected
         self._save()
         self._set(quickstart=selected)
 
@@ -1513,14 +1612,14 @@ class Launcher:
     # -- local presentation import (serialized by the existing setup busy flag) --
     def _ensure_assets(self, force: bool = False, install: str | None = None) -> None:
         """Metadata-check or import inside setup; normal composition is local only."""
-        if patcher.read_manifest(self.folder).get("base_family") == patcher.ownimage_build.FAMILY:
+        if self._source_kind == "owned" or patcher.read_manifest(self.game_dir).get("base_family") == patcher.ownimage_build.FAMILY:
             return  # Native retail has no Reborn presentation import dependency.
         old = textures.read_store(self.folder)
         install = install or old.get("install") or self.reborn_install(search=True)
         if not install and not old and not force:
             textures.write_list(self.user_dir, self.refresh_textures())  # clear legacy source references
             return
-        label = self._patcher.read_manifest(self.folder).get("source_label") if hasattr(self._patcher, "read_manifest") else ""
+        label = self._patcher.read_manifest(self.game_dir).get("source_label") if hasattr(self._patcher, "read_manifest") else ""
         manifest = textures.ensure_store(self.folder, install, self._env, force=force,
             version=(label or "unknown").removeprefix("Reborn "), progress=lambda d, t: self._set("game",
                 text="Importing Reborn textures into your local folder…", progress=round(d * 100 / max(t, 1))))
@@ -1564,10 +1663,28 @@ class Launcher:
 
     def reimport_reborn(self) -> None:
         """Settings → Advanced: refresh assets, preserving our ISO and controls."""
+        if self._source_kind == "owned":
+            self.notify("Using your disc’s original look. Add packs to TexturePacks/GN7E69, then start the game.")
+            return
         self._spawn(lambda: self._import_assets_setup(force=True))
 
     def _startup_checks(self) -> None:
-        self._check_game_now()
+        # Hashing can take seconds. Freeze the source while it is in flight so
+        # a previous family's ready result cannot publish into a newer selection.
+        with self._lock:
+            if self.state["game"]["busy"]:
+                return
+            self._set("game", busy=True)
+        try:
+            if "game_source" not in self.cfg:
+                # Preserve an existing Reborn cache even after its original install moves.
+                available = (os.path.isfile(os.path.join(self.folder, patcher.OUTPUT_NAME))
+                             or self._reborn_iso() or self._patcher.saved_reborn_install(self.folder))
+                self._select_source("reborn" if available else "owned")
+            self._check_game_now()
+            self.sync_controllers_now(search=True)
+        finally:
+            self._set("game", busy=False)
         if self.state["game"]["state"] == "ready":
             self._import_assets_setup()
         self.update_content_now(user=False)  # auto: install; manual: just report
@@ -1582,7 +1699,6 @@ class Launcher:
 
     def startup(self) -> None:
         def setup():
-            self.sync_controllers_now(search=True)
             self._startup_checks()
         self._spawn(setup)
         self._loop_spawn(self._stats_loop)
@@ -1651,15 +1767,21 @@ class WebApi:
     def refresh_controllers(self): self._l.refresh_controllers()
     def copy_text(self, text): return copy_to_clipboard(str(text))
 
+    def set_source(self, kind): self._l.set_source(str(kind))
+
     def browse_iso(self):
         import webview
         kind = getattr(getattr(webview, "FileDialog", None), "OPEN", None) or webview.OPEN_DIALOG
         try:  # pywebview filters must be "Label (*.ext)"; NSR.iso sits in content\games
-            picked = self._window.create_file_dialog(kind, file_types=("Disc images (*.iso)",))
+            picked = self._window.create_file_dialog(kind, file_types=("Disc images (*.iso;*.ciso;*.rvz)",))
         except Exception:  # noqa: BLE001  (a pywebview that rejects the filter)
             picked = self._window.create_file_dialog(kind)
         if picked:
-            self._l.prepare(picked[0] if isinstance(picked, (list, tuple)) else picked)
+            image = picked[0] if isinstance(picked, (list, tuple)) else picked
+            if self._l._source_kind == "owned":
+                self._l.set_source("owned", image)
+            else:
+                self._l.prepare(image)
 
 
 def run_web(launcher: Launcher, selftest: bool = False) -> int:
@@ -1827,9 +1949,16 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     progress = ttk.Progressbar(sp, length=300, mode="determinate")
     ttk.Button(sp, text="Re-import from Reborn", command=launcher.reimport_reborn).grid(row=8, column=2, sticky="w", pady=8)
     b_find = ttk.Button(sp, text="Find Reborn automatically", command=launcher.find_game)
-    b_browse = ttk.Button(sp, text="Browse for NSR.iso…")
+    b_browse = ttk.Button(sp, text="Browse…")
     b_find.grid(row=8, column=0, sticky="w")
     b_browse.grid(row=8, column=1, sticky="w", padx=6)
+    ttk.Label(sp, text="Advanced — Game source").grid(row=13, column=0, sticky="w", pady=(12, 0))
+    source_names = {"Reborn install": "reborn", "My own disc image": "owned"}
+    source_var = tk.StringVar(value=next(k for k,v in source_names.items() if v == launcher._source_kind))
+    source_box = ttk.Combobox(sp, textvariable=source_var, values=list(source_names), state="readonly", width=24)
+    source_box.grid(row=13, column=1, columnspan=3, sticky="w")
+    source_box.bind("<<ComboboxSelected>>", lambda _: launcher.set_source(source_names[source_var.get()]))
+    label(sp, 14).configure(text="Own disc: ISO/CISO/RVZ of NFL Street 2 USA rev 0. Optional packs: TexturePacks/GN7E69/<pack>/; icons: ButtonIcons/GN7E69/<kind>/.")
     content_text = label(sp, 9, pady=(14, 4))
     b_updates = ttk.Button(sp, text="Check for updates", command=launcher.check_updates)
     b_updates.grid(row=10, column=0, sticky="w")
@@ -1856,10 +1985,13 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
               wraplength=560).grid(row=10, column=0, columnspan=4, sticky="w")
 
     def browse():
-        iso = filedialog.askopenfilename(title="Pick NFL Street Reborn's NSR.iso (content\\games)",
-                                         filetypes=[("Reborn game image", "NSR.iso"), ("ISO", "*.iso")])
+        iso = filedialog.askopenfilename(title="Choose your game source",
+                                         filetypes=[("Disc images", "*.iso *.ciso *.rvz"), ("All files", "*")])
         if iso:
-            launcher.prepare(iso)
+            if launcher._source_kind == "owned":
+                launcher.set_source("owned", iso)
+            else:
+                launcher.prepare(iso)
     b_browse.configure(command=browse)
 
     def set_list(box, names):
@@ -1877,7 +2009,8 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
         if s is not None:
             seen["rev"] = s["rev"]
             g, h, j, c = s["game"], s["host"], s["join"], s["controllers"]
-            status.configure(text=("● Ready to play" if g["state"] == "ready" else "● " + g["text"])
+            status.configure(text=("● Getting the game ready…" if g["busy"] or g["state"] in ("checking", "building")
+                                   else "● Ready to play" if g["state"] == "ready" else "● " + g["text"])
                              + f"     {s['name']} · Port 1")
             host_code.configure(text=h["code"] if h["state"] in ("open", "starting") else "")
             quality = s["link_quality"]
@@ -1908,6 +2041,8 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
             setup_idle = (not g["busy"] and not s["content"]["busy"]
                           and h["state"] == "idle" and j["state"] == "idle")
             enable(b_find, setup_idle); enable(b_browse, setup_idle)
+            source_var.set(next(k for k,v in source_names.items() if v == s["source"]["kind"]))
+            source_box.configure(state="readonly" if setup_idle else "disabled")
             draft_order.set(g["draft_order"]); draft_first.set(g["draft_first"])
             order_box.configure(state="readonly" if setup_idle else "disabled")
             first_box.configure(state="readonly" if setup_idle else "disabled")

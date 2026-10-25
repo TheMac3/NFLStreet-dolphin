@@ -103,7 +103,25 @@ def bootstrap(stream, entries: dict[str, tuple[int, int]]) -> dict:
             "patch_lo": PATCH_BASE, "arena_min": ARENA_MIN, "family": FAMILY, "recipe": RECIPE}
 
 
-def build(source: str | Path, output: str | Path, progress=None) -> dict:
+def output_path(output: str | Path, *, private_root: str | Path | None = None) -> Path:
+    """Validate the output boundary before creating conversion files or patching anything."""
+    if private_root is None:
+        output = eadb.local_output(output)
+    else:
+        # Packaged launchers have no repository-local root (PyInstaller unpacks
+        # modules elsewhere). Accept only the launcher's dedicated owned root.
+        root = Path(private_root).resolve()
+        output = Path(output).resolve()
+        if (tuple(part.lower() for part in root.parts[-3:]) != ("local", "gamesources", "owned")
+                or output.parent != root or output.name != "nsr-net.iso.retail-partial"):
+            raise ValueError("owned output must be in local/GameSources/owned")
+        if any((parent / "content/games/NSR.iso").exists() or
+               (parent / "app/content/games/NSR.iso").exists() for parent in (root, *root.parents)):
+            raise ValueError("keep NFLStreetRollback outside the Reborn install")
+    return output
+
+
+def build(source: str | Path, output: str | Path, progress=None, *, private_root: str | Path | None = None) -> dict:
     """Verify, copy, bootstrap, patch and atomically publish under local/.
 
     No force option exists. Every referenced payload must retain its input
@@ -111,7 +129,7 @@ def build(source: str | Path, output: str | Path, progress=None) -> dict:
     previous outputs; copy hashing detects a source changed after verification.
     """
     source = Path(source).resolve()
-    output = eadb.local_output(output)
+    output = output_path(output, private_root=private_root)
     if output.exists() or output.is_symlink() or output == source:
         raise pp.PatchError("retail output must be a new local image")
     receipt = ownimage.verify(source)
