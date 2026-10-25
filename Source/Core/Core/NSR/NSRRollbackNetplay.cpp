@@ -219,6 +219,170 @@ std::uint8_t AutoInputDelay(double one_way_ms, double jitter_ms, const AutoDelay
   return static_cast<std::uint8_t>(clamped);
 }
 
+// Dedicated fixed-size timing protocol, separate from handoff-v5 and NSRB.
+std::vector<std::uint8_t> EncodeProbe(const ProbePacket& packet)
+{
+  std::vector<std::uint8_t> out;
+  out.reserve(24);
+  Put(out, PROBE_MAGIC);
+  Put(out, std::uint8_t{1});
+  Put(out, static_cast<std::uint8_t>(packet.kind));
+  Put(out, packet.sender);
+  Put(out, packet.target);
+  Put(out, packet.sequence);
+  Put(out, packet.sent_us);
+  Put(out, packet.rtt_us);
+  Put(out, packet.jitter_us);
+  return out;
+}
+
+// Unknown versions, oversized payloads and nonsensical measurements are ignored.
+std::optional<ProbePacket> DecodeProbe(std::span<const std::uint8_t> bytes)
+{
+  if (bytes.size() != 24)
+    return std::nullopt;
+  std::size_t at = 0;
+  std::uint32_t magic = 0;
+  std::uint8_t version = 0, kind = 0;
+  ProbePacket packet;
+  if (!Get(bytes, at, &magic) || !Get(bytes, at, &version) || !Get(bytes, at, &kind) ||
+      !Get(bytes, at, &packet.sender) || !Get(bytes, at, &packet.target) ||
+      !Get(bytes, at, &packet.sequence) || !Get(bytes, at, &packet.sent_us) ||
+      !Get(bytes, at, &packet.rtt_us) || !Get(bytes, at, &packet.jitter_us) ||
+      magic != PROBE_MAGIC || version != 1 || kind < 1 || kind > 4 ||
+      packet.sender >= MAX_PLAYERS || packet.rtt_us > 2'000'000 || packet.jitter_us > 2'000'000)
+    return std::nullopt;
+  packet.kind = static_cast<ProbeKind>(kind);
+  if (packet.kind == ProbeKind::Quality ?
+          (packet.sender != 0 || packet.target < 1 || packet.target > 8) :
+          (packet.target >= MAX_PLAYERS || packet.target == packet.sender))
+    return std::nullopt;
+  return packet;
+}
+
+// A star relays leaf-to-leaf through two measured legs; a mesh uses direct
+// paths, including links absent from the host's own ENet peer array.
+std::optional<InputPath> WorstInputPath(const LinkMatrix& links, std::uint8_t players, bool star)
+{
+  if (players < 2 || players > MAX_PLAYERS)
+    return std::nullopt;
+  InputPath path;
+  for (std::uint8_t i = 0; i < players; ++i)
+    for (std::uint8_t j = i + 1; j < players; ++j)
+    {
+      double one_way = 0, jitter = 0;
+      if (star && i != 0)
+      {
+        if (!links[0][i] || !links[0][j])
+          return std::nullopt;
+        one_way = (links[0][i]->rtt_ms + links[0][j]->rtt_ms) / 2;
+        jitter = links[0][i]->jitter_ms + links[0][j]->jitter_ms;
+      }
+      else
+      {
+        if (!links[i][j])
+          return std::nullopt;
+        one_way = links[i][j]->rtt_ms / 2;
+        jitter = links[i][j]->jitter_ms;
+      }
+      path.one_way_ms = std::max(path.one_way_ms, one_way);
+      path.jitter_ms = std::max(path.jitter_ms, jitter);
+    }
+  return path;
+}
+
+// Lost pongs expire without retries: reliable retransmission would bias RTT.
+std::optional<ProbePacket> LinkProbeWindow::Start(std::uint32_t now_us)
+{
+  if (m_started && now_us - m_last_send < 250'000)
+    return std::nullopt;
+  m_started = true;
+  m_last_send = now_us;
+  std::erase_if(m_pending, [now_us](const auto& p) { return now_us - p.sent_us > 2'000'000; });
+  ProbePacket packet;
+  packet.sequence = ++m_sequence;
+  packet.sent_us = now_us;
+  m_pending.push_back(packet);
+  return packet;
+}
+
+// Duplicates, forged timestamps and late echoes cannot mutate the sample set.
+bool LinkProbeWindow::Accept(const ProbePacket& pong, std::uint32_t now_us)
+{
+  if (pong.kind != ProbeKind::Pong)
+    return false;
+  const auto it = std::find_if(m_pending.begin(), m_pending.end(), [&](const auto& p) {
+    return p.sequence == pong.sequence && p.sent_us == pong.sent_us;
+  });
+  if (it == m_pending.end())
+    return false;
+  m_pending.erase(it);
+  const auto rtt_us = now_us - pong.sent_us;
+  if (rtt_us > 2'000'000)
+    return false;
+  // An older reordered pong does not create artificial inter-arrival jitter.
+  if (!m_samples.empty() && pong.sent_us - m_samples.back().sent_us >= 0x80000000U)
+    return false;
+  std::erase_if(m_samples, [now_us](const auto& p) { return now_us - p.received_us > 12'000'000; });
+  if (m_samples.size() == 48)
+    m_samples.erase(m_samples.begin());
+  m_samples.push_back({pong.sent_us, now_us, rtt_us});
+  return true;
+}
+
+// Use only fresh samples; require six so the first pong is never the policy.
+std::optional<LinkQuality> LinkProbeWindow::Quality(std::uint32_t now_us) const
+{
+  std::vector<double> rtts, variations;
+  const Sample* previous = nullptr;
+  for (const auto& sample : m_samples)
+  {
+    if (now_us - sample.received_us > 12'000'000)
+      continue;
+    rtts.push_back(sample.rtt_us / 1000.0);
+    if (previous)
+    {
+      const double arrival = static_cast<double>(sample.received_us - previous->received_us);
+      const double departure = static_cast<double>(sample.sent_us - previous->sent_us);
+      variations.push_back(std::abs(arrival - departure) / 1000.0 / std::sqrt(2.0));
+    }
+    previous = &sample;
+  }
+  if (rtts.size() < 6)
+    return std::nullopt;
+  const auto p75 = [](std::vector<double>& values) {
+    std::sort(values.begin(), values.end());
+    return values[(values.size() - 1) * 3 / 4];
+  };
+  return LinkQuality{p75(rtts), p75(variations), rtts.size()};
+}
+
+// Busy intervals invalidate echoes, but preserve the last uncontaminated window.
+void LinkProbeWindow::DiscardPending()
+{
+  m_pending.clear();
+}
+
+// Post-match measurements must not inherit the previous epoch's link samples.
+void LinkProbeWindow::Reset()
+{
+  DiscardPending();
+  m_samples.clear();
+  m_started = false;
+}
+
+// Jitter may downgrade a low fixed delay; it never upgrades a heavy delay.
+const char* InputQualityLabel(std::uint8_t delay, double jitter_ms)
+{
+  if (delay >= 4 || jitter_ms >= 24.0)
+    return "Poor";
+  if (delay >= 3 || jitter_ms >= 16.0)
+    return "OK";
+  if (delay >= 2 || jitter_ms >= 8.0)
+    return "Good";
+  return "Great";
+}
+
 bool HandoffAgreement::Complete() const
 {
   return !Mismatched() &&

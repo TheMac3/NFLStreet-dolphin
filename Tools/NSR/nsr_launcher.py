@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import shlex
 import socket
@@ -459,6 +460,27 @@ def choose_ui(env=os.environ, platform: str = sys.platform, has_webview: bool | 
     return "web"
 
 
+# Only the local Dolphin's dedicated measurement records drive the lobby label.
+# Before Start the game transport does not exist, so show a waiting state rather
+# than presenting the rendezvous server's latency as the peer link's quality.
+DELAY_WARNING = "Delay 4 chosen: controls may feel slower. A wired connection may help."
+
+
+def parse_link_quality(line: str) -> dict | None:
+    """Read the fork's host-agreed/preview measurement, independently of telemetry."""
+    match = re.fullmatch(r"\[NSR\] link quality: delay=([1-8]) one_way_dms=(\d{1,5}) "
+                         r"jitter_dms=(\d{1,5}) chosen=([01]) label=(Great|Good|OK|Poor)",
+                         line.strip())
+    if not match:
+        return None
+    delay, _one_way, jitter, chosen = map(int, match.groups()[:4])
+    label = match.group(5)
+    prefix = "For this match" if chosen else "Menu estimate"
+    return {"label": label, "delay": delay, "jitter_ms": jitter / 10, "chosen": bool(chosen),
+            "text": f"{prefix}: {label} · delay {delay} · jitter {jitter / 10:.1f} ms",
+            "warning": DELAY_WARNING if delay == 4 and chosen else ""}
+
+
 # --- Launcher: the state machine both views drive ---------------------------------
 CONTROLLER_STATES = {"first-import": "synced", "imported": "synced", "updated": "synced",
                      "up-to-date": "synced", "kept-yours": "yours", "no-reborn": "no-reborn",
@@ -507,6 +529,7 @@ class Launcher:
         self._runtime_content = None  # installed, signed runtime release (also used offline)
         self._source_sha = ""     # SHA-256 of the Reborn image nsr-net.iso was built from
         self._proc = None         # the Dolphin we started, to avoid rebuilding under it
+        self._quality_generation = 0  # a new lobby invalidates the previous reader
         self.rev = 0
         self._notice_id = 0
         cfg = self.cfg
@@ -548,6 +571,9 @@ class Launcher:
             "textures": {"icons": self._icons_setting(), "effective": "", "why": "",
                          "base_kind": "", "base": "", "packages": [], "warning": ""},
             "resolution": self._resolution_setting(),
+            "link_quality": {"label": "", "delay": None, "jitter_ms": None, "chosen": False,
+                             "text": "Connection quality is measured in the game menus after Start.",
+                             "warning": ""},
             "notice": None,
         }
 
@@ -1184,9 +1210,62 @@ class Launcher:
             return False
         if start is not None and not open_ui and hasattr(self._proc, "poll"):
             process = self._proc
+            generation = self._clear_link_quality(measuring=True)
+            self._spawn(lambda: self._watch_link_quality(process, env["NSR_LOG"], generation))
             self._spawn(lambda: self._watch_boot_sync(process, env["NSR_LOG"],
                 quickstart=start.quickstart != "manual"))
         return True
+
+    def _clear_link_quality(self, measuring: bool = False) -> int:
+        """Clear the previous room and return the new reader's ownership token."""
+        with self._lock:
+            self._quality_generation += 1
+            self._set("link_quality", label="", delay=None, jitter_ms=None, chosen=False,
+                      text=("Measuring connection quality in the game menus…" if measuring else
+                            "Connection quality is measured in the game menus after Start."), warning="")
+            return self._quality_generation
+
+    def _watch_link_quality(self, process, path: str, generation: int | None = None) -> None:
+        """Tail only our launch's log, retaining partial lines across reads/rematches.
+
+        This also works with telemetry off and costs no socket or simulation work.
+        A changed choice is shown in both lobby views; each delay-4 entry warns.
+        """
+        generation = self._quality_generation if generation is None else generation
+        offset, pending, exited = 0, "", False
+        while not self._stop.is_set():
+            if (generation != self._quality_generation
+                    or (self._proc is not None and process is not self._proc)):
+                return  # a newer lobby/launch owns the quality panel now
+            chunk = ""
+            try:
+                with open(path, encoding="utf-8", errors="replace") as stream:
+                    stream.seek(offset)
+                    chunk = stream.read(65536)
+                    pending += chunk
+                    offset = stream.tell()
+            except OSError:
+                pass
+            lines = pending.split("\n")
+            pending = lines.pop()
+            for line in lines:
+                quality = parse_link_quality(line)
+                if quality:
+                    with self._lock:
+                        if (generation != self._quality_generation
+                                or (self._proc is not None and process is not self._proc)):
+                            return  # a lobby may have changed during this read
+                        self._set("link_quality", **quality)
+                        if quality["warning"]:
+                            self.notify(quality["warning"], "warning")
+            if exited and not chunk:
+                return
+            if process.poll() is not None:
+                # Drain to EOF once the process exits: a paused launcher may
+                # have several chunks pending, including the last match choice.
+                exited = True
+                continue
+            self._stop.wait(0.5)
 
     def _watch_boot_sync(self, process, path: str, quickstart: bool = False) -> None:
         """Surface the fork's named preboot failure without exposing wire internals.
@@ -1244,6 +1323,7 @@ class Launcher:
         if not self.rv_server:
             self.notify("Room codes aren't set up in this download. Use “Host by IP”.", "error")
             return
+        self._clear_link_quality()
         self._set("host", state="opening", mode="room", info="Creating a room…")
 
         def work():
@@ -1265,6 +1345,7 @@ class Launcher:
     def host_ip(self) -> None:
         if self.need_game() or self._host or self.state["host"]["state"] != "idle":
             return
+        self._clear_link_quality()
         self._set("host", state="opening", mode="ip", info="Opening a direct lobby…")
         try:
             h = self._lobby.LobbyHost(self.state["name"], self.state["game"]["fingerprint"],
@@ -1342,6 +1423,7 @@ class Launcher:
         cancel = threading.Event()
         self._join_cancel = cancel
         self._set(last_host=target)
+        self._clear_link_quality()
         self._set("join", state="waiting", players=[], quickstart="manual", draft_label="",
                   info=f"Joining {target}… waiting for the host to start.")
         on_lobby = lambda names: self._set("join", players=list(names))  # noqa: E731
@@ -1798,14 +1880,18 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
             status.configure(text=("● Ready to play" if g["state"] == "ready" else "● " + g["text"])
                              + f"     {s['name']} · Port 1")
             host_code.configure(text=h["code"] if h["state"] in ("open", "starting") else "")
-            host_info.configure(text=h["info"] + "\n" + lobby.draft_label(launcher.draft_settings()))
+            quality = s["link_quality"]
+            quality_text = quality["text"] + ("\n" + quality["warning"] if quality["warning"] else "")
+            host_info.configure(text=h["info"] + "\n" + lobby.draft_label(launcher.draft_settings())
+                                + "\n" + quality_text)
             mode_var.set(lobby.QUICKSTARTS[s["quickstart"]])
             mode_picker.configure(state="readonly" if h["state"] == "idle" else "disabled")
             set_list(host_roster, h["players"])
             idle = h["state"] == "idle"
             enable(b_open, idle and s["rooms"]); enable(b_ip, idle)
             enable(b_close, not idle); enable(b_start, h["state"] == "open" and h["can_start"])
-            join_info.configure(text=j["info"] + "\nGame mode: " + lobby.QUICKSTARTS[j["quickstart"]] + "\n" + j.get("draft_label", ""))
+            join_info.configure(text=j["info"] + "\nGame mode: " + lobby.QUICKSTARTS[j["quickstart"]]
+                                + "\n" + j.get("draft_label", "") + "\n" + quality_text)
             set_list(join_roster, j["players"])
             enable(b_join, j["state"] == "idle"); enable(b_leave, j["state"] == "waiting")
             p1 = c["port1"]
