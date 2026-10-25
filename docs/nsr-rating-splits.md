@@ -1,10 +1,10 @@
 # Runtime rating splits (GN7E69 revision 0)
 
-NSRContent's application policy 3 separates normal-pass velocity (`PPVL`)
+NSRContent's application policy 4 separates normal-pass velocity (`PPVL`)
 from native passing (`PPSS`), and movement acceleration (`PCEL`) from top
 speed (`PSPD`). The launcher supplies a canonical, peer-agreed
-`nsrb.runtime-content.v3` bundle before boot. Its object has the v1 ratings
-shape and may include the v2 `draft` member. The complete bundle SHA-256,
+`nsrb.runtime-content.v4` bundle before boot. Its object has the v1 ratings
+shape and may include the v2 `draft` member and v3 `playbooks` member. The complete bundle SHA-256,
 release version and policy participate in the existing M2 agreement. Older
 forks reject the format. This is a compiled allowlist, not executable content.
 
@@ -12,12 +12,12 @@ forks reject the format. This is a compiled allowlist, not executable content.
 
 No split entry means no split consumer hook. An unset/zero PPVL inherits
 the live native passing cache, including modifiers. Stock PCEL metadata is
-inert: only an explicit nonzero v3 PCEL entry opts a named player into the
+inert: only an explicit nonzero v4 PCEL entry opts a named player into the
 acceleration consumer. Zero/unset uses live PSPD-based acceleration. Existing
-v1/v2 PCEL packs retain their original native metadata semantics.
+v1/v2/v3 PCEL packs retain their original native metadata semantics.
 
 PCEL activation is meaningful even when the requested value already equals
-the packed original. Policy 3 permits this semantic edit; other no-op edits
+the packed original. Policy 4 permits this semantic edit; other no-op edits
 remain invalid. Both split fields accept 0–99. Explicit values use integer
 `value * 255 / 99` scaling. PPVL preserves the native velocity curve, which
 already saturates around rating 30. Explicit split values are independent

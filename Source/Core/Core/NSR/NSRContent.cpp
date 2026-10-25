@@ -136,13 +136,13 @@ std::string Load(const std::string& path, const std::string& expected)
     return "invalid content object shape";
   bool valid = true;
   const auto format = Text(root.get("format"), 64, valid);
-  s.split_policy = format == "nsrb.runtime-content.v3";
+  s.split_policy = format == "nsrb.runtime-content.v4";
   if ((!s.split_policy && format !=
           (books ? "nsrb.runtime-content.v3" : draft ? "nsrb.runtime-content.v2" : "nsrb.runtime-content.v1")) ||
       !root.get("packs").is<picojson::array>())
     return "unsupported content format";
   s.fingerprint[4] = Number(root.get("version"), 0x7fffffff, valid);
-  s.fingerprint[5] = s.split_policy ? 3 : books ? 3 : draft ? 2 : 1;  // exact hook/application policy is part of M2
+  s.fingerprint[5] = s.split_policy ? 4 : books ? 3 : draft ? 2 : 1;  // exact hook/application policy is part of M2
   if (draft)
   {
     const auto& settings = root.get("draft");
@@ -257,12 +257,12 @@ std::string Load(const std::string& path, const std::string& expected)
       for (const auto& original : originals)
         edit.expected.push_back(Number(original, 255, valid));
       // An explicit nonzero PCEL entry activates a new consumer even when
-      // its packed bits already equal that value. Only v3 grants that meaning.
+      // its packed bits already equal that value. Only v4 grants that meaning.
       const bool activation = s.split_policy && edit.field == "PCEL" && edit.value != 0;
       if (edit.expected == std::vector<std::uint32_t>{edit.value} && !activation)
         return "no-op content edit";
       if (edit.field == "PPVL" && !s.split_policy)
-        return "PPVL requires split policy v3";
+        return "PPVL requires split policy v4";
       s.edits.push_back(std::move(edit));
     }
   }
@@ -406,7 +406,7 @@ void DatabaseLoaded(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t
   }
   if (!s.splits.empty())
   {
-    std::fprintf(stderr, "[NSR] splits applied: velocity %u acceleration %u names %zu policy 3\n",
+    std::fprintf(stderr, "[NSR] splits applied: velocity %u acceleration %u names %zu policy 4\n",
                  velocity ? 1u : 0u, acceleration ? 1u : 0u, s.splits.size());
   }
   s.applied = true;

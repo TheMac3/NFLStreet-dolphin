@@ -56,7 +56,7 @@ CHANNEL = "friends"
 # Content format this launcher understands. A release with a larger
 # min_launcher needs a newer NFLStreetRollback download (it may use fields or
 # build steps this code doesn't know); bump when the release format changes.
-LAUNCHER_CONTENT_FORMAT = 3  # v3: runtime passing/acceleration splits, neutral by default
+LAUNCHER_CONTENT_FORMAT = 4  # v4: runtime passing/acceleration splits, neutral by default
 
 # Public keys trusted to sign manifests: key id -> (modulus hex, exponent).
 # Empty until Mason generates the signing key on the server
@@ -457,7 +457,7 @@ class Content:
         if not split and any(edit["field"] == "PPVL" for edit in self.edits):
             raise ContentError("Republish this legacy velocity pack with the current editor for "
                                "game-start updates, or use image builds.")
-        raw = canonical({"format": "nsrb.runtime-content.v3" if split else "nsrb.runtime-content.v1", "version": self.version,
+        raw = canonical({"format": "nsrb.runtime-content.v4" if split else "nsrb.runtime-content.v1", "version": self.version,
                          "packs": self.packs})
         if len(raw) > 4 * 1024 * 1024:
             raise ContentError("Runtime content bundle is too large; use image baking.")
@@ -552,7 +552,7 @@ class Cache:
         if playbooks:
             bundle = strict_loads(raw) if raw else {"version": 0, "packs": [],
                 "draft": {"order": draft_order, "first": draft_first, "policy": 1}}
-            bundle["format"] = "nsrb.runtime-content.v3"
+            bundle["format"] = "nsrb.runtime-content.v4" if bundle.get("format") == "nsrb.runtime-content.v4" else "nsrb.runtime-content.v3"
             bundle.setdefault("draft", {"order": draft_order, "first": draft_first, "policy": 1})
             bundle["playbooks"] = {"policy": 1, "captain": "lowest-pad", "users": playbooks}
             raw = canonical(bundle)
