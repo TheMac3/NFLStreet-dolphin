@@ -73,12 +73,14 @@ inline State Read(const NSRGameStats::Memory& memory, std::uint32_t local_pads)
     return {};
   const auto opponents = 3U & ~LocalSides(memory, local_pads);
   // Native fn_8017DD68/8017DDDC toggles per-team audible menus at these bytes.
-  // They can expose calls during lineup; ordinary lineup remains uncovered.
+  // Prediction submenu fn_8017DFA8/8017E01C uses the next per-team array.
+  // Both can expose choices during lineup; ordinary lineup remains uncovered.
   if (phase == 2)
   {
     State audible;
     for (std::uint32_t side = 0; side < 2; ++side)
-      if (memory.UInt(0x803eb48c + side, 1) == 1U)
+      if (memory.UInt(0x803eb48c + side, 1) == 1U ||
+          memory.UInt(0x803eb490 + side, 1) == 1U)
         audible.hidden |= opponents & (1U << side);
     return audible;
   }
