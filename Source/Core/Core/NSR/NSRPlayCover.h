@@ -69,7 +69,7 @@ inline State Read(const NSRGameStats::Memory& memory, std::uint32_t local_pads)
     return {};
   const auto phase = *memory.UInt(*flow);
   if ((phase != 1 && phase != 2 && phase != 5) ||
-      (phase == 5 && memory.UInt(*flow + 4) != 1))
+      (phase == 5 && memory.UInt(*flow + 4) != 1U))
     return {};
   const auto opponents = 3U & ~LocalSides(memory, local_pads);
   // Native fn_8017DD68/8017DDDC toggles per-team audible menus at these bytes.
@@ -78,7 +78,7 @@ inline State Read(const NSRGameStats::Memory& memory, std::uint32_t local_pads)
   {
     State audible;
     for (std::uint32_t side = 0; side < 2; ++side)
-      if (memory.UInt(0x803eb48c + side, 1) == 1)
+      if (memory.UInt(0x803eb48c + side, 1) == 1U)
         audible.hidden |= opponents & (1U << side);
     return audible;
   }
@@ -88,13 +88,13 @@ inline State Read(const NSRGameStats::Memory& memory, std::uint32_t local_pads)
   State result;
   result.hidden = opponents;
   for (std::uint32_t side = 0; side < 2; ++side)
-    if (memory.UInt(*ui + 0x42 + side, 1) == 1)
+    if (memory.UInt(*ui + 0x42 + side, 1) == 1U)
       result.locked |= 1U << side;
   // Four-column selection is the native full-width human-vs-CPU layout.
   // In same-side co-op the shared human book occupies the whole screen;
   // masking the CPU half would hide teammates' own cards. A spectator/local
   // unmapped pad instead covers the entire visible opponent book.
-  if (memory.UInt(*ui + 0x4e, 1) == 4)
+  if (memory.UInt(*ui + 0x4e, 1) == 4U)
   {
     const auto humans = LocalSides(memory, 15);
     if (humans == 1 || humans == 2)
