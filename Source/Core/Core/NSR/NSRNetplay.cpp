@@ -8031,7 +8031,7 @@ struct HostPerformance
   u64 frames = 0, over = 0, window_frames = 0;
   u64 work_us = 0, cycle_us = 0, resim_us = 0, gpu_us = 0, present_us = 0;
   u64 save_us = 0, texture_us = 0, decode_us = 0;
-  std::array<u64, 6> window{};
+  std::array<u64, 7> window{};
 };
 HostPerformance s_host_perf;
 
@@ -8077,6 +8077,11 @@ void HostPerformanceEnd()
     T::Observe(T::Hist::ResimGpuUs, gpu);
     return;
   }
+  const u64 unit_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - s_cost.host).count());
+  const u64 unit_pacing = (totals[H::Pacing] - s_cost.host_unit[H::Pacing]) / 1000;
+  const u64 emulation_us = unit_us > unit_pacing ? unit_us - unit_pacing : 0;
+  T::Observe(T::Hist::EmulationUs, emulation_us);
   ++p.frames;
   ++p.window_frames;
   if (p.cycle_us > 17535)
@@ -8090,16 +8095,16 @@ void HostPerformanceEnd()
   // Log per-window totals separately below; telemetry histograms describe one
   // complete live cycle (all re-sims plus the final visible frame).
   p.work_us += p.cycle_us;
-  const std::array<u64, 6> cycle{p.gpu_us, p.present_us, p.save_us, p.resim_us, p.texture_us, p.decode_us};
+  const std::array<u64, 7> cycle{p.gpu_us, p.present_us, p.save_us, p.resim_us, p.texture_us, p.decode_us, emulation_us};
   for (size_t i = 0; i < cycle.size(); ++i)
     p.window[i] += cycle[i];
   p.cycle_us = 0;
   if (p.window_frames == 300)
   {
     Log("performance window: live_frames={} host_work_us={} gpu_us={} present_us={} "
-        "save_us={} resim_us={} texture_load_us={} texture_decode_us={}",
+        "save_us={} resim_us={} texture_load_us={} texture_decode_us={} emulation_us={}",
         p.window_frames, p.work_us, p.window[0], p.window[1], p.window[2], p.window[3],
-        p.window[4], p.window[5]);
+        p.window[4], p.window[5], p.window[6]);
     p.window = {};
     p.window_frames = 0;
     p.work_us = 0;
@@ -8180,6 +8185,7 @@ void CostFrameStart(const Core::CPUThreadGuard& guard,
     if (!r.in_resim && r.tick_running % prof_every == 0 && s_cost.prof_n[0] + s_cost.prof_n[1])
       ProfDump();
   }
+  s_cost.host_unit = NSRHostMetrics::Read();
   if (!cost || !r.vtime_on)
   {
     s_cost.host = std::chrono::steady_clock::now();
@@ -8198,7 +8204,6 @@ void CostFrameStart(const Core::CPUThreadGuard& guard,
   std::copy(std::begin(s_phase_ns), std::end(s_phase_ns), s_cost.ph_unit);
   std::copy(std::begin(g_nsr_host_ns), std::end(g_nsr_host_ns), s_cost.dev_unit);
   s_cost.digest_us = (s_digest.total_ns - s_cost.digest_step) / 1000;
-  s_cost.host_unit = NSRHostMetrics::Read();
   s_cost.host = std::chrono::steady_clock::now();
 }
 

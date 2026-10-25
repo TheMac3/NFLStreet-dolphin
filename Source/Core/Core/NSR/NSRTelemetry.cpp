@@ -89,7 +89,7 @@ constexpr std::array<const char*, static_cast<size_t>(Hist::Count)> HIST_NAMES{
     "check_us",        "net_rtt_us",        "remote_input_late_frames",
     "prediction_frames", "time_sync_wait_us", "net_stall_us", "lockstep_wait_us",
     "host_work_us", "gpu_us", "present_us", "resim_us", "texture_load_us", "texture_decode_us",
-    "resim_unit_us", "resim_gpu_us",
+    "resim_unit_us", "resim_gpu_us", "emulation_us",
 };
 constexpr std::array<const char*, static_cast<size_t>(EventKind::Count)> EVENT_NAMES{
     "session_enter", "session_leave", "desync",            "peer_desync", "hang",

@@ -236,7 +236,7 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     # Reborn paths there. The caller surfaces write failures before starting.
     textures.write_list(os.path.join(folder, "User"), tex)
     env["NSR_TEXTURES"] = tex.summary()  # logged by the launcher; the fork ignores it
-    if tex.warnings:
+    if tex.warnings and hd_textures:
         env["NSR_TEXTURES_WARNING"] = " ".join(tex.warnings)
     args += ["-C", f"Graphics.Settings.HiresTextures={hd_textures}",
              "-C", "Graphics.Settings.CacheHiresTextures=False"]

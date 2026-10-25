@@ -153,6 +153,7 @@ enum class Hist : std::uint8_t
   TextureDecodeUs,         // background worker time; never a CPU-thread stall
   ResimUnitUs,             // one re-simulated unit, excluding its preceding step
   ResimGpuUs,              // GPU subset of one re-simulated unit
+  EmulationUs,             // final live unit incl GPU/DSP, excluding deliberate pacing
   Count
 };
 
