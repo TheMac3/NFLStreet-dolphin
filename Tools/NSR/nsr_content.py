@@ -64,7 +64,11 @@ LAUNCHER_CONTENT_FORMAT = 1
 # pastes the printed line here; with no key, launchers report content updates
 # as "not set up in this download" and never apply anything. Keep the old key
 # listed for one release when rotating.
-TRUSTED_KEYS: dict[str, tuple[str, int]] = {}
+# Content-signing public keys (docs/content-updates.md "Signing key handling").
+# The private half lives only on the server (~/.config/nsr/content-signing-key.pem).
+TRUSTED_KEYS: dict[str, tuple[str, int]] = {
+    "97c6fcf83c653ae9": ("d679da7952506fca9302eb2458f7b0e8b8c3532ba2a770134813380765fa44c3c0111f3781e3ecdc63e80a85fe077633a07068a1ae437153114c8add9d49a133878767d9c4501f322db9b738500aac08e8cb6bb4620352f7cbff7d4cdf0d99ee07aa0bd96c611c9280850a08fa3cc6093d5894b11def27dd240a0ce4aad84ceb3d0b4e191a3747e0ac22d8c456c0b7286289d2a2ad66f43e900278366db88df6a2fc3f2068d652e61e9bdf6e2a39b2c5188dc088c7aedb6c3863bcdd630dcab5bf1748bafb0c9c76aafab89baf863d8e9a5e148c365af942a0360cc7b7e5ea3a46684994adabeb1a7b9b7b0398b23f424c14014eb827062d7cc07e052b4ac58528929d969c8f0424132bfdc630a0a9e10e5a53b26fb64ff40e6378ac8e0ff1219ecc4661ed325e70c4d8f80bc6f43ac3b13dda1d7115e7b910658ea307e5d00f5de15a8612ae816b83914f74957006563aa8195ecbde097f2a7fe8bca35e3036c9c6202614a007d2843d07c411d9d729339ab783bd3f479f950ba179a91ef1bb", 65537),
+}
 MIN_KEY_BITS = 3072
 
 # Size limits (bytes / counts). Generous for a friends' roster, small enough
