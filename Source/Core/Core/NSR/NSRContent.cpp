@@ -21,6 +21,7 @@
 #include "Core/HW/Memmap.h"
 #include "Core/NSR/NSRContentRead.h"
 #include "Core/NSR/NSRDraft.h"
+#include "Core/NSR/NSRPlaybooks.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
@@ -37,6 +38,7 @@ struct State
   std::vector<Edit> edits;
   std::uint32_t draft_order = 0, draft_first = 0;
   bool draft = false;
+  std::vector<Playbook> playbooks;
 };
 State s;
 
@@ -124,16 +126,17 @@ std::string Load(const std::string& path, const std::string& expected)
   picojson::value root;
   if (!picojson::parse(root, raw).empty())
     return "invalid content JSON";
-  const bool draft = Keys(root, {"format", "version", "packs", "draft"});
+  const bool books = Keys(root, {"format", "version", "packs", "draft", "playbooks"});
+  const bool draft = books || Keys(root, {"format", "version", "packs", "draft"});
   if (!draft && !Keys(root, {"format", "version", "packs"}))
     return "invalid content object shape";
   bool valid = true;
   if (Text(root.get("format"), 64, valid) !=
-          (draft ? "nsrb.runtime-content.v2" : "nsrb.runtime-content.v1") ||
+          (books ? "nsrb.runtime-content.v3" : draft ? "nsrb.runtime-content.v2" : "nsrb.runtime-content.v1") ||
       !root.get("packs").is<picojson::array>())
     return "unsupported content format";
   s.fingerprint[4] = Number(root.get("version"), 0x7fffffff, valid);
-  s.fingerprint[5] = draft ? 2 : 1;  // exact hook/application policy is part of M2
+  s.fingerprint[5] = books ? 3 : draft ? 2 : 1;  // exact hook/application policy is part of M2
   if (draft)
   {
     const auto& settings = root.get("draft");
@@ -151,6 +154,75 @@ std::string Load(const std::string& path, const std::string& expected)
     s.draft_order = static_cast<std::uint32_t>(o - ORDERS.begin());
     s.draft_first = static_cast<std::uint32_t>(f - FIRSTS.begin());
     s.draft = true;
+  }
+  if (books)
+  {
+    const auto& settings = root.get("playbooks");
+    if (!Keys(settings, {"policy", "captain", "users"}) ||
+        Number(settings.get("policy"), 1, valid) != 1 ||
+        Text(settings.get("captain"), 32, valid) != "lowest-pad" ||
+        !settings.get("users").is<picojson::array>())
+      return "unsupported playbook binding policy";
+    const auto& users = settings.get("users").get<picojson::array>();
+    if (users.empty() || users.size() > 4)
+      return "invalid playbook participant count";
+    for (const auto& user : users)
+    {
+      if (!Keys(user, {"pad", "pack"}) || Number(user.get("pad"), 3, valid) != s.playbooks.size())
+        return "playbooks must be in contiguous pad order";
+      s.playbooks.emplace_back();
+      const auto& pack = user.get("pack");
+      if (pack.is<picojson::null>())
+        continue;
+      if (!Keys(pack, {"format", "owner", "revision", "name", "base_sha256", "igdata_sha256", "groups"}) ||
+          Text(pack.get("format"), 64, valid) != "nsrb.playbook.v1" ||
+          !Number(pack.get("revision"), 0x7fffffff, valid) ||
+          !pack.get("groups").is<picojson::array>())
+        return "invalid user playbook";
+      for (const char* key : {"owner", "base_sha256", "igdata_sha256"})
+      {
+        const auto hash = Text(pack.get(key), 64, valid);
+        if (hash.size() != 64 || hash.find_first_not_of("0123456789abcdef") != std::string::npos)
+          return "invalid playbook provenance hash";
+      }
+      // Python limits names to 64 Unicode characters; UTF-8 needs up to 256 bytes.
+      if (Text(pack.get("name"), 256, valid).empty())
+        return "empty playbook name";
+      const auto& groups = pack.get("groups").get<picojson::array>();
+      if (groups.empty() || groups.size() > 16)
+        return "invalid playbook category count";
+      std::set<std::pair<std::uint32_t, std::uint32_t>> seen;
+      for (const auto& group : groups)
+      {
+        if (!Keys(group, {"entry", "pbst", "library", "slots"}) ||
+            !group.get("library").is<picojson::array>() || !group.get("slots").is<picojson::array>())
+          return "invalid playbook category";
+        PlaybookGroup parsed;
+        parsed.entry = Number(group.get("entry"), 2, valid);
+        parsed.category = Number(group.get("pbst"), 65535, valid);
+        if (!parsed.entry || !seen.emplace(parsed.entry, parsed.category).second)
+          return "invalid/duplicate playbook category";
+        for (const char* key : {"library", "slots"})
+        {
+          const auto& ids = group.get(key).get<picojson::array>();
+          if (ids.empty() || ids.size() > 127)
+            return "invalid playbook slot count";
+          auto& output = std::string_view(key) == "library" ? parsed.library : parsed.slots;
+          std::set<std::uint32_t> unique;
+          for (const auto& id : ids)
+          {
+            const auto value = Number(id, 1023, valid);
+            if (!unique.insert(value).second)
+              return "duplicate playbook occurrence";
+            output.push_back(value);
+          }
+        }
+        for (const auto id : parsed.slots)
+          if (std::find(parsed.library.begin(), parsed.library.end(), id) == parsed.library.end())
+            return "playbook slot outside library";
+        s.playbooks.back().push_back(std::move(parsed));
+      }
+    }
   }
   const auto& packs = root.get("packs").get<picojson::array>();
   if (packs.size() > 8)
@@ -257,7 +329,9 @@ void DatabaseLoaded(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t
     error = "invalid content or failed native database load";
   else
   {
-    if (s.draft)
+    if (!s.playbooks.empty() && view.UInt(0x80057d8c) != 0x7f23cb78u)
+      error = "playbook native instruction guard mismatch";
+    if (s.draft && error.empty())
       draft_words = PlanDraft(view, s.draft_order, s.draft_first, &error);
     if (error.empty())
       writes = Plan(view, s.edits, &error);
@@ -291,6 +365,63 @@ void DatabaseLoaded(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t
                        "table %08x bytes %zu host_us %lld\n",
                static_cast<unsigned long long>(s.fingerprint[4]), s.sha.c_str(), frame,
                NSRGameStats::FindTable(view, "TATS", "YALP").value_or(0), writes->size(), static_cast<long long>(elapsed));
+}
+
+// GN7E69 rev 0, fn_80057C58 at 0x80057D8C: the game has allocated an
+// order array (r26, r28 bytes), and retains team r25, book tag r27, category
+// PBST at sp+0xF1C. Custom indices replace saved-profile resolution, then the
+// native tail publishes counts/fills unused slots. Other sides run the original.
+void PlaybookMenu(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t frame)
+{
+  auto& system = guard.GetSystem();
+  auto& ppc = system.GetPPCState();
+  ppc.gpr[3] = ppc.gpr[25];  // displaced mr r3,r25 for the stock path
+  ppc.npc = 0x80057d90;
+  Configure();
+  if (s.playbooks.empty())
+    return;
+  auto& memory = system.GetMemory();
+  const NSRGameStats::Memory view{{memory.GetRAM(), memory.GetRamSizeReal()},
+      {memory.GetFakeVMEM(), memory.GetFakeVMEM() ? memory.GetFakeVMemSize() : 0}};
+  std::string error;
+  const auto side = ppc.gpr[25];
+  const auto players = static_cast<std::uint32_t>(s.playbooks.size());
+  if (side > 1 || !PlaybookTeams(view, players))
+  {
+    s.failed = true;
+    std::fprintf(stderr, "[NSR] playbook failed: invalid native controller/team registry\n");
+    Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+    return;
+  }
+  const auto captain = PlaybookCaptain(view, side, players);
+  if (!captain || s.playbooks[*captain].empty())
+    return;
+  const auto category = view.Bytes(ppc.gpr[1], 0xf20) ?
+      view.UInt(ppc.gpr[1] + 0xf1c) : std::nullopt;
+  const std::uint32_t entry = ppc.gpr[27] == 0x31544250 ? 2 : ppc.gpr[27] == 0x31444250 ? 1 : 0;
+  const auto& book = s.playbooks[*captain];
+  const auto group = std::find_if(book.begin(), book.end(), [&](const PlaybookGroup& candidate) {
+    return category && candidate.entry == entry && candidate.category == *category;
+  });
+  std::optional<std::vector<std::uint8_t>> indices;
+  if (s.failed || resim || group == book.end() || !view.Bytes(ppc.gpr[26], ppc.gpr[28]) ||
+      ppc.gpr[26] < 0x80000000 || !view.Bytes(ppc.gpr[24], 1) || !view.Bytes(ppc.gpr[23], 1))
+    error = "invalid native playbook boundary or unsupported reload in rollback";
+  else
+    indices = PlanPlaybook(view, *group, ppc.gpr[28], &error);
+  if (!indices)
+  {
+    s.failed = true;
+    std::fprintf(stderr, "[NSR] playbook failed: %s\n", error.c_str());
+    Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+    return;
+  }
+  for (std::size_t i = 0; i < indices->size(); ++i)
+    memory.GetRAM()[ppc.gpr[26] - 0x80000000 + i] = (*indices)[i];
+  ppc.gpr[29] = static_cast<std::uint32_t>(indices->size());
+  ppc.npc = 0x80057ee4;
+  std::fprintf(stderr, "[NSR] playbook applied: pad %u team %u entry %u category %u slots %zu first_index %u frame %u\n",
+               *captain, side, entry, *category, indices->size(), unsigned(indices->front()), frame);
 }
 
 void Reset()

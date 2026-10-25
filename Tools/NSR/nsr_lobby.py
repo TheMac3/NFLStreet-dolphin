@@ -66,6 +66,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import nsr_content
+import nsr_playbooks as books
 
 PORT = 51515
 MAX_PLAYERS = 4
@@ -181,6 +182,7 @@ class StartInfo:
     telemetry_token: str = ""  # per-session/per-player token (docs/telemetry.md)
     quickstart: str = "manual"  # optional game-mode route, independent of netplay mode
     draft: dict = field(default_factory=draft_settings)
+    playbooks: list = field(default_factory=list)  # frozen pad-ordered public pack references
 
 
 def _send(sock: socket.socket, msg: dict) -> None:
@@ -205,6 +207,8 @@ class _Joiner:
     name: str
     sock: socket.socket
     address: str
+    playbook: dict | None = None
+    books_version: int = 0
 
 
 @dataclass
@@ -223,6 +227,8 @@ class LobbyHost:
     content: dict | None = None  # our nsr_content descriptor (None: don't compare)
     quickstart: str = "manual"
     draft: dict | None = None
+    playbook: dict | None = None
+    on_playbooks: Callable[[list], None] = lambda selected: None
     _joiners: list[_Joiner] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _server: socket.socket | None = None
@@ -241,12 +247,15 @@ class LobbyHost:
             return [self.name] + [j.name for j in self._joiners]
 
     def _notify(self) -> None:
-        names = self.names()
         with self._lock:
             joiners = list(self._joiners)
+            names = [self.name] + [j.name for j in joiners]
+            refs = [self.playbook] + [j.playbook for j in joiners]
+        self.on_playbooks(refs)
         for j in joiners:
             try:
                 message = _quickstart_message({"type": "lobby", "players": names}, self.quickstart)
+                message.update(playbooks=refs, books_version=books.VERSION)
                 _send(j.sock, _draft_message(message, self.draft))
             except OSError:
                 pass
@@ -269,6 +278,14 @@ class LobbyHost:
         except (StopIteration, OSError, ValueError):
             sock.close()
             return
+        if not isinstance(hello, dict):
+            sock.close()
+            return
+        try:
+            personal_book = books.parse_descriptor(hello.get("playbook"))
+        except ValueError:
+            sock.close()
+            return
         name = str(hello.get("name") or "Player")[:24]
         reason, action = None, ""
         content = nsr_content.room_content_reason(self.content, hello.get("content"))
@@ -288,10 +305,18 @@ class LobbyHost:
             reason = (f"Game setup mismatch: yours is {hello.get('fingerprint')}, the host's is "
                       f"{self.fingerprint}. Everyone needs the same Reborn version, patches.")
         with self._lock:
+            # Admission and capability checks share the roster lock. Otherwise
+            # simultaneous old/custom joiners could each inspect a stale roster.
+            if reason is None and (self.playbook or personal_book or any(j.playbook for j in self._joiners)):
+                if (hello.get("books_version") != books.VERSION or
+                        any(j.books_version != books.VERSION for j in self._joiners)):
+                    reason = "Everyone needs the latest launcher for custom playbooks."
+            if reason is None and self._closed:
+                reason = "The host already started or closed this lobby."
             if reason is None and len(self._joiners) + 1 >= MAX_PLAYERS:
                 reason = "The lobby is full (4 players)."
             if reason is None:
-                self._joiners.append(_Joiner(name, sock, address))
+                self._joiners.append(_Joiner(name, sock, address, personal_book, hello.get("books_version", 0)))
         if reason:
             self.on_reject(name, reason)  # before replying, so the host's UI is never behind
             try:
@@ -326,14 +351,16 @@ class LobbyHost:
         if players < 2:
             self._closed = False
             raise ValueError("Need at least one other player to start.")
+        refs = [self.playbook] + [j.playbook for j in joiners]
         seed = secrets.randbits(32)  # per-match RNG seed, sent to everyone
         for k, j in enumerate(joiners, start=1):
             _send(j.sock, {"type": "start", "player": k, "players": players, "delay": delay,
-                           "seed": seed, "mode": mode, "quickstart": self.quickstart, "draft": self.draft})
+                           "seed": seed, "mode": mode, "quickstart": self.quickstart, "draft": self.draft,
+                           "playbooks": refs})
             j.sock.close()
         self._server.close()
         return StartInfo(0, players, delay, "", seed=seed, mode=mode,
-                         quickstart=self.quickstart, draft=draft_settings(self.draft))
+                         quickstart=self.quickstart, draft=draft_settings(self.draft), playbooks=refs)
 
     def close(self) -> None:
         self._closed = True
@@ -354,7 +381,9 @@ def join(host: str, name: str, fingerprint: str,
          cancel: threading.Event | None = None, port: int = PORT,
          mode: str = RELEASE_MODE, content: dict | None = None,
          on_game_mode: Callable[[str], None] = lambda selected: None,
-         on_draft: Callable[[dict], None] = lambda selected: None) -> StartInfo:
+         on_draft: Callable[[dict], None] = lambda selected: None,
+         playbook: dict | None = None,
+         on_playbooks: Callable[[list], None] = lambda selected: None) -> StartInfo:
     """Connect to a host's lobby and wait for Start. Raises ConnectionError
     with a readable reason if refused, closed, or unreachable."""
     if ":" in host:
@@ -370,9 +399,11 @@ def join(host: str, name: str, fingerprint: str,
     _check_mode(mode)
     _send(sock, _with_content({"type": "hello", "name": name, "fingerprint": fingerprint,
                                "version": PROTOCOL_VERSION, "mode": mode,
-                               "quickstart_version": QUICKSTART_VERSION, "draft_version": DRAFT_VERSION}, content))
+                               "quickstart_version": QUICKSTART_VERSION, "draft_version": DRAFT_VERSION,
+                               "playbook": playbook, "books_version": books.VERSION}, content))
     buf = b""
     shown_draft = None
+    shown_books = []
     try:
         while True:
             if cancel and cancel.is_set():
@@ -390,6 +421,10 @@ def join(host: str, name: str, fingerprint: str,
                 kind = msg.get("type")
                 if kind == "lobby":
                     on_lobby(list(msg["players"]))
+                    shown_books = books.room_set(msg.get("playbooks"), len(msg["players"]))
+                    if playbook and playbook not in shown_books:
+                        raise ConnectionError("Room service did not retain your playbook. Update the service.")
+                    on_playbooks(shown_books)
                     on_game_mode(quickstart_id(msg.get("quickstart")))
                     current_draft = draft_settings(msg.get("draft"))
                     if shown_draft is not None and shown_draft != current_draft:
@@ -401,6 +436,8 @@ def join(host: str, name: str, fingerprint: str,
                 elif kind == "closed":
                     raise ConnectionError("The host closed the lobby.")
                 elif kind == "start":
+                    if shown_books != books.room_set(msg.get("playbooks"), int(msg["players"])):
+                        raise ConnectionError("Room playbooks changed at start; rejoin.")
                     if shown_draft != draft_settings(msg.get("draft")):
                         raise ConnectionError("The host changed the draft setup; rejoin the room.")
                     agreed = _agreed_mode(msg, mode, "The host")
@@ -408,7 +445,8 @@ def join(host: str, name: str, fingerprint: str,
                                      int(msg.get("delay", 2)), address,
                                      seed=int(msg.get("seed", 0x13579BDF)), mode=agreed,
                                      quickstart=quickstart_id(msg.get("quickstart")),
-                                     draft=draft_settings(msg.get("draft")))
+                                     draft=draft_settings(msg.get("draft")),
+                                     playbooks=books.room_set(msg.get("playbooks"), int(msg["players"])))
     finally:
         sock.close()
 
@@ -445,6 +483,8 @@ class RoomHost:
     content: dict | None = None  # our nsr_content descriptor (sent with create)
     quickstart: str = "manual"
     draft: dict | None = None
+    playbook: dict | None = None
+    on_playbooks: Callable[[list], None] = lambda selected: None
     code: str = ""
     _sock: socket.socket | None = None
     _start: StartInfo | None = None
@@ -463,7 +503,8 @@ class RoomHost:
                                          "version": RENDEZVOUS_VERSION, "mode": _check_mode(self.mode),
                                          "quickstart": quickstart_id(self.quickstart),
                                          "quickstart_version": QUICKSTART_VERSION,
-                                         "draft": self.draft, "draft_version": DRAFT_VERSION},
+                                         "draft": self.draft, "draft_version": DRAFT_VERSION,
+                                         "playbook": self.playbook, "books_version": books.VERSION},
                                         self.content))
         lines = _lines(self._sock)
         first = next(lines, None)
@@ -475,6 +516,10 @@ class RoomHost:
         if draft_settings(first.get("draft")) != self.draft:
             self.close()
             raise ConnectionError("This room server needs an update for Pickup drafting. Use Alternating / Stock for now.")
+        if self.playbook and first.get("books_version") != books.VERSION:
+            self.close()
+            raise ConnectionError("The room service needs an update for custom playbooks.")
+        self._shown_books = [self.playbook]
         self.code = first["code"]
         self._sock.settimeout(None)
         threading.Thread(target=self._read, args=(lines,), daemon=True).start()
@@ -486,11 +531,17 @@ class RoomHost:
                 kind = msg.get("type")
                 if kind == "lobby":
                     self.on_change(list(msg["players"]))
+                    self._shown_books = books.room_set(msg.get("playbooks"), len(msg["players"]))
+                    self.on_playbooks(self._shown_books)
                 elif kind == "error":
                     self.on_error(msg.get("reason", "error"))
                 elif kind == "start":
                     try:
                         self._start = _start_info(msg, self.rendezvous, self.mode)
+                        if self._start.playbooks != self._shown_books:
+                            raise ConnectionError("Room playbooks changed at start; reopen the room.")
+                        if self.playbook and self._start.playbooks[0] != self.playbook:
+                            raise ConnectionError("Room service lost your playbook; update it.")
                         if self._start.draft != self.draft:
                             raise ConnectionError("The room server changed the draft setup; reopen the room.")
                         if self._start.quickstart != self.quickstart:
@@ -543,7 +594,8 @@ def _start_info(msg: dict, rendezvous: str, expected_mode: str = RELEASE_MODE) -
                      mode=mode, room_code=str(msg.get("code", ""))[:16],
                      telemetry_url=str(telemetry.get("url", "")),
                      telemetry_token=str(telemetry.get("token", "")),
-                     quickstart=quickstart_id(msg.get("quickstart")), draft=draft_settings(msg.get("draft")))
+                     quickstart=quickstart_id(msg.get("quickstart")), draft=draft_settings(msg.get("draft")),
+                     playbooks=books.room_set(msg.get("playbooks"), int(msg["players"])))
 
 
 def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
@@ -551,7 +603,9 @@ def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
               cancel: threading.Event | None = None, mode: str = RELEASE_MODE,
               content: dict | None = None,
               on_game_mode: Callable[[str], None] = lambda selected: None,
-              on_draft: Callable[[dict], None] = lambda selected: None) -> StartInfo:
+              on_draft: Callable[[dict], None] = lambda selected: None,
+              playbook: dict | None = None,
+              on_playbooks: Callable[[list], None] = lambda selected: None) -> StartInfo:
     """Join a room by code and wait for the host's Start. Raises
     ConnectionError with a readable reason if refused, closed, or unreachable."""
     host, port = _split(rendezvous, RENDEZVOUS_PORT)
@@ -563,9 +617,11 @@ def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
     _check_mode(mode)
     _send(sock, _with_content({"type": "join", "code": code, "name": name, "fingerprint": fingerprint,
                                "version": RENDEZVOUS_VERSION, "mode": mode,
-                               "quickstart_version": QUICKSTART_VERSION, "draft_version": DRAFT_VERSION}, content))
+                               "quickstart_version": QUICKSTART_VERSION, "draft_version": DRAFT_VERSION,
+                               "playbook": playbook, "books_version": books.VERSION}, content))
     buf = b""
     shown_draft = None
+    shown_books = []
     try:
         while True:
             if cancel and cancel.is_set():
@@ -583,6 +639,10 @@ def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
                 kind = msg.get("type")
                 if kind == "lobby":
                     on_lobby(list(msg["players"]))
+                    shown_books = books.room_set(msg.get("playbooks"), len(msg["players"]))
+                    if playbook and playbook not in shown_books:
+                        raise ConnectionError("Room service did not retain your playbook. Update the service.")
+                    on_playbooks(shown_books)
                     on_game_mode(quickstart_id(msg.get("quickstart")))
                     current_draft = draft_settings(msg.get("draft"))
                     if shown_draft is not None and shown_draft != current_draft:
@@ -594,6 +654,8 @@ def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
                 elif kind == "closed":
                     raise ConnectionError(msg.get("reason", "Refused."))
                 elif kind == "start":
+                    if shown_books != books.room_set(msg.get("playbooks"), int(msg["players"])):
+                        raise ConnectionError("Room playbooks changed at start; rejoin.")
                     if shown_draft != draft_settings(msg.get("draft")):
                         raise ConnectionError("The room server changed the draft setup; rejoin the room.")
                     return _start_info(msg, rendezvous, mode)

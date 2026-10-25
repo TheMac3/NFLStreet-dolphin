@@ -144,6 +144,7 @@ add_library(core
   NSR/NSRQuickstart.h
   NSR/NSRBootAgreement.h
   NSR/NSRContent.cpp
+  NSR/NSRPlaybooks.h
   NSR/NSRDraft.h
   NSR/NSRContent.h
   NSR/NSRContentRead.h

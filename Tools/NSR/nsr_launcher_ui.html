@@ -273,6 +273,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
           <div class="info" id="hostQuality" aria-live="polite"></div>
           <div class="note" id="hostDelayWarning" role="status" style="color:var(--red)"></div>
           <div class="note" id="hostDraft"></div>
+          <div class="note" id="hostBooks"></div>
           <div class="info" id="hostInfo"></div>
         </div>
         <div class="card players"><div class="ph"><h3>Players</h3><span class="faint" id="hostSlots">0 / 4</span></div><ol id="hostPlayers"></ol></div>
@@ -293,6 +294,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
           <div class="info" id="joinQuality" aria-live="polite"></div>
           <div class="note" id="joinDelayWarning" role="status" style="color:var(--red)"></div>
           <div class="info" id="joinInfo"></div><div class="note" id="joinGameMode"></div><div class="note" id="joinDraft"></div>
+          <div class="note" id="joinBooks"></div>
         </div>
         <div class="card players"><div class="ph"><h3>Players</h3><span class="faint" id="joinSlots">–</span></div><ol id="joinPlayers"></ol></div>
       </div>
@@ -340,6 +342,11 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
           <div class="toggle" id="gameStats"><div class="switch"></div><div><b>Upload game results to Mason's server</b>
             <div class="note" style="margin-top:4px">For the shared Stats page: final scores and box-score stats of the games you finish in NFLStreetRollback (saved after the Game Stats/MVP screens), your name and a random ID for this install. Never other files, folder paths, or your PC's name. Off: nothing is uploaded.</div>
             <div class="note" id="gameStatsText" style="margin-top:4px"></div></div></div>
+        </div>
+        <div class="card"><div class="label">My playbook</div>
+          <div class="note">On the editor website, open My playbooks and link this launcher once. Publish your choices, then fetch them here before opening a room. Teammates use the lowest-numbered pad’s book.</div>
+          <div class="info" id="bookText"></div><code id="bookLink" style="display:block;overflow-wrap:anywhere;user-select:all"></code>
+          <div class="row"><button class="btn" id="btnBookLink">Show private link code</button><button class="btn" id="btnBookFetch">Fetch my playbook</button><button class="btn" id="btnBookDefault">Use game default</button></div>
         </div>
         <div class="card"><div class="label" style="margin-bottom:8px">Graphics: internal resolution</div>
           <div class="seg" id="resSeg"></div>
@@ -551,6 +558,9 @@ function render(s) {
   setText("hostDraft", "Pickup draft: " + (draftOrder[g.draft_order] || "Alternating")
     + " · First pick: " + (draftFirst[g.draft_first] || "Select Controller"));
   setText("joinDraft", j.draft_label || "");
+  setText("hostBooks", h.playbooks || ""); setText("joinBooks", j.playbooks || "");
+  setText("bookText", (s.playbook || {}).text || "Game default");
+  setText("bookLink", (s.playbook || {}).link_code || "");
   $("draftOrder").value = g.draft_order || "alternating";
   $("draftFirst").value = g.draft_first || "stock";
   enable("draftOrder", setupIdle); enable("draftFirst", setupIdle);
@@ -595,6 +605,9 @@ function wire() {
   $("btnSetup").onclick = () => call("setup_controllers");
   $("nameIn").onchange = () => call("set_name", $("nameIn").value.trim());
   $("telemetry").onclick = () => call("set_telemetry", !(S.snap && S.snap.telemetry));
+  $("btnBookLink").onclick = () => call("show_playbook_link");
+  $("btnBookFetch").onclick = () => call("refresh_playbook");
+  $("btnBookDefault").onclick = () => call("use_default_playbook");
   $("gameStats").onclick = () => call("set_game_stats", !(S.snap && S.snap.game_stats && S.snap.game_stats.enabled));
   // Stage both choices together; the backend clears readiness until rebuilt.
   $("draftOrder").onchange = $("draftFirst").onchange = () => call("set_draft", $("draftOrder").value, $("draftFirst").value);
