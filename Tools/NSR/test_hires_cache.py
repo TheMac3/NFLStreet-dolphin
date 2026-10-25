@@ -27,7 +27,7 @@ def main():
     reference = next(row for row in commands if row["file"].endswith("/CustomResourceManager.cpp"))
     objects = []
     for name in ("Source/Core/VideoCommon/Assets/CustomResourceManager.cpp",
-                 "Source/Core/VideoCommon/Assets/CustomAsset.cpp", "Tools/NSR/NSRHiresCacheTest.cpp"):
+                 "Source/Core/VideoCommon/Assets/CustomAsset.cpp", "Tools/NSR/NSRRollbackNetplayTest.cpp"):
         command = shlex.split(reference["command"])
         index = command.index("-o")
         del command[index:index + 2]
@@ -37,7 +37,7 @@ def main():
         objects.append(str(obj))
         command += ["-ffunction-sections", "-fdata-sections", "-UNDEBUG", "-c", str(root / name), "-o", str(obj)]
         if name.endswith("Test.cpp"):
-            command += ["-Werror"]
+            command += ["-Werror", "-DNSR_HIRES_CACHE_TEST"]
         subprocess.run(command, cwd=reference["directory"], check=True)
     binary = out / "hires-cache-test"
     subprocess.run(["g++", "-Wl,--gc-sections", *objects, "-o", str(binary)], check=True)
