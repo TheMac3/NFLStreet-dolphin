@@ -6765,15 +6765,16 @@ struct MenuDelayProposal
   u8 source = 0;
 };
 
-static MenuDelayProposal ProposeMenuDelay()
+static MenuDelayProposal ProposeMenuDelay(bool startup)
 {
   // An explicit host-only diagnostic override makes paired fixed/adaptive
   // proxy measurements possible. Production launchers sanitize NSR_* inputs.
   if (const auto fixed = ParseU32(Env("NSR_MENU_DELAY")))
     return {static_cast<u8>(std::clamp<u32>(*fixed, 2, 12)), 0, 0, 3};
   auto& s = s_session;
+  const u8 cap = startup ? RollbackNet::MENU_DELAY_STARTUP_MAX : RollbackNet::MENU_DELAY_MAX;
   if (const auto probe = ProposeInputDelay(); probe.measured)
-    return {RollbackNet::MenuInputDelay(probe.one_way_dms / 10.0, probe.jitter_dms / 10.0),
+    return {std::min(cap, RollbackNet::MenuInputDelay(probe.one_way_dms / 10.0, probe.jitter_dms / 10.0)),
             probe.one_way_dms, probe.jitter_dms, 2};
   std::array<std::vector<u32>, MAX_PLAYERS> rtts, variances;
   const u32 now = HostNowUs();
@@ -6810,8 +6811,8 @@ static MenuDelayProposal ProposeMenuDelay()
   }
   Log("menu delay measurement: ENet median {}, worst one-way {:.1f} ms jitter {:.1f} ms",
       measured ? "ready" : "insufficient; fallback", one_way, jitter);
-  return {measured ? RollbackNet::MenuInputDelay(one_way, jitter) :
-              static_cast<u8>(std::clamp<u32>(s.delay, 2, 12)),
+  return {measured ? std::min(cap, RollbackNet::MenuInputDelay(one_way, jitter)) :
+              static_cast<u8>(std::clamp<u32>(s.delay, 2, cap)),
           static_cast<u16>(std::clamp(one_way * 10.0, 0.0, 65535.0)),
           static_cast<u16>(std::clamp(jitter * 10.0, 0.0, 65535.0)),
           static_cast<u8>(measured ? 1 : 0)};
@@ -6866,7 +6867,7 @@ static bool AgreeStartupMenuDelay(u32 frame)
     }
     Service(1);
   }
-  const MenuDelayProposal menu = s.me == 0 ? ProposeMenuDelay() : MenuDelayProposal{};
+  const MenuDelayProposal menu = s.me == 0 ? ProposeMenuDelay(true) : MenuDelayProposal{};
   OpenHandoffBarrier({static_cast<u8>(s.players), static_cast<u8>(s.me),
                       RollbackNet::HandoffKind::StartMenus, 0x7fffffff, frame, 0, {},
                       0, 0, 0, 0, 0, menu.delay, menu.one_way_dms, menu.jitter_dms, menu.source});
@@ -6940,7 +6941,7 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
                                   ProposeInputDelay() :
                                   DelayProposal{};
   const MenuDelayProposal menu = kind == RollbackNet::HandoffKind::LeaveRollback && s.me == 0 ?
-                                  ProposeMenuDelay() : MenuDelayProposal{};
+                                  ProposeMenuDelay(false) : MenuDelayProposal{};
   OpenHandoffBarrier({static_cast<u8>(s.players), static_cast<u8>(s.me), kind, transition, frame,
                       semantic, config, sync_clock, sync_aux_clock, delay.delay,
                       delay.one_way_dms, delay.jitter_dms, menu.delay, menu.one_way_dms,

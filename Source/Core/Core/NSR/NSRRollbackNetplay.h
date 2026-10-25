@@ -224,6 +224,11 @@ std::uint8_t AutoInputDelay(double one_way_ms, double jitter_ms, const AutoDelay
 // and one frame for service/relay scheduling. 2..12 frames bounds both local
 // responsiveness and history use (legacy redundancy is 32 frames). Revisit
 // the upper bound if supported links need more than about 180 ms one way.
+// Menu delay bounds. The session-start choice is measured while both PCs are
+// still booting (stalls inflate latency and jitter), so it is capped lower; the
+// post-match re-measurement uses settled samples and may go up to the max.
+constexpr std::uint8_t MENU_DELAY_MAX = 6;
+constexpr std::uint8_t MENU_DELAY_STARTUP_MAX = 3;
 std::uint8_t MenuInputDelay(double one_way_ms, double jitter_ms);
 // Median over a bounded window rejects isolated ENet retransmission spikes.
 // No estimate until six fresh ACKs exist; callers retain the previous delay.

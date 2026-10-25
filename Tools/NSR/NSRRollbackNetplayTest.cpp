@@ -2086,11 +2086,12 @@ static void TestAutoInputDelay()
 static void TestMenuDelay()
 {
   assert(RN::MenuInputDelay(10, 2) == 2);
-  assert(RN::MenuInputDelay(35, 6) == 4);
-  assert(RN::MenuInputDelay(55, 8) == 5);
-  assert(RN::MenuInputDelay(75, 10) == 7);
+  assert(RN::MenuInputDelay(35, 6) == 3);   // ~70 ms RTT link
+  assert(RN::MenuInputDelay(55, 8) == 4);   // ~110 ms RTT
+  assert(RN::MenuInputDelay(75, 10) == 5);  // ~150 ms RTT
+  assert(RN::MenuInputDelay(75, 70) == 6);  // 2026-10-24 boot-time sample: capped, was 10
   assert(RN::MenuInputDelay(-10, -2) == 2);
-  assert(RN::MenuInputDelay(10000, 10000) == 12);
+  assert(RN::MenuInputDelay(10000, 10000) == RN::MENU_DELAY_MAX);
   assert(RN::MenuInputDelay(std::numeric_limits<double>::infinity(), 0) == 2);
   assert(!RN::MenuMedian(std::array<std::uint32_t, 5>{1, 2, 3, 4, 5}));
   assert(RN::MenuMedian(std::array<std::uint32_t, 7>{70, 71, 69, 72, 68, 70, 1800}) == 70);

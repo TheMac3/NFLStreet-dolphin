@@ -235,13 +235,19 @@ std::uint8_t AutoInputDelay(double one_way_ms, double jitter_ms, const AutoDelay
   return static_cast<std::uint8_t>(clamped);
 }
 
+// Menu lockstep delay. Lockstep only stalls when an input is still in flight,
+// so the bound is one-way latency plus a margin; jitter is spiky, so it counts
+// at half weight. Capped at 6 frames (~100 ms): beyond that menus feel broken,
+// and fixed delay 2 played acceptably on a 73 ms RTT link for weeks. Real
+// playtest 2026-10-24: a boot-time probe (one-way 75 ms, jitter 70 ms, while
+// both PCs were still loading) produced 10 frames for the whole menu session.
 std::uint8_t MenuInputDelay(double one_way_ms, double jitter_ms)
 {
   if (!std::isfinite(one_way_ms) || !std::isfinite(jitter_ms))
     return 2;
-  const double frames = std::ceil((std::max(0.0, one_way_ms) + std::max(0.0, jitter_ms)) /
-                                  (FRAME_US / 1000.0)) + 1.0;
-  return static_cast<std::uint8_t>(std::clamp(frames, 2.0, 12.0));
+  const double frames = std::ceil((std::max(0.0, one_way_ms) + 0.5 * std::max(0.0, jitter_ms)) /
+                                  (FRAME_US / 1000.0));
+  return static_cast<std::uint8_t>(std::clamp(frames, 2.0, static_cast<double>(MENU_DELAY_MAX)));
 }
 
 std::optional<std::uint32_t> MenuMedian(std::span<const std::uint32_t> samples)
