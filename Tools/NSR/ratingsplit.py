@@ -1,6 +1,6 @@
 """Select runtime split releases and retain the legacy GN7E69-r0 PPVL builder.
 
-New split releases use an agreed v3 boot bundle and leave the image unchanged.
+New split releases use an agreed v4 boot bundle and leave the image unchanged.
 For legacy local PPVL image builds only, PLAY bit 790 (seven bits, no EA
 descriptor) compiles into isopatch's bounded name-hash table. No game bytes or
 roster rows are distributed. See docs/ratingsplit.md.
@@ -59,12 +59,12 @@ def enabled(rows: list[dict]) -> bool:
 
 
 def runtime_splits(rows: list[dict]) -> bool:
-    """The signed release uses v3 runtime semantics for either split."""
+    """The signed release uses v4 runtime semantics for either split."""
     return any(row.get("field") in ("PPVL", "PCEL") for row in rows)
 
 
 def requires_runtime(rows: list[dict]) -> bool:
-    """PCEL's new acceleration consumer requires the v3 runtime policy."""
+    """PCEL's new acceleration consumer requires the v4 runtime policy."""
     return any(row.get("field") == "PCEL" for row in rows)
 
 

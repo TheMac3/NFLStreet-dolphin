@@ -78,12 +78,31 @@ real two-PC qualification. No game image, roster records or dumps belong in
 this repository. Revisit broader balancing after those cases have matched
 controls, rather than changing every native rating consumer at once.
 
-Linux qualification on 2026-10-24: stock and full-roster both-split forced
+Linux qualification on 2026-10-25: stock and full-roster both-split forced
 rollback pass RNG/whole-RAM/ARAM checks; both two-human proxy runs pass with
 zero differing game bytes at the requested live checkpoints. Quick regression
-passes 7 cases (2 expected skips), 445 Python tests pass, and the strict C++20
+passes 7 cases (2 expected skips), 478 Python tests pass, and the strict C++20
 socket-free suite passes. A matched normal throw changes velocity while
 preserving its target/error. An isolated native-motion control holds PSPD,
 rest state and native cap fixed: PCEL 1/99 reaches 95% of the same cap in
 46/23 native steps. This controlled function-level experiment is separate
 from the unmodified-image gameplay gates and broader AI/platform testing.
+
+Final integration is rebased onto `mine/nsr-netplay` `a0170e14e2`; the launcher
+source is rebased onto NFLStreet `de6fad8`. Both-split two-peer qualification
+also exercises the v4 ratings/draft/playbook composition. No-content and empty
+v4 controls match upstream gameplay RAM/ARAM at 3,500 and 5,000. Their 17 raw
+MEM1 differences lie entirely within the existing memory-card work-area keep
+range; no exclusion mask was added or widened.
+
+Host-cost attribution uses three quiet alternating pairs for each comparison,
+`NSR_RB_COST=1`, CPUs 6/7, 3,821 measured live frames per arm and 4,921 matching
+RNG samples per pair. Requested run26 versus the original image helper averages
++0.10%; matched modern upstream versus this build averages -0.11% for neutral
+content and -0.09% for active native-equivalent split values. These differences
+are measurement variation, not speedup claims. Monitors observe no other
+Dolphin/compiler processes. CPU frequency controls require root; clocks were
+sampled, not pinned. The original +10–40% increase does not reproduce under
+these controls; contended runs scale broadly across host GPU/DSP/step costs.
+The private task report preserves exact pairs, source/snapshot hashes, command
+lines and invalidated attempts. This is not an overhead bound for every host.
