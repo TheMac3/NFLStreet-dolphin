@@ -753,6 +753,7 @@
     <ClInclude Include="VideoCommon\GraphicsModSystem\Runtime\GraphicsModManager.h" />
     <ClInclude Include="VideoCommon\GXPipelineTypes.h" />
     <ClInclude Include="VideoCommon\HiresTextures.h" />
+    <ClInclude Include="VideoCommon\NSRHostMetrics.h" />
     <ClInclude Include="VideoCommon\ImageWrite.h" />
     <ClInclude Include="VideoCommon\IndexGenerator.h" />
     <ClInclude Include="VideoCommon\LightingShaderGen.h" />

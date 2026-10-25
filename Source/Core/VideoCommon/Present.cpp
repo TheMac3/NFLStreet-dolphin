@@ -3,6 +3,8 @@
 
 #include "VideoCommon/Present.h"
 
+#include "VideoCommon/NSRHostMetrics.h"
+
 #include "Common/ChunkFile.h"
 #include "Core/Config/GraphicsSettings.h"
 #include "Core/Config/MainSettings.h"
@@ -25,6 +27,11 @@
 #include "VideoCommon/Widescreen.h"
 
 std::unique_ptr<VideoCommon::Presenter> g_presenter;
+
+// NSR single-core rollback already skips primitives and EFB/XFB copies.
+// VI can still request a duplicate of the last live XFB while re-simulating;
+// leave host presentation/cache state alone until the final visible frame.
+extern bool g_nsr_skip_vertices;  // VertexLoaderManager.cpp
 
 namespace VideoCommon
 {
@@ -161,6 +168,8 @@ bool Presenter::FetchXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_heigh
 void Presenter::ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height, u64 ticks,
                        TimePoint presentation_time)
 {
+  if (g_nsr_skip_vertices)
+    return;
   bool is_duplicate = FetchXFB(xfb_addr, fb_width, fb_stride, fb_height, ticks);
 
   PresentInfo present_info{
@@ -214,6 +223,8 @@ void Presenter::ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height,
 
 void Presenter::ImmediateSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height)
 {
+  if (g_nsr_skip_vertices)
+    return;
   const u64 ticks = m_next_swap_estimated_ticks;
 
   FetchXFB(xfb_addr, fb_width, fb_stride, fb_height, ticks);
@@ -835,6 +846,7 @@ void Presenter::RenderXFBToScreen(const MathUtil::Rectangle<int>& target_rc,
 
 void Presenter::Present(PresentInfo* present_info)
 {
+  NSRHostMetrics::Scope host_timer(NSRHostMetrics::Present);
   m_present_count++;
 
   if (g_gfx->IsHeadless() || (!m_onscreen_ui && !m_xfb_entry))

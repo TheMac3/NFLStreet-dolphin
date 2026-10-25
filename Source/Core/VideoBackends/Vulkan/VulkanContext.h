@@ -28,6 +28,9 @@ public:
     u8 pipelineCacheUUID[VK_UUID_SIZE];
     u32 apiVersion;
     u32 driverVersion;
+    // Host diagnostics from Vulkan 1.2 driver properties (empty on older APIs).
+    char driverName[VK_MAX_DRIVER_NAME_SIZE]{};
+    char driverInfo[VK_MAX_DRIVER_INFO_SIZE]{};
     u32 vendorID;
     u32 deviceID;
     VkDeviceSize minUniformBufferOffsetAlignment;

@@ -100,7 +100,9 @@
 #include "Core/PowerPC/PPCCache.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
-#include "Core/NSR/NSRTelemetry.h"  // NSR telemetry
+#include "Core/NSR/NSRTelemetry.h"
+#include "VideoCommon/NSRHostMetrics.h"
+#include "VideoCommon/VideoConfig.h"  // NSR telemetry
 #include "Core/HW/GCPad.h"                          // NSR local pad log
 #include "Core/HW/SI/SI_Device.h"                    // NSR local pad log
 #include "InputCommon/ControllerEmu/ControllerEmu.h"  // NSR local pad log
@@ -3915,6 +3917,10 @@ void RbSave(const u8* ram, std::vector<u8>& slot)
     std::atomic<u32> fifo_skipped{0};
     std::atomic<u64> copied{0};  // NSR telemetry
     s_workers.Run(d.mem1_pages + vmem_pages, PAGE_CHUNK, [&](u32 lo, u32 hi) {
+      // Count within each disjoint chunk. Per-page atomic adds make all
+      // snapshot workers contend on the same cache line while copying RAM.
+      u32 local_skipped = 0;
+      u64 local_copied = 0;
       for (u32 p = lo; p < hi; ++p)
       {
         if (!RollbackLogic::PageNeedsCopy(d.stamp[p], since))
@@ -3923,22 +3929,24 @@ void RbSave(const u8* ram, std::vector<u8>& slot)
         {
           if (since && p >= fifo_lo && p < fifo_hi)
           {
-            fifo_skipped.fetch_add(1, std::memory_order_relaxed);
+            ++local_skipped;
             continue;
           }
-          copied.fetch_add(1, std::memory_order_relaxed);
+          ++local_copied;
           for (u32 c = d.page_first[p]; c < d.page_first[p + 1]; ++c)
             std::memcpy(slot.data() + d.chunks[c].first, ram + d.chunks[c].first,
                         d.chunks[c].second - d.chunks[c].first);
         }
         else
         {
-          copied.fetch_add(1, std::memory_order_relaxed);
+          ++local_copied;
           const u32 a = (p - d.mem1_pages) * DirtyTracker::PAGE;
           const u32 n = std::min(DirtyTracker::PAGE, s_rb.vmem_bytes - a);
           std::memcpy(slot.data() + s_rb.mem1_size + a, s_rb.vmem + a, n);
         }
       }
+      fifo_skipped.fetch_add(local_skipped, std::memory_order_relaxed);
+      copied.fetch_add(local_copied, std::memory_order_relaxed);
     });
     d.fifo_skipped += fifo_skipped.load();
     d.pages_copied += copied.load();  // NSR telemetry
@@ -7224,6 +7232,7 @@ static bool RbNetworkPreflight(u32 live)
   };
 
   auto wait_until = [&](auto predicate, std::chrono::microseconds limit, bool starvation) {
+    NSRHostMetrics::Scope host_timer(NSRHostMetrics::NetworkWait);
     const auto start = std::chrono::steady_clock::now();
     auto last_send = start;
     while (predicate() && !s.failed)
@@ -7992,6 +8001,7 @@ struct CostState
   bool active = false;
   u64 ph_step[PH_COUNT] = {};  // phase totals before RbStep
   u64 ph_unit[PH_COUNT] = {};  // ... after RbStep (unit start)
+  std::array<u64, NSRHostMetrics::Count> host_unit{};
   u64 dev_unit[2] = {};        // GPU/DSP host totals at unit start
   u64 digest_step = 0;         // state digest host ns before RbStep
   u64 digest_us = 0;           // ... spent in this unit's RbStep
@@ -8009,6 +8019,93 @@ struct CostState
   u64 prof_n[2] = {0, 0};
 };
 CostState s_cost;
+
+// Host-only per-match and five-second accounting also works with uploads off.
+// Device categories are inclusive (texture upload is inside GPU); async decode
+// runs on workers and must never be added to the CPU-thread frame budget.
+struct HostPerformance
+{
+  std::chrono::steady_clock::time_point begin;
+  std::array<u64, NSRHostMetrics::Count> baseline{};
+  u64 gpu = 0, save = 0;
+  u64 frames = 0, over = 0, window_frames = 0;
+  u64 work_us = 0, cycle_us = 0, resim_us = 0, gpu_us = 0, present_us = 0;
+  u64 save_us = 0, texture_us = 0, decode_us = 0;
+  std::array<u64, 6> window{};
+};
+HostPerformance s_host_perf;
+
+// Capture before RbStep so restore/snapshot and all re-simulated units count.
+void HostPerformanceBegin()
+{
+  NSRHostMetrics::enabled.store(true, std::memory_order_relaxed);
+  g_nsr_host_timing = true;  // NSR enforces CPUThread=False
+  s_host_perf.begin = std::chrono::steady_clock::now();
+  s_host_perf.baseline = NSRHostMetrics::Read();
+  s_host_perf.gpu = g_nsr_host_ns[0];
+  s_host_perf.save = s_phase_ns[PH_SAVE];
+}
+
+// Exclude intentional host waits from the PC-struggled hint. Scheduling delays
+// in real work remain visible; a peer's network/time-sync wait alone cannot
+// trigger advice to lower local graphics quality.
+void HostPerformanceEnd()
+{
+  namespace H = NSRHostMetrics;
+  namespace T = NSRTelemetry;
+  if (!s_rb.vtime_on || !s_rb.in_unit)
+    return;
+  auto& p = s_host_perf;
+  const auto totals = H::Read();
+  const auto delta = [&](H::Kind kind) { return (totals[kind] - p.baseline[kind]) / 1000; };
+  const u64 elapsed = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - p.begin).count());
+  const u64 waits = delta(H::NetworkWait) + delta(H::Pacing);
+  const u64 work = elapsed > waits ? elapsed - waits : 0;
+  const u64 gpu = (g_nsr_host_ns[0] - p.gpu) / 1000;
+  p.cycle_us += work;
+  p.gpu_us += gpu;
+  p.present_us += delta(H::Present);
+  p.save_us += (s_phase_ns[PH_SAVE] - p.save) / 1000;
+  p.texture_us += delta(H::TextureRequest) + delta(H::TextureUpload);
+  p.decode_us += delta(H::TextureDecode);
+  if (s_rb.in_resim)
+  {
+    p.resim_us += work;
+    T::Observe(T::Hist::ResimUnitUs, static_cast<u64>(std::chrono::duration_cast<
+        std::chrono::microseconds>(std::chrono::steady_clock::now() - s_cost.host).count()));
+    T::Observe(T::Hist::ResimGpuUs, gpu);
+    return;
+  }
+  ++p.frames;
+  ++p.window_frames;
+  if (p.cycle_us > 17535)
+    ++p.over;
+  T::Observe(T::Hist::HostWorkUs, p.cycle_us);
+  T::Observe(T::Hist::GpuUs, p.gpu_us);
+  T::Observe(T::Hist::PresentUs, p.present_us);
+  T::Observe(T::Hist::ResimUs, p.resim_us);
+  T::Observe(T::Hist::TextureLoadUs, p.texture_us);
+  T::Observe(T::Hist::TextureDecodeUs, p.decode_us);
+  // Log per-window totals separately below; telemetry histograms describe one
+  // complete live cycle (all re-sims plus the final visible frame).
+  p.work_us += p.cycle_us;
+  const std::array<u64, 6> cycle{p.gpu_us, p.present_us, p.save_us, p.resim_us, p.texture_us, p.decode_us};
+  for (size_t i = 0; i < cycle.size(); ++i)
+    p.window[i] += cycle[i];
+  p.cycle_us = 0;
+  if (p.window_frames == 300)
+  {
+    Log("performance window: live_frames={} host_work_us={} gpu_us={} present_us={} "
+        "save_us={} resim_us={} texture_load_us={} texture_decode_us={}",
+        p.window_frames, p.work_us, p.window[0], p.window[1], p.window[2], p.window[3],
+        p.window[4], p.window[5]);
+    p.window = {};
+    p.window_frames = 0;
+    p.work_us = 0;
+  }
+  p.gpu_us = p.present_us = p.save_us = p.resim_us = p.texture_us = p.decode_us = 0;
+}
 
 void ProfDump()
 {
@@ -8084,7 +8181,10 @@ void CostFrameStart(const Core::CPUThreadGuard& guard,
       ProfDump();
   }
   if (!cost || !r.vtime_on)
+  {
+    s_cost.host = std::chrono::steady_clock::now();
     return;
+  }
   s_cost.active = true;
   s_cost.step_us = std::chrono::duration_cast<std::chrono::microseconds>(
                        std::chrono::steady_clock::now() - step_start)
@@ -8098,6 +8198,7 @@ void CostFrameStart(const Core::CPUThreadGuard& guard,
   std::copy(std::begin(s_phase_ns), std::end(s_phase_ns), s_cost.ph_unit);
   std::copy(std::begin(g_nsr_host_ns), std::end(g_nsr_host_ns), s_cost.dev_unit);
   s_cost.digest_us = (s_digest.total_ns - s_cost.digest_step) / 1000;
+  s_cost.host_unit = NSRHostMetrics::Read();
   s_cost.host = std::chrono::steady_clock::now();
 }
 
@@ -8109,12 +8210,16 @@ void CostFrameEnd(const Core::CPUThreadGuard& guard)
   auto& system = guard.GetSystem();
   const auto now = std::chrono::steady_clock::now();
   const auto us = [](u64 ns) { return ns / 1000; };
+  const auto host_totals = NSRHostMetrics::Read();
+  const auto host_us = [&](NSRHostMetrics::Kind kind) {
+    return (host_totals[kind] - s_cost.host_unit[kind]) / 1000;
+  };
   const u64 tb = system.GetSystemTimers().GetFakeTimeBase();
   // Per unit: emulated time, idle-skipped and GPU cycles; host time of the
   // unit (host_us; of which gpu/dsp emulation), of RbStep before it (step_us;
   // of which save/restore/live/jit/check), and the host clock at its end.
   Log("cost frame {} resim {} tb {} idle_cyc {} gpu_cyc {} host_us {} step_us {} at {} "
-      "save {} restore {} live {} jit {} check {} gpu_us {} dsp_us {} hat {} digest {}",
+      "save {} restore {} live {} jit {} check {} gpu_us {} dsp_us {} hat {} digest {} present_us {} texture_us {} decode_us {} pace_us {}",
       s_cost.frame, s_cost.resim ? 1 : 0, tb - s_cost.tb,
       system.GetCoreTiming().GetIdleTicks() - s_cost.idle, g_nsr_gpu_cycles - s_cost.gpu,
       std::chrono::duration_cast<std::chrono::microseconds>(now - s_cost.host).count(),
@@ -8125,7 +8230,9 @@ void CostFrameEnd(const Core::CPUThreadGuard& guard)
       us(s_cost.ph_unit[PH_CHECK] - s_cost.ph_step[PH_CHECK]),
       us(g_nsr_host_ns[0] - s_cost.dev_unit[0]), us(g_nsr_host_ns[1] - s_cost.dev_unit[1]),
       std::chrono::duration_cast<std::chrono::microseconds>(now - s_cost.epoch).count(),
-      s_cost.digest_us);
+      s_cost.digest_us, host_us(NSRHostMetrics::Present),
+      host_us(NSRHostMetrics::TextureRequest) + host_us(NSRHostMetrics::TextureUpload),
+      host_us(NSRHostMetrics::TextureDecode), host_us(NSRHostMetrics::Pacing));
 }
 // Re-simulated frames run on a faster emulated machine: NSR_RB_RESIM_SPEED
 // (default 16; 1 = off) times faster CPU, and the devices whose work the
@@ -8312,6 +8419,7 @@ void RollbackFrameHook(const Core::CPUThreadGuard& guard)
       HostProfDump();
   }
   s_hp_phase = 3;
+  HostPerformanceBegin();
   const auto step_start = std::chrono::steady_clock::now();
   ppc_state.gpr[3] = RbStep(guard, RB_PAD_BUF);
   s_hp_phase = r.in_resim ? 2 : 1;
@@ -8344,6 +8452,7 @@ void RollbackFrameEndHook(const Core::CPUThreadGuard& guard)
       confirmed_through = s_rb_exchange->ConfirmedThrough();
     NSRGameStats::ObserveFrame(guard, r.tick_running, r.in_game_seen, confirmed_through);
   }
+  HostPerformanceEnd();
   CostFrameEnd(guard);
   TelemetryUnitEnd(guard);  // NSR telemetry
   s_hp_phase = 0;
@@ -10636,6 +10745,14 @@ void TelemetryUnitEnd(const Core::CPUThreadGuard& guard)
 
 void TelemetrySessionEnter()
 {
+  // Entry runs inside RbStep: preserve this unit's clock while clearing the
+  // previous match's totals, so the first frame never measures host uptime.
+  HostPerformance fresh;
+  fresh.begin = s_host_perf.begin;
+  fresh.baseline = s_host_perf.baseline;
+  fresh.gpu = s_host_perf.gpu;
+  fresh.save = s_host_perf.save;
+  s_host_perf = fresh;
   NSRTelemetry::Rearm();  // a new boot after a previous core shutdown
   if (!NSRTelemetry::Enabled())
     return;
@@ -10667,6 +10784,11 @@ void TelemetrySessionEnter()
 
 void TelemetrySessionLeave(const char* reason)
 {
+  if (s_host_perf.frames != 0)
+  {
+    Log("performance summary: live_frames={} over_budget={}", s_host_perf.frames, s_host_perf.over);
+    s_host_perf.frames = s_host_perf.over = 0;
+  }
   namespace T = NSRTelemetry;
   if (!T::Enabled())
     return;
@@ -10693,7 +10815,7 @@ void TelemetryShutdown()
   const Session& s = s_session;
   // Shutdown runs before LeaveRollbackSession("core shutdown"), whose own
   // telemetry call would then be a no-op: report the leave first.
-  if (s_rb.vtime_on && T::Enabled())
+  if (s_rb.vtime_on)
     TelemetrySessionLeave("core shutdown");
   TelemetryAudioGauges();
   T::Shutdown(s.failed ? "netplay failure (NSR stopped the core)" : "core stop",
@@ -10719,6 +10841,26 @@ void TelemetryNetplayStart()
   namespace T = NSRTelemetry;
   const Session& s = s_session;
   T::StartInfo info;
+  info.gpu = g_backend_info.AdapterName;
+  info.driver = g_backend_info.DriverDescription;
+  const int adapter_index = g_ActiveConfig.iAdapter;
+  if (adapter_index >= 0 && static_cast<size_t>(adapter_index) < g_backend_info.Adapters.size())
+  {
+    info.gpu = g_backend_info.Adapters[static_cast<size_t>(adapter_index)];
+    if (static_cast<size_t>(adapter_index) < g_backend_info.AdapterDriverVersions.size())
+      info.driver = g_backend_info.AdapterDriverVersions[static_cast<size_t>(adapter_index)];
+  }
+  info.backend = Config::Get(Config::MAIN_GFX_BACKEND);
+  info.resolution = g_ActiveConfig.iEFBScale;
+  info.hd_textures = g_ActiveConfig.bHiresTextures;
+  info.texture_count = NSRHostMetrics::texture_count.load(std::memory_order_relaxed);
+  info.vsync = g_ActiveConfig.bVSync;
+  info.fullscreen = Config::Get(Config::MAIN_FULLSCREEN);
+  info.speed_limit = static_cast<double>(Config::Get(Config::MAIN_EMULATION_SPEED));
+  Log("presentation: gpu={} driver={} backend={} resolution={} hd_textures={} textures={} "
+      "vsync={} fullscreen={} speed_limit={}", info.gpu, info.driver, info.backend,
+      info.resolution, info.hd_textures, info.texture_count, info.vsync, info.fullscreen,
+      info.speed_limit);
   info.phase = T::Phase::LockstepMenu;
   info.players = s.players;
   info.delay = s.delay;

@@ -123,14 +123,22 @@ private:
     // Inserts or moves the asset to the top of the queue.
     void MakeAssetHighestPriority(u64 asset_handle, CustomAsset* asset)
     {
-      RemoveAsset(asset_handle);
-      m_assets.push_front(asset);
-
-      // See CreateAsset for how a handle gets defined
+      // Loaded HD textures hit this on every cache lookup. Move the existing
+      // node instead of freeing/reallocating it; the priority order and handle
+      // lookup remain identical, including repeated requests for the front.
       if (asset_handle >= m_iterator_lookup.size())
         m_iterator_lookup.resize(asset_handle + 1, m_assets.end());
-
-      m_iterator_lookup[asset_handle] = m_assets.begin();
+      auto& iter = m_iterator_lookup[asset_handle];
+      if (iter != m_assets.end())
+      {
+        *iter = asset;
+        m_assets.splice(m_assets.begin(), m_assets, iter);
+      }
+      else
+      {
+        m_assets.push_front(asset);
+        iter = m_assets.begin();
+      }
     }
 
     // Inserts an asset at lowest priority or

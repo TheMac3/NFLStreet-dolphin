@@ -22,7 +22,7 @@ bool LoadLibraries();
 void UnloadLibraries();
 
 // Returns a list of D3D device names.
-std::vector<std::string> GetAdapterNames();
+std::vector<std::string> GetAdapterNames(std::vector<std::string>* driver_versions = nullptr);
 
 // Helper function which creates a DXGI factory.
 Microsoft::WRL::ComPtr<IDXGIFactory> CreateDXGIFactory(bool debug_device);

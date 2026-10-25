@@ -3,6 +3,8 @@
 
 #include "VideoCommon/Assets/CustomAssetLoader.h"
 
+#include "VideoCommon/NSRHostMetrics.h"
+
 #include <fmt/format.h>
 
 #include "Common/Logging/Log.h"
@@ -98,7 +100,11 @@ void CustomAssetLoader::WorkerThreadRun(u32 thread_index)
     // Unload previously loaded asset.
     m_change_in_memory -= item->Unload();
 
-    const std::size_t bytes_loaded = item->Load();
+    std::size_t bytes_loaded = 0;
+    {
+      NSRHostMetrics::Scope host_timer(NSRHostMetrics::TextureDecode);
+      bytes_loaded = item->Load();
+    }
     m_change_in_memory += s64(bytes_loaded);
 
     load_lock.lock();

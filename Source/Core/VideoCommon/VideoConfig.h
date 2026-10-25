@@ -134,6 +134,9 @@ struct BackendInfo
 
   // TODO: merge AdapterName and Adapters array
   std::string AdapterName;  // for OpenGL
+  // Host diagnostics only; never part of the simulation/config fingerprint.
+  std::string DriverDescription;
+  std::vector<std::string> AdapterDriverVersions;  // DXGI, same order as Adapters
 
   u32 MaxTextureSize = 16384;
   bool bUsesLowerLeftOrigin = false;

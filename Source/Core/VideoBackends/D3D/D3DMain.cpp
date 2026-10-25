@@ -117,7 +117,7 @@ void VideoBackend::FillBackendInfo()
   g_backend_info.bSupportsDynamicVertexLoader = false;
   g_backend_info.bSupportsHDROutput = true;
 
-  g_backend_info.Adapters = D3DCommon::GetAdapterNames();
+  g_backend_info.Adapters = D3DCommon::GetAdapterNames(&g_backend_info.AdapterDriverVersions);
   g_backend_info.AAModes = D3D::GetAAModes(g_Config.iAdapter);
 
   // Override optional features if we are actually booting.

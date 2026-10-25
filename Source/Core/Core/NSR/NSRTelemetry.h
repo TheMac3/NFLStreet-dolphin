@@ -145,6 +145,14 @@ enum class Hist : std::uint8_t
   TimeSyncWaitUs,          // host wait per time-sync yield
   NetStallUs,              // host wait per prediction-window stall
   LockstepWaitUs,          // lockstep menus: host wait per frame for the peers' pads
+  HostWorkUs,              // whole live cycle incl re-sims, minus network/pacing waits
+  GpuUs,                   // inclusive GPU command work per live cycle (SC only)
+  PresentUs,               // host presentation (can overlap GPU, not additive)
+  ResimUs,                 // re-simulated units plus their snapshot/restore steps
+  TextureLoadUs,           // texture requests + GPU uploads (subset of GPU)
+  TextureDecodeUs,         // background worker time; never a CPU-thread stall
+  ResimUnitUs,             // one re-simulated unit, excluding its preceding step
+  ResimGpuUs,              // GPU subset of one re-simulated unit
   Count
 };
 
@@ -251,6 +259,12 @@ struct RollbackInfo
 // the headers alone, before any handoff could refuse them) and the topology.
 struct StartInfo
 {
+  // Presentation facts are host-only and may differ between peers.
+  std::string gpu, driver, backend;
+  int resolution = 0;
+  std::uint64_t texture_count = 0;
+  bool hd_textures = false, vsync = false, fullscreen = false;
+  double speed_limit = 1.0;
   Phase phase = Phase::LockstepMenu;  // the phase the header reports
   std::uint64_t config_digest = 0;
   // Boot settings before guest boot; rollback initialization after RbInit.

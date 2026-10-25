@@ -3,6 +3,8 @@
 
 #include "VideoCommon/TextureCacheBase.h"
 
+#include "VideoCommon/NSRHostMetrics.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -1623,6 +1625,7 @@ RcTcacheEntry TextureCacheBase::CreateTextureEntry(
   RcTcacheEntry entry;
   if (custom_texture_data)
   {
+    NSRHostMetrics::Scope host_timer(NSRHostMetrics::TextureUpload);
     const u32 texLevels = no_mips ? 1 : (u32)custom_texture_data->m_slices[0].m_levels.size();
     const auto& first_level = custom_texture_data->m_slices[0].m_levels[0];
     const TextureConfig config(first_level.width, first_level.height, texLevels, 1, 1,

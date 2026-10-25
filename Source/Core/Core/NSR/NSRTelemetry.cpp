@@ -88,6 +88,8 @@ constexpr std::array<const char*, static_cast<size_t>(Hist::Count)> HIST_NAMES{
     "save_us",         "restore_us",        "live_ranges_us",  "jit_us",
     "check_us",        "net_rtt_us",        "remote_input_late_frames",
     "prediction_frames", "time_sync_wait_us", "net_stall_us", "lockstep_wait_us",
+    "host_work_us", "gpu_us", "present_us", "resim_us", "texture_load_us", "texture_decode_us",
+    "resim_unit_us", "resim_gpu_us",
 };
 constexpr std::array<const char*, static_cast<size_t>(EventKind::Count)> EVENT_NAMES{
     "session_enter", "session_leave", "desync",            "peer_desync", "hang",
@@ -533,6 +535,16 @@ std::string HeaderJson()
   if (s_have_start)
   {
     const StartInfo& st = s_start;
+    out += ",\"presentation\":{\"gpu\":";
+    JsonString(out, st.gpu);
+    out += ",\"driver\":";
+    JsonString(out, st.driver);
+    out += ",\"backend\":";
+    JsonString(out, st.backend);
+    out += fmt::format(",\"internal_resolution\":{},\"hd_textures\":{},\"texture_count\":{},"
+                       "\"vsync\":{},\"fullscreen\":{},\"speed_limit\":{}}}",
+                       st.resolution, st.hd_textures, st.texture_count, st.vsync,
+                       st.fullscreen, st.speed_limit);
     out += fmt::format(",\"netplay\":{{\"players\":{},\"delay\":{},\"star\":{},\"punch\":{},"
                        "\"rollback_image\":{}}}",
                        st.players, st.delay, st.star, st.punch, st.rollback_image);
