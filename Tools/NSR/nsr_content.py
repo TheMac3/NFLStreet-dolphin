@@ -56,7 +56,7 @@ CHANNEL = "friends"
 # Content format this launcher understands. A release with a larger
 # min_launcher needs a newer NFLStreetRollback download (it may use fields or
 # build steps this code doesn't know); bump when the release format changes.
-LAUNCHER_CONTENT_FORMAT = 1
+LAUNCHER_CONTENT_FORMAT = 4  # v4: runtime passing/acceleration splits, neutral by default
 
 # Public keys trusted to sign manifests: key id -> (modulus hex, exponent).
 # Empty until Mason generates the signing key on the server
@@ -93,9 +93,10 @@ MAX_SERIAL = 2**31 - 1
 # this table, so a valid release never fails here.
 _RATING = (0, 127)
 ATTRIBUTE_LIMITS = {
-    "POVR": _RATING, "PSPD": _RATING, "PCEL": _RATING, "PAGI": _RATING, "PJUM": _RATING,
+    "POVR": _RATING, "PSPD": _RATING, "PCEL": (0, 99), "PAGI": _RATING, "PJUM": _RATING,
     "PCTH": _RATING, "PPSS": _RATING, "PCOV": _RATING, "PTAK": _RATING, "PBLK": _RATING,
     "PBTK": _RATING, "PHGT": (48, 96), "PWGT": (0, 255),
+    "PPVL": (0, 99),
 }
 EXPECTED_LIMIT = (0, 65535)  # original values only need to be plausible storage values
 
@@ -216,7 +217,7 @@ def validate_pack(obj) -> dict:
             raise ContentError(f"{where}: expected must be 1..8 sorted distinct original values")
         for v in expected:
             _int(v, f"{where} expected value", *EXPECTED_LIMIT)
-        if expected == [e["value"]]:
+        if expected == [e["value"]] and not (field == "PCEL" and e["value"] > 0):
             raise ContentError(f"{where}: no-op edit")
         key = (first.casefold(), last.casefold(), field)
         if key in seen:
@@ -449,7 +450,14 @@ class Content:
             for key in ("first_name", "last_name"):
                 if not all(32 <= ord(c) < 127 for c in edit[key]):
                     raise ContentError("Runtime ratings currently require ASCII player names; use image baking.")
-        raw = canonical({"format": "nsrb.runtime-content.v1", "version": self.version,
+        import ratingsplit
+        # Activation is signed policy, not merely the presence of a field.
+        # Existing native PCEL releases must not acquire new physics on upgrade.
+        split = self.release.get("recipe") == ratingsplit.RUNTIME_RECIPE
+        if not split and any(edit["field"] == "PPVL" for edit in self.edits):
+            raise ContentError("Republish this legacy velocity pack with the current editor for "
+                               "game-start updates, or use image builds.")
+        raw = canonical({"format": "nsrb.runtime-content.v4" if split else "nsrb.runtime-content.v1", "version": self.version,
                          "packs": self.packs})
         if len(raw) > 4 * 1024 * 1024:
             raise ContentError("Runtime content bundle is too large; use image baking.")
@@ -544,7 +552,7 @@ class Cache:
         if playbooks:
             bundle = strict_loads(raw) if raw else {"version": 0, "packs": [],
                 "draft": {"order": draft_order, "first": draft_first, "policy": 1}}
-            bundle["format"] = "nsrb.runtime-content.v3"
+            bundle["format"] = "nsrb.runtime-content.v4" if bundle.get("format") == "nsrb.runtime-content.v4" else "nsrb.runtime-content.v3"
             bundle.setdefault("draft", {"order": draft_order, "first": draft_first, "policy": 1})
             bundle["playbooks"] = {"policy": 1, "captain": "lowest-pad", "users": playbooks}
             raw = canonical(bundle)

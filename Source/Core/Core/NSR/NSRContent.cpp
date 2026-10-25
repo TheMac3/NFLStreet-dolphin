@@ -19,6 +19,7 @@
 #include "Common/StringUtil.h"
 #include "Core/Core.h"
 #include "Core/HW/Memmap.h"
+#include "Core/HLE/HLE.h"
 #include "Core/NSR/NSRContentRead.h"
 #include "Core/NSR/NSRDraft.h"
 #include "Core/NSR/NSRPlaybooks.h"
@@ -37,8 +38,11 @@ struct State
   std::array<std::uint64_t, 6> fingerprint{};
   std::vector<Edit> edits;
   std::uint32_t draft_order = 0, draft_first = 0;
-  bool draft = false;
+  bool draft = false, split_policy = false;
+  SplitRatings splits;
   std::vector<Playbook> playbooks;
+  bool measure_splits = false;
+  std::array<std::uint64_t, 2> split_calls{}, split_ns{};
 };
 State s;
 
@@ -131,12 +135,14 @@ std::string Load(const std::string& path, const std::string& expected)
   if (!draft && !Keys(root, {"format", "version", "packs"}))
     return "invalid content object shape";
   bool valid = true;
-  if (Text(root.get("format"), 64, valid) !=
-          (books ? "nsrb.runtime-content.v3" : draft ? "nsrb.runtime-content.v2" : "nsrb.runtime-content.v1") ||
+  const auto format = Text(root.get("format"), 64, valid);
+  s.split_policy = format == "nsrb.runtime-content.v4";
+  if ((!s.split_policy && format !=
+          (books ? "nsrb.runtime-content.v3" : draft ? "nsrb.runtime-content.v2" : "nsrb.runtime-content.v1")) ||
       !root.get("packs").is<picojson::array>())
     return "unsupported content format";
   s.fingerprint[4] = Number(root.get("version"), 0x7fffffff, valid);
-  s.fingerprint[5] = books ? 3 : draft ? 2 : 1;  // exact hook/application policy is part of M2
+  s.fingerprint[5] = s.split_policy ? 4 : books ? 3 : draft ? 2 : 1;  // exact hook/application policy is part of M2
   if (draft)
   {
     const auto& settings = root.get("draft");
@@ -250,11 +256,18 @@ std::string Load(const std::string& path, const std::string& expected)
         return "rating edit limit";
       for (const auto& original : originals)
         edit.expected.push_back(Number(original, 255, valid));
-      if (edit.expected == std::vector<std::uint32_t>{edit.value})
+      // An explicit nonzero PCEL entry activates a new consumer even when
+      // its packed bits already equal that value. Only v4 grants that meaning.
+      const bool activation = s.split_policy && edit.field == "PCEL" && edit.value != 0;
+      if (edit.expected == std::vector<std::uint32_t>{edit.value} && !activation)
         return "no-op content edit";
+      if (edit.field == "PPVL" && !s.split_policy)
+        return "PPVL requires split policy v4";
       s.edits.push_back(std::move(edit));
     }
   }
+  if (s.split_policy)
+    s.splits = Splits(s.edits);
   return valid ? "" : "invalid content value";
 }
 
@@ -268,6 +281,7 @@ void Configure()
   if (path.empty() && expected.empty())
     return;
   s.enabled = true;
+  s.measure_splits = !Env("NSR_RB_COST").empty();
   const auto error = Load(path, expected);
   s.failed = !error.empty();
   if (s.failed)
@@ -322,6 +336,10 @@ void DatabaseLoaded(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t
   Configure();
   if (!s.enabled)
     return;
+  const bool velocity = std::any_of(s.splits.begin(), s.splits.end(),
+      [](const auto& entry) { return entry.second[0] != 0; });
+  const bool acceleration = std::any_of(s.splits.begin(), s.splits.end(),
+      [](const auto& entry) { return entry.second[1] != 0; });
   std::string error;
   std::optional<std::map<std::uint32_t, std::uint8_t>> writes;
   std::optional<std::map<std::uint32_t, std::uint32_t>> draft_words;
@@ -331,10 +349,38 @@ void DatabaseLoaded(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t
   {
     if (!s.playbooks.empty() && view.UInt(0x80057d8c) != 0x7f23cb78u)
       error = "playbook native instruction guard mismatch";
+    // Install no gameplay hooks for an unchanged roster. Validate all sites
+    // before committing ratings/draft writes or publishing any HLE mapping.
+    if (!s.splits.empty())
+    {
+      if ((velocity && view.UInt(0x80103544) != 0xa81f0bc4u) ||
+          (acceleration && (view.UInt(0x8016d1b8) != 0xa81e0bc0u ||
+                            view.UInt(0x8016d26c) != 0xa81e0bc0u)))
+        error = "split consumer instruction mismatch";
+    }
     if (s.draft && error.empty())
       draft_words = PlanDraft(view, s.draft_order, s.draft_first, &error);
     if (error.empty())
       writes = Plan(view, s.edits, &error);
+  }
+  if (error.empty() && writes && (velocity || acceleration))
+  {
+    // Patch silently ignores unknown names. Fail before any guest write if a
+    // stale/mismatched registration table cannot install the compiled recipe.
+    const auto install = [&](std::uint32_t address, std::string_view name) {
+      HLE::Patch(system, address, name);
+      const auto index = HLE::GetHookByAddress(address);
+      return index != 0 && std::string_view{HLE::GetHookNameByIndex(index)} == name;
+    };
+    if ((velocity && !install(0x80103544, "NSR_SplitVelocity")) ||
+        (acceleration && (!install(0x8016d1b8, "NSR_SplitAccelFirst") ||
+                          !install(0x8016d26c, "NSR_SplitAccelSecond"))))
+    {
+      HLE::UnPatch(system, "NSR_SplitVelocity");
+      HLE::UnPatch(system, "NSR_SplitAccelFirst");
+      HLE::UnPatch(system, "NSR_SplitAccelSecond");
+      error = "missing split HLE registration";
+    }
   }
   if (!error.empty() || !writes)
   {
@@ -357,6 +403,11 @@ void DatabaseLoaded(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t
     system.GetPPCState().iCache.Reset(system.GetJitInterface());
     std::fprintf(stderr, "[NSR] draft applied: order %u first %u policy 1 words %zu frame %u\n",
                  s.draft_order, s.draft_first, draft_words->size(), frame);
+  }
+  if (!s.splits.empty())
+  {
+    std::fprintf(stderr, "[NSR] splits applied: velocity %u acceleration %u names %zu policy 4\n",
+                 velocity ? 1u : 0u, acceleration ? 1u : 0u, s.splits.size());
   }
   s.applied = true;
   const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -424,8 +475,63 @@ void PlaybookMenu(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t f
                *captain, side, entry, *category, indices->size(), unsigned(indices->front()), frame);
 }
 
+// Replace exactly one signed halfword load. Other registers/CR/FPRs are
+// untouched; the same immutable lookup runs for live and restored frames.
+namespace
+{
+// Select r0 from restored guest metadata and the immutable agreed boot policy.
+void SelectRating(const Core::CPUThreadGuard& guard, bool velocity, std::uint32_t continuation)
+{
+  auto& system = guard.GetSystem();
+  auto& ppc = system.GetPPCState();
+  auto& memory = system.GetMemory();
+  const NSRGameStats::Memory view{{memory.GetRAM(), memory.GetRamSizeReal()}, {}};
+  const auto player = ppc.gpr[velocity ? 31 : 30];
+  const auto native = view.UInt(player + (velocity ? 0xbc4u : 0xbc0u), 2).value_or(0);
+  const auto fallback = static_cast<std::uint32_t>(static_cast<std::int32_t>(
+      static_cast<std::int16_t>(native)));
+  // Optional host-only attribution shares NSR_RB_COST's diagnostic switch.
+  // Counts/timings never choose simulation data and are intentionally not rolled back.
+  const auto started = s.measure_splits ? std::chrono::steady_clock::now() :
+                                        std::chrono::steady_clock::time_point{};
+  ppc.gpr[0] = SplitValue(view, player, velocity, s.splits, fallback);
+  if (s.measure_splits)
+  {
+    const auto lane = velocity ? 0u : 1u;
+    ++s.split_calls[lane];
+    s.split_ns[lane] += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count());
+  }
+  ppc.npc = continuation;
+}
+}
+
+// JIT may call an HLE in the middle of a block without updating ppc.pc.
+// Separate fixed continuations avoid using stale block-start CPU state.
+void VelocityHook(const Core::CPUThreadGuard& guard)
+{
+  SelectRating(guard, true, 0x80103548);
+}
+
+// The two native acceleration branches have distinct return instructions.
+void AccelerationFirstHook(const Core::CPUThreadGuard& guard)
+{
+  SelectRating(guard, false, 0x8016d1bc);
+}
+
+// Continue the ordinary movement branch after its displaced PSPD load.
+void AccelerationSecondHook(const Core::CPUThreadGuard& guard)
+{
+  SelectRating(guard, false, 0x8016d270);
+}
+
 void Reset()
 {
+  if (s.measure_splits)
+    std::fprintf(stderr, "[NSR] split cost: velocity calls %llu ns %llu acceleration calls %llu ns %llu\n",
+        static_cast<unsigned long long>(s.split_calls[0]), static_cast<unsigned long long>(s.split_ns[0]),
+        static_cast<unsigned long long>(s.split_calls[1]), static_cast<unsigned long long>(s.split_ns[1]));
   s = {};
 }
 }

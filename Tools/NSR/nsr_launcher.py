@@ -1024,7 +1024,9 @@ class Launcher:
     def _usable(self, payload: dict) -> bool:
         rel = payload["release"]
         return (rel["min_launcher"] <= nsr_content.LAUNCHER_CONTENT_FORMAT
-                and rel["recipe"] == self._patcher.ROLLBACK_RECIPE)
+                and rel["recipe"] in (self._patcher.ROLLBACK_RECIPE,
+                                      self._patcher.ratingsplit.RECIPE,
+                                      self._patcher.ratingsplit.RUNTIME_RECIPE))
 
     def _known_content(self):
         """Newest verified content for a rebuild: the cached manifest with its
