@@ -12,10 +12,12 @@ Git in NFLStreet's ignored `local/` tree.
 
 The exporter only reads bounded direct MEM1/fake-VMEM spans on the CPU thread.
 It does not invoke guest routines, write guest memory, use MMU helpers, enter
-rollback snapshots or influence the input exchange. Two HLE **Start** hooks
-preserve the original native instruction and registers: one remembers the
-native stats formatter's output pointers; one observes native MVP selection.
-Both are suppressed during re-simulation. Instruction fingerprints and the
+rollback snapshots or influence the input exchange. HLE **Start** hooks preserve the original native instruction and registers.
+The totals formatter observer remembers its output pointers during both live
+execution and re-simulation; rollback invalidates abandoned pointers, because
+initialization may occur only on the corrected path. The MVP callback remains
+live-only, with the confirmed-screen fallback described below. Snap/event and
+final-result observations also replay, as described in the play-call section. Instruction fingerprints and the
 existing GN7E69 revision-0 rollback-image guard constrain installation.
 
 At a live frame end, the Game Stats snapshot requires confirmed input and no
@@ -33,6 +35,9 @@ on publication. A temporary exclusive file is closed before atomic rename to
 `<safe-team>_vs_<safe-team>_NNN.json`; uploaders should enumerate `*.json` only.
 
 Optional reliable `NSRI` packets distribute names and a shared timestamp.
+Identity packets are accepted during the preboot agreement as well as play:
+connection setup sends them immediately, and dropping them behind the boot
+filter would permanently lose the peer name. This metadata adds no boot wait.
 The existing ENet connection-to-player binding validates every sender; a star
 host relays accepted identities and replays known identities to new leaves.
 The payload is `NSRI`, version byte 1, pad byte, player-count byte, name-length
@@ -267,6 +272,16 @@ changes possession, and 5/6/21 distinguish throw/catch/incomplete. The native
 evaluator's sack path returns pass kind 1 without a throw; a tackled native
 run uses kind 2. All decoding remains observational; native code applies the
 actual game outcome after the hook returns.
+
+A scripted two-peer short match with both humans defending selected the same
+A-card call on five snaps: PLYL20 / PBPL239 / SETL2. Both peers exported
+byte-identical JSON; a separate read-only RAM observer and private extracted
+book catalog corroborated the selected IDs, occurrence, labels and formation.
+The five offensive calls also resolved against that catalog. One first down
+and one touchdown agreed with native totals, and importing the capture into
+the stats service counted each role exactly once per snap. This case exercises
+ambiguous co-op attribution (null pad), not identification of its winning button
+press. Private scripts, captures and exact hashes stay in the task report.
 
 Synthetic socket-free tests cover bounded reads, malformed pointers/names,
 byte-width flip decoding, unknown ownership, conversions and rollback of a

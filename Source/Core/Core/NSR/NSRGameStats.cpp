@@ -3,7 +3,8 @@
 
 // Passive NFL Street 2 (GN7E69 rev 0) results exporter. The native frontend owns
 // calculation of stats and MVP selection. We inspect bounded direct RAM/VMEM
-// views only on the live timeline, then write one nsr.game.v1 file per match.
+// views, rebuild play facts during correction, then publish one confirmed
+// nsr.game.v1 file per match.
 #include "Core/NSR/NSRGameStats.h"
 
 #include <algorithm>
@@ -59,6 +60,7 @@ struct State
   std::array<std::uint32_t, 2> team_ids{};
   std::uint32_t totals_team_ids = 0;
   std::array<std::uint32_t, 2> totals_arrays{};
+  std::optional<std::uint32_t> totals_frame;
   std::array<int, 4> pad_teams{-1, -1, -1, -1};
   bool have_lineup = false, stats_seen = false;
   std::uint32_t mvp_ready_mask = 0;
@@ -70,6 +72,7 @@ struct State
   // which reuse the drafted rosters; a new draft restarts it at zero picks.
   DraftLog draft;
   PlayCalls play_calls;
+  std::string last_capture_failure;
 };
 State s;
 
@@ -428,12 +431,23 @@ std::optional<Object> DraftJson(const Memory& memory, const Array& players)
 // or defense tables legitimately mean no events; unavailable tables fail closed.
 std::optional<Object> Capture(const Memory& memory, std::uint32_t frame)
 {
+  // Trace a changed validation failure once; do not flood a friend's result
+  // screen or silently substitute guessed totals when native data is missing.
+  const auto unavailable = [frame](const char* reason) -> std::optional<Object> {
+    if (s.trace && s.last_capture_failure != reason)
+    {
+      s.last_capture_failure = reason;
+      std::fprintf(stderr, "[NSR stats] capture unavailable frame %u: %s (totals %08x %08x/%08x)\n",
+                   frame, reason, s.totals_team_ids, s.totals_arrays[0], s.totals_arrays[1]);
+    }
+    return std::nullopt;
+  };
   if (s.netplay)
   {
     for (std::uint32_t pad = 0; pad < s.players; ++pad)
     {
       if (s.identities[pad].empty())
-        return std::nullopt;
+        return unavailable("peer identity");
     }
   }
   const auto teams = ReadTable(memory, "EMAG", "MAET");
@@ -446,9 +460,9 @@ std::optional<Object> Capture(const Memory& memory, std::uint32_t frame)
   const auto offense = ReadTable(memory, "EMAG", "FOGP", offense_fields);
   const auto defense = ReadTable(memory, "EMAG", "EDGP", defense_fields);
   if (!s.have_lineup || !teams || !players || !totals || !offense || !defense)
-    return std::nullopt;
+    return unavailable("native tables");
   if (!UniqueIntegerKeys(*offense, "DIGP") || !UniqueIntegerKeys(*defense, "DIGP"))
-    return std::nullopt;
+    return unavailable("duplicate stats IDs");
   Array team_json, style_json, total_json, player_json, pads;
   std::set<std::uint32_t> lineup_ids;
   std::array<std::string, 2> names;
@@ -457,10 +471,10 @@ std::optional<Object> Capture(const Memory& memory, std::uint32_t frame)
     const auto* team = Find(*teams, "DIGT", s.team_ids[side]);
     const auto* total = Find(*totals, "DIGT", s.team_ids[side]);
     if (!team || !total)
-      return std::nullopt;
+      return unavailable("team row");
     const auto name = String(*team, "ANDT");
     if (!name || name->empty())
-      return std::nullopt;
+      return unavailable("team name");
     names[side] = CP1252ToUTF8(*name);
     // fn_80055F4C writes the exact fifteen displayed totals, including
     // GameBreaker/2-point counts and credits whose calculation belongs to the
@@ -468,13 +482,13 @@ std::optional<Object> Capture(const Memory& memory, std::uint32_t frame)
     if (!memory.Bytes(s.totals_team_ids, 8) ||
         memory.UInt(s.totals_team_ids + side * 4) != s.team_ids[side] ||
         !memory.Bytes(s.totals_arrays[side], 15 * 4))
-      return std::nullopt;
+      return unavailable("native total buffers");
     const auto score = *memory.UInt(s.totals_arrays[side]);
     const auto points = *memory.UInt(s.totals_arrays[side] + 4);
     // A negative formatter score is a hidden/non-numeric score (e.g. a
     // time-to-win challenge), not an enormous unsigned football score.
     if (score > 0x7fffffff)
-      return std::nullopt;
+      return unavailable("non-numeric score");
     team_json.emplace_back(Object{{"name", Json(names[side])}, {"score", Json(double(score))}});
     style_json.emplace_back(double(points));
     static constexpr std::array<const char*, 15> keys{
@@ -489,7 +503,7 @@ std::optional<Object> Capture(const Memory& memory, std::uint32_t frame)
     {
       const auto value = Integer(*total, column);
       if (!value)
-        return std::nullopt;
+        return unavailable("native total counters");
       stats.emplace(key, Json(double(*value)));
     }
     total_json.emplace_back(std::move(stats));
@@ -497,14 +511,14 @@ std::optional<Object> Capture(const Memory& memory, std::uint32_t frame)
     {
       const auto id = s.lineup[side][slot];
       if (!lineup_ids.insert(id).second)
-        return std::nullopt;
+        return unavailable("duplicate lineup");
       const auto* player = Find(*players, "DIGP", id);
       if (!player || Integer(*player, "DIGT") != s.team_ids[side])
-        return std::nullopt;
+        return unavailable("lineup membership");
       const auto first = String(*player, "ANFP");
       const auto last = String(*player, "ANLP");
       if (!first || !last)
-        return std::nullopt;
+        return unavailable("player names");
       player_json.emplace_back(Object{
           {"name", Json(CP1252ToUTF8(*first + " " + *last))}, {"team", Json(names[side])},
           {"side", Json(double(side))}, {"slot", Json(double(slot))}, {"digp", Json(double(id))},
@@ -720,11 +734,12 @@ void AcceptCaptureAnchor(std::span<const std::uint8_t> packet)
   s.capture_anchors.emplace(anchor->ordinal, anchor->frame);
 }
 
-void ObserveTotals(const Core::CPUThreadGuard& guard)
+void ObserveTotals(const Core::CPUThreadGuard& guard, std::uint32_t frame)
 {
   const auto& ppc = guard.GetSystem().GetPPCState();
   s.totals_team_ids = ppc.gpr[3];
   s.totals_arrays = {ppc.gpr[5], ppc.gpr[4]};
+  s.totals_frame = frame;
 }
 
 void ObserveMvp(const Core::CPUThreadGuard& guard)
@@ -779,12 +794,14 @@ void ObserveFrame(const Core::CPUThreadGuard& guard, std::uint32_t frame, bool i
     if (!s.was_in_game || (s.stats_seen && screen == std::pair{3u, 2u}))
     {
       s.play_calls = PlayCalls{};
+      s.last_capture_failure.clear();
       s.match_frame = frame;
       ++s.ordinal;
       s.saved = false;
       s.have_lineup = false;
       s.totals_team_ids = 0;
       s.totals_arrays = {};
+      s.totals_frame.reset();
       s.stats_seen = false;
       s.mvp_ready_mask = 0;
       s.capture.reset();
@@ -911,6 +928,15 @@ void ObservePlayResult(const Core::CPUThreadGuard& guard, std::uint32_t frame)
 void RollbackFrom(std::uint32_t frame)
 {
   s.play_calls.RollbackFrom(frame);
+  // Native result-screen initialization can occur solely in re-simulation.
+  // Discard pointers allocated on an abandoned path, then let that same
+  // initialization rebuild them on the corrected path, just like play facts.
+  if (s.totals_frame && *s.totals_frame >= frame)
+  {
+    s.totals_team_ids = 0;
+    s.totals_arrays = {};
+    s.totals_frame.reset();
+  }
   if (!s.ready || s.ready->observed_frame < frame)
     return;
   if (s.ready->ordinal == s.ordinal)

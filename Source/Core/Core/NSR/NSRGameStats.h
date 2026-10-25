@@ -3,7 +3,7 @@
 
 // Host-only results capture and optional peer identity metadata. CPU-thread owned;
 // none of these operations call guest code, change guest memory or participate in
-// rollback state/digests. The adapter must exclude re-simulation before calling.
+// rollback state/digests. Observer-specific replay rules are documented below.
 #pragma once
 
 #include <cstdint>
@@ -42,7 +42,9 @@ void ObserveMvp(const Core::CPUThreadGuard& guard);
 
 // Native Game Stats formatter supplies its two output arrays at function entry;
 // remember their addresses, then read them only after the live frame completes.
-void ObserveTotals(const Core::CPUThreadGuard& guard);
+// Run this during re-simulation too: initialization may occur only on a corrected
+// path. RollbackFrom invalidates pointers from the abandoned path.
+void ObserveTotals(const Core::CPUThreadGuard& guard, std::uint32_t frame);
 
 // Only called at live frame ends. A missing frontier means correction is still
 // pending. Stage an MVP on the live timeline, then publish after its frame is
