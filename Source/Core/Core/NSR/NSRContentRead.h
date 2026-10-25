@@ -205,7 +205,7 @@ inline std::uint32_t SplitValue(const NSRGameStats::Memory& view, std::uint32_t 
     return fallback;
   // PCEL is read from the live native metadata cache, not from PSPD. The
   // immutable map only opts this player in; unedited stock PCEL stays inert.
-  const auto rating = velocity ? found->second[0] : view.UInt(player + 0xb65, 1).value_or(0);
+  const auto rating = velocity ? found->second[0] : view.UInt(player + 0xb66, 1).value_or(0);
   return std::min(rating, 99u) * 255 / 99;
 }
 

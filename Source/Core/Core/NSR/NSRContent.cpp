@@ -336,6 +336,10 @@ void DatabaseLoaded(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t
   Configure();
   if (!s.enabled)
     return;
+  const bool velocity = std::any_of(s.splits.begin(), s.splits.end(),
+      [](const auto& entry) { return entry.second[0] != 0; });
+  const bool acceleration = std::any_of(s.splits.begin(), s.splits.end(),
+      [](const auto& entry) { return entry.second[1] != 0; });
   std::string error;
   std::optional<std::map<std::uint32_t, std::uint8_t>> writes;
   std::optional<std::map<std::uint32_t, std::uint32_t>> draft_words;
@@ -349,10 +353,6 @@ void DatabaseLoaded(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t
     // before committing ratings/draft writes or publishing any HLE mapping.
     if (!s.splits.empty())
     {
-      const bool velocity = std::any_of(s.splits.begin(), s.splits.end(),
-          [](const auto& entry) { return entry.second[0] != 0; });
-      const bool acceleration = std::any_of(s.splits.begin(), s.splits.end(),
-          [](const auto& entry) { return entry.second[1] != 0; });
       if ((velocity && view.UInt(0x80103544) != 0xa81f0bc4u) ||
           (acceleration && (view.UInt(0x8016d1b8) != 0xa81e0bc0u ||
                             view.UInt(0x8016d26c) != 0xa81e0bc0u)))
@@ -362,6 +362,25 @@ void DatabaseLoaded(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t
       draft_words = PlanDraft(view, s.draft_order, s.draft_first, &error);
     if (error.empty())
       writes = Plan(view, s.edits, &error);
+  }
+  if (error.empty() && writes && (velocity || acceleration))
+  {
+    // Patch silently ignores unknown names. Fail before any guest write if a
+    // stale/mismatched registration table cannot install the compiled recipe.
+    const auto install = [&](std::uint32_t address, std::string_view name) {
+      HLE::Patch(system, address, name);
+      const auto index = HLE::GetHookByAddress(address);
+      return index != 0 && std::string_view{HLE::GetHookNameByIndex(index)} == name;
+    };
+    if ((velocity && !install(0x80103544, "NSR_SplitVelocity")) ||
+        (acceleration && (!install(0x8016d1b8, "NSR_SplitAccelFirst") ||
+                          !install(0x8016d26c, "NSR_SplitAccelSecond"))))
+    {
+      HLE::UnPatch(system, "NSR_SplitVelocity");
+      HLE::UnPatch(system, "NSR_SplitAccelFirst");
+      HLE::UnPatch(system, "NSR_SplitAccelSecond");
+      error = "missing split HLE registration";
+    }
   }
   if (!error.empty() || !writes)
   {
@@ -387,17 +406,6 @@ void DatabaseLoaded(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t
   }
   if (!s.splits.empty())
   {
-    const bool velocity = std::any_of(s.splits.begin(), s.splits.end(),
-        [](const auto& entry) { return entry.second[0] != 0; });
-    const bool acceleration = std::any_of(s.splits.begin(), s.splits.end(),
-        [](const auto& entry) { return entry.second[1] != 0; });
-    if (velocity)
-      HLE::Patch(system, 0x80103544, "NSR_SplitVelocity");
-    if (acceleration)
-    {
-      HLE::Patch(system, 0x8016d1b8, "NSR_SplitAccelFirst");
-      HLE::Patch(system, 0x8016d26c, "NSR_SplitAccelSecond");
-    }
     std::fprintf(stderr, "[NSR] splits applied: velocity %u acceleration %u names %zu policy 3\n",
                  velocity ? 1u : 0u, acceleration ? 1u : 0u, s.splits.size());
   }

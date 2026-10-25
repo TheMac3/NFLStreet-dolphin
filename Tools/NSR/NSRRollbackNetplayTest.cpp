@@ -1761,13 +1761,13 @@ static void TestRuntimeSplitRatings()
   const std::uint32_t player = 0x80001000;
   std::copy_n("Ada", 3, ram.begin() + 0x1b6f);
   std::copy_n("Test", 4, ram.begin() + 0x1b84);
-  ram[0x1b65] = 99;
+  ram[0x1b66] = 99;
   assert(C::SplitValue(view, player, true, {}, 87) == 87);
   const auto splits = C::Splits({{" ada ", "TEST", "PPVL", 1, {0}},
                                   {"Ada", "Test", "PCEL", 99, {70}}});
   assert(C::SplitValue(view, player, true, splits, 87) == 2);
   assert(C::SplitValue(view, player, false, splits, 87) == 255);
-  ram[0x1b65] = 1;
+  ram[0x1b66] = 1;
   assert(C::SplitValue(view, player, false, splits, 87) == 2);
   assert(C::SplitValue(view, player + 1, false, splits, 87) == 87);
   assert(C::SplitValue(view, 0xffffffff, true, splits, 87) == 87);

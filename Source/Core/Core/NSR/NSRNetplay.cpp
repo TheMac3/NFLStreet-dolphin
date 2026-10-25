@@ -10135,21 +10135,6 @@ void ProbeHook(const Core::CPUThreadGuard& guard)
   if (r.config.probe_all)
     Log("probe hit {:08x} from {:08x}: [{:08x}] = {:08x}; live {} cursor {} resim {} r3 {:08x} r4 {:08x}",
         s_hook_pc, LR(ppc) - 4, r.watch, v, r.live, r.cursor, r.in_resim, ppc.gpr[3], ppc.gpr[4]);
-  // GN7E69 rev 0 diagnostics only: the native locomotion integrator takes
-  // motion in r3. Log raw IEEE words so sprint comparisons can require exact
-  // start/heading/cap equality, without guest writes or host float conversion.
-  if (r.config.probe_all && s_hook_pc == 0x800b26e0)
-  {
-    const u32 motion = ppc.gpr[3];
-    const auto word = [&](u32 offset) { return PowerPC::MMU::HostRead<u32>(guard, motion + offset); };
-    Log("motion live {} cursor {} resim {} object {:08x} pos {:08x},{:08x},{:08x} "
-        "speed {:08x} cap {:08x} accel {:08x} dir {:08x} request {:08x}",
-        r.live, r.cursor, r.in_resim, motion, word(0), word(4), word(8), word(0x1c),
-        word(0x24), word(0x34), word(0x20), word(0x38));
-  }
-  if (r.config.probe_all && s_hook_pc == 0x80103548)
-    Log("split-pass live {} cursor {} resim {} player {:08x} selected {}",
-        r.live, r.cursor, r.in_resim, ppc.gpr[31], ppc.gpr[0]);
   if (v != r.probe_last_value)
     Log("probe: [{:08x}] {:08x} -> {:08x} after {:08x} (called from {:08x}), before {:08x} "
         "(called from {:08x}); live {} cursor {}",
