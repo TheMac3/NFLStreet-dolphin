@@ -2078,6 +2078,58 @@ static void TestAutoInputDelay()
   assert(RN::AutoInputDelay(41.0, 9.0, strict) == 3);
 }
 
+// A menu epoch has no prediction allowance. Cover clamp/invalid arithmetic,
+// median spike rejection, both boundary kinds, immutable retransmissions and
+// relay copies, then prove a fresh stream's neutral prefix after a decrease.
+static void TestMenuDelay()
+{
+  assert(RN::MenuInputDelay(10, 2) == 2);
+  assert(RN::MenuInputDelay(35, 6) == 4);
+  assert(RN::MenuInputDelay(55, 8) == 5);
+  assert(RN::MenuInputDelay(75, 10) == 7);
+  assert(RN::MenuInputDelay(-10, -2) == 2);
+  assert(RN::MenuInputDelay(10000, 10000) == 12);
+  assert(RN::MenuInputDelay(std::numeric_limits<double>::infinity(), 0) == 2);
+  assert(!RN::MenuMedian(std::array<std::uint32_t, 5>{1, 2, 3, 4, 5}));
+  assert(RN::MenuMedian(std::array<std::uint32_t, 7>{70, 71, 69, 72, 68, 70, 1800}) == 70);
+  for (const auto kind : {RN::HandoffKind::StartMenus, RN::HandoffKind::LeaveRollback})
+  {
+    RN::HandoffAgreement host(3, 0, kind, 3, 4000, 0, {}, 0, 0, 0, 0, 0, 7, 750, 100);
+    RN::HandoffAgreement leaf(3, 2, kind, 3, 4000, 0);
+    auto packet = RN::DecodeHandoff(RN::EncodeHandoff(host.Local()));
+    assert(packet && packet->menu_delay == 7 && packet->menu_one_way_dms == 750 &&
+           packet->menu_jitter_dms == 100);
+    assert(leaf.Accept(*packet) && !leaf.Complete());
+    assert(leaf.Accept({1, 3, kind, 3, 4000, 0}));
+    assert(leaf.Complete() && leaf.HostProposal()->menu_delay == 7);
+    assert(leaf.Proposal(0)->menu_one_way_dms == 750);
+    packet->menu_delay = 2;
+    assert(!leaf.Accept(*packet) && leaf.Mismatched());
+    packet->menu_delay = 13;
+    assert(!RN::DecodeHandoff(RN::EncodeHandoff(*packet)));
+    auto wire = RN::EncodeHandoff(host.Local());
+    wire[4] = RN::HANDOFF_VERSION - 1;
+    assert(!RN::DecodeHandoff(wire));
+  }
+  for (const std::uint32_t delay : {12U, 2U, 7U})
+  {
+    RN::Exchange host(100, 2, 0, delay, 0, 55);
+    RN::Exchange leaf(100, 2, 1, delay, 0, 55);
+    for (std::uint32_t f = 100; f < 160; ++f)
+    {
+      RN::Pad a{}, b{};
+      a[0] = static_cast<std::uint8_t>(f);
+      b[0] = static_cast<std::uint8_t>(f + 1);
+      host.SubmitLocal(f, a);
+      leaf.SubmitLocal(f, b);
+      Deliver(host, &leaf, f);
+      Deliver(leaf, &host, f);
+      assert(!host.ShouldStall(f) && !leaf.ShouldStall(f));
+      assert(host.Assemble(f) == leaf.Assemble(f));
+    }
+  }
+}
+
 // Probe windows must forget barrier echoes, loss/duplicates, timestamp forgery,
 // old epochs and occasional service stalls without inheriting ENet's EWMA.
 static void TestLinkProbes()
@@ -2226,6 +2278,7 @@ static void TestRuntimeDraft()
 
 int main()
 {
+  TestMenuDelay();
   TestHandoffInputDelay();
   TestAutoInputDelay();
   TestLinkProbes();

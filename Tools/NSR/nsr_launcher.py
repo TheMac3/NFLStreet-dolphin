@@ -99,10 +99,9 @@ MAX_DELAY = 4
 # every start, usually the old default 1) is migrated once: 2..4 means the
 # player picked it, so it is kept; anything else becomes Auto.
 DELAY_CONFIG_KEY = "rb_delay_choice"
-# Lockstep input delay for the menus around rollback matches (stage 4), the
-# fork's default and what every stage-4 gate ran with. Menus wait on real
-# input each frame, so a larger value only smooths them; the host's choice
-# above is the rollback (match) delay, NSR_RB_DELAY.
+# Startup fallback for stage-4 menus. Dolphin agrees an adaptive 2..12-frame
+# menu delay before the first input and at every match exit; NSR_DELAY seeds
+# only the fallback. The host's choice above controls matches (NSR_RB_DELAY).
 MENU_LOCKSTEP_DELAY = 2
 
 # Stage-4 rollback profile (release plan 3.2), exactly what the rollback

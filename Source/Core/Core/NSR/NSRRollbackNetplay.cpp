@@ -16,7 +16,7 @@ namespace NSRNetplay::RollbackNet
 namespace
 {
 constexpr std::size_t HEADER_SIZE = 96;
-constexpr std::size_t HANDOFF_SIZE = 38 + 8 * CONFIG_FIELDS;
+constexpr std::size_t HANDOFF_SIZE = 44 + 8 * CONFIG_FIELDS;
 constexpr double FRAME_US = 16683.0;
 constexpr std::uint32_t MAX_TIMING_RTT_US = 2'000'000;
 constexpr std::size_t MIN_TIMING_SAMPLES = 6;
@@ -102,6 +102,10 @@ std::vector<std::uint8_t> EncodeHandoff(const HandoffPacket& packet)
   Put(out, packet.input_delay);
   Put(out, packet.delay_one_way_dms);
   Put(out, packet.delay_jitter_dms);
+  Put(out, packet.menu_delay);
+  Put(out, packet.menu_one_way_dms);
+  Put(out, packet.menu_jitter_dms);
+  Put(out, packet.menu_source);
   return out;
 }
 
@@ -125,7 +129,8 @@ std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes)
       packet.sender >= packet.players ||
       (kind != static_cast<std::uint8_t>(HandoffKind::EnterRollback) &&
        kind != static_cast<std::uint8_t>(HandoffKind::LeaveRollback) &&
-       kind != static_cast<std::uint8_t>(HandoffKind::SyncClocks)))
+       kind != static_cast<std::uint8_t>(HandoffKind::SyncClocks) &&
+       kind != static_cast<std::uint8_t>(HandoffKind::StartMenus)))
   {
     return std::nullopt;
   }
@@ -136,7 +141,11 @@ std::optional<HandoffPacket> DecodeHandoff(std::span<const std::uint8_t> bytes)
   }
   if (!Get(bytes, at, &packet.sync_clock) || !Get(bytes, at, &packet.sync_aux_clock) ||
       !Get(bytes, at, &packet.input_delay) || !Get(bytes, at, &packet.delay_one_way_dms) ||
-      !Get(bytes, at, &packet.delay_jitter_dms))
+      !Get(bytes, at, &packet.delay_jitter_dms) || !Get(bytes, at, &packet.menu_delay) ||
+      !Get(bytes, at, &packet.menu_one_way_dms) || !Get(bytes, at, &packet.menu_jitter_dms) ||
+      !Get(bytes, at, &packet.menu_source) ||
+      packet.menu_source > 3 ||
+      (packet.menu_delay != 0 && (packet.menu_delay < 2 || packet.menu_delay > 12)))
     return std::nullopt;
   packet.kind = static_cast<HandoffKind>(kind);
   return packet;
@@ -147,12 +156,15 @@ HandoffAgreement::HandoffAgreement(std::uint8_t players, std::uint8_t me, Handof
                                    std::uint64_t semantic_hash, const ConfigFingerprint& config,
                                    std::uint32_t sync_clock, std::uint32_t sync_aux_clock,
                                    std::uint8_t input_delay, std::uint16_t delay_one_way_dms,
-                                   std::uint16_t delay_jitter_dms)
+                                   std::uint16_t delay_jitter_dms, std::uint8_t menu_delay,
+                                   std::uint16_t menu_one_way_dms, std::uint16_t menu_jitter_dms,
+                                   std::uint8_t menu_source)
     : m_players(std::clamp<std::uint8_t>(players, 2, static_cast<std::uint8_t>(MAX_PLAYERS))),
       m_me(std::min<std::uint8_t>(me, m_players - 1)),
       m_local{m_me,       m_players,      kind,           transition,        frame,
               semantic_hash, config,      sync_clock,     sync_aux_clock,    input_delay,
-              delay_one_way_dms, delay_jitter_dms}
+              delay_one_way_dms, delay_jitter_dms, menu_delay, menu_one_way_dms,
+              menu_jitter_dms, menu_source}
 {
   m_seen[m_me] = true;
   m_sync_clocks[m_me] = sync_clock;
@@ -187,7 +199,11 @@ bool HandoffAgreement::Accept(const HandoffPacket& packet)
   if (m_seen[packet.sender] &&
       (m_sync_clocks[packet.sender] != packet.sync_clock ||
        m_sync_aux_clocks[packet.sender] != packet.sync_aux_clock ||
-       m_proposals[packet.sender].input_delay != packet.input_delay))
+       m_proposals[packet.sender].input_delay != packet.input_delay ||
+       m_proposals[packet.sender].menu_delay != packet.menu_delay ||
+       m_proposals[packet.sender].menu_one_way_dms != packet.menu_one_way_dms ||
+       m_proposals[packet.sender].menu_jitter_dms != packet.menu_jitter_dms ||
+       m_proposals[packet.sender].menu_source != packet.menu_source))
   {
     if (!m_mismatch)
       m_mismatch = packet;
@@ -217,6 +233,24 @@ std::uint8_t AutoInputDelay(double one_way_ms, double jitter_ms, const AutoDelay
   const double clamped =
       std::clamp(frames, static_cast<double>(rule.min_delay), static_cast<double>(rule.max_delay));
   return static_cast<std::uint8_t>(clamped);
+}
+
+std::uint8_t MenuInputDelay(double one_way_ms, double jitter_ms)
+{
+  if (!std::isfinite(one_way_ms) || !std::isfinite(jitter_ms))
+    return 2;
+  const double frames = std::ceil((std::max(0.0, one_way_ms) + std::max(0.0, jitter_ms)) /
+                                  (FRAME_US / 1000.0)) + 1.0;
+  return static_cast<std::uint8_t>(std::clamp(frames, 2.0, 12.0));
+}
+
+std::optional<std::uint32_t> MenuMedian(std::span<const std::uint32_t> samples)
+{
+  if (samples.size() < 6)
+    return std::nullopt;
+  std::vector<std::uint32_t> sorted(samples.begin(), samples.end());
+  std::sort(sorted.begin(), sorted.end());
+  return sorted[sorted.size() / 2];
 }
 
 // Dedicated fixed-size timing protocol, separate from handoff-v5 and NSRB.

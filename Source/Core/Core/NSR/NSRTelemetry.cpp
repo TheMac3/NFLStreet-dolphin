@@ -81,7 +81,7 @@ constexpr std::array<const char*, static_cast<size_t>(Counter::Count)> COUNTER_N
 };
 constexpr std::array<const char*, static_cast<size_t>(Gauge::Count)> GAUGE_NAMES{
     "rtt_ms", "rtt_var_ms", "loss_pct", "frame_advantage", "input_delay", "max_prediction",
-    "ring_slots", "audio_gap_fills", "audio_skips",
+    "ring_slots", "audio_gap_fills", "audio_skips", "menu_input_delay",
 };
 constexpr std::array<const char*, static_cast<size_t>(Hist::Count)> HIST_NAMES{
     "rollback_depth",  "frame_interval_us", "step_us",         "live_unit_us",

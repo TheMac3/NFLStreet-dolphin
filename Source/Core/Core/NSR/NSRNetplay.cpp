@@ -214,6 +214,14 @@ struct Session
   u32 me = 0;          // our player index = our game port (0-based)
   u32 players = 2;
   u32 delay = 2;
+  // At most 64 recent fresh ACK observations per physical host link. Delays
+  // are derived at boundaries only; collection never changes simulation.
+  struct MenuLinkSample
+  {
+    u32 time_us, rtt_ms, jitter_ms;
+  };
+  std::array<std::deque<MenuLinkSample>, MAX_PLAYERS> menu_links;
+  std::array<u32, MAX_PLAYERS> menu_last_ack{};
   FILE* log = stderr;
   ENetHost* host = nullptr;
   bool enet_initialized = false;
@@ -237,6 +245,7 @@ struct Session
   std::map<u32, u64> local_hashes;
   std::array<std::map<u32, u64>, MAX_PLAYERS> remote_hashes;
   u32 last_sent_hash_frame = 0;
+  bool menu_delay_agreed = false;  // startup barrier precedes the first delayed pad
   bool started = false;
   u32 first_frame = 0;   // frame of the first hook call (same on every machine)
   u32 next_target = 0;   // next frame index we haven't recorded a pad for
@@ -1255,6 +1264,29 @@ void Service(int timeout_ms)
       break;
     }
   }
+  // Keep post-match selection immediate: a fresh sampling pause here would
+  // drain the audio FIFO at every leave. Ignore reliable application bursts
+  // and barriers, and never count the same ENet ACK observation twice.
+  if (s.me == 0 && !s.boot_pending && !s_rb_handoff && !s.failed)
+  {
+    const u32 now = HostNowUs();
+    for (u32 i = 1; i < s.players; ++i)
+    {
+      if (!Linked(i))
+        continue;
+      const auto* peer = s.peers[i];
+      if (peer->lastReceiveTime == s.menu_last_ack[i] || peer->reliableDataInTransit != 0 ||
+          !enet_list_empty(&peer->outgoingSendReliableCommands))
+        continue;
+      s.menu_last_ack[i] = peer->lastReceiveTime;
+      auto& samples = s.menu_links[i];
+      if (peer->roundTripTime > 0 && peer->roundTripTime <= 2000)
+        samples.push_back({now, peer->roundTripTime, peer->roundTripTimeVariance});
+      while (!samples.empty() && (samples.size() > 64 || now - samples.front().time_us > 5'000'000))
+        samples.pop_front();
+    }
+  }
+
   TickTimingProbes();
   NSRTelemetry::Poll();  // Includes preboot and input waits with zero live frames.
   // One small host-only results announcement per completed stats snapshot.
@@ -1979,6 +2011,7 @@ void TelemetrySessionEnter();
 void TelemetrySessionLeave(const char* reason);
 void TelemetryShutdown();
 void TelemetryLinkGauges();
+void TelemetryAudioGauges();
 void TelemetryStateDesyncSummary();
 void TelemetryHandoffDesyncSummary(u32 frame, u32 player, u64 local, u64 remote, bool leave);
 
@@ -4576,7 +4609,10 @@ static void ApplyQuickstart(const Core::CPUThreadGuard& guard, u32 frame,
   }
 }
 
-// Run milestone-1 raw-pad lockstep for one poll.  Keeping this independent
+// Startup negotiation is implemented beside the other host-side barriers.
+static bool AgreeStartupMenuDelay(u32 frame);
+
+// Run milestone-1 raw-pad lockstep for one poll. Keeping this independent
 // from either game-side stub lets the rollback image use the same proven
 // ordering in menus: PADRead -> agreement -> Reborn remap/PADClamp.
 static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 frame)
@@ -4592,6 +4628,9 @@ static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 fra
   if (!s.enabled || s.failed)
     return false;
   if (!AllConnected() && !WaitForConnection())
+    return false;
+
+  if (s_rb.net_enabled && !s.menu_delay_agreed && !AgreeStartupMenuDelay(frame))
     return false;
 
   // The pad poll can run more than once for the same retrace (the game also
@@ -4765,6 +4804,8 @@ bool PrepareBoot()
   if (const auto manifest = NSRBootSync::Prepare())
   {
     s.boot_manifest = *manifest;
+    if (!Env("NSR_RB_NET").empty())
+      s.boot_manifest["MenuDelay.Protocol"] = std::to_string(RollbackNet::HANDOFF_VERSION);
     if (*mode != NSRQuickstart::Mode::Manual)
     {
       s.boot_manifest["Quickstart.Mode"] = Env("NSR_QUICKSTART");
@@ -6707,6 +6748,149 @@ static void AdoptInputDelay(const RollbackNet::HandoffPacket& host)
                       "match input delay");
 }
 
+// Menu delay is selected only with the guest stopped at a stream boundary.
+// Prefer the quiet-menu timing probes and complete star/mesh path aggregate.
+// If no fresh probe window exists at exit (probes pause during matches), use
+// each link's recent median RTT/variance without pausing to gather samples.
+// Mesh fallback estimates the path using host legs; arbitrary routing can
+// make a direct mesh path slower. Revisit all-pair live reports if mesh menu
+// stalls remain after a link changes during a match (launcher uses a star).
+struct MenuDelayProposal
+{
+  u8 delay = 0;
+  u16 one_way_dms = 0, jitter_dms = 0;
+  u8 source = 0;
+};
+
+static MenuDelayProposal ProposeMenuDelay()
+{
+  // An explicit host-only diagnostic override makes paired fixed/adaptive
+  // proxy measurements possible. Production launchers sanitize NSR_* inputs.
+  if (const auto fixed = ParseU32(Env("NSR_MENU_DELAY")))
+    return {static_cast<u8>(std::clamp<u32>(*fixed, 2, 12)), 0, 0, 3};
+  auto& s = s_session;
+  if (const auto probe = ProposeInputDelay(); probe.measured)
+    return {RollbackNet::MenuInputDelay(probe.one_way_dms / 10.0, probe.jitter_dms / 10.0),
+            probe.one_way_dms, probe.jitter_dms, 2};
+  std::array<std::vector<u32>, MAX_PLAYERS> rtts, variances;
+  const u32 now = HostNowUs();
+  for (u32 i = 1; i < s.players; ++i)
+    for (const auto& sample : s.menu_links[i])
+      if (now - sample.time_us <= 5'000'000)
+      {
+        rtts[i].push_back(sample.rtt_ms);
+        variances[i].push_back(sample.jitter_ms);
+      }
+  double one_way = 0.0, jitter = 0.0;
+  bool measured = true;
+  for (u32 i = 1; i < s.players; ++i)
+  {
+    const auto rtt = RollbackNet::MenuMedian(rtts[i]);
+    const auto var = RollbackNet::MenuMedian(variances[i]);
+    if (!rtt || !var)
+    {
+      measured = false;
+      continue;
+    }
+    one_way = std::max(one_way, *rtt / 2.0);
+    jitter = std::max(jitter, static_cast<double>(*var));
+    for (u32 j = i + 1; j < s.players; ++j)
+    {
+      const auto rtt_j = RollbackNet::MenuMedian(rtts[j]);
+      const auto var_j = RollbackNet::MenuMedian(variances[j]);
+      if (rtt_j && var_j)
+      {
+        one_way = std::max(one_way, (static_cast<double>(*rtt) + *rtt_j) / 2.0);
+        jitter = std::max(jitter, static_cast<double>(*var) + *var_j);
+      }
+    }
+  }
+  Log("menu delay measurement: ENet median {}, worst one-way {:.1f} ms jitter {:.1f} ms",
+      measured ? "ready" : "insufficient; fallback", one_way, jitter);
+  return {measured ? RollbackNet::MenuInputDelay(one_way, jitter) :
+              static_cast<u8>(std::clamp<u32>(s.delay, 2, 12)),
+          static_cast<u16>(std::clamp(one_way * 10.0, 0.0, 65535.0)),
+          static_cast<u16>(std::clamp(jitter * 10.0, 0.0, 65535.0)),
+          static_cast<u8>(measured ? 1 : 0)};
+}
+
+// Only complete agreements may replace a stream's delay. Existing queued
+// inputs are consumed in their original epoch; the new stream seeds neutral
+// inputs for its delay prefix, so increasing/decreasing cannot create holes.
+static bool AdoptMenuDelay(const RollbackNet::HandoffPacket& host, u32 frame)
+{
+  if (host.menu_delay < 2 || host.menu_delay > 12 || host.menu_source > 3)
+    return FailHandoff("missing or invalid player 0 menu delay");
+  const u32 before = s_session.delay;
+  s_session.delay = host.menu_delay;
+  s_session.menu_delay_agreed = true;
+  constexpr std::array<const char*, 4> sources{"fallback", "enet-median", "timing-probes", "fixed"};
+  Log("menu delay {} agreed at frame {} transition {} (was {}); worst one-way {:.1f} ms, "
+      "jitter {:.1f} ms source {}", host.menu_delay, frame, host.transition, before,
+      host.menu_one_way_dms / 10.0, host.menu_jitter_dms / 10.0, sources[host.menu_source]);
+  NSRTelemetry::SetGauge(NSRTelemetry::Gauge::MenuInputDelay, host.menu_delay);
+  NSRTelemetry::Event(NSRTelemetry::EventKind::Note, frame,
+                      {NSRTelemetry::Int("source", host.menu_source),
+                       NSRTelemetry::Int("menu_delay", host.menu_delay),
+                       NSRTelemetry::Int("transition", host.transition),
+                       NSRTelemetry::Int("one_way_dms", host.menu_one_way_dms),
+                       NSRTelemetry::Int("jitter_dms", host.menu_jitter_dms)}, "menu input delay");
+  return true;
+}
+
+// Startup needs no guest-state digest: bootsync already agreed the machine
+// before boot. A reserved transition keeps this phase apart from match entry
+// zero, including early/duplicate proposals and retained relay repair copies.
+static bool AgreeStartupMenuDelay(u32 frame)
+{
+  auto& s = s_session;
+  // Collect six probes at 250 ms spacing plus the quiet filter, before
+  // opening any agreement (which invalidates outstanding timing probes).
+  // Every peer participates, even when player 0 selected a fixed diagnostic.
+  s.probe_menus = true;
+  const auto warmup = std::chrono::steady_clock::now();
+  auto last_ping = warmup - std::chrono::milliseconds(100);
+  while (!s.failed && std::chrono::steady_clock::now() - warmup < std::chrono::milliseconds(2500))
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (s.me == 0 && now - last_ping >= std::chrono::milliseconds(100))
+    {
+      for (u32 i = 1; i < s.players; ++i)
+        if (Linked(i))
+          enet_peer_ping(s.peers[i]);
+      enet_host_flush(s.host);
+      last_ping = now;
+    }
+    Service(1);
+  }
+  const MenuDelayProposal menu = s.me == 0 ? ProposeMenuDelay() : MenuDelayProposal{};
+  OpenHandoffBarrier({static_cast<u8>(s.players), static_cast<u8>(s.me),
+                      RollbackNet::HandoffKind::StartMenus, 0x7fffffff, frame, 0, {},
+                      0, 0, 0, 0, 0, menu.delay, menu.one_way_dms, menu.jitter_dms, menu.source});
+  SendHandoff(false);
+  const auto start = std::chrono::steady_clock::now();
+  auto last_send = start;
+  while (!s.failed && !s_rb_handoff->Complete() && !s_rb_handoff->Mismatched())
+  {
+    Service(1);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_send >= std::chrono::milliseconds(8))
+    {
+      SendHandoff(true);
+      last_send = now;
+    }
+    if (now - start >= std::chrono::milliseconds(PEER_TIMEOUT_MS))
+      return FailHandoff("timeout agreeing startup menu delay");
+  }
+  if (s.failed || s_rb_handoff->Mismatched())
+    return FailHandoff("startup menu delay agreement failed");
+  if (!AdoptMenuDelay(*s_rb_handoff->HostProposal(), frame))
+    return false;
+  s_rb_previous_handoff = s_rb_handoff;
+  s_rb_handoff.reset();
+  return true;
+}
+
 // Exchange and compare the canonical state digest (RbStateDigest, a full
 // one-off hash of RAM here) and the config fingerprint at an agreed absolute
 // frame.  This is a host-side barrier: no guest time advances while waiting,
@@ -6752,9 +6936,12 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
   const DelayProposal delay = kind == RollbackNet::HandoffKind::EnterRollback && s.me == 0 ?
                                   ProposeInputDelay() :
                                   DelayProposal{};
+  const MenuDelayProposal menu = kind == RollbackNet::HandoffKind::LeaveRollback && s.me == 0 ?
+                                  ProposeMenuDelay() : MenuDelayProposal{};
   OpenHandoffBarrier({static_cast<u8>(s.players), static_cast<u8>(s.me), kind, transition, frame,
                       semantic, config, sync_clock, sync_aux_clock, delay.delay,
-                      delay.one_way_dms, delay.jitter_dms});
+                      delay.one_way_dms, delay.jitter_dms, menu.delay, menu.one_way_dms,
+                      menu.jitter_dms, menu.source});
   SendHandoff(false);
   const auto start = std::chrono::steady_clock::now();
   auto last_send = start;
@@ -6815,6 +7002,9 @@ static bool HandoffBarrier(const Core::CPUThreadGuard& guard, RollbackNet::Hando
       semantic, *agreed_clock);
   if (kind == RollbackNet::HandoffKind::EnterRollback)
     AdoptInputDelay(*s_rb_handoff->HostProposal());  // fix/audio2
+  if (kind == RollbackNet::HandoffKind::LeaveRollback &&
+      !AdoptMenuDelay(*s_rb_handoff->HostProposal(), frame))
+    return false;
   s_rb_previous_handoff = s_rb_handoff;
   s_rb_handoff.reset();
   return true;
@@ -7006,17 +7196,10 @@ static bool RbNetworkPreflight(u32 live)
     namespace T = NSRTelemetry;
     TelemetryLinkGauges();
     T::SetGauge(T::Gauge::FrameAdvantage, s_rb_exchange->FrameAdvantage(live));
-    T::SetGauge(T::Gauge::InputDelay, r.net_delay);
-    T::SetGauge(T::Gauge::MaxPrediction, r.max_prediction);
-    if (live % 60 == 0)  // fix/audio2: mixer underruns/overflows (audio thread counters)
-    {
-      if (const auto* stream = Core::System::GetInstance().GetSoundStream())
-      {
-        const auto a = stream->GetMixer()->GetNSRDMAStats();
-        T::SetGauge(T::Gauge::AudioGapFills, static_cast<double>(a[0]));
-        T::SetGauge(T::Gauge::AudioSkips, static_cast<double>(a[2]));
-      }
-    }
+    T::SetGauge(T::Gauge::InputDelay, r.menu_frame_lockstep ? s_session.delay : r.net_delay);
+    T::SetGauge(T::Gauge::MaxPrediction, r.menu_frame_lockstep ? 0 : r.max_prediction);
+    if (live % 60 == 0)
+      TelemetryAudioGauges();
     if (const u32 confirmed = s_rb_exchange->ConfirmedThrough();
         confirmed != RollbackNet::NO_FRAME && confirmed <= live)
       T::Observe(T::Hist::PredictionFrames, live - confirmed);
@@ -10427,6 +10610,7 @@ void TelemetrySessionEnter()
   if (!NSRTelemetry::Enabled())
     return;
   const Rollback& r = s_rb;
+  TelemetryAudioGauges();
   NSRTelemetry::SetPhase(NSRTelemetry::Phase::RollbackMatch, r.vtime_from);
   s_tm.have_lockstep_end = false;
   TelemetryBaseline();
@@ -10457,6 +10641,7 @@ void TelemetrySessionLeave(const char* reason)
   if (!T::Enabled())
     return;
   const Rollback& r = s_rb;
+  TelemetryAudioGauges();
   T::SessionLeave(r.tick_running, reason ? reason : "",
                   {T::Int("generation", r.session_generation),
                    T::Int("rollbacks", static_cast<s64>(r.rollbacks)),
@@ -10480,6 +10665,7 @@ void TelemetryShutdown()
   // telemetry call would then be a no-op: report the leave first.
   if (s_rb.vtime_on && T::Enabled())
     TelemetrySessionLeave("core shutdown");
+  TelemetryAudioGauges();
   T::Shutdown(s.failed ? "netplay failure (NSR stopped the core)" : "core stop",
               {T::Int("failed", s.failed), T::Int("netplay", s.enabled),
                T::Int("exchanged", s.exchanged_once),
@@ -10555,6 +10741,22 @@ void TelemetryLinkGauges()
   }
 }
 
+// Snapshot cumulative mixer counters at phase boundaries and once a second.
+// Closing a phase with its final sample attributes every underrun to the
+// menu/match interval that produced it, rather than the next periodic sample.
+void TelemetryAudioGauges()
+{
+  namespace T = NSRTelemetry;
+  if (!T::Enabled())
+    return;
+  if (const auto* stream = Core::System::GetInstance().GetSoundStream())
+  {
+    const auto audio = stream->GetMixer()->GetNSRDMAStats();
+    T::SetGauge(T::Gauge::AudioGapFills, static_cast<double>(audio[0]));
+    T::SetGauge(T::Gauge::AudioSkips, static_cast<double>(audio[2]));
+  }
+}
+
 // One lockstep frame done (pre-match retrace lockstep, or post-match frame
 // lockstep when `wait_start` is default).  Host time only.
 void TelemetryLockstepFrame(u32 frame, std::chrono::steady_clock::time_point wait_start)
@@ -10568,6 +10770,9 @@ void TelemetryLockstepFrame(u32 frame, std::chrono::steady_clock::time_point wai
         0, std::chrono::duration_cast<std::chrono::microseconds>(d).count()));
   };
   s_tm.lockstep_frame = frame;
+  T::SetGauge(T::Gauge::MenuInputDelay, s_session.delay);
+  if (frame % 60 == 0 || !s_tm.have_lockstep_end)
+    TelemetryAudioGauges();
   if (wait_start != std::chrono::steady_clock::time_point{})
   {
     T::Observe(T::Hist::LockstepWaitUs, us(now - wait_start));
