@@ -143,6 +143,12 @@ NETPLAY_AUDIO_ARGS = ["-C", "Dolphin.Core.AudioFillGaps=True",
 # 14.5 ms per live frame at 1x vs 19.9 ms at 3x; local/work/textures/REPORT.md),
 # hence no higher default.
 RESOLUTIONS = (0, 1, 2, 3, 4)
+# Window and volume (Settings → Display & sound), applied on every launch so the
+# game always opens the same way. Dolphin's own default volume is 100%, which
+# players found very loud at startup; 40% matches Reborn's level more closely.
+# Volume is host-side output only (no emulated-state effect).
+VOLUMES = (25, 40, 60, 80, 100)
+DEFAULT_VOLUME = 40
 
 
 # --- pure helpers (tested without a GUI) --------------------------------------
@@ -201,7 +207,8 @@ def telemetry_env(folder: str, start: lobby.StartInfo, name: str, fingerprint: s
 def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: str | None,
                     open_ui: bool = False, name: str = "Player", fingerprint: str = "",
                     telemetry: bool = True, quickstart: str = "manual", icons: str = "auto",
-                    resolution: int = 0) -> tuple[list[str], dict[str, str]]:
+                    resolution: int = 0, fullscreen: bool = True,
+                    volume: int = DEFAULT_VOLUME) -> tuple[list[str], dict[str, str]]:
     """Command line and environment for the netplay Dolphin.
 
     start=None: practice offline. open_ui=True: just open Dolphin's window
@@ -235,6 +242,9 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
              "-C", "Graphics.Settings.CacheHiresTextures=False"]
     if resolution in RESOLUTIONS[1:]:
         args += ["-C", f"Graphics.Settings.InternalResolution={resolution}"]
+    if not open_ui:  # the controller-setup window stays a normal window
+        args += ["-C", f"Dolphin.Display.Fullscreen={'True' if fullscreen else 'False'}"]
+    args += ["-C", f"Dolphin.DSP.Volume={volume if volume in VOLUMES else DEFAULT_VOLUME}"]
     # Some Quick Play paths make Reborn's own code read through a null pointer
     # (harmless under Dolphin, which returns 0); keep those warnings out of
     # popup dialogs during a match. They still go to Dolphin's log.
@@ -562,6 +572,8 @@ class Launcher:
             "textures": {"icons": self._icons_setting(), "effective": "", "why": "",
                          "base_kind": "", "base": "", "packages": [], "warning": ""},
             "resolution": self._resolution_setting(),
+            "fullscreen": self._fullscreen_setting(),
+            "volume": self._volume_setting(),
             "link_quality": {"label": "", "delay": None, "jitter_ms": None, "chosen": False,
                              "text": "Connection quality is measured in the game menus after Start.",
                              "warning": ""},
@@ -643,6 +655,30 @@ class Launcher:
         except (TypeError, ValueError):
             return 0
         return v if v in RESOLUTIONS else 0
+
+    def _fullscreen_setting(self) -> bool:
+        return self.cfg.get("fullscreen", True) is not False
+
+    def _volume_setting(self) -> int:
+        try:
+            v = int(self.cfg.get("volume", DEFAULT_VOLUME))
+        except (TypeError, ValueError):
+            return DEFAULT_VOLUME
+        return v if v in VOLUMES else DEFAULT_VOLUME
+
+    def set_fullscreen(self, on) -> None:
+        self.cfg["fullscreen"] = bool(on)
+        self._save()
+        self._set(fullscreen=self._fullscreen_setting())
+
+    def set_volume(self, value) -> None:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = DEFAULT_VOLUME
+        self.cfg["volume"] = value if value in VOLUMES else DEFAULT_VOLUME
+        self._save()
+        self._set(volume=self._volume_setting())
 
     def set_button_icons(self, choice: str) -> None:
         """Button icons: auto (from the controller) or a fixed set. Per PC only."""
@@ -1209,7 +1245,8 @@ class Launcher:
             args, env = dolphin_command(self.folder, start, None, open_ui=open_ui,
                                         name=self.state["name"], fingerprint=self.room_fingerprint(selected_draft),
                                         telemetry=self.state["telemetry"], quickstart=self.state["quickstart"],
-                                        icons=self._icons_setting(), resolution=self._resolution_setting())
+                                        icons=self._icons_setting(), resolution=self._resolution_setting(),
+                                        fullscreen=self._fullscreen_setting(), volume=self._volume_setting())
         except OSError as e:
             self.notify(f"Couldn't prepare the local texture list: {e}. Close the game and retry.", "error")
             return False
@@ -1681,6 +1718,8 @@ class WebApi:
     def set_quickstart(self, selected): self._l.set_quickstart(selected)
     def set_button_icons(self, choice): self._l.set_button_icons(str(choice))
     def set_resolution(self, value): self._l.set_resolution(value)
+    def set_fullscreen(self, on): self._l.set_fullscreen(on)
+    def set_volume(self, value): self._l.set_volume(value)
     # Both manual and signed-content rebuilds preserve these image choices.
     def show_playbook_link(self): self._l.show_playbook_link()
     def refresh_playbook(self): self._l.refresh_playbook()

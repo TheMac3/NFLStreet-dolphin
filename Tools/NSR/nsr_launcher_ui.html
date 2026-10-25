@@ -351,6 +351,12 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
         <div class="card"><div class="label" style="margin-bottom:8px">Graphics: internal resolution</div>
           <div class="seg" id="resSeg"></div>
           <div class="note">Sharper at 2× or 3×, but every step costs frame time during rollback. If the game slows down, go back to Dolphin's setting (native unless you changed it). Only your screen changes.</div></div>
+        <div class="card"><div class="label" style="margin-bottom:8px">Display &amp; sound</div>
+          <div class="toggle" id="fullscreenToggle"><div class="switch"></div><div><b>Start the game in full screen</b>
+            <div class="note" style="margin-top:4px">Alt+Enter switches back to a window while playing.</div></div></div>
+          <div class="label" style="margin:14px 0 6px">Game volume</div>
+          <div class="seg" id="volSeg"></div>
+          <div class="note">Applied every time the game starts. Only your PC changes.</div></div>
         <details class="card advanced">
           <summary class="label">Advanced: game files</summary>
           <div class="fp mono" id="gameFp">–</div>
@@ -541,6 +547,8 @@ function render(s) {
   setText("texSource", tx.base ? "HD textures from: " + tx.base + (tx.packages && tx.packages.length ? " + " + tx.packages.join(", ") : "") : "");
   setText("texWarn", tx.warning || "");
   renderSeg("resSeg", [[0, "Dolphin's"], [1, "1×"], [2, "2×"], [3, "3×"], [4, "4×"]], s.resolution || 0, (k) => call("set_resolution", k));
+  renderSeg("volSeg", [[25, "25%"], [40, "40%"], [60, "60%"], [80, "80%"], [100, "100%"]], s.volume || 40, (k) => call("set_volume", k));
+  $("fullscreenToggle").classList.toggle("on", s.fullscreen !== false);
 
   // settings
   setValue("nameIn", s.name || "");
@@ -609,6 +617,7 @@ function wire() {
   $("btnBookFetch").onclick = () => call("refresh_playbook");
   $("btnBookDefault").onclick = () => call("use_default_playbook");
   $("gameStats").onclick = () => call("set_game_stats", !(S.snap && S.snap.game_stats && S.snap.game_stats.enabled));
+  $("fullscreenToggle").onclick = () => call("set_fullscreen", !(S.snap && S.snap.fullscreen !== false));
   // Stage both choices together; the backend clears readiness until rebuilt.
   $("draftOrder").onchange = $("draftFirst").onchange = () => call("set_draft", $("draftOrder").value, $("draftFirst").value);
   $("btnReimport").onclick = () => call("reimport_reborn");
@@ -666,7 +675,7 @@ function demoApi(page) {
           ["D-pad left","Hat 0 W"],["D-pad right","Hat 0 E"]].map(([control, input]) => ({ control, input })) } },
     textures: { icons: "auto", effective: "playstation", why: "auto:playstation", base_kind: "library",
       base: "C:\\Users\\mason\\AppData\\Roaming\\NFL Street Reborn\\library\\textures\\GN7E69", packages: [], warning: "" },
-    resolution: 0,
+    resolution: 0, fullscreen: true, volume: 40,
     notice: null };
   if (page === "host") Object.assign(base.host, { state: "open", mode: "room", code: "NSRB-4K7QX", players: names.host, can_start: true,
     info: "Room open. Give your friends this code; click Start when everyone's listed." });
