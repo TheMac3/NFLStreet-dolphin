@@ -351,6 +351,9 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
         <div class="card"><div class="label" style="margin-bottom:8px">Graphics: internal resolution</div>
           <div class="seg" id="resSeg"></div>
           <div class="note">Sharper at 2× or 3×, but every step costs frame time during rollback. If the game slows down, go back to Dolphin's setting (native unless you changed it). Only your screen changes.</div></div>
+        <div class="card"><div class="label" style="margin-bottom:8px">Default button icons</div>
+          <div class="seg" id="iconSeg2"></div>
+          <div class="note" id="iconNote2">Which controller's buttons the game shows. Auto matches the controller you use; the same choice is on the Controllers page.</div></div>
         <div class="card"><div class="label" style="margin-bottom:8px">Display &amp; sound</div>
           <div class="toggle" id="fullscreenToggle"><div class="switch"></div><div><b>Start the game in full screen</b>
             <div class="note" style="margin-top:4px">Alt+Enter switches back to a window while playing.</div></div></div>
@@ -542,6 +545,7 @@ function render(s) {
   // button icons (nsr_textures) and resolution
   const tx = s.textures || {}, labels = { auto: "Auto", gamecube: "GameCube", playstation: "PlayStation", xbox: "Xbox" };
   renderSeg("iconSeg", Object.keys(labels).map((k) => [k, labels[k]]), tx.icons || "auto", (k) => call("set_button_icons", k));
+  renderSeg("iconSeg2", Object.keys(labels).map((k) => [k, labels[k]]), tx.icons || "auto", (k) => call("set_button_icons", k));
   setText("iconNote", tx.effective ? "Showing " + labels[tx.effective] + " icons" +
     (String(tx.why || "").startsWith("auto") ? " (matched to your controller)." : ".") : "");
   setText("texSource", tx.base ? "HD textures from: " + tx.base + (tx.packages && tx.packages.length ? " + " + tx.packages.join(", ") : "") : "");
