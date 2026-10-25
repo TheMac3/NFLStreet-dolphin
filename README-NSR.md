@@ -9,7 +9,7 @@ Reborn install; it is not part of Reborn. Internal names (`NSR*` sources,
 
 Changes from upstream:
 
-- Passive per-game stats/MVP export to the Dolphin user `GameStats/` folder;
+- Passive per-game stats/MVP and snap/play-call export to the Dolphin user `GameStats/` folder;
   see [capture format and evidence](docs/nsr-game-stats.md).
 
 - `Source/Core/Core/NSR/NSRNetplay.{h,cpp}`: HLE hook for the NFLStreet

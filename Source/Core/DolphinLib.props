@@ -267,6 +267,7 @@
     <ClInclude Include="Core\NSR\NSRContentRead.h" />
     <ClInclude Include="Core\NSR\NSRNetplay.h" />
     <ClInclude Include="Core\NSR\NSRGameStats.h" />
+    <ClInclude Include="Core\NSR\NSRPlayCalls.h" />
     <ClInclude Include="Core\NSR\NSRGameStatsRead.h" />
     <ClInclude Include="Core\NSR\NSRGameStatsIdentity.h" />
     <ClInclude Include="Core\NSR\NSRDraftLog.h" />

@@ -23,6 +23,7 @@
 #include "Core/NSR/NSRTelemetryLogic.h"
 #include "Core/NSR/NSRGameStatsRead.h"
 #include "Core/NSR/NSRDraftLog.h"
+#include "Core/NSR/NSRPlayCalls.h"
 #include "Core/NSR/NSRPadSource.h"
 #include "Core/NSR/NSRContentRead.h"
 #include "Core/NSR/NSRDraft.h"
@@ -2334,9 +2335,134 @@ static void TestPlaybooks()
   put(ram, 0x104, 11, 1); assert(!NSRContent::PlaybookCaptain(memory, 0, 3));
 }
 
+// Synthetic snap state: malformed spans and modes fail closed, field NaNs are
+// unknown, co-op attribution stays unknown, and rollback replaces abandoned calls.
+static void TestPlayCalls()
+{
+  namespace GS = NSRGameStats;
+  std::vector<std::uint8_t> ram(0x400000);
+  const auto put = [&](std::uint32_t address, std::uint32_t value, unsigned width = 4) {
+    for (unsigned i = 0; i < width; ++i)
+      ram[address - 0x80000000 + i] = static_cast<std::uint8_t>(value >> ((width - 1 - i) * 8));
+  };
+  const GS::Memory memory{ram, {}};
+  assert(!GS::ReadSnap(memory, 7));
+  put(0x803eb444, 0x80000100);
+  put(0x80000130, 2);
+  put(0x80000138, 1, 1);
+  put(0x8000013c, 7, 2);
+  put(0x8000013e, 14, 2);
+  put(0x80000110, 0x7fc00000);  // NaN never becomes a JSON number.
+  put(0x803eab60, 0x80000200);
+  put(0x80000200, 0x80000300);
+  put(0x80000204, 2, 1);
+  put(0x80000300, 0, 1);
+  put(0x8000030c, 1, 1);
+  put(0x802eacac, 1);
+  put(0x802eacb0, 0);
+  const auto snap = GS::ReadSnap(memory, 7);
+  assert(snap && snap->frame == 7 && snap->down == 2 && snap->offense == 1);
+  assert(!snap->z && snap->score[0] == 7 && snap->score[1] == 14);
+  assert(snap->pads[0] == 1 && snap->pads[1] == 0 && !snap->calls[0]);
+  put(0x80000300, 1, 1);
+  assert(GS::ReadSnap(memory, 8)->pads[1] == -1);
+  put(0x80000130, 6);
+  assert(GS::ReadSnap(memory, 8)->down == 0);
+  put(0x80000130, 100);
+  assert(!GS::ReadSnap(memory, 8));
+  put(0x803eb444, 0xfffffff0);
+  assert(!GS::ReadSnap(memory, 8));
+  // Current selection is independent of the UI slot's number; both names
+  // and the byte-sized mirror flag are copied without touching guest RAM.
+  put(0x803ecaf4, 0x80000500);
+  const std::uint32_t current = 0x80000524;
+  put(current + 0xcf8, 252);
+  put(current + 0xcfc, 91);
+  put(current + 0x10, 1, 1);
+  const std::string raw = "16_Test Orbit";
+  std::copy(raw.begin(), raw.end(), ram.begin() + current + 0xee8 - 0x80000000);
+  const auto call = GS::ReadPlayCall(memory, 0);
+  assert(call && call->play_id == 252 && call->slot_id == 91 && call->flipped == true);
+  assert(call->play_name == raw && GS::PlayScreenName(call->play_name) == "Test Orbit");
+  assert(!call->formation_id && !call->category_id);  // No synthetic DB: leave unknown.
+  put(current + 0x10, 0, 1);
+  const auto unflipped = GS::ReadPlayCall(memory, 0);
+  assert(unflipped && unflipped->flipped.has_value() && !*unflipped->flipped);
+  put(current + 0x10, 2, 1);
+  assert(!GS::ReadPlayCall(memory, 0)->flipped);
+  std::fill_n(ram.begin() + current + 0xee8 - 0x80000000, 28, 'x');
+  assert(!GS::ReadPlayCall(memory, 0));  // Reject unterminated native names.
+  GS::PlayCalls log;
+  log.Observe(*snap);
+  auto predicted = *snap;
+  predicted.frame = 12;
+  log.Observe(predicted);
+  log.RollbackFrom(12);
+  assert(log.Snaps().size() == 1);
+  predicted.offense = 0;
+  log.Observe(predicted);
+  assert(log.Snaps().size() == 2 && log.Snaps().back().offense == 0);
+  GS::PlayEvent event;
+  event.frame = 14;
+  event.code = 20;
+  log.ObserveEvent(event);
+  GS::PlayResult outcome;
+  outcome.frame = 15;
+  outcome.kind = 1;
+  log.ObserveResult(outcome);
+  log.RollbackFrom(14);
+  assert(log.Snaps().size() == 2 && log.Snaps().back().events.empty());
+  assert(!log.Snaps().back().result);
+  event.frame = 14;
+  event.code = 6;  // Corrected catch replaces the abandoned interception.
+  log.ObserveEvent(event);
+  outcome.frame = 16;
+  log.ObserveResult(outcome);
+  assert(log.Snaps().back().events[0].code == 6 && log.Snaps().back().result->frame == 16);
+  log.RollbackFrom(7);
+  assert(log.Snaps().empty());
+  assert(GS::PlayScreenName("67_Test Sweep") == "Test Sweep");
+  assert(GS::PlayScreenName("Test Zone") == "Test Zone");
+  assert(GS::PlayScreenName("X7_Test Sweep") == "X7_Test Sweep");
+  assert(!GS::ReadPlayEvent(memory, 0xfffffff0, 20));
+  assert(!GS::ReadPlayResult(memory, 0xfffffff0, 1, 20));
+  put(0x803eb444, 0x80000100);
+  put(0x80000404, 6);
+  put(0x8000040c, 0x42200000);  // Finite finalized spot.
+  put(0x8000041d, 0xfe, 1);
+  auto decoded = GS::ReadPlayResult(memory, 0x80000400, 2, 40);
+  assert(decoded && decoded->result == 6 && decoded->scoring == -2 && decoded->z == 40.0f);
+  // Hitting either host bound must never attach a later play's result to an
+  // earlier snap or present missing turnover events as a complete outcome.
+  GS::PlayCalls bounded;
+  for (std::uint32_t frame = 0; frame <= 4096; ++frame)
+  {
+    GS::Snap entry;
+    entry.frame = frame;
+    bounded.Observe(std::move(entry));
+  }
+  assert(!bounded.Complete() && bounded.Snaps().size() == 4096);
+  bounded.ObserveResult(outcome);
+  assert(!bounded.Snaps().back().result);
+  bounded.RollbackFrom(4095);
+  assert(bounded.Complete() && bounded.Snaps().size() == 4095);
+  for (std::uint32_t i = 0; i < 129; ++i)
+  {
+    GS::PlayEvent extra;
+    extra.frame = 4100 + i;
+    bounded.ObserveEvent(std::move(extra));
+  }
+  assert(bounded.Snaps().back().events.size() == 128);
+  assert(bounded.Snaps().back().events_dropped_from == 4228);
+  bounded.RollbackFrom(4227);
+  assert(!bounded.Snaps().back().events_dropped_from);
+  assert(bounded.Snaps().back().events.size() == 127);
+}
+
 int main()
 {
   TestMenuDelay();
+  TestPlayCalls();
   TestHandoffInputDelay();
   TestAutoInputDelay();
   TestLinkProbes();

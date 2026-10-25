@@ -12,10 +12,12 @@ Git in NFLStreet's ignored `local/` tree.
 
 The exporter only reads bounded direct MEM1/fake-VMEM spans on the CPU thread.
 It does not invoke guest routines, write guest memory, use MMU helpers, enter
-rollback snapshots or influence the input exchange. Two HLE **Start** hooks
-preserve the original native instruction and registers: one remembers the
-native stats formatter's output pointers; one observes native MVP selection.
-Both are suppressed during re-simulation. Instruction fingerprints and the
+rollback snapshots or influence the input exchange. HLE **Start** hooks preserve the original native instruction and registers.
+The totals formatter observer remembers its output pointers during both live
+execution and re-simulation; rollback invalidates abandoned pointers, because
+initialization may occur only on the corrected path. The MVP callback remains
+live-only, with the confirmed-screen fallback described below. Snap/event and
+final-result observations also replay, as described in the play-call section. Instruction fingerprints and the
 existing GN7E69 revision-0 rollback-image guard constrain installation.
 
 At a live frame end, the Game Stats snapshot requires confirmed input and no
@@ -33,6 +35,9 @@ on publication. A temporary exclusive file is closed before atomic rename to
 `<safe-team>_vs_<safe-team>_NNN.json`; uploaders should enumerate `*.json` only.
 
 Optional reliable `NSRI` packets distribute names and a shared timestamp.
+Identity packets are accepted during the preboot agreement as well as play:
+connection setup sends them immediately, and dropping them behind the boot
+filter would permanently lose the peer name. This metadata adds no boot wait.
 The existing ENet connection-to-player binding validates every sender; a star
 host relays accepted identities and replays known identities to new leaves.
 The payload is `NSRI`, version byte 1, pad byte, player-count byte, name-length
@@ -188,6 +193,102 @@ pick_six/fum_td/interceptions/forced_fumbles/fumble_rec/tackles/sacks.
 AGST rfst/ipst map to fumble_rec/thrown_int. These tagged columns were checked
 against native stats/feat descriptors and live rows. The formatter remains the
 authority for displayed team counters, including credits/GameBreakers.
+
+## Passive snap and play-call observations
+
+The playcalls branch adds `plays[]` (`nsr.play.v1`), one journal entry per
+native snap, with `play_calls.schema = "nsr.play_calls.v1"`. It observes both
+offense and defense selected records, without calling guest functions or
+changing guest RAM, CPU registers, input, RNG, snapshots or state digests.
+Native argument registers locate the RAM record and name its result kind.
+The HLE **Start** hooks execute the original instructions normally.
+
+The CPU-thread-owned journal runs during live simulation **and re-simulation**.
+`RollbackFrom(frame)` removes snaps, events and finalized results at/after
+that frame, including a result of a snap that happened before the rollback.
+Corrected execution repopulates it. Serialization uses the existing confirmed
+Game Stats snapshot/host capture anchor; predicted snapshots are not published.
+The journal clears with the existing new-match stats bookkeeping and is bounded
+to 4096 snaps and 128 events per snap. An unfinished play retains null summary.
+Reaching the snap bound sets `nsr_netplay.play_calls_complete` false; reaching
+the event bound sets that play's `events_complete` false and leaves its summary
+null. Later results never overwrite the last retained snap after truncation.
+
+Each role (`offense`, `defense`) has:
+
+- `side`: native in-game side, matching this export's team order.
+- `pad`: zero-based global pad when the registry proves exactly one human
+  belongs to the side. CPU and ambiguous co-op ownership are null. This is
+  unique-side ownership, not a record of which co-op button press won.
+- `book_id`, `play_id` (PLYL), `slot_id` (PBPL occurrence), `play_name`
+  (visible label), and `raw_play_name` (resource label with its order prefix).
+- `formation_id`/`formation_name` (SETL), with `raw_formation_name` retained;
+  optional `category_id`/`category_name` (PBST) are a separate menu grouping.
+  A category such as All is never substituted for a formation.
+- `flipped`: observed native mirror byte when it is boolean, otherwise null.
+  `audible` remains null: final selection is observed at the snap, but the
+  provenance of an audible versus reselecting the same play is unqualified.
+  Revisit with a controlled native audible-switch probe.
+
+No play catalog is bundled. All identities and labels come from the owner's
+loaded game, and formation/category joins use that exact runtime book.
+Unavailable records/fields remain null. Screen labels hide the two-digit
+`NN_` profile-order prefix; the raw string allows audits and future revisions.
+
+`plays[]` also records snap frame/spot, offense, down (native 6 becomes 0 for
+a conversion), score at snap, line/goal coordinates, the snap's roster and
+native events. `summary` uses the finalized native result plus those events:
+run/pass/sack/interception, offensive yards when known, native first down,
+touchdown, turnover, safety and conversion outcome. Yardage is the observed
+normalized final spot minus the snap spot, using the goal line for a TD.
+Turnovers, incompletes and unobserved spots leave yardage unknown. The site
+may count a known incomplete pass as zero. A TD following a turnover remains
+a touchdown event, but must not count as an offensive TD or success.
+Unknown actor indexes use the `nsr.play.v1` sentinel -1.
+
+### GN7E69 revision-0 evidence and guards
+
+Addresses below were checked against the owned Reborn DOL with Capstone;
+runtime readers use bounded MEM1/fake-VMEM spans. Navigation labels from the
+local NFL Street 2 decomp were cross-checked against the instructions, rather
+than copied into this implementation. Re-verify on any other image revision.
+
+| Address/layout | Evidence/meaning |
+| --- | --- |
+| `0x800B1540`, expected instruction `0x7C7E1B78` | Native event commit; r3 points to the completed 0x1C-byte event. Event code 3 is the snap. |
+| `0x8017BD70`, expected instruction `0x9421FFB0` | Native result/stat processor entry, after event evaluation; r3 points to the finalized result, r4 is its native kind. |
+| `*(0x803ECAF4) + 4 + side*0x6974` | Loaded side playbook block, from the earlier playbooks loader research. Current selection starts at +0x20. |
+| Current +0xCF8 / +0xCFC / +0xEE8 | PLYL ID / PBPL occurrence / 28-byte resource name, populated by the native play loader. |
+| Current +0x10, **one byte** | Native mirror flag: `0x80168D84` reads it with lbz; `0x80168D90` writes it with stb. Position/art consumers use it to mirror. |
+| Runtime PLYL → SETL, PBPL → PBST | Native IDs resolve formation and category independently within the active book. |
+| `*(0x803EB444)` | Scrimmage: down+0x30, offense byte+0x38, score halfwords+0x3C/+0x3E, snap x/z+0x0C/+0x10, line+0x08, goal+0x90. |
+| Native result +0x04/+0x18/+0x1D | Result, flags, signed scoring delta; finalized spot is +0x08/+0x0C. |
+
+The native processor increments the first-down counter for kind 1/2,
+result 1, no result flag 4, no scrimmage flag 1, on non-conversion downs.
+Result 6 is the touchdown/goal-line case. Native scoring delta 2 identifies a
+good conversion, and -2 a safety. Event 20 identifies interception, event 30
+changes possession, and 5/6/21 distinguish throw/catch/incomplete. The native
+evaluator's sack path returns pass kind 1 without a throw; a tackled native
+run uses kind 2. All decoding remains observational; native code applies the
+actual game outcome after the hook returns.
+
+A scripted two-peer short match with both humans defending selected the same
+A-card call on five snaps: PLYL20 / PBPL239 / SETL2. Both peers exported
+byte-identical JSON; a separate read-only RAM observer and private extracted
+book catalog corroborated the selected IDs, occurrence, labels and formation.
+The five offensive calls also resolved against that catalog. One first down
+and one touchdown agreed with native totals, and importing the capture into
+the stats service counted each role exactly once per snap. This case exercises
+ambiguous co-op attribution (null pad), not identification of its winning button
+press. Private scripts, captures and exact hashes stay in the task report.
+
+Synthetic socket-free tests cover bounded reads, malformed pointers/names,
+byte-width flip decoding, unknown ownership, conversions and rollback of a
+final result while retaining its earlier snap. Private qualification artifacts
+and exact runtime gate results are in the owning NFLStreet task report.
+Windows/two-PC, explicit audible provenance and a natural multi-match capture
+soak remain release qualifications; the hooks do not alter session transitions.
 
 ## Validation and deferred coverage
 

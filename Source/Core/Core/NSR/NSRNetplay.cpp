@@ -956,18 +956,10 @@ void HandlePacket(const ENetPacket* packet, u32 source)
     HandleTimingProbe({packet->data, packet->dataLength}, source);
     return;
   }
-  // No pad/handoff packet may get ahead of the connection agreement.
-  if (s.boot_pending)
-    return;
-  // Optional stats identities use reliable, sender-bound metadata only. They
-  // neither enter the input exchange nor make simulation wait for a response.
+  // Connection setup sends optional identities before boot agreement ends.
+  // Accept this sender-bound metadata here too; dropping it under boot_pending
+  // permanently prevents named result exports. It never gates simulation.
   const std::span<const u8> bytes{packet->data, packet->dataLength};
-  if (packet->dataLength >= 4 && std::memcmp(packet->data, "NSRG", 4) == 0)
-  {
-    if (PacketSenderMatchesPeer(0, source))
-      NSRGameStats::AcceptCaptureAnchor(bytes);
-    return;
-  }
   if (packet->dataLength >= 4 && std::memcmp(packet->data, "NSRI", 4) == 0)
   {
     const auto sender = NSRGameStats::IdentitySender(bytes);
@@ -984,6 +976,17 @@ void HandlePacket(const ENetPacket* packet, u32 source)
                                             ENET_PACKET_FLAG_RELIABLE));
       }
     }
+    return;
+  }
+  // No pad/handoff packet may get ahead of the connection agreement.
+  if (s.boot_pending)
+    return;
+  // Optional result anchors use reliable, sender-bound metadata only. They
+  // neither enter the input exchange nor make simulation wait for a response.
+  if (packet->dataLength >= 4 && std::memcmp(packet->data, "NSRG", 4) == 0)
+  {
+    if (PacketSenderMatchesPeer(0, source))
+      NSRGameStats::AcceptCaptureAnchor(bytes);
     return;
   }
   u32 magic = 0;
@@ -8410,20 +8413,31 @@ void ContentDatabaseHook(const Core::CPUThreadGuard& guard)
   NSRContent::DatabaseLoaded(guard, s_rb.in_resim, s_rb.live);
 }
 
-// Observational HLE Start hook at GN7E69 rev-0 MVP calculation completion.
-// It preserves the original instruction, PPC registers and all guest state.
+// Passive native event reader. Re-simulation rebuilds observations after
+// RollbackFrom removes the abandoned timeline; no guest state is written.
+void GameStatsEventHook(const Core::CPUThreadGuard& guard)
+{
+  NSRGameStats::ObserveEvent(guard, s_rb.tick_running);
+}
+
+// Read the native finalized play result; re-simulation rebuilds this journal.
+void GameStatsPlayResultHook(const Core::CPUThreadGuard& guard)
+{
+  NSRGameStats::ObservePlayResult(guard, s_rb.tick_running);
+}
+
+// Observe MVP calculation completion, preserving the native instruction/state.
 void GameStatsMvpHook(const Core::CPUThreadGuard& guard)
 {
   if (!s_rb.in_resim)
     NSRGameStats::ObserveMvp(guard);
 }
 
-// Remember the native formatter's output buffers; no game reads/writes occur
-// until the live frame's result capture, and re-simulation cannot update them.
+// Remember the native formatter's output buffers on both live and corrected
+// paths. Rollback invalidates abandoned pointers; guest state is never changed.
 void GameStatsTotalsHook(const Core::CPUThreadGuard& guard)
 {
-  if (!s_rb.in_resim)
-    NSRGameStats::ObserveTotals(guard);
+  NSRGameStats::ObserveTotals(guard, s_rb.tick_running);
 }
 
 // Frame mode, during the session: exactly one tick per unpaused frame.

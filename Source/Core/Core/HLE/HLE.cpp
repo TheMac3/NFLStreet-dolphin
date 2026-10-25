@@ -31,7 +31,7 @@ namespace HLE
 static std::map<u32, u32> s_hooked_addresses;
 
 // clang-format off
-constexpr std::array<Hook, 55> os_patches{{
+constexpr std::array<Hook, 57> os_patches{{
     // Placeholder, os_patches[0] is the "non-existent function" index
     {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
 
@@ -77,6 +77,8 @@ constexpr std::array<Hook, 55> os_patches{{
     {"NSR_InGame",                   NSRNetplay::InGameHook,                 HookType::Start,   HookFlag::Fixed}, // NFLStreet POC rollback: match lifecycle
     {"NSR_PlaybookMenu",             NSRNetplay::PlaybookMenuHook,         HookType::Replace, HookFlag::Fixed}, // existing-play side/pad ordering
     {"NSR_ContentDatabase",          NSRNetplay::ContentDatabaseHook,      HookType::Start,   HookFlag::Fixed}, // native database registration complete
+    {"NSR_GameStatsPlayResult",       NSRNetplay::GameStatsPlayResultHook,    HookType::Start,   HookFlag::Fixed}, // passive native play-result observation
+    {"NSR_GameStatsEvent",            NSRNetplay::GameStatsEventHook,          HookType::Start,   HookFlag::Fixed}, // passive native play-event observation
     {"NSR_GameStatsMvp",             NSRNetplay::GameStatsMvpHook,           HookType::Start,   HookFlag::Fixed}, // passive native MVP observation
     {"NSR_GameStatsTotals",          NSRNetplay::GameStatsTotalsHook,        HookType::Start,   HookFlag::Fixed}, // passive native totals observation
     {"NSR_TickCount",                NSRNetplay::TickCountHook,             HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: one tick per frame
@@ -163,8 +165,13 @@ void PatchFixedFunctions(Core::System& system)
     Patch(system, NSRNetplay::RB_TIME_STUB, "NSR_RollbackTime");
     Patch(system, NSRNetplay::RB_FRAME_STUB, "NSR_RollbackFrame");
     Patch(system, NSRNetplay::RB_FRAME_END_STUB, "NSR_RollbackFrameEnd");
-    // GN7E69 rev 0 only: after the native MVP selection/stat calculation and
-    // before closing its database cursor. Start preserves the original BL.
+    // GN7E69 rev 0 only: passive native event/result readers. Start preserves
+    // each original instruction and the CPU state consumed by native code.
+    if (system.GetMemory().Read_U32(0x800b1540) == 0x7c7e1b78)
+      Patch(system, 0x800b1540, "NSR_GameStatsEvent");
+    if (system.GetMemory().Read_U32(0x8017bd70) == 0x9421ffb0)
+      Patch(system, 0x8017bd70, "NSR_GameStatsPlayResult");
+    // After MVP selection/stat calculation, before closing its DB cursor.
     if (system.GetMemory().Read_U32(0x8005ae44) == 0x4bfffe85)
       Patch(system, 0x8005ae44, "NSR_GameStatsMvp");
     if (system.GetMemory().Read_U32(0x80055f4c) == 0x9421ff80)

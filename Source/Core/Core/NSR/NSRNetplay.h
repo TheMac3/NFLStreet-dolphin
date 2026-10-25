@@ -179,6 +179,8 @@ constexpr unsigned int IN_GAME_FN = 0x8002854C;
 void InGameHook(const Core::CPUThreadGuard& guard);  // HookType::Start
 void PlaybookMenuHook(const Core::CPUThreadGuard& guard);  // HookType::Replace
 void ContentDatabaseHook(const Core::CPUThreadGuard& guard);  // HookType::Start
+void GameStatsPlayResultHook(const Core::CPUThreadGuard& guard);  // read-only Start
+void GameStatsEventHook(const Core::CPUThreadGuard& guard);  // HookType::Start, read-only
 void GameStatsMvpHook(const Core::CPUThreadGuard& guard);  // HookType::Start, read-only
 void GameStatsTotalsHook(const Core::CPUThreadGuard& guard);  // HookType::Start, read-only
 void TickCountHook(const Core::CPUThreadGuard& guard);  // HookType::Gate
