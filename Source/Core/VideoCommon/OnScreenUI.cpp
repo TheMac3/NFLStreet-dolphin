@@ -31,6 +31,8 @@
 #include "VideoCommon/VertexManagerBase.h"
 #include "VideoCommon/VideoConfig.h"
 
+#include <algorithm>
+#include <cfloat>
 #include <inttypes.h>
 #include <mutex>
 
@@ -121,15 +123,12 @@ OnScreenUI::~OnScreenUI()
 
 bool OnScreenUI::RecompileImGuiPipeline()
 {
-  if (g_presenter->GetBackbufferFormat() == AbstractTextureFormat::Undefined)
-  {
-    // No backbuffer (nogui) means no imgui rendering will happen
-    // Some backends don't like making pipelines with no render targets
-    return true;
-  }
+  // Headless EGL has no swapchain; captures use an RGBA8 render target.
+  const auto target_format = g_gfx->IsHeadless() ? AbstractTextureFormat::RGBA8 :
+                                                   g_presenter->GetBackbufferFormat();
 
   const bool linear_space_output =
-      g_presenter->GetBackbufferFormat() == AbstractTextureFormat::RGBA16F;
+      target_format == AbstractTextureFormat::RGBA16F;
 
   std::unique_ptr<AbstractShader> vertex_shader = g_gfx->CreateShaderFromSource(
       ShaderStage::Vertex, FramebufferShaderGen::GenerateImGuiVertexShader(), nullptr,
@@ -170,11 +169,35 @@ bool OnScreenUI::RecompileImGuiPipeline()
   pconfig.blending_state.dst_factor = DstBlendFactor::InvSrcAlpha;
   pconfig.blending_state.src_factor_alpha = SrcBlendFactor::Zero;
   pconfig.blending_state.dst_factor_alpha = DstBlendFactor::One;
-  pconfig.framebuffer_state.color_texture_format = g_presenter->GetBackbufferFormat();
+  pconfig.framebuffer_state.color_texture_format = target_format;
   pconfig.framebuffer_state.depth_texture_format = AbstractTextureFormat::Undefined;
   pconfig.framebuffer_state.samples = 1;
   pconfig.framebuffer_state.per_sample_shading = false;
   pconfig.usage = AbstractPipelineUsage::Utility;
+  // Captures use RGBA8 and OpenGL textures have the opposite Y origin from
+  // its swapchain. Keep the display pipeline untouched on all four backends.
+  m_imgui_capture_pipeline.reset();
+  const bool capture_invert_y = g_backend_info.api_type == APIType::OpenGL;
+  if (linear_space_output || capture_invert_y)
+  {
+    auto capture_vertex = g_gfx->CreateShaderFromSource(
+        ShaderStage::Vertex, FramebufferShaderGen::GenerateImGuiVertexShader(capture_invert_y),
+        nullptr, "ImGui capture vertex shader");
+    auto capture_pixel = g_gfx->CreateShaderFromSource(
+        ShaderStage::Pixel, FramebufferShaderGen::GenerateImGuiPixelShader(false), nullptr,
+        "ImGui capture pixel shader");
+    if (!capture_vertex || !capture_pixel)
+      return false;
+    pconfig.vertex_shader = capture_vertex.get();
+    pconfig.pixel_shader = capture_pixel.get();
+    pconfig.framebuffer_state.color_texture_format = AbstractTextureFormat::RGBA8;
+    m_imgui_capture_pipeline = g_gfx->CreatePipeline(pconfig);
+    if (!m_imgui_capture_pipeline)
+      return false;
+    pconfig.vertex_shader = vertex_shader.get();
+    pconfig.pixel_shader = pixel_shader.get();
+    pconfig.framebuffer_state.color_texture_format = target_format;
+  }
   m_imgui_pipeline = g_gfx->CreatePipeline(pconfig);
   if (!m_imgui_pipeline)
   {
@@ -228,7 +251,8 @@ void OnScreenUI::DrawImGui()
   ImGuiUbo ubo = {{1.0f / m_backbuffer_width * 2.0f, 1.0f / m_backbuffer_height * 2.0f}};
 
   // Set up common state for drawing.
-  g_gfx->SetPipeline(m_imgui_pipeline.get());
+  g_gfx->SetPipeline(m_drawing_capture && m_imgui_capture_pipeline ?
+                         m_imgui_capture_pipeline.get() : m_imgui_pipeline.get());
   g_gfx->SetSamplerState(0, RenderState::GetPointSamplerState());
   g_vertex_manager->UploadUtilityUniforms(&ubo, sizeof(ubo));
 
@@ -413,6 +437,54 @@ void OnScreenUI::DrawChallengesAndLeaderboards()
 #endif  // USE_RETRO_ACHIEVEMENTS
 }
 
+// Fully opaque foreground rectangles survive HD texture replacement, OSD disable,
+// internal-resolution changes and window stretching. The target rectangle already
+// includes Dolphin's aspect correction/crop; clip only at the framebuffer edge.
+void OnScreenUI::DrawPlayCover(NSRPlayCover::State state,
+                               const MathUtil::Rectangle<int>& rect)
+{
+  auto* draw = ImGui::GetForegroundDrawList();
+  for (u32 side = 0; side < 2; ++side)
+  {
+    if (!(state.hidden & (1U << side)))
+      continue;
+    const auto region = NSRPlayCover::SideRegion(side);
+    const float left = static_cast<float>(rect.left);
+    const float top = static_cast<float>(rect.top);
+    const float width = static_cast<float>(rect.GetWidth());
+    const float height = static_cast<float>(rect.GetHeight());
+    const ImVec2 lo(left + width * region.left, top + height * region.top);
+    const ImVec2 hi(left + width * region.right, top + height * region.bottom);
+    draw->AddRectFilled(lo, hi, IM_COL32(17, 22, 30, 255));
+    const char* text = state.locked & (1U << side) ? "Play locked" : "Opponent is picking...";
+    const float font_size = std::min(ImGui::GetFontSize(), (hi.x - lo.x) / 12.0f);
+    const ImVec2 size = ImGui::GetFont()->CalcTextSizeA(font_size, FLT_MAX, 0.0f, text);
+    draw->PushClipRect(lo, hi, true);
+    draw->AddText(ImGui::GetFont(), font_size,
+                  ImVec2((lo.x + hi.x - size.x) * 0.5f, (lo.y + hi.y - size.y) * 0.5f),
+                  IM_COL32(231, 236, 243, 255), text);
+    draw->PopClipRect();
+  }
+}
+
+// Captures normally omit Dolphin UI. Privacy must be retained in screenshots
+// and headless recordings too, so render just the cover into their host texture.
+// Restore the pending display frame's dimensions before returning.
+void OnScreenUI::DrawPlayCoverForDump(u32 width, u32 height, NSRPlayCover::State state)
+{
+  auto lock = GetImGuiLock();
+  const u32 old_width = m_backbuffer_width;
+  const u32 old_height = m_backbuffer_height;
+  ImGui::EndFrame();
+  BeginImGuiFrameUnlocked(width, height);
+  DrawPlayCover(state, {0, 0, static_cast<int>(width), static_cast<int>(height)});
+  FinishImGuiFrame();
+  m_drawing_capture = true;
+  DrawImGui();
+  m_drawing_capture = false;
+  BeginImGuiFrameUnlocked(old_width, old_height);
+}
+
 void OnScreenUI::Finalize()
 {
   auto lock = GetImGuiLock();
@@ -421,6 +493,13 @@ void OnScreenUI::Finalize()
   DrawDebugText();
   OSD::DrawMessages();
   DrawChallengesAndLeaderboards();
+  DrawPlayCover(g_presenter->GetPlayCover(), g_presenter->GetTargetRectangle());
+  FinishImGuiFrame();
+}
+
+// Finish both display and capture frames through the same font upload path.
+void OnScreenUI::FinishImGuiFrame()
+{
   ImGui::Render();
 
   // Check for font changes

@@ -9,6 +9,8 @@
 #include <span>
 #include <vector>
 
+#include "Core/NSR/NSRPlayCover.h"
+#include "Common/MathUtil.h"
 #include "Common/CommonTypes.h"
 #include "VideoCommon/OnScreenUIKeyMap.h"
 
@@ -54,6 +56,9 @@ public:
 
   void Finalize();
 
+  // Draw the same privacy overlay into a capture target, including headless EGL.
+  void DrawPlayCoverForDump(u32 width, u32 height, NSRPlayCover::State state);
+
   // Receive keyboard and mouse from QT
   void SetKeyMap(const DolphinKeyMap& key_map);
   void SetKey(u32 key, bool is_down, const char* chars);
@@ -61,6 +66,8 @@ public:
   void SetMousePress(u32 button_mask);
 
 private:
+  void DrawPlayCover(NSRPlayCover::State state, const MathUtil::Rectangle<int>& rect);
+  void FinishImGuiFrame();
   void DrawDebugText();
   void DrawChallengesAndLeaderboards();
   void UpdateImguiTexture(ImTextureData* tex);
@@ -69,6 +76,8 @@ private:
   std::unique_ptr<NativeVertexFormat> m_imgui_vertex_format;
   std::vector<std::unique_ptr<AbstractTexture>> m_imgui_textures;
   std::unique_ptr<AbstractPipeline> m_imgui_pipeline;
+  std::unique_ptr<AbstractPipeline> m_imgui_capture_pipeline;
+  bool m_drawing_capture = false;
   std::map<u32, int> m_dolphin_to_imgui_map;
   std::mutex m_imgui_mutex;
   u64 m_imgui_last_frame_time = 0;
