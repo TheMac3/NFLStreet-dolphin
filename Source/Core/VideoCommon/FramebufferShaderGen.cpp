@@ -647,7 +647,7 @@ std::string GenerateEFBRestorePixelShader()
   return code.GetBuffer();
 }
 
-std::string GenerateImGuiVertexShader()
+std::string GenerateImGuiVertexShader(bool invert_y)
 {
   ShaderCode code;
 
@@ -664,8 +664,8 @@ std::string GenerateImGuiVertexShader()
              "  opos = float4(rawpos.x * u_rcp_viewport_size_mul2.x - 1.0,"
              "                1.0 - rawpos.y * u_rcp_viewport_size_mul2.y, 0.0, 1.0);\n");
 
-  // NDC space is flipped in Vulkan.
-  if (GetAPIType() == APIType::Vulkan)
+  // Vulkan flips NDC. Capture targets can additionally invert their Y origin.
+  if ((GetAPIType() == APIType::Vulkan) != invert_y)
     code.Write("  opos.y = -opos.y;\n");
 
   code.Write("}}\n");
