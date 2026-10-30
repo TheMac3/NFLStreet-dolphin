@@ -2845,6 +2845,17 @@ static void TestAudibles()
         assert(memory.UInt(AU::Port(0)) == 0U);
         tick(0); tick(0x18);
         assert(memory.UInt(AU::Port(0)) == 2U);
+        // The inner tick must retain the frame filter without re-running Step.
+        const auto before_tick = ram;
+        auto inner_tick = pads;
+        inner_tick[0][0] = 0x11;  // Start + A; only Start may reach native input
+        inner_tick[0][1] = 8;
+        inner_tick[0][2] = 90;
+        assert(AU::FilterTick(memory, inner_tick));
+        assert(inner_tick[0][0] == 0x10 && inner_tick[0][1] == 0 && inner_tick[0][2] == 0);
+        assert(ram == before_tick);
+        const auto once = inner_tick;
+        assert(AU::FilterTick(memory, inner_tick) && inner_tick == once);
         const auto held = tick(0x18);
         assert(held[0][1] == 0 && memory.UInt(sequence) == 0xdc010000U);
         tick(0);  // release entry; no assignment committed

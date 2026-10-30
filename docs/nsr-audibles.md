@@ -21,7 +21,9 @@ on that side is captain and may adjust any of its seven native slots. Partners
 cannot write assignments. Registry-to-port mapping is resolved explicitly.
 
 All mutable control state is in the trace-reserved guest MEM1 block
-`0x80413A00..0x80413B00`, covered by ordinary snapshots and state digests.
+`0x80413A00..0x80413B00`, explicitly removed from the trace live-keep range when enabled, so ordinary
+snapshots and state digests cover it. The inner simulation tick reapplies a
+guest-owned consumption mask without advancing the picker a second time.
 The frame filter runs after pad assembly and snapshot capture, on both live
 and re-simulated frames. Never call it from a VI poll, renderer or local input
 callback. No host clock, local player ID, separate command packet or host latch

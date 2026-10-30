@@ -3468,6 +3468,18 @@ void RbInit(Core::System& system)
 
   // Segments = MEM1 minus the keep ranges (defaults + NSR_RB_KEEP).
   std::vector<std::pair<u32, u32>> keep(RB_KEEP.begin(), RB_KEEP.end());
+  if (Env("NSR_AUDIBLES") == "1")
+  {
+    // The picker reuses 256 bytes of the optional trace reservation. Unlike
+    // diagnostic trace data, its target/latches/mask are simulation state:
+    // restore and digest them. Keeping this range live repeats navigation
+    // edges during a rollback even when every exchanged pad is identical.
+    constexpr u32 state = NSRAudibles::STATE & 0x01FFFFFF;
+    for (auto& range : keep)
+      if (range.first == 0x004132C0 && range.second == 0x00413E00)
+        range.second = state;
+    keep.emplace_back(state + NSRAudibles::SIZE, 0x00413E00);
+  }
   r.audio_rollback = r.net_enabled || !Env("NSR_RB_AUDIO_ROLLBACK").empty();
   if (!r.audio_rollback)
     keep.insert(keep.end(), AUDIO_KEEP.begin(), AUDIO_KEEP.end());
@@ -8231,7 +8243,20 @@ void RollbackTickHook(const Core::CPUThreadGuard& guard)
     // gets the frame's pads (one tick per frame during the session).
     ++r.ticks_since_poll;
     if (const auto it = r.pads.find(r.tick_running); it != r.pads.end())
-      RbWritePads(guard, buf, it->second);
+    {
+      auto pads = it->second;
+      if (Env("NSR_AUDIBLES") == "1")
+      {
+        auto& memory = guard.GetSystem().GetMemory();
+        if (!NSRAudibles::FilterTick({{memory.GetRAM(), memory.GetRamSizeReal()}, {}}, pads))
+        {
+          Log("audibles FAILED: invalid frame consumption state; stopping");
+          Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+          pads = {};
+        }
+      }
+      RbWritePads(guard, buf, pads);
+    }
     ppc_state.gpr[3] = 0;
     return;
   }

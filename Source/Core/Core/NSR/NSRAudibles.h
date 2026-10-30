@@ -18,7 +18,7 @@ using Pads = std::array<std::array<std::uint8_t, 12>, 4>;
 constexpr U32 STATE = 0x80413a00, SIZE = 0x100, MAGIC = 0x41554432;
 constexpr U32 RUSH = 0x82000000;
 constexpr U32 CHORD = 0x18;  // processed Z + D-pad Up; unchanged by Reborn remaps
-constexpr const char* VERSION = "rush-picker-v1-captain-mirrors-rejected";
+constexpr const char* VERSION = "rush-picker-v2-captain-mirrors-rejected";
 // Per-port records: mode, target, previous buttons, context, reason, count,
 // applied player/sequence/old command. Reserve the last words for diagnostics.
 constexpr U32 Port(U32 port) { return STATE + 16 + port * 48; }
@@ -128,6 +128,22 @@ inline void Consume(std::array<std::uint8_t, 12>& pad)
     pad[i] = 0;
 }
 
+// The legacy inner tick re-installs this frame's assembled pads. Replay only
+// the guest-owned consumption mask there; never advance selection or latches
+// twice in one frame, and never let that shim undo the frame's input filter.
+inline bool FilterTick(const NSRGameStats::Memory& m, Pads& pads)
+{
+  if (m.UInt(STATE) != MAGIC)
+    return false;
+  const auto mask = m.UInt(STATE + 4);
+  if (!mask || (*mask & ~15U))
+    return false;
+  for (U32 port = 0; port < 4; ++port)
+    if (*mask & (1U << port))
+      Consume(pads[port]);
+  return true;
+}
+
 // Apply after the frame's snapshot and input assembly, identically on live and
 // replayed frames. Writes go through the emulator's normal guest-write path so
 // dirty trackers see the state. False means the reserved cave/image conflicts.
@@ -149,6 +165,7 @@ bool Step(const NSRGameStats::Memory& m, Pads& pads, Write write)
     write(STATE, MAGIC);
   }
   const auto c = ReadContext(m);
+  U32 consume_mask = 0;
   for (U32 port = 0; port < 4; ++port)
   {
     const U32 record = Port(port);
@@ -209,8 +226,12 @@ bool Step(const NSRGameStats::Memory& m, Pads& pads, Write write)
     write(record + 4, target);
     write(record + 8, buttons & ~0x1000U);
     if (consume)
+    {
       Consume(pads[port]);
+      consume_mask |= 1U << port;
+    }
   }
+  write(STATE + 4, consume_mask);
   return true;
 }
 }  // namespace NSRAudibles

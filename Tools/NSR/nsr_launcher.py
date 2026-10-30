@@ -1995,9 +1995,10 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
 
     # The fallback exposes the same default-off opt-in as the web settings.
     audible_var = tk.BooleanVar(value=launcher.state["audibles"])
-    ttk.Checkbutton(pages["Settings"], text="Experimental defender BLITZ picker (all peers must enable)",
-                    variable=audible_var, command=lambda: launcher.set_audibles(audible_var.get())).grid(
-                        row=20, column=0, columnspan=4, sticky="w", pady=8)
+    audible_toggle = ttk.Checkbutton(
+        pages["Settings"], text="Experimental defender BLITZ picker (all peers must enable)",
+        variable=audible_var, command=lambda: launcher.set_audibles(audible_var.get()))
+    audible_toggle.grid(row=20, column=0, columnspan=4, sticky="w", pady=8)
 
     # Controllers
     cp = pages["Controllers"]
@@ -2114,6 +2115,7 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
             audible_var.set(s["audibles"])
             res_var.set(str(s["resolution"]))
             g, h, j, c = s["game"], s["host"], s["join"], s["controllers"]
+            enable(audible_toggle, h["state"] == "idle" and j["state"] == "idle")
             status.configure(text=("● Ready to play" if g["state"] == "ready" else "● " + g["text"])
                              + f"     {s['name']} · Port 1")
             host_code.configure(text=h["code"] if h["state"] in ("open", "starting") else "")
