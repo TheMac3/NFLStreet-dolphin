@@ -275,11 +275,22 @@ void OnScreenUI::DrawImGui()
         continue;
       }
 
-      g_gfx->SetScissorRect(g_gfx->ConvertFramebufferRectangle(
-          MathUtil::Rectangle<int>(
-              static_cast<int>(cmd.ClipRect.x), static_cast<int>(cmd.ClipRect.y),
-              static_cast<int>(cmd.ClipRect.z), static_cast<int>(cmd.ClipRect.w)),
-          g_gfx->GetCurrentFramebuffer()));
+      MathUtil::Rectangle<int> clip(static_cast<int>(cmd.ClipRect.x),
+                                     static_cast<int>(cmd.ClipRect.y),
+                                     static_cast<int>(cmd.ClipRect.z),
+                                     static_cast<int>(cmd.ClipRect.w));
+      // The OpenGL capture vertex shader reverses Y relative to the display.
+      // Apply the same transform to command scissors, or foreground text is
+      // clipped out while its earlier full-scissor background remains visible.
+      if (m_drawing_capture && g_backend_info.api_type == APIType::OpenGL)
+      {
+        const int top = clip.top;
+        const int height = static_cast<int>(m_backbuffer_height);
+        clip.top = height - clip.bottom;
+        clip.bottom = height - top;
+      }
+      g_gfx->SetScissorRect(
+          g_gfx->ConvertFramebufferRectangle(clip, g_gfx->GetCurrentFramebuffer()));
       g_gfx->SetTexture(0, reinterpret_cast<const AbstractTexture*>(cmd.GetTexID()));
       g_gfx->DrawIndexed(base_index, cmd.ElemCount, base_vertex);
       base_index += cmd.ElemCount;
