@@ -2549,7 +2549,7 @@ static void TestPlayCalls()
     bounded.ObserveEvent(std::move(extra));
   }
   assert(bounded.Snaps().back().events.size() == 128);
-  assert(bounded.Snaps().back().events_dropped_from == 4228);
+  assert(bounded.Snaps().back().events_dropped_from == 4228u);
   bounded.RollbackFrom(4227);
   assert(!bounded.Snaps().back().events_dropped_from);
   assert(bounded.Snaps().back().events.size() == 127);
