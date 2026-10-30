@@ -746,3 +746,41 @@ def _append_roster_art(folder: str, ts: TextureSet) -> None:
         ts.packages.append(Package("nsrb.roster-headshots", data["sha256"], str(directory), "local-store"))
     except (OSError, ValueError, KeyError, TypeError):
         ts.warnings.append("Roster headshots are unavailable; using local art.")
+
+def compose_owned(folder: str, icons_setting: str | None, pad_kind: str | None,
+                  *, game_folder: str | None = None) -> TextureSet:
+    """Use native art plus player-dropped packs; never discover/import Reborn assets.
+
+    Packs load alphabetically under TexturePacks/GN7E69/<pack> (later wins).
+    Optional ButtonIcons/GN7E69/<controller-kind> loads last. Symlinks are
+    refused so an owned launch cannot accidentally traverse a Reborn store.
+    """
+    ts = TextureSet()
+    ts.icons, ts.icons_why = resolve_icons(icons_setting, pad_kind)
+    root = Path(folder).resolve()
+    def usable(path: Path) -> bool:
+        """Allow only local folders containing Dolphin texture files, without symlink hops."""
+        if not path.is_dir() or not path.resolve().is_relative_to(root):
+            return False
+        if any(part.is_symlink() for part in (path, *path.parents) if part != root):
+            return False
+        files = list(path.rglob("*"))
+        if any(p.is_symlink() for p in files):
+            return False
+        return any(p.is_file() and p.name.startswith("tex1_") and p.suffix.lower() in (".png", ".dds")
+                   and not p.is_symlink() and not any(a.is_symlink() for a in p.parents if a != root)
+                   for p in files)
+    packs = root / "TexturePacks" / GAME_ID
+    if packs.is_dir() and not packs.is_symlink():
+        for path in sorted(packs.iterdir(), key=lambda p: p.name.casefold()):
+            if usable(path):
+                ts.packages.append(Package(path.name, "local", str(path), "owned-folder"))
+    prompt = root / "ButtonIcons" / GAME_ID / ts.icons
+    if ts.icons != "gamecube" and usable(prompt):
+        ts.prompt = Package(ts.icons, "local", str(prompt), "owned-folder")
+    elif ts.icons != "gamecube":
+        ts.icons, ts.icons_why = "gamecube", ts.icons_why + ":native-fallback"
+    # Published roster art belongs to the active family's store; optional packs
+    # and icons remain app-local. Never reuse Reborn's signed portrait overlay.
+    _append_roster_art(game_folder or str(root / "local/GameSources/owned"), ts)
+    return ts
