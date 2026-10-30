@@ -32,7 +32,7 @@ namespace HLE
 static std::map<u32, u32> s_hooked_addresses;
 
 // clang-format off
-constexpr std::array<Hook, 60> os_patches{{
+constexpr std::array<Hook, 61> os_patches{{
     // Placeholder, os_patches[0] is the "non-existent function" index
     {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
 
@@ -85,6 +85,7 @@ constexpr std::array<Hook, 60> os_patches{{
     {"NSR_GameStatsEvent",            NSRNetplay::GameStatsEventHook,          HookType::Start,   HookFlag::Fixed}, // passive native play-event observation
     {"NSR_GameStatsMvp",             NSRNetplay::GameStatsMvpHook,           HookType::Start,   HookFlag::Fixed}, // passive native MVP observation
     {"NSR_GameStatsTotals",          NSRNetplay::GameStatsTotalsHook,        HookType::Start,   HookFlag::Fixed}, // passive native totals observation
+    {"NSR_RebornStatsLog",          NSRNetplay::RebornStatsLogHook,       HookType::Start,   HookFlag::Fixed}, // bound the diagnostic write before its address calculation
     {"NSR_TickCount",                NSRNetplay::TickCountHook,             HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: one tick per frame
     {"NSR_Present",                  NSRNetplay::PresentHook,               HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: no vsync wait in re-sim
     {"NSR_PeekZ",                    NSRNetplay::PeekZHook,                 HookType::Gate,    HookFlag::Fixed}, // NFLStreet POC rollback: GPU-independent depth peek
@@ -163,6 +164,17 @@ void PatchFixedFunctions(Core::System& system)
     // GN7E69 rev 0: immediately after fn_801F9134 registers a loaded DB.
     if (system.GetMemory().Read_U32(0x8020d334) == 0x7c7e1b78)
       Patch(system, 0x8020d334, "NSR_ContentDatabase");
+    // nextgame: GN7E69-r0 Reborn's stats diagnostics start at803FE5A0,
+    // but the shipped wrap mask reaches8040259F and overwrites added code.
+    // Recognize the index/base/address/store/mask footprint before changing
+    // the offset register; leave image bytes and native stats stores intact.
+    const auto& memory = system.GetMemory();
+    if (memory.Read_U32(0x803fe4f0) == 0x60e7e578 &&
+        memory.Read_U32(0x803fe4fc) == 0x6129e5a0 &&
+        memory.Read_U32(0x803fe500) == 0x7d294214 &&
+        memory.Read_U32(0x803fe504) == 0x90a90000 &&
+        memory.Read_U32(0x803fe518) == 0x71083ff0)
+      Patch(system, 0x803fe500, "NSR_RebornStatsLog");
     Patch(system, NSRNetplay::RB_POLL_STUB, "NSR_RollbackPoll");
     Patch(system, NSRNetplay::RB_TICK_STUB, "NSR_RollbackTick");
     Patch(system, NSRNetplay::RB_TICK_END_STUB, "NSR_RollbackTickEnd");

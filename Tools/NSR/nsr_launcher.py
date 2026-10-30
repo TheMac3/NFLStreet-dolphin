@@ -1332,6 +1332,19 @@ class Launcher:
             lines = pending.split("\n")
             pending = lines.pop()
             for line in lines:
+                # nextgame: the game window closes on a transport failure.
+                # Keep its named reason visible in the launcher's persistent
+                # notification as well as Dolphin's OSD/log/telemetry record.
+                prefix = "[NSR] netplay stopped: "
+                if line.startswith(prefix):
+                    reason = line[len(prefix):].strip()
+                    with self._lock:
+                        if (generation != self._quality_generation
+                                or (self._proc is not None and process is not self._proc)):
+                            return
+                        if reason and len(reason) <= 256 and all(c.isprintable() for c in reason):
+                            self.notify(reason, "error")
+                            return
                 quality = parse_link_quality(line)
                 if quality:
                     with self._lock:
