@@ -2573,7 +2573,7 @@ static void TestPlayCover()
   assert(PC::LocalSides(memory, 3) == 3);  // couch humans on both sides
   assert(PC::LocalSides(memory, 0) == 0);  // spectator
   put(0x803eaad4, 0x80401000);
-  put(0x80401000, 1);
+  put(0x80401000, 5);
   put(0x803ea58c, 0x80402000);
   assert((PC::Read(memory, 1) == PC::State{1, 0}));
   assert((PC::Read(memory, 2) == PC::State{2, 0}));
@@ -2584,27 +2584,56 @@ static void TestPlayCover()
   put(0x8040204a, 1, 1);  // flipped calls stay covered
   assert(PC::Read(memory, 1).hidden == 1);
   put(0x80401004, 1);
-  put(0x80401000, 5);  // native lock-in animation still exposes call cards
+  put(0x80401000, 5);  // the normal card state includes lock-in
   assert(PC::Read(memory, 1).hidden == 1);
-  for (const auto flow : {0U, 2U, 3U, 4U, 0xffffffffU})
+  for (const auto flow : {0U, 1U, 2U, 3U, 4U, 0xffffffffU})
   {
     put(0x80401000, flow);
     assert(PC::Read(memory, 1).hidden == 0);
   }
+  // Regression: later downs enter card state 5 from 4, not from initial state 1.
+  // A second match reallocates flow state and swaps sides; no history is latched.
+  put(0x80402042, 0, 1);
+  for (std::uint32_t match = 0; match < 2; ++match)
+  {
+    const auto flow_address = 0x80401000U + match * 0x100U;
+    put(0x803eaad4, flow_address);
+    put(0x80400100, match == 0 ? 1U : 0U, 1);
+    put(0x8040010c, match == 0 ? 0U : 1U, 1);
+    for (std::uint32_t down = 0; down < 4; ++down)
+    {
+      put(flow_address + 4, down == 0 ? 1U : 4U);
+      put(flow_address, 5);
+      assert(PC::Read(memory, 1).hidden == (match == 0 ? 1U : 2U));
+      put(flow_address, 3);
+      assert(PC::Read(memory, 1).hidden == 0);
+      put(flow_address, 4);
+      assert(PC::Read(memory, 1).hidden == 0);
+    }
+  }
+  put(0x803eaad4, 0x80401000);
+  put(0x80400100, 1, 1);
+  put(0x8040010c, 0, 1);
+  put(0x80401000, 5);
+  put(0x803eb4a0, 1, 1);  // native selection suppression clears the card cover
+  assert(PC::Read(memory, 1).hidden == 0);
+  put(0x803eb4a0, 0, 1);
   // Same-side co-op uses a full-width panel, including for a remote spectator.
-  put(0x80401000, 1);
+  put(0x80401000, 5);
   put(0x80400004, 2, 1);
   put(0x8040010c, 1, 1);
   put(0x8040204e, 4, 1);
   assert(PC::Read(memory, 1).hidden == 0);
   assert(PC::Read(memory, 2).hidden == 0);
   assert(PC::Read(memory, 0).hidden == 3);
+  assert(PC::Read(memory, 0).layout == PC::Layout::Shared);
   put(0x8040204e, 2, 1);
   put(0x80400004, 4, 1);
   put(0x8040010c, 0, 1);
   put(0x80401000, 2);
   put(0x803eb48c, 1, 1);  // remote audible/flip menu during lineup
   assert(PC::Read(memory, 1).hidden == 1);
+  assert(PC::Read(memory, 1).layout == PC::Layout::Audible);
   assert(PC::Read(memory, 2).hidden == 0);
   put(0x803eb48c, 0, 1);
   put(0x803eb490, 1, 1);  // R opens the defense prediction submenu
@@ -2614,7 +2643,7 @@ static void TestPlayCover()
   assert(PC::Read(memory, 0).hidden == 3);
   put(0x80401000, 3);  // stale menu flag never covers a live play
   assert(PC::Read(memory, 1).hidden == 0);
-  put(0x80401000, 1);
+  put(0x80401000, 5);
   put(0x803ea58c, 0x817ffff0);
   assert(PC::Read(memory, 1).hidden == 0);
   put(0x80400004, 11, 1);
@@ -2623,8 +2652,16 @@ static void TestPlayCover()
   assert(PC::LocalSides(memory, 1) == 0);
   const auto left = PC::SideRegion(1);
   const auto right = PC::SideRegion(0);
-  assert(left.left == 0 && left.right == right.left && right.right == 1);
-  assert(left.top == 0 && left.bottom == 1 && right.top == 0 && right.bottom == 1);
+  assert(left.left == 0.15f && left.right == 0.49f);
+  assert(right.left == 0.51f && right.right == 0.85f);
+  assert(left.top == 0.275f && left.bottom == 0.875f);
+  assert(right.top == left.top && right.bottom == left.bottom);
+  const float area = (left.right - left.left) * (left.bottom - left.top);
+  assert(area > 0.20f && area < 0.21f);  // about 20%, instead of half the frame
+  const auto audible = PC::SideRegion(1, PC::Layout::Audible);
+  assert(audible.top < left.top && audible.bottom < left.bottom);
+  const auto shared = PC::SideRegion(0, PC::Layout::Shared);
+  assert(shared.left < left.left && shared.right > right.right);
 }
 
 int main()

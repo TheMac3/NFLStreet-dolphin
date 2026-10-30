@@ -12,10 +12,19 @@
 
 namespace NSRPlayCover
 {
+// Layout describes only host geometry; audible choices occupy a different HUD area.
+enum class Layout : std::uint8_t
+{
+  Split,
+  Shared,
+  Audible
+};
+
 struct State
 {
   std::uint32_t hidden = 0;
   std::uint32_t locked = 0;
+  Layout layout = Layout::Split;
   bool operator==(const State&) const = default;
 };
 
@@ -24,12 +33,20 @@ struct Region
   float left, top, right, bottom;
 };
 
-// Native two-team play-call panels are tied to team indices, not possession
-// or controller order: native team 1 is left, team 0 is right.
-// Coordinates are relative to the presented game image.
-inline Region SideRegion(std::uint32_t side)
+// Native team 1 is left, team 0 right. The split-card bounds reproduce observed
+// Reborn presentation (not its code/assets): 15..49% / 51..85% X, 27.5..87.5% Y.
+// Audible/prediction choices sit higher on the HUD; protect that list separately.
+// Shared full-width books are relevant only to explicitly covered spectators.
+// All coordinates are relative to Dolphin's presented game image, not the window.
+inline Region SideRegion(std::uint32_t side, Layout layout = Layout::Split)
 {
-  return side == 1 ? Region{0.0f, 0.0f, 0.5f, 1.0f} : Region{0.5f, 0.0f, 1.0f, 1.0f};
+  if (layout == Layout::Shared)
+    return {0.05f, 0.275f, 0.95f, 0.875f};
+  if (layout == Layout::Audible)
+    return side == 1 ? Region{0.075f, 0.17f, 0.49f, 0.52f} :
+                       Region{0.51f, 0.17f, 0.925f, 0.52f};
+  return side == 1 ? Region{0.15f, 0.275f, 0.49f, 0.875f} :
+                     Region{0.51f, 0.275f, 0.85f, 0.875f};
 }
 
 // Resolve *every* local pad through the same native registry as stats capture.
@@ -59,7 +76,10 @@ inline std::uint32_t LocalSides(const NSRGameStats::Memory& memory, std::uint32_
   return sides;
 }
 
-// Flow 1 is selection and 5 is its lock-in transition; 2 is lineup, 3 the snap.
+// Flow 5 is card selection on every down; flow 1 only prepares the initial play.
+// In particular, later selections enter 5 from 4, not 1. Never gate on history.
+// Reborn also suppresses its card cover while the native byte at 803EB4A0 is set.
+// Flow 2 is lineup, where separate audible/prediction flags reveal call choices.
 // UI +42/+43 are set by fn_800577DC when each side commits its play (including
 // flip at +4A/+4B). Read the complete allocation extent before using any fields.
 inline State Read(const NSRGameStats::Memory& memory, std::uint32_t local_pads)
@@ -68,8 +88,7 @@ inline State Read(const NSRGameStats::Memory& memory, std::uint32_t local_pads)
   if (!flow || !memory.Bytes(*flow, 4))
     return {};
   const auto phase = *memory.UInt(*flow);
-  if ((phase != 1 && phase != 2 && phase != 5) ||
-      (phase == 5 && memory.UInt(*flow + 4) != 1U))
+  if (phase != 2 && phase != 5)
     return {};
   const auto opponents = 3U & ~LocalSides(memory, local_pads);
   // Native fn_8017DD68/8017DDDC toggles per-team audible menus at these bytes.
@@ -78,12 +97,15 @@ inline State Read(const NSRGameStats::Memory& memory, std::uint32_t local_pads)
   if (phase == 2)
   {
     State audible;
+    audible.layout = Layout::Audible;
     for (std::uint32_t side = 0; side < 2; ++side)
       if (memory.UInt(0x803eb48c + side, 1) == 1U ||
           memory.UInt(0x803eb490 + side, 1) == 1U)
         audible.hidden |= opponents & (1U << side);
     return audible;
   }
+  if (memory.UInt(0x803eb4a0, 1) != 0U)
+    return {};
   const auto ui = memory.UInt(0x803ea58c);
   if (!ui || !memory.Bytes(*ui, 0x54))
     return {};
@@ -101,6 +123,7 @@ inline State Read(const NSRGameStats::Memory& memory, std::uint32_t local_pads)
     const auto humans = LocalSides(memory, 15);
     if (humans == 1 || humans == 2)
     {
+      result.layout = Layout::Shared;
       result.hidden = (humans & opponents) ? 3U : 0U;
       result.locked = (result.locked & humans) ? 3U : 0U;
     }

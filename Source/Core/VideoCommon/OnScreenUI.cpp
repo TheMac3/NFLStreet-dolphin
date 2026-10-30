@@ -448,14 +448,17 @@ void OnScreenUI::DrawPlayCover(NSRPlayCover::State state,
   {
     if (!(state.hidden & (1U << side)))
       continue;
-    const auto region = NSRPlayCover::SideRegion(side);
+    // A shared book is one continuous panel, even though both side bits are set.
+    if (state.layout == NSRPlayCover::Layout::Shared && side != 0)
+      continue;
+    const auto region = NSRPlayCover::SideRegion(side, state.layout);
     const float left = static_cast<float>(rect.left);
     const float top = static_cast<float>(rect.top);
     const float width = static_cast<float>(rect.GetWidth());
     const float height = static_cast<float>(rect.GetHeight());
     const ImVec2 lo(left + width * region.left, top + height * region.top);
     const ImVec2 hi(left + width * region.right, top + height * region.bottom);
-    draw->AddRectFilled(lo, hi, IM_COL32(17, 22, 30, 255));
+    draw->AddRectFilled(lo, hi, IM_COL32(0, 0, 0, 255));
     const char* text = state.locked & (1U << side) ? "Play locked" : "Opponent is picking...";
     const float font_size = std::min(ImGui::GetFontSize(), (hi.x - lo.x) / 12.0f);
     const ImVec2 size = ImGui::GetFont()->CalcTextSizeA(font_size, FLT_MAX, 0.0f, text);
