@@ -43,6 +43,8 @@ public:
   // Immutable CPU-observed metadata, applied on the GPU swap queue.
   void SetPlayCover(NSRPlayCover::State state) { m_play_cover = state; }
   NSRPlayCover::State GetPlayCover() const { return m_play_cover; }
+  void SetAudibles(const std::array<std::string, 4>& lines) { m_audibles = lines; }
+  const std::array<std::string, 4>& GetAudibles() const { return m_audibles; }
   void DrawPlayCoverForDump(u32 width, u32 height);
 
   void SetNextSwapEstimatedTime(u64 ticks, TimePoint host_time);
@@ -108,6 +110,7 @@ public:
 
 private:
   NSRPlayCover::State m_play_cover;
+  std::array<std::string, 4> m_audibles;
 
   // Fetches the XFB texture from the texture cache.
   // Returns true the contents have changed since last time

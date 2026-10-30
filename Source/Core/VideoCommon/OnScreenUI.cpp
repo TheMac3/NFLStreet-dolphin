@@ -470,10 +470,35 @@ void OnScreenUI::DrawPlayCover(NSRPlayCover::State state,
   }
 }
 
+// The renderer receives immutable text with the XFB. Fit it to the game
+// rectangle so target/assignment/rejection feedback survives resolution changes.
+void OnScreenUI::DrawAudibles(const std::array<std::string, 4>& lines,
+                              const MathUtil::Rectangle<int>& rect)
+{
+  auto* draw = ImGui::GetForegroundDrawList();
+  const float width = static_cast<float>(rect.GetWidth());
+  const float font = std::min(ImGui::GetFontSize(), width / 76.0f);
+  float y = static_cast<float>(rect.top) + static_cast<float>(rect.GetHeight()) * 0.75f;
+  for (const auto& line : lines)
+  {
+    if (line.empty())
+      continue;
+    const ImVec2 lo(static_cast<float>(rect.left) + width * 0.025f, y);
+    const ImVec2 hi(lo.x + width * 0.95f, y + font * 2.5f);
+    draw->AddRectFilled(lo, hi, IM_COL32(0, 0, 0, 235));
+    draw->PushClipRect(lo, hi, true);
+    draw->AddText(ImGui::GetFont(), font, ImVec2(lo.x + 4.0f, lo.y + 2.0f),
+                  IM_COL32(240, 245, 255, 255), line.c_str());
+    draw->PopClipRect();
+    y = hi.y + 2.0f;
+  }
+}
+
 // Captures normally omit Dolphin UI. Privacy must be retained in screenshots
 // and headless recordings too, so render just the cover into their host texture.
 // Restore the pending display frame's dimensions before returning.
-void OnScreenUI::DrawPlayCoverForDump(u32 width, u32 height, NSRPlayCover::State state)
+void OnScreenUI::DrawPlayCoverForDump(u32 width, u32 height, NSRPlayCover::State state,
+                                      const std::array<std::string, 4>& audibles)
 {
   auto lock = GetImGuiLock();
   const u32 old_width = m_backbuffer_width;
@@ -481,6 +506,7 @@ void OnScreenUI::DrawPlayCoverForDump(u32 width, u32 height, NSRPlayCover::State
   ImGui::EndFrame();
   BeginImGuiFrameUnlocked(width, height);
   DrawPlayCover(state, {0, 0, static_cast<int>(width), static_cast<int>(height)});
+  DrawAudibles(audibles, {0, 0, static_cast<int>(width), static_cast<int>(height)});
   FinishImGuiFrame();
   m_drawing_capture = true;
   DrawImGui();
@@ -497,6 +523,7 @@ void OnScreenUI::Finalize()
   OSD::DrawMessages();
   DrawChallengesAndLeaderboards();
   DrawPlayCover(g_presenter->GetPlayCover(), g_presenter->GetTargetRectangle());
+  DrawAudibles(g_presenter->GetAudibles(), g_presenter->GetTargetRectangle());
   FinishImGuiFrame();
 }
 

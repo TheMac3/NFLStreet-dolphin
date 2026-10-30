@@ -266,7 +266,7 @@ void Presenter::SetNextSwapEstimatedTime(u64 ticks, TimePoint host_time)
 void Presenter::DrawPlayCoverForDump(u32 width, u32 height)
 {
   if (m_onscreen_ui)
-    m_onscreen_ui->DrawPlayCoverForDump(width, height, m_play_cover);
+    m_onscreen_ui->DrawPlayCoverForDump(width, height, m_play_cover, m_audibles);
 }
 
 void Presenter::ProcessFrameDumping(u64 ticks) const

@@ -347,6 +347,10 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
           <div class="toggle" id="playCoverToggle"><div class="switch"></div><div><b>Hide opponent's play calls</b>
             <div class="note">Covers the opposing team’s choices during netplay. Teammates share their own choices. Couch play and spectators stay uncovered.</div></div></div>
         </div>
+        <div class="card"><div class="label">Individual defensive adjustments</div>
+          <div class="toggle" id="audiblesToggle"><div class="switch"></div><div><b>Experimental defender BLITZ picker</b>
+            <div class="note">Off by default until man, zone and QB spy arrive. All peers must enable before opening a room. Defense: release buttons, press Z + D-pad Up together, release, then Left/Right picks a defender, Up applies BLITZ, Down or Z cancels. Release to resume. Lowest controller port on each side is captain. Mirrored formations are unavailable.</div></div></div>
+        </div>
         <div class="card"><div class="label">My playbook</div>
           <div class="note">On the editor website, open My playbooks and link this launcher once. Publish your choices, then fetch them here before opening a room. Teammates use the lowest-numbered pad’s book.</div>
           <div class="info" id="bookText"></div><code id="bookLink" style="display:block;overflow-wrap:anywhere;user-select:all"></code>
@@ -563,6 +567,7 @@ function render(s) {
   document.getElementById("performanceHint").hidden = !s.performance_hint;
   renderSeg("resSeg", [[0, "Dolphin's"], [1, "1×"], [2, "2×"], [3, "3×"], [4, "4×"]], s.resolution || 0, (k) => call("set_resolution", k));
   renderSeg("volSeg", [[25, "25%"], [40, "40%"], [60, "60%"], [80, "80%"], [100, "100%"]], s.volume || 40, (k) => call("set_volume", k));
+  $("audiblesToggle").classList.toggle("on", s.audibles === true);
   $("playCoverToggle").classList.toggle("on", s.hide_play_calls !== false);
   $("fullscreenToggle").classList.toggle("on", s.fullscreen !== false);
 
@@ -634,6 +639,7 @@ function wire() {
   $("btnBookDefault").onclick = () => call("use_default_playbook");
   $("gameStats").onclick = () => call("set_game_stats", !(S.snap && S.snap.game_stats && S.snap.game_stats.enabled));
   $("hdToggle").onclick = () => call("set_hd_textures", S.snap && S.snap.hd_textures === false);
+  $("audiblesToggle").onclick = () => call("set_audibles", !(S.snap && S.snap.audibles === true));
   $("playCoverToggle").onclick = () => call("set_hide_play_calls", !(S.snap && S.snap.hide_play_calls !== false));
   $("fullscreenToggle").onclick = () => call("set_fullscreen", !(S.snap && S.snap.fullscreen !== false));
   // Stage both choices together; the backend clears readiness until rebuilt.

@@ -147,6 +147,7 @@ int main()
 #include "Core/NSR/NSRDraftLog.h"
 #include "Core/NSR/NSRPlayCalls.h"
 #include "Core/NSR/NSRPlayCover.h"
+#include "Core/NSR/NSRAudibles.h"
 #include "Core/NSR/NSRPadSource.h"
 #include "Core/NSR/NSRContentRead.h"
 #include "Core/NSR/NSRDraft.h"
@@ -2779,6 +2780,135 @@ static void TestPlayCalls()
   assert(bounded.Snaps().back().events.size() == 127);
 }
 
+// Synthetic guest layout tests exercise the production picker, including its
+// input filter and rolled-back latches. No emulator or game data is needed.
+static void TestAudibles()
+{
+  namespace AU = NSRAudibles;
+  using U = std::uint32_t;
+  for (U side = 0; side < 2; ++side)
+  {
+    for (U mirrored = 0; mirrored < 2; ++mirrored)
+    {
+      for (U slot = 0; slot < 7; ++slot)
+      {
+        std::vector<std::uint8_t> ram(0x1800000);
+        const NSRGameStats::Memory memory{ram, {}};
+        const auto put = [&](U address, U value, U size = 4) {
+          for (U i = 0; i < size; ++i)
+            ram.at(address - 0x80000000 + i) =
+                static_cast<std::uint8_t>(value >> ((size - i - 1) * 8));
+        };
+        put(0x800be678, 0x4bfff49d);
+        put(0x803eb2ac, 15);
+        put(0x803eaad4, 0x80500000); put(0x80500000, 2);
+        put(0x803eb444, 0x80500100); put(0x80500138, side ^ 1U, 1);
+        put(0x803ea3f8, 0x80500200); put(0x80500200, 0x80600000);
+        put(0x80500208, 7, 2); put(0x8050020a, 14, 2);
+        for (U team = 0; team < 2; ++team)
+          for (U position = 0; position < 7; ++position)
+          {
+            put(0x80600000 + (team * 7 + position) * 0x14d8 + 1, position, 1);
+            put(0x80600000 + (team * 7 + position) * 0x14d8 + 2, team, 1);
+          }
+        put(0x803eab60, 0x80500300); put(0x80500300, 0x80500400);
+        put(0x80500304, 4, 1);
+        // Nonidentity pad map: ports 0/2 share defense, ports 1/3 offense.
+        const std::array<U, 4> ports{2, 3, 0, 1};
+        for (U row = 0; row < 4; ++row)
+        {
+          put(0x802eacac + row * 4, ports[row]);
+          put(0x80500400 + row * 12, row % 2 == 0 ? side : side ^ 1U, 1);
+          put(0x80500401 + row * 12, slot, 1);
+        }
+        put(0x803ecaf4, 0x80800000);
+        const U selected = 0x80800024 + side * 0x6974;
+        put(selected + 0x14 + 0x17, mirrored, 1);
+        put(0x803eb098, 0x80500500);
+        put(0x803eaaf4, 0x80500600);
+        const U sequence = selected + 0xcf8 + 0x38 + slot * 40;
+        for (U word = 0; word < 70; ++word)
+          put(selected + 0xcf8 + 0x38 + word * 4, 0xdc010000);
+        AU::Pads pads{};
+        for (auto& pad : pads)
+          for (U axis = 2; axis < 6; ++axis) pad[axis] = 0;
+        const auto tick = [&](U buttons, U port = 0) {
+          auto input = pads;
+          input[port][0] = static_cast<std::uint8_t>(buttons >> 8);
+          input[port][1] = static_cast<std::uint8_t>(buttons);
+          assert(AU::Step(memory, input, [&](U address, U value) { put(address, value); }));
+          return input;
+        };
+        assert(AU::ReadContext(memory).captain == 0);
+        const auto untouched = ram;
+        tick(8); tick(0x18);  // held Up cannot activate the chord
+        assert(memory.UInt(AU::Port(0)) == 0U);
+        tick(0); tick(0x18);
+        assert(memory.UInt(AU::Port(0)) == 2U);
+        const auto held = tick(0x18);
+        assert(held[0][1] == 0 && memory.UInt(sequence) == 0xdc010000U);
+        tick(0);  // release entry; no assignment committed
+        assert(memory.UInt(AU::Port(0)) == 1U);
+        const auto snapshot = ram;
+        auto filtered = tick(8);
+        assert(filtered[0][1] == 0);
+        const auto after = ram;
+        ram = snapshot; tick(8);  // restore and re-simulate the exact pad
+        assert(ram == after);
+        if (mirrored)
+        {
+          assert(memory.UInt(sequence) == 0xdc010000U);
+          assert(memory.UInt(AU::Port(0) + 16) == AU::Mirror);
+          tick(0); tick(4); tick(0);  // cancel unavailable menu
+          assert(memory.UInt(AU::Port(0)) == 0U);
+        }
+        else
+        {
+          assert(memory.UInt(sequence) == AU::RUSH);
+          for (U offset = 4; offset < 40; offset += 4)
+            assert(memory.UInt(sequence + offset) == 0U);
+          assert(memory.UInt(AU::Port(0) + 24) == 0x80600000 + (side * 7 + slot) * 0x14d8);
+          // Exactly one native sequence and our state may change.
+          for (U offset = 0; offset < ram.size(); ++offset)
+            if (ram[offset] != untouched[offset])
+              assert((offset >= AU::STATE - 0x80000000 && offset < AU::STATE - 0x80000000 + AU::SIZE) ||
+                     (offset >= sequence - 0x80000000 && offset < sequence - 0x80000000 + 40));
+          tick(0x100);  // held face button cannot escape after commit
+          assert(memory.UInt(AU::Port(0)) == 3U);
+          tick(0x100); tick(0);
+          assert(memory.UInt(AU::Port(0)) == 0U);
+          assert(tick(0x100)[0][0] == 1);  // fresh native face press passes
+          tick(0); tick(0x18); tick(0); tick(2); tick(2);
+          assert(memory.UInt(AU::Port(0) + 4) == (slot + 1) % 7);  // no repeat
+          tick(0); tick(1);
+          assert(memory.UInt(AU::Port(0) + 4) == slot);
+          tick(0); tick(4); tick(0);
+          tick(0x18, 2); tick(0, 2); tick(8, 2);
+          assert(memory.UInt(AU::Port(2) + 20) == 0U);  // co-op partner cannot edit
+          tick(0x18, 1);  // offense keeps ordinary controls
+          assert(memory.UInt(AU::Port(1)) == 0U);
+          put(0x8050050e, 1, 1);
+          put(0x80600000 + (side * 7 + slot) * 0x14d8 + 0xb62, 17, 1);
+          assert(AU::Availability(memory, AU::ReadContext(memory), slot) == AU::Special);
+          put(0x8050050e, 0, 1);
+          put(0x80500600 + 0x230 + side * 28, 0x80600000 + (side * 7 + slot) * 0x14d8);
+          assert(AU::Availability(memory, AU::ReadContext(memory), slot) == AU::Special);
+        }
+        // Flow exit closes the picker, with the release barrier retained.
+        tick(0); tick(0x18); tick(0);
+        put(0x80500000, 3); tick(0x100);
+        assert(memory.UInt(AU::Port(0)) == 3U || memory.UInt(AU::Port(0)) == 0U);
+        tick(0);
+        assert(memory.UInt(AU::Port(0)) == 0U);
+        put(0x803eaad4, 0xfffffff0);
+        assert(AU::ReadContext(memory).side == 2U);
+        put(AU::STATE, 0x12345678);
+        assert(!AU::Step(memory, pads, [&](U address, U value) { put(address, value); }));
+      }
+    }
+  }
+}
+
 // Synthetic GN7E69-r0 RAM exercises ownership independent of pad order,
 // possession, teammate count, malformed pointers and the locked/snap boundary.
 static void TestPlayCover()
@@ -2980,6 +3110,7 @@ static void TestPlayCoverPlayerCounts()
 int main()
 {
   TestPlayCover();
+  TestAudibles();
   TestPlayCoverPlayerCounts();
   TestMenuDelay();
   TestPlayCalls();

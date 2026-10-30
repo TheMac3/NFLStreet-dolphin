@@ -209,7 +209,7 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
                     telemetry: bool = True, quickstart: str = "manual", icons: str = "auto",
                     resolution: int = 0, fullscreen: bool = True,
                     volume: int = DEFAULT_VOLUME, hd_textures: bool = True,
-                    hide_play_calls: bool = True) -> tuple[list[str], dict[str, str]]:
+                    hide_play_calls: bool = True, audibles: bool = False) -> tuple[list[str], dict[str, str]]:
     """Command line and environment for the netplay Dolphin.
 
     start=None: practice offline. open_ui=True: just open Dolphin's window
@@ -230,6 +230,10 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
         return args, env
     # Per-PC presentation preference; never included in room/simulation agreement.
     args += ["-C", f"Dolphin.NSR.HideOpponentPlayCalls={'True' if hide_play_calls else 'False'}"]
+    # Simulation policy: every peer must opt in; the fork names mismatches
+    # before boot. No image/content-recipe mutation is needed for this picker.
+    if audibles:
+        env["NSR_AUDIBLES"] = "1"
     players = start.players if start else 1
     pad = controllers.controller_kind(os.path.join(folder, "User"))
     # Imported presentation assets only. This launch path never resolves or
@@ -596,6 +600,7 @@ class Launcher:
             "performance_hint": "",
             "fullscreen": self._fullscreen_setting(),
             "hide_play_calls": self.cfg.get("hide_play_calls", True) is not False,
+            "audibles": self.cfg.get("audibles") is True,
             "volume": self._volume_setting(),
             "link_quality": {"label": "", "delay": None, "jitter_ms": None, "chosen": False,
                              "text": "Connection quality is measured in the game menus after Start.",
@@ -688,6 +693,14 @@ class Launcher:
         except (TypeError, ValueError):
             return DEFAULT_VOLUME
         return v if v in VOLUMES else DEFAULT_VOLUME
+
+    def set_audibles(self, on) -> None:
+        """Keep the experimental policy fixed while either room is open."""
+        if self.state["host"]["state"] != "idle" or self.state["join"]["state"] != "idle":
+            return
+        self.cfg["audibles"] = bool(on)
+        self._save()
+        self._set(audibles=bool(on))
 
     def set_hide_play_calls(self, on) -> None:
         """Keep play-call privacy local; couch and spectator rules live in Dolphin."""
@@ -1303,7 +1316,8 @@ class Launcher:
                                         icons=self._icons_setting(), resolution=self._resolution_setting(),
                                         fullscreen=self._fullscreen_setting(), volume=self._volume_setting(),
                                         hd_textures=self.cfg.get("hd_textures", True) is not False,
-                                        hide_play_calls=self.cfg.get("hide_play_calls", True) is not False)
+                                        hide_play_calls=self.cfg.get("hide_play_calls", True) is not False,
+                                        audibles=self.cfg.get("audibles") is True)
         except OSError as e:
             self.notify(f"Couldn't prepare the local texture list: {e}. Close the game and retry.", "error")
             return False
@@ -1816,6 +1830,7 @@ class WebApi:
     def set_hd_textures(self, on): self._l.set_hd_textures(bool(on))
     def set_resolution(self, value): self._l.set_resolution(value)
     def set_hide_play_calls(self, on): self._l.set_hide_play_calls(on)
+    def set_audibles(self, on): self._l.set_audibles(on)
     def set_fullscreen(self, on): self._l.set_fullscreen(on)
     def set_volume(self, value): self._l.set_volume(value)
     # Both manual and signed-content rebuilds preserve these image choices.
@@ -1978,6 +1993,12 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     b_join.grid(row=3, column=0, sticky="w", pady=8)
     b_leave.grid(row=3, column=1, sticky="w")
 
+    # The fallback exposes the same default-off opt-in as the web settings.
+    audible_var = tk.BooleanVar(value=launcher.state["audibles"])
+    ttk.Checkbutton(pages["Settings"], text="Experimental defender BLITZ picker (all peers must enable)",
+                    variable=audible_var, command=lambda: launcher.set_audibles(audible_var.get())).grid(
+                        row=20, column=0, columnspan=4, sticky="w", pady=8)
+
     # Controllers
     cp = pages["Controllers"]
     ctl_dev = label(cp, 1, style="Big.TLabel")
@@ -2090,6 +2111,7 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
             seen["rev"] = s["rev"]
             perf_hint.configure(text=s["performance_hint"])
             hd_var.set(s["hd_textures"])
+            audible_var.set(s["audibles"])
             res_var.set(str(s["resolution"]))
             g, h, j, c = s["game"], s["host"], s["join"], s["controllers"]
             status.configure(text=("● Ready to play" if g["state"] == "ready" else "● " + g["text"])

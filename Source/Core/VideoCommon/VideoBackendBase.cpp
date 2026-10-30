@@ -104,6 +104,7 @@ void VideoBackendBase::Video_OutputXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride
 
   // Capture on the CPU thread; never read guest RAM from the video thread.
   const auto play_cover = NSRNetplay::CapturePlayCover();
+  const auto audibles = NSRNetplay::CaptureAudibles();
 
   if (!g_ActiveConfig.bImmediateXFB)
   {
@@ -112,13 +113,15 @@ void VideoBackendBase::Video_OutputXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride
     const TimePoint presentation_time = core_timing.GetTargetHostTime(ticks);
     AsyncRequests::GetInstance()->PushEvent([=] {
       g_presenter->SetPlayCover(play_cover);
+      g_presenter->SetAudibles(audibles);
       g_presenter->ViSwap(xfb_addr, fb_width, fb_stride, fb_height, ticks, presentation_time);
     });
   }
   else
   {
-    AsyncRequests::GetInstance()->PushEvent([play_cover] {
+    AsyncRequests::GetInstance()->PushEvent([play_cover, audibles] {
       g_presenter->SetPlayCover(play_cover);
+      g_presenter->SetAudibles(audibles);
     });
   }
 

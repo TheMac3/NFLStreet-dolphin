@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <string>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -57,7 +59,8 @@ public:
   void Finalize();
 
   // Draw the same privacy overlay into a capture target, including headless EGL.
-  void DrawPlayCoverForDump(u32 width, u32 height, NSRPlayCover::State state);
+  void DrawPlayCoverForDump(u32 width, u32 height, NSRPlayCover::State state,
+                            const std::array<std::string, 4>& audibles);
 
   // Receive keyboard and mouse from QT
   void SetKeyMap(const DolphinKeyMap& key_map);
@@ -67,6 +70,9 @@ public:
 
 private:
   void DrawPlayCover(NSRPlayCover::State state, const MathUtil::Rectangle<int>& rect);
+  // Host-only text over the game image, also included in headless captures.
+  void DrawAudibles(const std::array<std::string, 4>& lines,
+                    const MathUtil::Rectangle<int>& rect);
   void FinishImGuiFrame();
   void DrawDebugText();
   void DrawChallengesAndLeaderboards();

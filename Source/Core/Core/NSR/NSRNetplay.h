@@ -132,6 +132,8 @@ namespace NSRNetplay
 {
 // CPU-thread read-only snapshot for the corresponding queued XFB presentation.
 NSRPlayCover::State CapturePlayCover();
+// Text is captured on the CPU thread; drawing never changes picker state.
+std::array<std::string, 4> CaptureAudibles();
 
 // Install canonical settings/cards and agree all peers before Core::Init executes
 // any guest boot code. Returns false with a named diagnostic on incompatibility.

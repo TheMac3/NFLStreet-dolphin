@@ -13,6 +13,7 @@
 
 #include "Core/NSR/NSRNetplay.h"
 #include "Core/NSR/NSRPlayCover.h"
+#include "Core/NSR/NSRAudibles.h"
 #include "Core/NSR/NSRBootSync.h"
 #include "Core/NSR/NSRQuickstart.h"
 #include "Core/NSR/NSRBootAgreement.h"
@@ -4579,6 +4580,28 @@ void RbWritePads(const Core::CPUThreadGuard& guard, u32 buf, const Pads& pads)
   }
 }
 
+// The picker sees only frame-keyed assembled inputs. Its latches and target
+// are MEM1, not host globals; VI pad polls must never advance this state.
+void WriteAudiblePads(const Core::CPUThreadGuard& guard, u32 buf, const Pads& pads)
+{
+  if (Env("NSR_AUDIBLES") != "1")
+  {
+    RbWritePads(guard, buf, pads);
+    return;
+  }
+  auto filtered = pads;
+  auto& memory = guard.GetSystem().GetMemory();
+  const NSRGameStats::Memory view{{memory.GetRAM(), memory.GetRamSizeReal()}, {}};
+  if (!NSRAudibles::Step(view, filtered, [&](u32 address, u32 value) {
+        PowerPC::MMU::HostWrite<u32>(guard, value, address);
+      }))
+  {
+    Log("audibles FAILED: incompatible image or occupied guest state cave; stopping");
+    Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+  }
+  RbWritePads(guard, buf, filtered);
+}
+
 // Count granules (within segments) that differ between RAM and `before`.
 void RbCountWrites(const u8* ram, const std::vector<u8>& before, std::vector<u32>& counts)
 {
@@ -4684,6 +4707,69 @@ NSRPlayCover::State CapturePlayCover()
     return {};
   return NSRPlayCover::Read({{ram, memory.GetRamSizeReal()}, {}},
                             spectator ? 0U : (1U << s.me));
+}
+
+// Read guest identity and current assignment for display only. The runtime AGLP
+// decoder is shared with stats; no names or presentation caches drive gameplay.
+std::array<std::string, 4> CaptureAudibles()
+{
+  std::array<std::string, 4> lines;
+  if (Env("NSR_AUDIBLES") != "1")
+    return lines;
+  auto& memory = Core::System::GetInstance().GetMemory();
+  if (!memory.GetRAM())
+    return lines;
+  const NSRGameStats::Memory view{
+      {memory.GetRAM(), memory.GetRamSizeReal()},
+      {memory.GetFakeVMEM(), memory.GetFakeVMEM() ? memory.GetFakeVMemSize() : 0}};
+  if (view.UInt(NSRAudibles::STATE) != NSRAudibles::MAGIC)
+    return lines;
+  const auto context = NSRAudibles::ReadContext(view);
+  if (context.side > 1)
+    return lines;
+  for (u32 port = 0; port < 4; ++port)
+  {
+    if ((s_session.enabled && port != s_session.me) || context.sides[port] != context.side)
+      continue;
+    const u32 record = NSRAudibles::Port(port);
+    const u32 mode = view.UInt(record).value_or(0);
+    const u32 target = view.UInt(record + 4).value_or(7);
+    if (target >= 7)
+      continue;
+    const u32 player = context.player_base + target * 0x14d8;
+    std::string name = fmt::format("Defender {}", target + 1);
+    const auto id = view.UInt(player + 0xb5c, 2);
+    const auto rows = NSRGameStats::ReadTable(view, "EMAG", "AGLP");
+    if (id && rows)
+      for (const auto& row : *rows)
+        if (NSRGameStats::Integer(row, "DIGP") == *id)
+        {
+          const auto first = NSRGameStats::String(row, "ANFP");
+          const auto last = NSRGameStats::String(row, "ANLP");
+          if (first && last)
+            name = *first + " " + *last;
+          break;
+        }
+    const auto available = NSRAudibles::Availability(view, context, target);
+    const char* assignment = view.UInt(context.play + 0x38 + target * 40) == NSRAudibles::RUSH ?
+                                 "BLITZ" : "Native play";
+    std::string status;
+    if (port != context.captain)
+      status = fmt::format("P{} is adjustment captain", context.captain + 1);
+    else if (available == NSRAudibles::Mirror)
+      status = "Mirrored formation unavailable; choose an unflipped play";
+    else if (available != NSRAudibles::Ready)
+      status = "Native special assignment unavailable";
+    else if (mode == 2 || mode == 3)
+      status = "Release buttons to continue";
+    else if (mode == 1)
+      status = "D-pad Left/Right: target | Up: BLITZ | Down/Z: cancel";
+    else
+      status = "Z + D-pad Up from released buttons: adjust";
+    lines[port] = fmt::format("P{} DEF {}/7: {} | {}\n{}", port + 1, target + 1,
+                              name, assignment, status);
+  }
+  return lines;
 }
 
 bool IsEnabled()
@@ -4986,6 +5072,7 @@ bool PrepareBoot()
   if (const auto manifest = NSRBootSync::Prepare())
   {
     s.boot_manifest = *manifest;
+    s.boot_manifest["Audibles.Policy"] = Env("NSR_AUDIBLES") == "1" ? NSRAudibles::VERSION : "off";
     if (!Env("NSR_RB_NET").empty())
       s.boot_manifest["MenuDelay.Protocol"] = std::to_string(RollbackNet::HANDOFF_VERSION);
     if (*mode != NSRQuickstart::Mode::Manual)
@@ -6668,7 +6755,8 @@ static RollbackNet::ConfigFingerprint LocalConfigFingerprint(Core::System& syste
       list(c.effect_gates), list(c.skip_resim), c.keep_resim_vsync, c.async_present, c.peek_z));
   fp[ConfigField::SessionRules] = hash_text(
       fmt::format("stats-log-bound-v1 results-confirm-v1 auto {} from {} end {} reenter {}", r.auto_handoff,
-                  r.auto_handoff ? 0 : r.vtime_from, c.session_end, c.auto_reenter));
+                  r.auto_handoff ? 0 : r.vtime_from, c.session_end, c.auto_reenter) +
+      (Env("NSR_AUDIBLES") == "1" ? NSRAudibles::VERSION : "audibles-off"));
   fp[ConfigField::DolphinCore] = hash_text(fmt::format(
       "cheats {} mmu {} ram {} {} fprf {} nans {} rtc {} {}",
       Config::Get(Config::MAIN_ENABLE_CHEATS), Config::Get(Config::MAIN_MMU),
@@ -7660,7 +7748,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
       std::fwrite(pass_pads.data(), 1, sizeof(Pads), r.record);
       std::fflush(r.record);
     }
-    RbWritePads(guard, buf, pass_pads);
+    WriteAudiblePads(guard, buf, pass_pads);
     // Post-match lockstep is frame-driven even though rollback ownership is
     // off: game time/audio queries and instant DVD completion must observe
     // the same frame on every peer while the next match is loading.
@@ -7915,7 +8003,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
       r.io_idle[r.cursor] = IsIoIdle(ram);
     if (r.net_enabled && s_rb_exchange)
       r.pads[r.cursor] = FromNetPads(s_rb_exchange->Assemble(r.cursor));
-    RbWritePads(guard, buf, r.pads.at(r.cursor));
+    WriteAudiblePads(guard, buf, r.pads.at(r.cursor));
     if (r.net_enabled && s_rb_exchange)
     {
       // Same point as the live unit's digest: snapshot saved, pads written.
@@ -8019,7 +8107,7 @@ u32 RbStep(const Core::CPUThreadGuard& guard, u32 buf)
     std::fwrite(r.pads[t].data(), 1, sizeof(Pads), r.record);
     std::fflush(r.record);
   }
-  RbWritePads(guard, buf, r.pads[t]);
+  WriteAudiblePads(guard, buf, r.pads[t]);
   RbAdopt(system, ram, t);
   RbDumpUnit(system, ram, t, t);
   if (t == r.vtime_from)
