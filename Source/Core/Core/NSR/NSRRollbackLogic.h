@@ -20,6 +20,15 @@
 
 namespace NSRNetplay::RollbackLogic
 {
+// GN7E69-r0 Reborn stats diagnostics: 16-byte records begin at803FE5A0.
+// The shipped 16KiB wrap crosses added code at80400000. Bound the offset
+// before its address calculation to the documented 1KiB diagnostic ring;
+// no host clock, network arrival or match lifecycle determines the wrap.
+constexpr std::uint32_t RebornStatsLogOffset(std::uint32_t offset)
+{
+  return offset & 0x3F0u;
+}
+
 // A page needs copying when a slot has never been synchronized or the page
 // was stamped after that slot's synchronization epoch.
 constexpr bool PageNeedsCopy(std::uint32_t stamp, std::optional<std::uint32_t> synced)
@@ -258,10 +267,12 @@ constexpr bool PausedFrame(std::uint32_t pause_depth)
 // 3918529284: dialog open from frame 6890, A at 6960 requests the end, 6961
 // tears down); and a real match's post-game flow (fn_800AB3B0 at 0x800AB550,
 // no modal UI; CPU match: request in 101554, teardown 101555). The input
-// driven ones come from modal UI, so a live frame waits for every player's
+// driven ones include the natural-result Rematch/Exit selector, which has
+// zero pause depth and is not modal. A live frame waits for every player's
 // confirmed input when it starts
 //  - with the pause menu open,
 //  - with a modal dialog on top of the in-game UI stack,
+//  - in the natural Game Stats/MVP result menus (Rematch/Exit),
 //  - after the end was requested (the teardown frame itself), or
 //  - within `grace` frames after one of the above, which covers screens
 //    that close a few frames before the request takes effect.
@@ -269,20 +280,20 @@ constexpr bool PausedFrame(std::uint32_t pause_depth)
 // disagree on it without affecting determinism. The menus are static, so
 // the added input latency is invisible; normal play never waits (but a
 // confirmed frame is lockstep: ~one network hop per frame while it lasts).
-// Deferred: if a non-modal request turns out to be input-driven (the
-// post-game flow above has not been traced for that), a correction could
-// move the request into a re-simulated frame; RbStep logs "re-simulated
-// frame ... starts after a match-end request" then. Revisit on that log line.
+// GN7E69 rev 0 natural-match tests observed input-driven Rematch/Exit in
+// the non-modal MVP screen. Keep it confirmed through closing/loading rather
+// than waiting for the InGame keep-running byte to change one frame later.
 struct LifecycleSignals
 {
   std::uint32_t pause_depth = 0;
   bool in_game_running = true;  // InGame's keep-running byte != 0
   bool modal_dialog = false;    // in-game UI stack top is the modal dialog
+  bool results_menu = false;    // native Game Stats/MVP, including Rematch/Exit
 };
 
 constexpr bool LifecycleTransition(const LifecycleSignals& s)
 {
-  return PausedFrame(s.pause_depth) || !s.in_game_running || s.modal_dialog;
+  return PausedFrame(s.pause_depth) || !s.in_game_running || s.modal_dialog || s.results_menu;
 }
 
 // `hold_until` (exclusive end of the grace window, 0 = none) is updated.
