@@ -1308,7 +1308,21 @@ class Launcher:
             self._spawn(lambda: self._watch_link_quality(process, env["NSR_LOG"], generation))
             self._spawn(lambda: self._watch_boot_sync(process, env["NSR_LOG"],
                 quickstart=start.quickstart != "manual"))
+            self._spawn(lambda: self._upload_when_game_exits(process))
         return True
+
+    def _upload_when_game_exits(self, process) -> None:
+        """Upload this session's results as soon as the game closes.
+
+        The background pass only runs every gamestats.INTERVAL_S and on room
+        start, so captures written during a session could sit unsent until the
+        next launch (2026-10-26: two saved captures never reached the server).
+        """
+        try:
+            process.wait()
+        except Exception:  # noqa: BLE001 - absent/fake process (tests, odd Popen)
+            return
+        self._stats_wake.set()
 
     def _clear_link_quality(self, measuring: bool = False) -> int:
         """Clear the previous room and return the new reader's ownership token."""
