@@ -3,6 +3,8 @@
 
 #include "VideoCommon/HiresTextures.h"
 
+#include "VideoCommon/NSRHostMetrics.h"
+
 #include <algorithm>
 #include <memory>
 #include <mutex>
@@ -142,6 +144,13 @@ void HiresTexture::Update()
   // NSR: listed folders first (highest precedence), then the stock ones.
   std::vector<std::string> ordered_directories = NSRTextureFolders(game_id);
   const bool nsr_overlay = !ordered_directories.empty();
+  if (nsr_overlay)
+  {
+    // A 15 GiB decoded pack cannot fit alongside Dolphin, its snapshots and
+    // another peer on a 16 GiB PC. Cache only recent CPU pixels (512 MiB target);
+    // texture eviction does not discard already uploaded GPU entries.
+    Core::System::GetInstance().GetCustomResourceManager().LimitTextureMemory(512ULL * 1024 * 1024);
+  }
   ordered_directories.insert(ordered_directories.end(), texture_directories.begin(),
                              texture_directories.end());
 
@@ -207,6 +216,8 @@ void HiresTexture::Update()
     }
   }
 
+  NSRHostMetrics::texture_count.store(static_cast<u64>(s_hires_texture_id_to_arbmipmap.size()),
+                                      std::memory_order_relaxed);
   if (g_ActiveConfig.bCacheHiresTextures)
   {
     OSD::AddMessage(fmt::format("Loading '{}' custom textures", s_hires_texture_cache.size()),
@@ -221,6 +232,7 @@ void HiresTexture::Update()
 
 void HiresTexture::Clear()
 {
+  NSRHostMetrics::texture_count.store(0, std::memory_order_relaxed);
   s_hires_texture_cache.clear();
   s_hires_texture_id_to_arbmipmap.clear();
   s_file_library = std::make_shared<VideoCommon::DirectFilesystemAssetLibrary>();
@@ -254,9 +266,17 @@ HiresTexture::HiresTexture(bool has_arbitrary_mipmaps, std::string id)
 
 VideoCommon::CustomResourceManager::TextureTimePair HiresTexture::LoadTexture() const
 {
+  NSRHostMetrics::Scope host_timer(NSRHostMetrics::TextureRequest);
   auto& system = Core::System::GetInstance();
   auto& custom_resource_manager = system.GetCustomResourceManager();
   return custom_resource_manager.GetTextureDataFromAsset(m_id, s_file_library);
+}
+
+// Report completed hot reloads without resurrecting evicted decoded pixels.
+VideoCommon::CustomAsset::TimeType HiresTexture::GetLoadTime() const
+{
+  NSRHostMetrics::Scope host_timer(NSRHostMetrics::TextureRequest);
+  return Core::System::GetInstance().GetCustomResourceManager().GetTextureLoadTime(m_id);
 }
 
 std::set<std::string> GetTextureDirectoriesWithGameId(const std::string& root_directory,

@@ -31,6 +31,8 @@ public:
 
   bool HasArbitraryMipmaps() const { return m_has_arbitrary_mipmaps; }
   VideoCommon::CustomResourceManager::TextureTimePair LoadTexture() const;
+  // Metadata-only cache validation; never schedules a decode for a warm GPU entry.
+  VideoCommon::CustomAsset::TimeType GetLoadTime() const;
   const std::string& GetId() const { return m_id; }
 
 private:

@@ -348,9 +348,13 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
           <div class="info" id="bookText"></div><code id="bookLink" style="display:block;overflow-wrap:anywhere;user-select:all"></code>
           <div class="row"><button class="btn" id="btnBookLink">Show private link code</button><button class="btn" id="btnBookFetch">Fetch my playbook</button><button class="btn" id="btnBookDefault">Use game default</button></div>
         </div>
-        <div class="card"><div class="label" style="margin-bottom:8px">Graphics: internal resolution</div>
+        <div class="card"><div class="label" style="margin-bottom:8px">Performance</div>
+          <div class="toggle" id="hdToggle"><div class="switch"></div><div><b>HD textures</b>
+            <div class="note" style="margin-top:4px">Turn off for the lightest graphics load and the game's original button icons.</div></div></div>
+          <div class="label" style="margin:14px 0 6px">Internal resolution</div>
           <div class="seg" id="resSeg"></div>
-          <div class="note">Sharper at 2× or 3×, but every step costs frame time during rollback. If the game slows down, go back to Dolphin's setting (native unless you changed it). Only your screen changes.</div></div>
+          <div class="info warn" id="performanceHint" hidden role="status"></div>
+          <div class="note">Start at 1× for smooth netplay. Try 2× or 3× only if your PC keeps up. HD textures and resolution affect only your screen; each player chooses their own.</div></div>
         <div class="card"><div class="label" style="margin-bottom:8px">Default button icons</div>
           <div class="seg" id="iconSeg2"></div>
           <div class="note" id="iconNote2">Which controller's buttons the game shows. Auto matches the controller you use; the same choice is on the Controllers page.</div></div>
@@ -550,6 +554,9 @@ function render(s) {
     (String(tx.why || "").startsWith("auto") ? " (matched to your controller)." : ".") : "");
   setText("texSource", tx.base ? "HD textures from: " + tx.base + (tx.packages && tx.packages.length ? " + " + tx.packages.join(", ") : "") : "");
   setText("texWarn", tx.warning || "");
+  $("hdToggle").classList.toggle("on", s.hd_textures !== false);
+  setText("performanceHint", s.performance_hint || "");
+  document.getElementById("performanceHint").hidden = !s.performance_hint;
   renderSeg("resSeg", [[0, "Dolphin's"], [1, "1×"], [2, "2×"], [3, "3×"], [4, "4×"]], s.resolution || 0, (k) => call("set_resolution", k));
   renderSeg("volSeg", [[25, "25%"], [40, "40%"], [60, "60%"], [80, "80%"], [100, "100%"]], s.volume || 40, (k) => call("set_volume", k));
   $("fullscreenToggle").classList.toggle("on", s.fullscreen !== false);
@@ -621,6 +628,7 @@ function wire() {
   $("btnBookFetch").onclick = () => call("refresh_playbook");
   $("btnBookDefault").onclick = () => call("use_default_playbook");
   $("gameStats").onclick = () => call("set_game_stats", !(S.snap && S.snap.game_stats && S.snap.game_stats.enabled));
+  $("hdToggle").onclick = () => call("set_hd_textures", S.snap && S.snap.hd_textures === false);
   $("fullscreenToggle").onclick = () => call("set_fullscreen", !(S.snap && S.snap.fullscreen !== false));
   // Stage both choices together; the backend clears readiness until rebuilt.
   $("draftOrder").onchange = $("draftFirst").onchange = () => call("set_draft", $("draftOrder").value, $("draftFirst").value);

@@ -3,6 +3,8 @@
 
 #include "VideoBackends/D3DCommon/D3DCommon.h"
 
+#include <fmt/format.h>
+
 #include <d3d11_4.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -97,8 +99,10 @@ Microsoft::WRL::ComPtr<IDXGIFactory> CreateDXGIFactory(bool debug_device)
   return factory;
 }
 
-std::vector<std::string> GetAdapterNames()
+std::vector<std::string> GetAdapterNames(std::vector<std::string>* driver_versions)
 {
+  if (driver_versions)
+    driver_versions->clear();
   Microsoft::WRL::ComPtr<IDXGIFactory> factory;
   HRESULT hr = create_dxgi_factory(IID_PPV_ARGS(factory.GetAddressOf()));
   if (FAILED(hr))
@@ -114,6 +118,14 @@ std::vector<std::string> GetAdapterNames()
     if (SUCCEEDED(adapter->GetDesc(&desc)))
       name = WStringToUTF8(desc.Description);
 
+    if (driver_versions)
+    {
+      LARGE_INTEGER version{};
+      const bool known = SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &version));
+      const auto bits = static_cast<u64>(version.QuadPart);
+      driver_versions->push_back(known ? fmt::format("{}.{}.{}.{}",
+          (bits >> 48) & 0xffff, (bits >> 32) & 0xffff, (bits >> 16) & 0xffff, bits & 0xffff) : "unknown");
+    }
     adapters.push_back(std::move(name));
   }
 

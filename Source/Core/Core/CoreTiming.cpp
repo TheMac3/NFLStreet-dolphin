@@ -3,6 +3,8 @@
 
 #include "Core/CoreTiming.h"
 
+#include "VideoCommon/NSRHostMetrics.h"
+
 #include <algorithm>
 #include <mutex>
 #include <string>
@@ -414,6 +416,7 @@ void CoreTimingManager::SleepUntil(TimePoint time_point)
 
   if (Core::IsCPUThread())
   {
+    NSRHostMetrics::Scope host_timer(NSRHostMetrics::Pacing);
     const TimePoint time = Clock::now();
 
     if (use_precision_timer)

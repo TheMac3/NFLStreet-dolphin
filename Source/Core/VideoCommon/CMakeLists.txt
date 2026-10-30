@@ -110,6 +110,7 @@ add_library(videocommon
   GraphicsModSystem/Runtime/GraphicsModManager.h
   HiresTextures.cpp
   HiresTextures.h
+  NSRHostMetrics.h
   IndexGenerator.cpp
   IndexGenerator.h
   LightingShaderGen.cpp

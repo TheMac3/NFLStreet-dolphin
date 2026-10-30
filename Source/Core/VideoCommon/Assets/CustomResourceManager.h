@@ -39,6 +39,14 @@ public:
 
   void XFBTriggered();
 
+  // NSR's multi-GB pack must not consume half physical RAM in each peer.
+  // Only reduces the normal budget; two in-flight decoder assets may overshoot.
+  void LimitTextureMemory(u64 bytes);
+
+  // Check hot reload without requesting decoded pixels for a GPU-resident
+  // texture. Evicted CPU data stays evicted until an actual upload needs it.
+  CustomAsset::TimeType GetTextureLoadTime(const CustomAssetLibrary::AssetID& asset_id);
+
   using TextureTimePair = std::pair<std::shared_ptr<CustomTextureData>, CustomAsset::TimeType>;
 
   // Returns a pair with the custom texture data and the time it was last loaded
@@ -48,6 +56,9 @@ public:
                                           std::shared_ptr<VideoCommon::CustomAssetLibrary> library);
 
 private:
+  // Socket/renderer-free synthetic tests inspect metadata and LRU ownership.
+  friend struct NSRHiresCacheTestAccess;
+
   // A generic interface to describe an assets' type
   // and load state
   struct AssetData
@@ -123,14 +134,22 @@ private:
     // Inserts or moves the asset to the top of the queue.
     void MakeAssetHighestPriority(u64 asset_handle, CustomAsset* asset)
     {
-      RemoveAsset(asset_handle);
-      m_assets.push_front(asset);
-
-      // See CreateAsset for how a handle gets defined
+      // Loaded HD textures hit this on every cache lookup. Move the existing
+      // node instead of freeing/reallocating it; the priority order and handle
+      // lookup remain identical, including repeated requests for the front.
       if (asset_handle >= m_iterator_lookup.size())
         m_iterator_lookup.resize(asset_handle + 1, m_assets.end());
-
-      m_iterator_lookup[asset_handle] = m_assets.begin();
+      auto& iter = m_iterator_lookup[asset_handle];
+      if (iter != m_assets.end())
+      {
+        *iter = asset;
+        m_assets.splice(m_assets.begin(), m_assets, iter);
+      }
+      else
+      {
+        m_assets.push_front(asset);
+        iter = m_assets.begin();
+      }
     }
 
     // Inserts an asset at lowest priority or

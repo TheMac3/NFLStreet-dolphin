@@ -79,7 +79,7 @@ void VideoBackend::FillBackendInfo()
   g_backend_info.bSupportsLargePoints = false;
   g_backend_info.bSupportsDepthReadback = true;
   g_backend_info.bSupportsPartialDepthCopies = false;
-  g_backend_info.Adapters = D3DCommon::GetAdapterNames();
+  g_backend_info.Adapters = D3DCommon::GetAdapterNames(&g_backend_info.AdapterDriverVersions);
   g_backend_info.AAModes = DXContext::GetAAModes(g_Config.iAdapter);
   g_backend_info.bSupportsShaderBinaries = true;
   g_backend_info.bSupportsPipelineCacheData = true;

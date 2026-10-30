@@ -226,6 +226,8 @@ bool PopulateConfig(GLContext* m_main_gl_context)
   g_ogl_config.gl_vendor = (const char*)glGetString(GL_VENDOR);
   g_ogl_config.gl_renderer = (const char*)glGetString(GL_RENDERER);
   g_ogl_config.gl_version = (const char*)glGetString(GL_VERSION);
+  g_backend_info.AdapterName = g_ogl_config.gl_renderer;
+  g_backend_info.DriverDescription = g_ogl_config.gl_version;
 
   if (!m_main_gl_context->IsGLES())
   {

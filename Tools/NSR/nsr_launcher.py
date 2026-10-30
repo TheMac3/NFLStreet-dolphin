@@ -208,7 +208,7 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
                     open_ui: bool = False, name: str = "Player", fingerprint: str = "",
                     telemetry: bool = True, quickstart: str = "manual", icons: str = "auto",
                     resolution: int = 0, fullscreen: bool = True,
-                    volume: int = DEFAULT_VOLUME) -> tuple[list[str], dict[str, str]]:
+                    volume: int = DEFAULT_VOLUME, hd_textures: bool = True) -> tuple[list[str], dict[str, str]]:
     """Command line and environment for the netplay Dolphin.
 
     start=None: practice offline. open_ui=True: just open Dolphin's window
@@ -236,9 +236,9 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     # Reborn paths there. The caller surfaces write failures before starting.
     textures.write_list(os.path.join(folder, "User"), tex)
     env["NSR_TEXTURES"] = tex.summary()  # logged by the launcher; the fork ignores it
-    if tex.warnings:
+    if tex.warnings and hd_textures:
         env["NSR_TEXTURES_WARNING"] = " ".join(tex.warnings)
-    args += ["-C", "Graphics.Settings.HiresTextures=True",
+    args += ["-C", f"Graphics.Settings.HiresTextures={hd_textures}",
              "-C", "Graphics.Settings.CacheHiresTextures=False"]
     if resolution in RESOLUTIONS[1:]:
         args += ["-C", f"Graphics.Settings.InternalResolution={resolution}"]
@@ -480,6 +480,23 @@ def parse_link_quality(line: str) -> dict | None:
             "warning": DELAY_WARNING if delay == 4 and chosen else ""}
 
 
+PERFORMANCE_HINT = "Your PC struggled to keep up: try 1× resolution or turn off HD textures"
+
+
+def parse_performance_summary(line: str) -> str | None:
+    """Use only our local completed match's host timing, including when uploads are off.
+
+    None means unrelated text; an empty string clears a previous match's hint.
+    The fork counts actual host work, excluding network/time-sync waits and pacing.
+    """
+    match = re.fullmatch(r"\[NSR\] performance summary: live_frames=(\d+) over_budget=(\d+)",
+                         line.strip())
+    if not match:
+        return None
+    frames, over = map(int, match.groups())
+    return PERFORMANCE_HINT if frames and frames >= over and over * 10 > frames else ""
+
+
 # --- Launcher: the state machine both views drive ---------------------------------
 CONTROLLER_STATES = {"first-import": "synced", "imported": "synced", "updated": "synced",
                      "up-to-date": "synced", "kept-yours": "yours", "no-reborn": "no-reborn",
@@ -572,6 +589,8 @@ class Launcher:
             "textures": {"icons": self._icons_setting(), "effective": "", "why": "",
                          "base_kind": "", "base": "", "packages": [], "warning": ""},
             "resolution": self._resolution_setting(),
+            "hd_textures": cfg.get("hd_textures", True) is not False,
+            "performance_hint": "",
             "fullscreen": self._fullscreen_setting(),
             "volume": self._volume_setting(),
             "link_quality": {"label": "", "delay": None, "jitter_ms": None, "chosen": False,
@@ -686,6 +705,12 @@ class Launcher:
         self._save()
         self._set("textures", icons=self._icons_setting())
         self._spawn(self.refresh_textures)
+
+    def set_hd_textures(self, on) -> None:
+        """Choose local presentation quality without changing the room or simulation."""
+        self.cfg["hd_textures"] = bool(on)
+        self._save()
+        self._set(hd_textures=bool(on))
 
     def set_resolution(self, value) -> None:
         try:
@@ -1242,13 +1267,15 @@ class Launcher:
             # for our own native game-result captures.
             self.uploader.remember_server(start.telemetry_url, start.telemetry_token)
             self._stats_wake.set()
+        self._set(performance_hint="")
         selected_draft = lobby.draft_settings(start.draft) if start else self.draft_settings()
         try:
             args, env = dolphin_command(self.folder, start, None, open_ui=open_ui,
                                         name=self.state["name"], fingerprint=self.room_fingerprint(selected_draft),
                                         telemetry=self.state["telemetry"], quickstart=self.state["quickstart"],
                                         icons=self._icons_setting(), resolution=self._resolution_setting(),
-                                        fullscreen=self._fullscreen_setting(), volume=self._volume_setting())
+                                        fullscreen=self._fullscreen_setting(), volume=self._volume_setting(),
+                                        hd_textures=self.cfg.get("hd_textures", True) is not False)
         except OSError as e:
             self.notify(f"Couldn't prepare the local texture list: {e}. Close the game and retry.", "error")
             return False
@@ -1260,7 +1287,8 @@ class Launcher:
             # Which texture folders and button icons this launch shows, so a
             # "MISSING TEXTURES"/wrong-icons report is diagnosable from the log.
             log(self.folder, f"{env.get('NSR_TEXTURES', 'textures ?')} "
-                f"resolution={self._resolution_setting() or 'dolphin'}")
+                f"resolution={self._resolution_setting() or 'dolphin'} "
+                f"hd_textures={self.cfg.get('hd_textures', True) is not False}")
             if env.get("NSR_TEXTURES_WARNING"):
                 log(self.folder, f"textures warning: {env['NSR_TEXTURES_WARNING']}")
                 self.notify(env["NSR_TEXTURES_WARNING"], "error")
@@ -1297,7 +1325,21 @@ class Launcher:
             self._spawn(lambda: self._watch_link_quality(process, env["NSR_LOG"], generation))
             self._spawn(lambda: self._watch_boot_sync(process, env["NSR_LOG"],
                 quickstart=start.quickstart != "manual"))
+            self._spawn(lambda: self._upload_when_game_exits(process))
         return True
+
+    def _upload_when_game_exits(self, process) -> None:
+        """Upload this session's results as soon as the game closes.
+
+        The background pass only runs every gamestats.INTERVAL_S and on room
+        start, so captures written during a session could sit unsent until the
+        next launch (2026-10-26: two saved captures never reached the server).
+        """
+        try:
+            process.wait()
+        except Exception:  # noqa: BLE001 - absent/fake process (tests, odd Popen)
+            return
+        self._stats_wake.set()
 
     def _clear_link_quality(self, measuring: bool = False) -> int:
         """Clear the previous room and return the new reader's ownership token."""
@@ -1345,6 +1387,17 @@ class Launcher:
                         if reason and len(reason) <= 256 and all(c.isprintable() for c in reason):
                             self.notify(reason, "error")
                             return
+                # perf: a completed match reports its own local processing
+                # budget, which is independent of the transport reason above.
+                hint = parse_performance_summary(line)
+                if hint is not None:
+                    with self._lock:
+                        if (generation != self._quality_generation
+                                or (self._proc is not None and process is not self._proc)):
+                            return
+                        self._set(performance_hint=hint)
+                        if hint:
+                            self.notify(hint, "warning")
                 quality = parse_link_quality(line)
                 if quality:
                     with self._lock:
@@ -1732,6 +1785,7 @@ class WebApi:
     def set_delay(self, delay): self._l.set_delay(delay)
     def set_quickstart(self, selected): self._l.set_quickstart(selected)
     def set_button_icons(self, choice): self._l.set_button_icons(str(choice))
+    def set_hd_textures(self, on): self._l.set_hd_textures(bool(on))
     def set_resolution(self, value): self._l.set_resolution(value)
     def set_fullscreen(self, on): self._l.set_fullscreen(on)
     def set_volume(self, value): self._l.set_volume(value)
@@ -1924,6 +1978,20 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     name_entry = ttk.Entry(sp, textvariable=name_var, width=24)
     name_entry.grid(row=0, column=1, sticky="w")
     name_entry.bind("<FocusOut>", lambda e: launcher.set_name(name_var.get()))
+    perf_frame = ttk.LabelFrame(sp, text="Performance", padding=8)
+    perf_frame.grid(row=15, column=0, columnspan=4, sticky="ew", pady=6)
+    hd_var = tk.BooleanVar(value=launcher.state["hd_textures"])
+    ttk.Checkbutton(perf_frame, text="HD textures", variable=hd_var,
+                    command=lambda: launcher.set_hd_textures(hd_var.get())).pack(anchor="w")
+    ttk.Label(perf_frame, text="Start at 1×. Try 2× or 3× only if your PC keeps up.").pack(anchor="w")
+    res_var = tk.StringVar(value=str(launcher.state["resolution"]))
+    res_box = ttk.Combobox(perf_frame, textvariable=res_var, values=RESOLUTIONS,
+                           state="readonly", width=8)
+    res_box.pack(anchor="w")
+    res_box.bind("<<ComboboxSelected>>", lambda _event: launcher.set_resolution(res_var.get()))
+    perf_hint = ttk.Label(perf_frame, wraplength=540, justify="left")
+    perf_hint.pack(anchor="w", pady=(6, 0))
+
     telemetry_var = tk.BooleanVar(value=launcher.state["telemetry"])
     ttk.Checkbutton(sp, text="Send lag/rollback stats to Mason's server to help fix netplay",
                     variable=telemetry_var, command=lambda: launcher.set_telemetry(telemetry_var.get())) \
@@ -1991,6 +2059,9 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
         s = launcher.snapshot(seen["rev"])
         if s is not None:
             seen["rev"] = s["rev"]
+            perf_hint.configure(text=s["performance_hint"])
+            hd_var.set(s["hd_textures"])
+            res_var.set(str(s["resolution"]))
             g, h, j, c = s["game"], s["host"], s["join"], s["controllers"]
             status.configure(text=("● Ready to play" if g["state"] == "ready" else "● " + g["text"])
                              + f"     {s['name']} · Port 1")

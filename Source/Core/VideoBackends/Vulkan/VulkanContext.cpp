@@ -3,6 +3,8 @@
 
 #include "VideoBackends/Vulkan/VulkanContext.h"
 
+#include <cstring>
+
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -57,6 +59,8 @@ VulkanContext::PhysicalDeviceInfo::PhysicalDeviceInfo(VkPhysicalDevice device)
     if (apiVersion >= VK_API_VERSION_1_2)
     {
       driverID = properties_vk12.driverID;
+      std::memcpy(driverName, properties_vk12.driverName, sizeof(driverName));
+      std::memcpy(driverInfo, properties_vk12.driverInfo, sizeof(driverInfo));
     }
 
     subgroupSize = properties_subgroup.subgroupSize;
@@ -1058,6 +1062,9 @@ void VulkanContext::InitDriverDetails()
   if (driver_id == VK_DRIVER_ID_MOLTENVK)
     driver = DriverDetails::DRIVER_PORTABILITY;
 
+  g_backend_info.AdapterName = m_device_info.deviceName;
+  g_backend_info.DriverDescription = fmt::format("{} {} (version {})",
+      m_device_info.driverName, m_device_info.driverInfo, m_device_info.driverVersion);
   DriverDetails::Init(DriverDetails::API_VULKAN, vendor, driver,
                       static_cast<double>(m_device_info.driverVersion),
                       DriverDetails::Family::UNKNOWN, std::move(device_name));
