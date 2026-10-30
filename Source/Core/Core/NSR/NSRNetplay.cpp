@@ -17,6 +17,7 @@
 #include "Core/NSR/NSRBootAgreement.h"
 #include "Core/NSR/NSRContent.h"
 #include "Core/NSR/NSRGameStats.h"
+#include "Core/NSR/NSRGameStatsIdentity.h"
 #include "Core/NSR/NSRRollbackLogic.h"
 #include "Core/NSR/NSRRollbackNetplay.h"
 #include "Core/NSR/ReplayFollow.h"
@@ -819,6 +820,28 @@ bool PacketSenderMatchesPeer(u32 sender, u32 source)
   return source == sender;
 }
 
+// nextgame: one host-only failure path for every menu/match phase. Identities
+// are already bounded and connection-validated by the stats metadata adapter.
+void FailPeer(u32 player, std::string_view detail, NSRTelemetry::EventKind kind)
+{
+  if (s_session.failed)
+    return;
+  std::string name = player < s_session.players ? fmt::format("Player {}", player + 1) : "A player";
+  for (const auto& packet : NSRGameStats::Identities())
+    if (const auto identity = NSRGameStats::DecodeIdentity(packet);
+        identity && identity->pad == player && !identity->name.empty())
+      name = identity->name;
+  const std::string reason = fmt::format("{} disconnected ({})", name, detail);
+  Log("netplay stopped: {}", reason);
+  Core::DisplayMessage(reason, 10000);
+  NSRTelemetry::Event(kind, TelemetryLiveFrame(),
+                      {NSRTelemetry::Int("player", player)}, reason);
+  s_session.failed = true;
+  // Preboot agreement owns its own failure/cleanup path; no core exists yet.
+  if (!s_session.boot_pending)
+    Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+}
+
 void StopForRollbackTransportFailure()
 {
   // Milestone-1 lockstep historically falls back offline.  Rollback cannot:
@@ -1261,16 +1284,8 @@ void Service(int timeout_ms)
         ConnectToHost();
         break;
       }
-      if (event.peer->data)
-        Log("player {} disconnected", PeerIndex(event.peer));
-      NSRTelemetry::Event(NSRTelemetry::EventKind::TransportFailure, TelemetryLiveFrame(),  // NSR telemetry
-                          {NSRTelemetry::Int("player", event.peer->data ?
-                                                           static_cast<s64>(PeerIndex(event.peer)) :
-                                                           -1),
-                           NSRTelemetry::Int("exchanged", s.exchanged_once)},
-                          "peer disconnected");
-      s.failed = true;
-      StopForRollbackTransportFailure();
+      FailPeer(event.peer->data ? PeerIndex(event.peer) : MAX_PLAYERS,
+               "connection closed", NSRTelemetry::EventKind::TransportFailure);
       break;
     default:
       break;
@@ -2013,6 +2028,106 @@ std::atomic<bool> s_wd_post_match{false};  // post-match frame lockstep is activ
 // Release watchdog threshold: above every host barrier timeout
 // (PEER_TIMEOUT_MS), so a logged host timeout always wins over a stall report.
 constexpr s64 STALL_REPORT_MS = 20000;
+std::atomic<bool> s_stall_sample_requested{false};
+CoreTiming::EventType* s_liveness_event = nullptr;
+bool s_diagnostic_screenshots = false;
+u32 s_diagnostic_screen_bucket = 0;
+
+
+// CPU-thread timer: unlike pad/frame hooks it still runs in a guest load or
+// spin loop. Never read PPC/RAM or service ENet from the watchdog thread.
+// The event has no guest writes; packet arrivals only populate host histories.
+void LivenessSample(Core::System& system, u64, s64)
+{
+  if (s_session.enabled && !s_session.boot_pending && !s_session.failed)
+  {
+    Service(0);
+    const u32 now = enet_time_get();
+    for (u32 player = 0; player < s_session.players; ++player)
+    {
+      if (player == s_session.me || (s_session.star && s_session.me != 0 && player != 0))
+        continue;
+      if (Linked(player) && now - s_session.peers[player]->lastReceiveTime >= PEER_TIMEOUT_MS)
+      {
+        FailPeer(player, "no network traffic for 10 seconds",
+                 NSRTelemetry::EventKind::InputTimeout);
+        break;
+      }
+    }
+  }
+  // Optional reproduction images, one per second of emulated retraces. Full
+  // PNG movie dumping otherwise dominates a headless menu-navigation run.
+  if (s_diagnostic_screenshots)
+  {
+    const u32 retrace = Common::swap32(system.GetMemory().GetRAM() + 0x00411f00);
+    if (retrace / 60 != s_diagnostic_screen_bucket)
+    {
+      s_diagnostic_screen_bucket = retrace / 60;
+      Core::SaveScreenShot(fmt::format("nextgame-{}", retrace));
+    }
+  }
+  if (s_stall_sample_requested.exchange(false))
+  {
+    const auto& ppc = system.GetPPCState();
+    const u8* ram = system.GetMemory().GetRAM();
+    const auto read = [ram](u32 address) -> u32 {
+      return address >= 0x80000000 && address <= 0x817ffffc ?
+                 Common::swap32(ram + address - 0x80000000) : 0;
+    };
+    std::string stack;
+    u32 sp = ppc.gpr[1];
+    for (int depth = 0; depth < 12 && sp >= 0x80003100 && sp <= 0x817ffff8; ++depth)
+    {
+      stack += fmt::format(" {:08x}:{:08x}", sp, read(sp + 4));
+      const u32 next = read(sp);
+      if (next <= sp || next > 0x817ffff8)
+        break;
+      sp = next;
+    }
+    Log("STALL CPU: pc {:08x} lr {:08x} thread {:08x} stack{}; DVD busy {:08x} "
+        "worker {:08x} bytes {:08x} pending {:08x}; ARQ {:08x}/{:08x}/{:08x}/{:08x}; "
+        "audio state {:08x} queue {:08x}",
+        ppc.pc, LR(ppc), read(0x800000e4), stack, read(0x803ed118), read(0x803d55f0),
+        read(0x803d55f8), read(PENDING_LOADS), read(0x803ed2d8), read(0x803ed2e0),
+        read(0x803ed2f0), read(0x803ed2f4), read(0x803aa828 + 0x2c8),
+        read(0x803aa828 + 0x2dc));
+    // A DVD/ARAM/audio waiter may have yielded the main thread. Its saved
+    // OSContext is then more useful than the SDK idle thread's current PC.
+    std::string main_stack;
+    sp = read(0x803a3f30 + 4);
+    for (int depth = 0; depth < 12 && sp >= 0x80003100 && sp <= 0x817ffff8; ++depth)
+    {
+      main_stack += fmt::format(" {:08x}:{:08x}", sp, read(sp + 4));
+      const u32 next = read(sp);
+      if (next <= sp || next > 0x817ffff8)
+        break;
+      sp = next;
+    }
+    Log("STALL main context: pc {:08x} lr {:08x} state {:08x} queue {:08x} stack{}",
+        read(0x803a3f30 + 0x198), read(0x803a3f30 + 0x84), read(0x803a3f30 + 0x2c8),
+        read(0x803a3f30 + 0x2dc), main_stack);
+    Log("STALL registers: r3 {:08x} r4 {:08x} r5 {:08x} r6 {:08x} r7 {:08x} r8 {:08x} "
+        "r9 {:08x} r10 {:08x} r30 {:08x} r31 {:08x}", ppc.gpr[3], ppc.gpr[4], ppc.gpr[5],
+        ppc.gpr[6], ppc.gpr[7], ppc.gpr[8], ppc.gpr[9], ppc.gpr[10], ppc.gpr[30], ppc.gpr[31]);
+    if (const std::string prefix = Env("NSR_RB_STALL_DUMP"); !prefix.empty())
+    {
+      // Explicit diagnostic opt-in only: game data remains in the caller's
+      // private work directory. Capture the first sample for this frame.
+      const std::string path = fmt::format("{}-frame-{}.bin", prefix, s_rb_watch_live.load());
+      if (!File::Exists(path))
+        if (FILE* dump = std::fopen(path.c_str(), "wb"))
+        {
+          std::fwrite(ram, 1, system.GetMemory().GetRamSizeReal(), dump);
+          std::fclose(dump);
+          Log("STALL RAM: {}", path);
+        }
+    }
+    NSRTelemetry::Event(NSRTelemetry::EventKind::Note, s_rb_watch_live.load(),
+                        {NSRTelemetry::Hex("pc", ppc.pc), NSRTelemetry::Hex("lr", LR(ppc))},
+                        "guest stall CPU sample");
+  }
+  system.GetCoreTiming().ScheduleEvent(8'100'000, s_liveness_event);  // 1/60 emulated second
+}
 
 void EnterRollbackSession(const Core::CPUThreadGuard& guard, u32 frame);
 void LeaveRollbackSession(const Core::CPUThreadGuard& guard, const char* reason);
@@ -3519,6 +3634,12 @@ void RbInit(Core::System& system)
       }
     }
   }
+  if (r.net_enabled && !s_liveness_event)
+  {
+    s_diagnostic_screenshots = !Env("NSR_RB_DIAGNOSTIC_SCREENSHOTS").empty();
+    s_liveness_event = system.GetCoreTiming().RegisterEvent("NSRLiveness", LivenessSample);
+    system.GetCoreTiming().ScheduleEvent(8'100'000, s_liveness_event);
+  }
   if (r.force > 0 || config.sample || r.stacks || r.net_enabled)
   {
     // The watchdog owns no emulator object.  CPU-thread hooks publish only the
@@ -3552,12 +3673,17 @@ void RbInit(Core::System& system)
             if (sample)
               Log("sample live {} rollbacks {} last-tick-age {}ms", live, rollbacks,
                   last ? now - last : 0);
+            // Sample the CPU before the 10-second peer timeout can stop a
+            // survivor. A live loading loop still dispatches CoreTiming events.
+            if (last != 0 && now - last >= 5000)
+              s_stall_sample_requested = true;
             // lifecycle3: release netplay builds report a frame stall once
             // (and its recovery), never stop the core: a debugger break or a
             // suspended window looks the same from here.
             if (last != 0 && now - last >= STALL_REPORT_MS && !stall_reported)
             {
               stall_reported = true;
+              s_stall_sample_requested = true;
               const u32 waits = s_wd_frame_waits.load();
               const u32 from = s_wd_last_wait_from.load();
               const bool post_match = s_wd_post_match.load();
@@ -4510,6 +4636,17 @@ void NoteDiscCommand()
   ++s_rb.disc_commands;
 }
 
+// nextgame: Reborn's diagnostic ring mask permits writes over its own added
+// code. At a natural end the native stats call produces enough records to
+// corrupt later loading functions. Clamp the guest offset before the original
+// add/stores; the displaced native stats write and return path still execute.
+// HLE installs this only for the known logger footprint in our GN7E69-r0 image.
+void RebornStatsLogHook(const Core::CPUThreadGuard& guard)
+{
+  auto& ppc = guard.GetSystem().GetPPCState();
+  ppc.gpr[8] = RollbackLogic::RebornStatsLogOffset(ppc.gpr[8]);
+}
+
 void LogMemHit(u32 pc, u32 lr, bool write, size_t size, u64 value, u32 addr)
 {
   if (!s_session.log)
@@ -4730,8 +4867,12 @@ static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 fra
                                                 .count())},
             s.failed ? "lockstep exchange aborted" : "lockstep: a player went silent");
       }
-      s.failed = true;
-      StopForRollbackTransportFailure();
+      for (u32 player = 0; player < s.players; ++player)
+        if (player != s.me && !s.remote_pads[player].contains(frame))
+        {
+          FailPeer(player, "menu input timeout", NSRTelemetry::EventKind::InputTimeout);
+          break;
+        }
       return false;
     }
   }
@@ -6497,7 +6638,7 @@ static RollbackNet::ConfigFingerprint LocalConfigFingerprint(Core::System& syste
       "gate {} effect {} skip {} vsync {} async {} peekz {}", list(c.audio_gate_only),
       list(c.effect_gates), list(c.skip_resim), c.keep_resim_vsync, c.async_present, c.peek_z));
   fp[ConfigField::SessionRules] = hash_text(
-      fmt::format("auto {} from {} end {} reenter {}", r.auto_handoff,
+      fmt::format("stats-log-bound-v1 results-confirm-v1 auto {} from {} end {} reenter {}", r.auto_handoff,
                   r.auto_handoff ? 0 : r.vtime_from, c.session_end, c.auto_reenter));
   fp[ConfigField::DolphinCore] = hash_text(fmt::format(
       "cheats {} mmu {} ram {} {} fprf {} nans {} rtc {} {}",
@@ -7154,6 +7295,11 @@ static RollbackLogic::LifecycleSignals RbLifecycleSignals(const Core::CPUThreadG
   RollbackLogic::LifecycleSignals out;
   out.pause_depth = MMU::HostRead<u32>(guard, PAUSE_DEPTH);
   out.in_game_running = MMU::HostRead<u8>(guard, IN_GAME_RUNNING) != 0;
+  // nextgame: GN7E69 rev 0 native command-stack screens, observed at a
+  // natural final whistle. MVP's Rematch/Exit is not an in-game modal and
+  // clears pause depth; it can start teardown/loading from ordinary input.
+  const u32 screen = QuickstartScreen(guard);
+  out.results_menu = screen == 0x00030006 || screen == 0x00030007;
   const u32 uis = MMU::HostRead<u32>(guard, UI_SCRATCH_ROOT);
   if ((uis >> 24) == 0x80 && MMU::HostRead<u32>(guard, uis) == UI_SCRATCH_MAGIC)
   {
@@ -7175,11 +7321,11 @@ static bool RbLifecycleConfirm(const Core::CPUThreadGuard& guard, u32 live)
   // Log changes of the transition signals (a few lines per match).
   static u32 s_last = ~0u;
   const u32 key = (std::min<u32>(sig.pause_depth, 0xFF) << 2) | (sig.in_game_running ? 2u : 0u) |
-                  (sig.modal_dialog ? 1u : 0u);
+                  (sig.modal_dialog ? 1u : 0u) | (sig.results_menu ? 0x400u : 0u);
   if (key != s_last)
   {
-    Log("lifecycle live {}: pause depth {} in-game running {} modal dialog {} (confirmed {})",
-        live, sig.pause_depth, sig.in_game_running, sig.modal_dialog,
+    Log("lifecycle live {}: pause depth {} in-game running {} modal dialog {} results {} (confirmed {})",
+        live, sig.pause_depth, sig.in_game_running, sig.modal_dialog, sig.results_menu,
         s_rb_exchange ? static_cast<s64>(s_rb_exchange->ConfirmedThrough()) : -1);
     s_last = key;
   }
@@ -7245,11 +7391,19 @@ static bool RbNetworkPreflight(u32 live)
       NSRTelemetry::Event(NSRTelemetry::EventKind::InputTimeout, live,  // NSR telemetry
                           {NSRTelemetry::Int("confirmed_through",
                                              s_rb_exchange->ConfirmedThrough())});
-      s.failed = true;
-      Core::QueueHostJob([](Core::System& core) { Core::Stop(core); });
+      for (u32 player = 0; player < s.players; ++player)
+      {
+        const u32 confirmed = s_rb_exchange->Contiguous()[player];
+        if (player != s.me && (confirmed == RollbackNet::NO_FRAME || confirmed < live))
+        {
+          FailPeer(player, r.menu_frame_lockstep ? "post-match input timeout" : "match input timeout",
+                   NSRTelemetry::EventKind::InputTimeout);
+          break;
+        }
+      }
       return false;
     }
-    return true;
+    return !s.failed;
   };
 
   if (s_rb_exchange->ShouldStall(live))
@@ -10391,6 +10545,12 @@ bool IsReplayCatchingUp()
 
 void Shutdown(const Core::CPUThreadGuard& guard)
 {
+  if (s_liveness_event)
+    guard.GetSystem().GetCoreTiming().RemoveEvent(s_liveness_event);
+  s_liveness_event = nullptr;
+  s_diagnostic_screenshots = false;
+  s_diagnostic_screen_bucket = 0;
+  s_stall_sample_requested = false;
   NSRContent::Reset();
   NSRGameStats::Reset();
   if (s_rb_watchdog.joinable())

@@ -195,6 +195,8 @@ std::vector<unsigned int> EffectGateList();  // NSR_RB_EFFECT_GATE
 constexpr unsigned int LOAD_START_FN = 0x801ED634;
 constexpr unsigned int LOAD_DONE_FN = 0x801EC914;
 void LoadBarrierHook(const Core::CPUThreadGuard& guard);  // HookType::Start  // functions skipped in re-simulated frames
+// Before the signature-checked Reborn diagnostic logger computes its write address.
+void RebornStatsLogHook(const Core::CPUThreadGuard& guard);
 void PresentHook(const Core::CPUThreadGuard& guard);    // HookType::Gate
 // fn_80198B24 reads the depth buffer at a screen point (GXPeekZ) for an
 // object's visibility flag. EFB contents differ between GPUs/backends, so

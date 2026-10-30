@@ -169,6 +169,23 @@ static void TestHandoffAgreement()
 // earliest affected frame and then disappearing once rollback begins.
 // fix/lifecycle: transition states hold confirmed-input mode for a grace
 // window; normal play never waits.
+// Natural-result logging must never touch Reborn code after the diagnostic ring.
+static void TestRebornStatsLogBounds()
+{
+  using NSRNetplay::RollbackLogic::RebornStatsLogOffset;
+  constexpr u32 base = 0x803FE5A0;
+  constexpr u32 end = base + 1024;
+  for (u32 record = 0; record < 4096; ++record)
+  {
+    const u32 offset = RebornStatsLogOffset(record * 16);
+    assert(offset == (record % 64) * 16);
+    assert(base + offset + 16 <= end);
+    assert(base + offset + 16 < 0x80400000);
+  }
+  assert(RebornStatsLogOffset(0xFFFFFFFFu) == 0x3F0);
+  assert(RebornStatsLogOffset(0x1000) == 0);
+}
+
 static void TestLifecycleConfirmFrames()
 {
   std::uint32_t hold = 0;
@@ -183,6 +200,14 @@ static void TestLifecycleConfirmFrames()
   ending.in_game_running = false;  // the teardown frame itself
   assert(RL::LifecycleConfirmFrame(500, ending, 0, hold));
   assert(!RL::LifecycleConfirmFrame(501, play, 0, hold));
+  // Natural MVPs expose Exit/Rematch after pause depth has returned to zero.
+  // Both the selection and the following teardown frames need confirmed pads.
+  RL::LifecycleSignals results{};
+  results.results_menu = true;
+  assert(results.pause_depth == 0 && !results.modal_dialog && results.in_game_running);
+  assert(RL::LifecycleConfirmFrame(600, results, 8, hold) && hold == 609);
+  assert(RL::LifecycleConfirmFrame(608, play, 8, hold));
+  assert(!RL::LifecycleConfirmFrame(609, play, 8, hold));
   RL::LifecycleSignals dialog{};
   dialog.modal_dialog = true;
   assert(RL::LifecycleConfirmFrame(0xFFFFFFFE, dialog, 8, hold));
@@ -2504,6 +2529,7 @@ int main()
   TestDigestComparedOnlyWhenFinal();
   TestPureRollbackHelpers();
   TestLifecycleConfirmFrames();
+  TestRebornStatsLogBounds();
   TestMispredictedPlayers();
   TestStreetEventRankingPadding();
   TestInGameHeapNamePadding();
