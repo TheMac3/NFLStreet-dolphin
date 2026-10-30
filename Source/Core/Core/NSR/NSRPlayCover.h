@@ -78,12 +78,16 @@ inline std::uint32_t LocalSides(const NSRGameStats::Memory& memory, std::uint32_
 
 // Flow 5 is card selection on every down; flow 1 only prepares the initial play.
 // In particular, later selections enter 5 from 4, not 1. Never gate on history.
-// Reborn also suppresses its card cover while the native byte at 803EB4A0 is set.
+// Reborn requires the native InGame root group (0xF) and suppresses its card
+// cover while the native byte at 803EB4A0 is set. This also clears stale state
+// during results/front-end transitions between matches.
 // Flow 2 is lineup, where separate audible/prediction flags reveal call choices.
 // UI +42/+43 are set by fn_800577DC when each side commits its play (including
 // flip at +4A/+4B). Read the complete allocation extent before using any fields.
 inline State Read(const NSRGameStats::Memory& memory, std::uint32_t local_pads)
 {
+  if (memory.UInt(0x803eb2ac) != 0x0fU)
+    return {};
   const auto flow = memory.UInt(0x803eaad4);
   if (!flow || !memory.Bytes(*flow, 4))
     return {};

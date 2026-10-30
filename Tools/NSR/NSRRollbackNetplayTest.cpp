@@ -2558,6 +2558,7 @@ static void TestPlayCover()
       ram.at(address - 0x80000000 + i) = static_cast<std::uint8_t>(value >> ((size - i - 1) * 8));
   };
   const NSRGameStats::Memory memory{ram, {}};
+  put(0x803eb2ac, 0x0f);
   put(0x803eab60, 0x80400000);
   put(0x80400000, 0x80400100);
   put(0x80400004, 4, 1);
@@ -2597,6 +2598,9 @@ static void TestPlayCover()
   for (std::uint32_t match = 0; match < 2; ++match)
   {
     const auto flow_address = 0x80401000U + match * 0x100U;
+    put(0x803eb2ac, 0);
+    assert(PC::Read(memory, 1).hidden == 0);  // stale previous-match flow is ignored
+    put(0x803eb2ac, 0x0f);
     put(0x803eaad4, flow_address);
     put(0x80400100, match == 0 ? 1U : 0U, 1);
     put(0x8040010c, match == 0 ? 0U : 1U, 1);
