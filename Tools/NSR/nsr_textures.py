@@ -657,6 +657,7 @@ def compose(folder: str, icons_setting: str | None, pad_kind: str | None) -> Tex
     if not m:
         ts.warnings.append('Local HD textures are missing ("MISSING TEXTURES" art). '
                            'Settings → Advanced → Re-import from Reborn.')
+        _append_roster_art(folder, ts)
         return ts
     root = Path(folder) / STORE_REL
     ts.warnings.extend(m.get("warnings", []))
@@ -672,4 +673,76 @@ def compose(folder: str, icons_setting: str | None, pad_kind: str | None) -> Tex
     if want and not ts.prompt:
         ts.warnings.append(f"{ICON_LABELS[ts.icons]} button icons were not imported; showing GameCube icons.")
         ts.icons, ts.icons_why = "gamecube", ts.icons_why + ":missing"
+    _append_roster_art(folder, ts)
     return ts
+
+
+def install_roster_headshots(folder: str, packs: list[dict]) -> None:
+    """Publish a complete signed-art overlay in our asset store, never Reborn.
+
+    The caller has verified the content signature and pack hashes. Build a fresh
+    generation so removing an override reveals the player's own imported art.
+    PNG files are disposable presentation data and are excluded from agreement.
+    """
+    import nsr_roster
+    import nsr_content
+    import shutil
+    import tempfile
+    art = [item for pack in packs for item in pack.get("headshots", [])]
+    nsr_roster.validate_headshots(art)
+    root = Path(folder) / STORE_REL
+    root.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(nsr_content.canonical(art)).hexdigest()
+    destination = _local_path(root, "roster-headshots")
+    destination.mkdir(parents=True, exist_ok=True)
+    files = {stem + ".png": nsr_roster.png_bytes(item["png"])
+             for item in art for stem in item["textures"]}
+    try:
+        old = json.loads((root / "roster-headshots.json").read_text(encoding="utf-8"))
+        directory = _local_path(root, old["directory"])
+        if (old.get("sha256") == digest and set(old.get("files", [])) == set(files) and
+                all(_local_path(root, old["directory"] + "/" + n).read_bytes() == raw
+                    for n, raw in files.items())):
+            return
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    # Recreate even an existing generation: missing/corrupt local PNGs recover
+    # from the authenticated pack. Atomic pointer publication follows all files.
+    directory = Path(tempfile.mkdtemp(prefix=".headshots-", dir=destination))
+    try:
+        for item in art:
+            raw = nsr_roster.png_bytes(item["png"])
+            for stem in item["textures"]:
+                with (directory / (stem + ".png")).open("xb") as stream:
+                    stream.write(raw)
+        # A unique generation avoids replacing directories while the texture
+        # reader may still reference the previous generation on Windows.
+        published = directory.name
+        _atomic_json(root / "roster-headshots.json", {
+            "format": "nsrb.roster-art.v1", "directory": f"roster-headshots/{published}",
+            "sha256": digest, "files": sorted(p.name for p in directory.iterdir())})
+        directory = None
+    finally:
+        if directory is not None:
+            shutil.rmtree(directory)  # only this call's unpublished scratch
+
+
+def _append_roster_art(folder: str, ts: TextureSet) -> None:
+    """A missing art file is diagnostic only; guest data agreement is unchanged."""
+    root = Path(folder) / STORE_REL
+    try:
+        pointer = root / "roster-headshots.json"
+        if not pointer.exists():
+            return
+        if pointer.stat().st_size > 65536:
+            raise ValueError("headshot index is too large")
+        data = json.loads(pointer.read_text(encoding="utf-8"))
+        if data.get("format") != "nsrb.roster-art.v1":
+            raise ValueError("invalid headshot index")
+        directory = _local_path(root, data["directory"])
+        if not directory.is_dir():
+            ts.warnings.append("Roster headshots are missing; using local art.")
+            return
+        ts.packages.append(Package("nsrb.roster-headshots", data["sha256"], str(directory), "local-store"))
+    except (OSError, ValueError, KeyError, TypeError):
+        ts.warnings.append("Roster headshots are unavailable; using local art.")

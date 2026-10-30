@@ -48,6 +48,7 @@ import urllib.error
 import urllib.request
 
 import rsasig
+import nsr_roster as roster
 
 ENVELOPE_FORMAT = "nsrb.content.signed.v1"
 MANIFEST_FORMAT = "nsrb.content.v1"
@@ -56,7 +57,7 @@ CHANNEL = "friends"
 # Content format this launcher understands. A release with a larger
 # min_launcher needs a newer NFLStreetRollback download (it may use fields or
 # build steps this code doesn't know); bump when the release format changes.
-LAUNCHER_CONTENT_FORMAT = 4  # v4: runtime passing/acceleration splits, neutral by default
+LAUNCHER_CONTENT_FORMAT = 5  # v5: bounded roster names/roles and signed presentation art
 
 # Public keys trusted to sign manifests: key id -> (modulus hex, exponent).
 # Empty until Mason generates the signing key on the server
@@ -74,7 +75,7 @@ MIN_KEY_BITS = 3072
 # Size limits (bytes / counts). Generous for a friends' roster, small enough
 # that a hostile or broken server can't make a launcher hold much.
 MAX_MANIFEST_BYTES = 64 * 1024
-MAX_PACK_BYTES = 512 * 1024
+MAX_PACK_BYTES = 8 * 1024 * 1024
 MAX_PACKS = 8
 MAX_EDITS = 5000
 MAX_BUILDS = 16
@@ -96,7 +97,7 @@ ATTRIBUTE_LIMITS = {
     "POVR": _RATING, "PSPD": _RATING, "PCEL": (0, 99), "PAGI": _RATING, "PJUM": _RATING,
     "PCTH": _RATING, "PPSS": _RATING, "PCOV": _RATING, "PTAK": _RATING, "PBLK": _RATING,
     "PBTK": _RATING, "PHGT": (48, 96), "PWGT": (0, 255),
-    "PPVL": (0, 99),
+    "PPVL": (0, 99), "PBPO": (0, 13),
 }
 EXPECTED_LIMIT = (0, 65535)  # original values only need to be plausible storage values
 
@@ -191,12 +192,19 @@ def _stamp(value, name: str) -> str:
 # --- ratings packs -----------------------------------------------------------------
 def validate_pack(obj) -> dict:
     """Strictly check one pack object; return it unchanged."""
-    _keys(obj, "pack", {"format", "name", "edits"})
-    if obj["format"] != PACK_FORMAT:
+    v2 = isinstance(obj, dict) and obj.get("format") == roster.PACK_FORMAT
+    _keys(obj, "pack", {"format", "name", "edits", "headshots"} if v2 else {"format", "name", "edits"})
+    if not v2 and obj["format"] != PACK_FORMAT:
         raise ContentError("unknown pack format")
     _text(obj["name"], "pack name", MAX_NAME)
     edits = obj["edits"]
-    if not isinstance(edits, list) or not 1 <= len(edits) <= MAX_EDITS:
+    art = obj.get("headshots", [])
+    if v2:
+        try:
+            roster.validate_headshots(art)
+        except ValueError as exc:
+            raise ContentError(str(exc)) from None
+    if not isinstance(edits, list) or not (0 if art else 1) <= len(edits) <= MAX_EDITS:
         raise ContentError(f"pack must have 1..{MAX_EDITS} edits")
     seen = set()
     for i, e in enumerate(edits, 1):
@@ -206,17 +214,41 @@ def validate_pack(obj) -> dict:
         last = _text(e["last_name"], f"{where} last_name", MAX_PLAYER_NAME, empty=True)
         if not (first.strip() or last.strip()) or first != first.strip() or last != last.strip():
             raise ContentError(f"{where}: player name must be trimmed and not empty")
+        if v2:
+            try:
+                roster.name(first, MAX_PLAYER_NAME)
+                roster.name(last, MAX_PLAYER_NAME)
+            except ValueError as exc:
+                raise ContentError(str(exc)) from None
         field = e["field"]
-        if field not in ATTRIBUTE_LIMITS:
+        if not isinstance(field, str):
+            raise ContentError("invalid edit field")
+        text_field = v2 and field in roster.NAME_LIMITS
+        if field not in ATTRIBUTE_LIMITS and not text_field or field == "PBPO" and not v2:
             raise ContentError(f"{where}: attribute {field!r} is not editable")
-        lo, hi = ATTRIBUTE_LIMITS[field]
-        _int(e["value"], f"{where} {field} value", lo, hi)
+        if text_field:
+            try:
+                roster.name(e["value"], roster.NAME_LIMITS[field])
+            except ValueError as exc:
+                raise ContentError(str(exc)) from None
+        else:
+            lo, hi = ATTRIBUTE_LIMITS[field]
+            _int(e["value"], f"{where} {field} value", lo, hi)
+            if field == "PBPO" and e["value"] not in roster.ROLES:
+                raise ContentError("PBPO must be a supported player role")
         expected = e["expected"]
         if (not isinstance(expected, list) or not 1 <= len(expected) <= 8
+                or any(not isinstance(v, str if text_field else int) or isinstance(v, bool) for v in expected)
                 or expected != sorted(set(expected))):
             raise ContentError(f"{where}: expected must be 1..8 sorted distinct original values")
         for v in expected:
-            _int(v, f"{where} expected value", *EXPECTED_LIMIT)
+            if text_field:
+                try:
+                    roster.name(v, roster.NAME_LIMITS[field])
+                except ValueError as exc:
+                    raise ContentError(str(exc)) from None
+            else:
+                _int(v, f"{where} expected value", *EXPECTED_LIMIT)
         if expected == [e["value"]] and not (field == "PCEL" and e["value"] > 0):
             raise ContentError(f"{where}: no-op edit")
         key = (first.casefold(), last.casefold(), field)
@@ -226,26 +258,32 @@ def validate_pack(obj) -> dict:
     return obj
 
 
-def make_pack(name: str, rows: list[dict]) -> dict:
+def make_pack(name: str, rows: list[dict], headshots=None) -> dict:
     """A pack from editor rows (eadb pack rows: expected as "70|71" or a list).
     Provenance hashes are dropped: the release's builds map pins them per
     Reborn input instead. Edits are sorted so the pack hash is stable."""
     edits = []
     for r in rows:
         expected = r.get("expected", "")
+        text_field = r["field"] in roster.NAME_LIMITS
         if isinstance(expected, str):
-            expected = [int(v) for v in expected.split("|") if v != ""]
+            expected = expected.split("|") if text_field else [int(v) for v in expected.split("|") if v != ""]
         edits.append({"first_name": str(r["first_name"]).strip(), "last_name": str(r["last_name"]).strip(),
-                      "field": r["field"], "value": int(r["value"]),
-                      "expected": sorted(set(int(v) for v in expected))})
+                      "field": r["field"], "value": r["value"] if text_field else int(r["value"]),
+                      "expected": sorted(set(expected if text_field else [int(v) for v in expected]))})
     edits.sort(key=lambda e: (e["last_name"].casefold(), e["first_name"].casefold(), e["field"]))
-    return validate_pack({"format": PACK_FORMAT, "name": name, "edits": edits})
+    v2 = bool(headshots) or any(e["field"] in (*roster.NAME_LIMITS, "PBPO") for e in edits)
+    pack = {"format": roster.PACK_FORMAT if v2 else PACK_FORMAT, "name": name, "edits": edits}
+    if v2:
+        pack["headshots"] = headshots or []
+    return validate_pack(pack)
 
 
 def pack_bytes(pack: dict) -> bytes:
     raw = canonical(validate_pack(pack))
-    if len(raw) > MAX_PACK_BYTES:
-        raise ContentError(f"pack exceeds {MAX_PACK_BYTES} bytes")
+    limit = MAX_PACK_BYTES if pack["format"] == roster.PACK_FORMAT else 512 * 1024
+    if len(raw) > limit:
+        raise ContentError(f"pack exceeds {limit} bytes")
     return raw
 
 
@@ -256,6 +294,8 @@ def parse_pack(raw: bytes, sha256: str, size: int) -> dict:
     if hashlib.sha256(raw).hexdigest() != sha256:
         raise ContentError("pack SHA-256 differs from the manifest")
     pack = validate_pack(strict_loads(raw))
+    if pack["format"] == PACK_FORMAT and len(raw) > 512 * 1024:
+        raise ContentError("legacy pack exceeds 512 KiB")
     if canonical(pack) != raw:
         raise ContentError("pack is not in canonical form")
     return pack
@@ -264,6 +304,10 @@ def parse_pack(raw: bytes, sha256: str, size: int) -> dict:
 def eadb_rows(packs: list[dict]) -> list[dict]:
     """All packs' edits as tools/eadb.py apply_edits rows (expected "a|b")."""
     rows, seen = [], set()
+    try:
+        roster.validate_headshots([item for pack in packs for item in pack.get("headshots", [])])
+    except ValueError as exc:
+        raise ContentError(str(exc)) from None
     for pack in packs:
         for e in pack["edits"]:
             key = (e["first_name"].casefold(), e["last_name"].casefold(), e["field"])
@@ -439,14 +483,21 @@ class Content:
         return self.release["builds"].get(source_sha256)
 
     def descriptor(self) -> dict:
-        return content_descriptor(self.version, self.serial)
+        descriptor = content_descriptor(self.version, self.serial)
+        if self.roster_content():
+            descriptor["simulation"] = hashlib.sha256(self.runtime_bytes()).hexdigest()
+        return descriptor
+
+    def roster_content(self) -> bool:
+        """New signed schema requires the explicit v5 application policy."""
+        return any(p["format"] == roster.PACK_FORMAT for p in self.packs)
 
     def runtime_bytes(self) -> bytes:
         """A deterministic edits-only boot bundle; serial/signatures stay outside
         its identity so re-signing the same release does not change gameplay."""
         if len(self.edits) > MAX_EDITS:
             raise ContentError("Runtime releases support at most 5000 total edits; use image baking.")
-        for edit in self.edits:
+        for edit in ([] if self.roster_content() else self.edits):
             for key in ("first_name", "last_name"):
                 if not all(32 <= ord(c) < 127 for c in edit[key]):
                     raise ContentError("Runtime ratings currently require ASCII player names; use image baking.")
@@ -457,8 +508,17 @@ class Content:
         if not split and any(edit["field"] == "PPVL" for edit in self.edits):
             raise ContentError("Republish this legacy velocity pack with the current editor for "
                                "game-start updates, or use image builds.")
-        raw = canonical({"format": "nsrb.runtime-content.v4" if split else "nsrb.runtime-content.v1", "version": self.version,
-                         "packs": self.packs})
+        if self.roster_content():
+            # Pack names, release numbers and art can change without changing the
+            # guest. Hash only canonical simulation edits; a missing PNG is safe.
+            edits = [{k: e[k] for k in ("first_name", "last_name", "field", "value", "expected")}
+                     for p in self.packs for e in p["edits"]]
+            edits.sort(key=lambda e: (e["last_name"].casefold(), e["first_name"].casefold(), e["field"]))
+            packs = [{"format": roster.PACK_FORMAT, "name": "roster", "edits": edits}] if edits else []
+            raw = canonical({"format": roster.RUNTIME_FORMAT, "version": 0, "packs": packs})
+        else:
+            raw = canonical({"format": "nsrb.runtime-content.v4" if split else "nsrb.runtime-content.v1", "version": self.version,
+                             "packs": self.packs})
         if len(raw) > 4 * 1024 * 1024:
             raise ContentError("Runtime content bundle is too large; use image baking.")
         return raw
@@ -552,7 +612,7 @@ class Cache:
         if playbooks:
             bundle = strict_loads(raw) if raw else {"version": 0, "packs": [],
                 "draft": {"order": draft_order, "first": draft_first, "policy": 1}}
-            bundle["format"] = "nsrb.runtime-content.v4" if bundle.get("format") == "nsrb.runtime-content.v4" else "nsrb.runtime-content.v3"
+            bundle["format"] = bundle["format"] if bundle.get("format") in ("nsrb.runtime-content.v4", roster.RUNTIME_FORMAT) else "nsrb.runtime-content.v3"
             bundle.setdefault("draft", {"order": draft_order, "first": draft_first, "policy": 1})
             bundle["playbooks"] = {"policy": 1, "captain": "lowest-pad", "users": playbooks}
             raw = canonical(bundle)
@@ -564,7 +624,7 @@ class Cache:
         path = os.path.abspath(os.path.join(self.root, "runtime", sha + ".json"))
         _atomic_write(path, raw)
         return {"NSR_CONTENT_PACK": path, "NSR_CONTENT_SHA256": sha,
-                "NSR_CONTENT_VERSION": str(content.version if content else 0)}
+                "NSR_CONTENT_VERSION": str(strict_loads(raw)["version"])}
 
     def clear_runtime(self) -> None:
         """Retire our active pointer only after a fallback image build succeeds."""
@@ -585,11 +645,14 @@ def content_descriptor(version: int, serial: int) -> dict:
 def parse_descriptor(value) -> dict | None:
     """A peer's descriptor, or None (absent: an older launcher; malformed: ignored,
     the image fingerprint check still keeps mismatched images apart)."""
-    if not isinstance(value, dict) or set(value) != {"version", "serial"}:
+    if not isinstance(value, dict) or set(value) not in ({"version", "serial"}, {"version", "serial", "simulation"}):
         return None
     try:
-        return content_descriptor(_int(value["version"], "version", 0, MAX_VERSION),
-                                  _int(value["serial"], "serial", 0, MAX_SERIAL))
+        descriptor = content_descriptor(_int(value["version"], "version", 0, MAX_VERSION),
+                                        _int(value["serial"], "serial", 0, MAX_SERIAL))
+        if "simulation" in value:
+            descriptor["simulation"] = _hex64(value["simulation"], "simulation")
+        return descriptor
     except ContentError:
         return None
 
@@ -605,7 +668,12 @@ def room_content_reason(room, joiner) -> tuple[str, str] | None:
     updates). The side whose manifest serial is lower has not seen the newest
     update, so it is the one told what to do."""
     r, j = parse_descriptor(room), parse_descriptor(joiner)
-    if r is None or j is None or r["version"] == j["version"]:
+    if r is None or j is None:
+        return None
+    if "simulation" in r and "simulation" in j:
+        if r["simulation"] == j["simulation"]:
+            return None
+    elif r["version"] == j["version"]:
         return None
     rv, jv = r["version"], j["version"]
     if j["serial"] < r["serial"]:

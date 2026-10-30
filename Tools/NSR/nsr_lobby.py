@@ -160,8 +160,12 @@ def _rejected(msg: dict, default: str) -> RoomRejected:
 
 
 def _with_content(msg: dict, content: dict | None) -> dict:
+    """Retain the verified simulation digest on direct and room-code requests."""
     if content is not None:
-        msg["content"] = nsr_content.content_descriptor(content["version"], content["serial"])
+        checked = nsr_content.parse_descriptor(content)
+        if checked is None:
+            raise ValueError("invalid installed content descriptor")
+        msg["content"] = checked
     return msg
 
 

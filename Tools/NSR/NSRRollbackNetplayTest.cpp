@@ -1714,6 +1714,92 @@ static void TestRuntimeContent()
   }
 }
 
+// GN7E69-r0 synthetic names and role exercise the actual audited descriptors.
+static void TestRuntimeRosterNames()
+{
+  namespace C = NSRContent;
+  std::vector<std::uint8_t> ram(0x400000), vmem(0x1000);
+  const auto put = [&](std::uint32_t off, std::uint32_t value, unsigned size = 4) {
+    for (unsigned i = 0; i < size; ++i)
+      vmem[off + i] = static_cast<std::uint8_t>(value >> ((size - i - 1) * 8));
+  };
+  const auto tag = [&](std::uint32_t off, std::string_view text) {
+    std::copy(text.begin(), text.end(), vmem.begin() + off);
+  };
+  ram[0x3ebe88] = 0x7e; ram[0x3ebe8a] = 1;
+  put(0x104, 0x7e000200); tag(0x108, "TATS"); tag(0x21c, "YALP");
+  put(0x214, 0x7e000400); put(0x220, 100); put(0x224, 799);
+  put(0x240, 3, 2); put(0x242, 3, 2); put(0x244, 3, 2); put(0x24a, 3, 1);
+  const std::array<std::string_view, 3> tags{{"ANFP", "ANLP", "OPBP"}};
+  const std::array<std::uint32_t, 3> offsets{{0, 88, 638}}, widths{{88, 112, 4}};
+  for (unsigned i = 0; i < 3; ++i)
+  {
+    put(0x24c + i * 16, i == 2 ? 3 : 0);
+    put(0x250 + i * 16, offsets[i]); tag(0x254 + i * 16, tags[i]);
+    put(0x258 + i * 16, widths[i]);
+  }
+  tag(0x400, "Ada"); tag(0x40b, "Test");
+  tag(0x464, "Ada"); tag(0x46f, "Test");
+  tag(0x4c8, "Other"); tag(0x4d3, "Test");
+  const NSRGameStats::Memory view{ram, vmem};
+  C::Edit rename{"Ada", "Test", "PFNA", 0, {}};
+  rename.string_value = "Ren\xc3\xa9"; rename.string_expected = {"Ada"};
+  rename.strict_names = true;
+  const C::Edit role{"Ada", "Test", "PBPO", 11, {0}};
+  const auto before = vmem;
+  const auto plan = C::Plan(view, {rename, role});
+  assert(plan && vmem == before);
+  for (const auto& [address, value] : *plan) vmem[address - 0x7e000000] = value;
+  assert(vmem[0x400] == 'R' && vmem[0x403] == 0xe9 && vmem[0x404] == 0 && vmem[0x40a] == 0);
+  assert(vmem[0x467] == 0xe9 && vmem[0x468] == 0);
+  assert((vmem[0x44f] & 3) == 2 && (vmem[0x450] & 0xc0) == 0xc0);
+  assert(!C::Plan(view, {rename, role}));
+  vmem = before;
+  rename.string_value = "Other";
+  assert(!C::Plan(view, {rename}));
+  rename.string_value = "Bad|Name"; assert(!C::Plan(view, {rename}));
+  rename.string_value = " "; assert(!C::Plan(view, {rename}));
+  rename.string_value = "\xf0\x9f\x8f\x88"; assert(!C::Plan(view, {rename}));
+  rename.string_value = "Ren\xc3\xa9"; rename.string_expected = {"Stale"};
+  assert(!C::Plan(view, {rename}));
+  assert(!C::Plan(view, {{"Ada", "Test", "PBPO", 3, {0}}}));
+  assert(C::GuestText("\xc3\x89") == std::string(1, static_cast<char>(0xc9)));
+  assert(C::Name(std::string(1, static_cast<char>(0xc9))) ==
+         C::Name(std::string(1, static_cast<char>(0xe9))));
+  assert(C::Name("Stra\xdf" "e") == "strasse");
+  rename.string_expected = {"Ada"};
+  const auto splits = C::Splits({rename, {"Ada", "Test", "PPVL", 99, {0}}});
+  assert(splits.count({C::Name(*C::GuestText("Ren\xc3\xa9")), "test"}) == 1);
+  assert(splits.count({"ada", "test"}) == 0);
+  // UTF-8 selectors and values are validated after conversion, using byte
+  // limits and Python strip semantics for CP1252 nonbreaking space.
+  for (const std::string bad : {"\xc2\xa0" "Ada", "Ada" "\xc2\xa0"})
+  {
+    auto edit = rename; edit.first = bad;
+    assert(!C::Plan(view, {edit}));
+    edit = rename; edit.string_value = bad;
+    assert(!C::Plan(view, {edit}));
+    edit = rename; edit.string_expected = {bad};
+    assert(!C::Plan(view, {edit}));
+  }
+  assert(C::NativeNameValid(std::string("A\xa0" "B", 3), 3));
+  assert(!C::NativeNameValid(std::string(1, static_cast<char>(0x81)), 1));
+  assert(!C::GuestText("\xc0\xaf") && !C::GuestText("\xc2\x81"));
+  assert(C::GuestText("\xe2\x80\xa6") == std::string(1, static_cast<char>(0x85)));
+  auto first = rename; first.string_value = "0123456789";
+  C::Edit last{"Ada", "Test", "PLNA", 0, {}};
+  last.string_value = "0123456789abc"; last.string_expected = {"Test"};
+  last.strict_names = true;
+  const auto boundary = C::Plan(view, {first, last});
+  assert(boundary);
+  assert(boundary->at(0x7e00040a) == 0 && boundary->at(0x7e000418) == 0);
+  first.string_value += "x"; assert(!C::Plan(view, {first}));
+  first.string_value.clear(); last.string_value.clear();
+  assert(!C::Plan(view, {first, last}));
+  last.string_value = "0123456789abcd"; assert(!C::Plan(view, {last}));
+  assert(vmem == before);
+}
+
 // Synthetic split records exercise audited virtual padding and opt-in native
 // cache selection, including unchanged rosters and malformed layouts.
 static void TestRuntimeSplitRatings()
@@ -1854,6 +1940,21 @@ static void TestBootAgreementWire()
   assert(DecodeBoot(EncodeBoot({BootKind::Go, 0, 3, {}})));
   assert(!DecodeBoot(EncodeBoot({BootKind::Ready, 1, 3, local.fields})));
   assert(!DecodeBoot(EncodeBoot({BootKind::Settings, 1, 3, {}})));
+  // Names/roles live in guest data. Every SHA word and policy must differ at
+  // preboot, before Ready/Go can permit execution; art is absent from this hash.
+  Manifest roster{{"RuntimeContent.0", "0123456789abcdef"},
+                  {"RuntimeContent.1", "1111111111111111"},
+                  {"RuntimeContent.2", "2222222222222222"},
+                  {"RuntimeContent.3", "3333333333333333"},
+                  {"RuntimeContent.4", "0000000000000000"},
+                  {"RuntimeContent.5", "0000000000000005"}};
+  for (const auto& [field, value] : roster)
+  {
+    auto changed = roster;
+    changed[field] = value == "0000000000000000" ? "0000000000000001" : "0000000000000000";
+    const auto peer = DecodeBoot(EncodeBoot({BootKind::Settings, 1, 2, changed}));
+    assert(peer && BootDifferences(roster, peer->fields) == std::vector<std::string>{field});
+  }
 }
 
 // Pickup draft recorder (NSRDraftLog.h): synthetic GN7E69 rev-0 draft table and
@@ -2533,6 +2634,7 @@ int main()
   TestQuickstartNavigation();
   TestBootAgreementWire();
   TestRuntimeContent();
+  TestRuntimeRosterNames();
   TestRuntimeSplitRatings();
   TestRuntimeDraft();
   TestPlaybooks();

@@ -136,13 +136,14 @@ std::string Load(const std::string& path, const std::string& expected)
     return "invalid content object shape";
   bool valid = true;
   const auto format = Text(root.get("format"), 64, valid);
-  s.split_policy = format == "nsrb.runtime-content.v4";
+  const bool roster_policy = format == "nsrb.runtime-content.v5";
+  s.split_policy = roster_policy || format == "nsrb.runtime-content.v4";
   if ((!s.split_policy && format !=
           (books ? "nsrb.runtime-content.v3" : draft ? "nsrb.runtime-content.v2" : "nsrb.runtime-content.v1")) ||
       !root.get("packs").is<picojson::array>())
     return "unsupported content format";
   s.fingerprint[4] = Number(root.get("version"), 0x7fffffff, valid);
-  s.fingerprint[5] = s.split_policy ? 4 : books ? 3 : draft ? 2 : 1;  // exact hook/application policy is part of M2
+  s.fingerprint[5] = roster_policy ? 5 : s.split_policy ? 4 : books ? 3 : draft ? 2 : 1;  // exact hook/application policy is part of M2
   if (draft)
   {
     const auto& settings = root.get("draft");
@@ -235,8 +236,11 @@ std::string Load(const std::string& path, const std::string& expected)
     return "too many content packs";
   for (const auto& pack : packs)
   {
+    if (!Keys(pack, {"format", "name", "edits"})) return "invalid ratings pack";
+    const auto pack_format = Text(pack.get("format"), 64, valid);
+    const bool roster_pack = roster_policy && pack_format == "nsrb.ratings-pack.v2";
     if (!Keys(pack, {"format", "name", "edits"}) ||
-        Text(pack.get("format"), 64, valid) != "nsrb.ratings-pack.v1" ||
+        (!roster_pack && pack_format != "nsrb.ratings-pack.v1") ||
         !pack.get("edits").is<picojson::array>())
       return "invalid ratings pack";
     (void)Text(pack.get("name"), 80, valid);
@@ -248,21 +252,40 @@ std::string Load(const std::string& path, const std::string& expected)
       if (!Keys(item, {"first_name", "last_name", "field", "value", "expected"}))
         return "invalid rating edit";
       Edit edit{Text(item.get("first_name"), 64, valid), Text(item.get("last_name"), 64, valid),
-                Text(item.get("field"), 4, valid), Number(item.get("value"), 255, valid), {}};
+                Text(item.get("field"), 4, valid), 0, {}};
+      edit.strict_names = roster_pack;
+      const bool name_edit = edit.field == "PFNA" || edit.field == "PLNA";
+      if ((name_edit || edit.field == "PBPO") && !roster_pack)
+        return "name and role edits require ratings pack v2";
+      if (roster_pack && (edit.first.find('|') != std::string::npos ||
+                          edit.last.find('|') != std::string::npos))
+        return "invalid player identity";
+      if (!roster_pack)
+      {
+        const auto ascii = [](const std::string& text) {
+          return std::all_of(text.begin(), text.end(), [](unsigned char c) { return c >= 32 && c < 127; });
+        };
+        if (!ascii(edit.first) || !ascii(edit.last)) return "invalid legacy identity";
+      }
+      if (name_edit) edit.string_value = Text(item.get("value"), 64, valid);
+      else edit.value = Number(item.get("value"), 255, valid);
       if (!item.get("expected").is<picojson::array>())
         return "original ratings array required";
       const auto& originals = item.get("expected").get<picojson::array>();
       if (originals.empty() || originals.size() > 8 || s.edits.size() >= 5000)
         return "rating edit limit";
       for (const auto& original : originals)
-        edit.expected.push_back(Number(original, 255, valid));
-      // An explicit nonzero PCEL entry activates a new consumer even when
-      // its packed bits already equal that value. Only v4 grants that meaning.
+      {
+        if (name_edit) edit.string_expected.push_back(Text(original, 64, valid));
+        else edit.expected.push_back(Number(original, 255, valid));
+      }
+      // Explicit PCEL entries may activate the split hook without changing bits.
       const bool activation = s.split_policy && edit.field == "PCEL" && edit.value != 0;
-      if (edit.expected == std::vector<std::uint32_t>{edit.value} && !activation)
+      if ((name_edit && edit.string_expected == std::vector<std::string>{edit.string_value}) ||
+          (!name_edit && edit.expected == std::vector<std::uint32_t>{edit.value} && !activation))
         return "no-op content edit";
       if (edit.field == "PPVL" && !s.split_policy)
-        return "PPVL requires split policy v4";
+        return "PPVL requires split policy v4 or later";
       s.edits.push_back(std::move(edit));
     }
   }
@@ -406,8 +429,9 @@ void DatabaseLoaded(const Core::CPUThreadGuard& guard, bool resim, std::uint32_t
   }
   if (!s.splits.empty())
   {
-    std::fprintf(stderr, "[NSR] splits applied: velocity %u acceleration %u names %zu policy 4\n",
-                 velocity ? 1u : 0u, acceleration ? 1u : 0u, s.splits.size());
+    std::fprintf(stderr, "[NSR] splits applied: velocity %u acceleration %u names %zu policy %llu\n",
+                 velocity ? 1u : 0u, acceleration ? 1u : 0u, s.splits.size(),
+                 static_cast<unsigned long long>(s.fingerprint[5]));
   }
   s.applied = true;
   const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(

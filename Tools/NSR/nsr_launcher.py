@@ -848,6 +848,7 @@ class Launcher:
                                "built without it.").strip()
             self.sync_controllers_now()
             self._ensure_assets(install=r.reborn_install)
+            self._install_roster_art(runtime or applied)
             self._ready(r.fingerprint, note, descriptor)
             return True
         except textures.ImportError as e:
@@ -993,6 +994,14 @@ class Launcher:
                                   json.dumps(self.cfg, indent=1).encode("utf-8"))
         self._runtime_content = content
 
+    def _install_roster_art(self, content) -> None:
+        """Install authenticated presentation separately; disk/art loss cannot desync."""
+        try:
+            textures.install_roster_headshots(self.folder, content.packs if content else [])
+        except (OSError, ValueError) as exc:
+            log(self.folder, f"roster headshots unavailable: {exc}")
+            self.notify("Roster headshots could not be installed; using your local art.", "error")
+
     def _validate_runtime(self, content, fingerprint=None) -> None:
         """Pin the signed release to the known unedited image before activation."""
         build = content.build_for(self._source_sha)
@@ -1136,6 +1145,7 @@ class Launcher:
             try:
                 self._validate_runtime(content)
                 self._activate_runtime(content)
+                self._install_roster_art(content)
                 self._ready(self.state["game"]["fingerprint"], "Ratings are applied when the game starts.",
                             content.descriptor())
                 self.notify(f"Game updated: {what}")
@@ -1243,6 +1253,13 @@ class Launcher:
             self.uploader.remember_server(start.telemetry_url, start.telemetry_token)
             self._stats_wake.set()
         selected_draft = lobby.draft_settings(start.draft) if start else self.draft_settings()
+        try:
+            active_art = self._installed_runtime()
+            if active_art:
+                self._install_roster_art(active_art)
+        except (OSError, nsr_content.ContentError) as exc:
+            self.notify(f"Couldn't verify installed roster content: {exc}", "error")
+            return False
         try:
             args, env = dolphin_command(self.folder, start, None, open_ui=open_ui,
                                         name=self.state["name"], fingerprint=self.room_fingerprint(selected_draft),
