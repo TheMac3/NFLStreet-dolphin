@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """nsr_launcher.py: "NFLStreetRollback", the friend-facing launcher for NFLStreet netplay
 ("NFLStreetRollback.exe"; short form "NSRB"; the module, NSR_* variables and
 nsr-*.json/.txt file names keep their old internal names on purpose).

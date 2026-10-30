@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Hash-only GN7E69-r0 input evidence for the ownimage verifier.
 
 File references: local Reborn importer source_files metadata, explicitly

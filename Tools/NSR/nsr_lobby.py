@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """nsr_lobby.py: host/join lobby for NFLStreet netplay (2-4 players).
 
 Two ways to meet:

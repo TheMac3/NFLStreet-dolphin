@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """nsr_content.py: signed content-update format for NFLStreetRollback (roster/rating updates).
 
 What a content release is (docs/content-updates.md): OUR edit data only, never

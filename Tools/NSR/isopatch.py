@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """isopatch.py: patch main.dol code inside a GameCube ISO copy, in place.
 
 Builds the test images for the determinism harness (backlog step 6) without

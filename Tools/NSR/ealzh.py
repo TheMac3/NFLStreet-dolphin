@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Bounded EA LZH1 codec, independently derived from GN7E69 revision 0.
 
 TERF COMP method 5 uses MSB-first bits, canonical Huffman trees described by

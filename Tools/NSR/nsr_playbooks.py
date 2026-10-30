@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Signed account playbooks and frozen room bundles (references only, no game assets).
 
 The Access editor owns publication. Launchers resolve immutable envelopes from the

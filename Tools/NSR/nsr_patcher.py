@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """nsr_patcher.py: one-click builder of the NFLStreet rollback netplay game image.
 
 Retail sources with the exact native DOL route to ownimage_build's separately

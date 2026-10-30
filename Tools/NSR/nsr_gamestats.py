@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """nsr_gamestats.py: find NFL Street Reborn's per-game stats files and upload them.
 
 Reborn's own Dolphin writes one JSON capture per finished game (schema

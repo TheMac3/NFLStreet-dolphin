@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Same-size GameCube FST file replacement into a new private ISO copy.
 
 The input is read-only. Header, FST, DOL and every non-target byte retain their

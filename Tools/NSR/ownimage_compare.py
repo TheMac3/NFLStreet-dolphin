@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Metadata-only FST/system/mapped-DOL delta for two private GN7E69-r0 images.
 
 The first image is an observed baseline, not implicitly an authenticated retail

@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """rsasig.py: RSASSA-PKCS1-v1_5 / SHA-256 signature *verification*, standard library only.
 
 Shared by two verifiers that must not grow a third-party dependency:

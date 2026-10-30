@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Select runtime split releases and retain the legacy GN7E69-r0 PPVL builder.
 
 New split releases use an agreed v4 boot bundle and leave the image unchanged.

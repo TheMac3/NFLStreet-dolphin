@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """nsr_controllers.py: use the player's NFL Street Reborn controller setup in NFLStreetRollback.
 
 Reborn ships its own Dolphin ("NFL Street Reborn Dolphin.exe" in <install>/runtime)

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Read-only retail verification and evidence inventories for the ownimage study.
 
 No game bytes are emitted. `verify` distinguishes raw retail, scrubbed retail

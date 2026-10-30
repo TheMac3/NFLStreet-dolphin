@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """eadb.py: parse and edit NFL Street 2 (GN7E69) roster attributes.
 
 Two formats, both big-endian (GameCube):

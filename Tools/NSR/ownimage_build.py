@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Authored GN7E69-r0 retail bootstrap and transactional local image recipe.
 
 Only metadata and our PPC encoders are distributed. The player's disc is read

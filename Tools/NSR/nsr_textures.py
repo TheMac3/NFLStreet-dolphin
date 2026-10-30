@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """nsr_textures.py: the HD texture set NFLStreetRollback's Dolphin shows, built from
 the player's own NFL Street Reborn install.
 

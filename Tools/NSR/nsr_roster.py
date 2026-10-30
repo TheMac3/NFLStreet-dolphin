@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Shared, stdlib-only roster-pack policy; artwork never enters guest identity.
 
 Native field limits target GN7E69 revision 0. The editor additionally decodes and

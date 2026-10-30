@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Inspect NFL Street 2 playbooks and build an edits-only reorder proof.
 
 GN7E69 rev 0 / Reborn: igdata.dat TERF slots 1 (defense), 2 (offense).

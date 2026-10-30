@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Mason Blanchard
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Pickup draft policies for GN7E69 revision 0 / Reborn 2026.09.12.
 
 The patch replaces only turn advancement after a valid, non-final pick.
