@@ -18,7 +18,7 @@ using Pads = std::array<std::array<std::uint8_t, 12>, 4>;
 constexpr U32 STATE = 0x80413a00, SIZE = 0x100, MAGIC = 0x41554432;
 constexpr U32 RUSH = 0x82000000;
 constexpr U32 CHORD = 0x18;  // processed Z + D-pad Up; unchanged by Reborn remaps
-constexpr const char* VERSION = "rush-picker-v2-captain-mirrors-rejected";
+constexpr const char* VERSION = "rush-picker-v3-normal-input-captain-mirrors-rejected";
 // Per-port records: mode, target, previous buttons, context, reason, count,
 // applied player/sequence/old command. Reserve the last words for diagnostics.
 constexpr U32 Port(U32 port) { return STATE + 16 + port * 48; }
@@ -38,10 +38,18 @@ inline Context ReadContext(const NSRGameStats::Memory& m)
   Context c;
   const auto flow = m.UInt(0x803eaad4), match = m.UInt(0x803eb444);
   if (m.UInt(0x803eb2ac) != 15U || !flow || m.UInt(*flow) != 2U ||
+      m.UInt(0x803ec5fc) != 0U || m.UInt(0x803eaa4d, 1) != 0U ||
+      m.UInt(0x803eaa84, 1) != 0U ||
       !match || !m.Bytes(*match, 0x39))
     return c;
   const auto offense = *m.UInt(*match + 0x38, 1);
   if (offense > 1)
+    return c;
+  // Match the normal branch of native pre-snap dispatch (800BE4C8):
+  // pause and its two global suppressors above, then side input mode 0.
+  // Whole-play audible/prediction/other native modes retain their inputs.
+  const auto input = m.UInt(0x803eaba8);
+  if (!input || m.UInt(*input + (offense ^ 1U) * 0x20) != 0U)
     return c;
   const auto descriptor = m.UInt(0x803ea3f8), registry = m.UInt(0x803eab60);
   const auto book = m.UInt(0x803ecaf4);

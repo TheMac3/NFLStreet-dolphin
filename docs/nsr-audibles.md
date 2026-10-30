@@ -16,7 +16,9 @@ pick a defender. Up applies BLITZ; Down or Z cancels. Release before ordinary
 controls resume. The picker consumes buttons, signed stick axes and analog
 triggers through its entry/menu/release phases, retaining Start for pause.
 Ordinary controls pass through while the picker is closed. Only defense in
-native lineup flow 2 is eligible. The lowest mapped physical controller port
+native lineup flow 2 with side input mode 0 is eligible. Pause and the native
+pre-snap dispatcher’s two suppressors close the picker with release gating;
+whole-play audible/prediction and other modal controls retain ownership. The lowest mapped physical controller port
 on that side is captain and may adjust any of its seven native slots. Partners
 cannot write assignments. Registry-to-port mapping is resolved explicitly.
 

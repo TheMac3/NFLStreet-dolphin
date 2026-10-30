@@ -2826,6 +2826,7 @@ static void TestAudibles()
         put(selected + 0x14 + 0x17, mirrored, 1);
         put(0x803eb098, 0x80500500);
         put(0x803eaaf4, 0x80500600);
+        put(0x803eaba8, 0x80500700);
         const U sequence = selected + 0xcf8 + 0x38 + slot * 40;
         for (U word = 0; word < 70; ++word)
           put(selected + 0xcf8 + 0x38 + word * 4, 0xdc010000);
@@ -2904,6 +2905,23 @@ static void TestAudibles()
           put(0x8050050e, 0, 1);
           put(0x80500600 + 0x230 + side * 28, 0x80600000 + (side * 7 + slot) * 0x14d8);
           assert(AU::Availability(memory, AU::ReadContext(memory), slot) == AU::Special);
+        }
+        // Native modes/dispatch suppressors and pause own their controls.
+        // Taking ownership while open closes the editor and drains a held
+        // commit; a fresh press after release must reach the native handler.
+        for (const auto address : {0x80500700U + side * 0x20, 0x803ec5fcU,
+                                   0x803eaa4dU, 0x803eaa84U})
+        {
+          const U size = address == 0x803eaa4d || address == 0x803eaa84 ? 1U : 4U;
+          tick(0); tick(0x18); tick(0);
+          const auto count = memory.UInt(AU::Port(0) + 20);
+          put(address, 1, size);
+          assert(AU::ReadContext(memory).side == 2U);
+          assert(tick(8)[0][1] == 0);
+          assert(memory.UInt(AU::Port(0) + 20) == count);
+          tick(0);
+          assert(tick(0x18)[0][1] == 0x18);  // native mode, no editor capture
+          put(address, 0, size);
         }
         // Flow exit closes the picker, with the release barrier retained.
         tick(0); tick(0x18); tick(0);
