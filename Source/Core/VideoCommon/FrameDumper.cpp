@@ -53,17 +53,18 @@ void FrameDumper::DumpCurrentFrame(const AbstractTexture* src_texture,
   int target_width = target_rect.GetWidth();
   int target_height = target_rect.GetHeight();
 
-  // We only need to render a copy if we need to stretch/scale the XFB copy.
+  // Scale or composite CPU-observed NSR overlays into a private host copy.
+  // The audible HUD must survive captures during lineup with no privacy cover.
   MathUtil::Rectangle<int> copy_rect = src_rect;
   if (source_width != target_width || source_height != target_height ||
-      g_presenter->GetPlayCover().hidden != 0)
+      (g_presenter->GetPlayCover().hidden != 0 || g_presenter->HasAudibles()))
   {
     if (!CheckFrameDumpRenderTexture(target_width, target_height))
       return;
 
     g_gfx->ScaleTexture(m_frame_dump_render_framebuffer.get(),
                         m_frame_dump_render_framebuffer->GetRect(), src_texture, src_rect);
-    if (g_presenter->GetPlayCover().hidden != 0)
+    if ((g_presenter->GetPlayCover().hidden != 0 || g_presenter->HasAudibles()))
     {
       g_gfx->BeginUtilityDrawing();
       g_gfx->SetFramebuffer(m_frame_dump_render_framebuffer.get());

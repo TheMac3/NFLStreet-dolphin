@@ -15,6 +15,7 @@
 #include <array>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <tuple>
 
 class AbstractTexture;
@@ -45,6 +46,14 @@ public:
   NSRPlayCover::State GetPlayCover() const { return m_play_cover; }
   void SetAudibles(const std::array<std::string, 4>& lines) { m_audibles = lines; }
   const std::array<std::string, 4>& GetAudibles() const { return m_audibles; }
+  // Capture overlays even when pre-snap text is the only visible NSR UI.
+  bool HasAudibles() const
+  {
+    for (const auto& line : m_audibles)
+      if (!line.empty())
+        return true;
+    return false;
+  }
   void DrawPlayCoverForDump(u32 width, u32 height);
 
   void SetNextSwapEstimatedTime(u64 ticks, TimePoint host_time);
