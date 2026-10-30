@@ -948,6 +948,9 @@ class Launcher:
             built = True
             if self._source_kind == "owned":
                 self.cfg["owned_iso"] = iso
+                # Startup may have checked a manifest before this source had a
+                # verified identity. Recheck for its matching release before play.
+                self._checked_at = None
             else:
                 self.cfg["reborn_iso"] = iso
                 self.cfg["reborn_install"] = r.reborn_install
@@ -1195,6 +1198,8 @@ class Launcher:
         payload = self._content_cache.manifest()
         if not payload or not self._usable(payload):
             return None
+        if self._source_kind == "owned" and self._source_sha not in payload["release"]["builds"]:
+            return None  # A cached Reborn-only release must not break owned setup.
         try:
             return self._content_cache.load(payload, self._content_fetch, self.content_base())
         except (OSError, nsr_content.ContentError) as e:
