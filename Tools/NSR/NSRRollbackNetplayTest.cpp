@@ -2303,7 +2303,7 @@ static void TestMenuDelay()
   assert(RN::MenuInputDelay(10000, 10000) == RN::MENU_DELAY_MAX);
   assert(RN::MenuInputDelay(std::numeric_limits<double>::infinity(), 0) == 2);
   assert(!RN::MenuMedian(std::array<std::uint32_t, 5>{1, 2, 3, 4, 5}));
-  assert(RN::MenuMedian(std::array<std::uint32_t, 7>{70, 71, 69, 72, 68, 70, 1800}) == 70);
+  assert(RN::MenuMedian(std::array<std::uint32_t, 7>{70, 71, 69, 72, 68, 70, 1800}) == 70u);
   for (const auto kind : {RN::HandoffKind::StartMenus, RN::HandoffKind::LeaveRollback})
   {
     RN::HandoffAgreement host(3, 0, kind, 3, 4000, 0, {}, 0, 0, 0, 0, 0, 7, 750, 100);
@@ -2663,7 +2663,7 @@ static void TestPlayCalls()
     bounded.ObserveEvent(std::move(extra));
   }
   assert(bounded.Snaps().back().events.size() == 128);
-  assert(bounded.Snaps().back().events_dropped_from == 4228);
+  assert(bounded.Snaps().back().events_dropped_from == 4228u);
   bounded.RollbackFrom(4227);
   assert(!bounded.Snaps().back().events_dropped_from);
   assert(bounded.Snaps().back().events.size() == 127);
