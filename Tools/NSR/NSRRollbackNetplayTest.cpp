@@ -2790,9 +2790,87 @@ static void TestPlayCover()
   assert(shared.left < left.left && shared.right > right.right);
 }
 
+// Every supported room size, from both seats' points of view. Each netplay seat
+// owns the pad with its own player index, so a 2-, 3- or 4-player room differs
+// only in how many registry entries map to each native side. Registry order is
+// deliberately not pad order: the native table is indexed by registration.
+static void TestPlayCoverPlayerCounts()
+{
+  namespace PC = NSRPlayCover;
+  std::vector<std::uint8_t> ram(0x1800000);
+  const auto put = [&](std::uint32_t address, std::uint32_t value, unsigned size = 4) {
+    for (unsigned i = 0; i < size; ++i)
+      ram.at(address - 0x80000000 + i) = static_cast<std::uint8_t>(value >> ((size - i - 1) * 8));
+  };
+  const NSRGameStats::Memory memory{ram, {}};
+  // sides[pad] names the native side each registered pad plays for; the entries
+  // are written in the given registration order, which is never pad order here.
+  const auto configure = [&](const std::vector<std::pair<std::uint32_t, std::uint32_t>>& entries) {
+    put(0x803eb2ac, 0x0f);
+    put(0x803eab60, 0x80400000);
+    put(0x80400000, 0x80400100);
+    put(0x80400004, static_cast<std::uint32_t>(entries.size()), 1);
+    put(0x803eaad4, 0x80401000);
+    put(0x80401000, 5);
+    put(0x80401004, 4);  // a later down, not the first play of the match
+    put(0x803ea58c, 0x80402000);
+    put(0x803eb4a0, 0, 1);
+    for (std::uint32_t i = 0; i < 4; ++i)
+      put(0x802eacac + i * 4, 0xff);
+    for (std::uint32_t i = 0; i < entries.size(); ++i)
+    {
+      put(0x802eacac + i * 4, entries[i].first);
+      put(0x80400100 + i * 12, entries[i].second, 1);
+    }
+  };
+  // Two players: pad 0 left (native side 1), pad 1 right (side 0).
+  configure({{0, 1}, {1, 0}});
+  assert(PC::Read(memory, 1U << 0).hidden == 1);  // seat 0 hides the right book
+  assert(PC::Read(memory, 1U << 1).hidden == 2);  // seat 1 hides the left book
+  // Three players: seat 2 joins seat 1 on the right; registration starts at pad 2.
+  configure({{2, 0}, {0, 1}, {1, 0}});
+  assert(PC::Read(memory, 1U << 0).hidden == 1);
+  assert(PC::Read(memory, 1U << 1).hidden == 2);
+  assert(PC::Read(memory, 1U << 2).hidden == 2);
+  // Four players, two a side, registered in reverse pad order.
+  configure({{3, 0}, {2, 1}, {1, 0}, {0, 1}});
+  for (const std::uint32_t seat : {0U, 2U})
+    assert(PC::Read(memory, 1U << seat).hidden == 1);  // left team hides the right
+  for (const std::uint32_t seat : {1U, 3U})
+    assert(PC::Read(memory, 1U << seat).hidden == 2);
+  // Locked labels are per side, not per seat: the left team committing its call
+  // is what turns the panel the right-hand seats see into "Play locked", and a
+  // seat never draws a label over a side it can see.
+  put(0x80402043, 1, 1);
+  for (const std::uint32_t seat : {1U, 3U})
+  {
+    const auto state = PC::Read(memory, 1U << seat);
+    assert(state.hidden == 2 && state.locked == 2);
+    assert(state.layout == PC::Layout::Split);
+  }
+  for (const std::uint32_t seat : {0U, 2U})
+  {
+    const auto state = PC::Read(memory, 1U << seat);
+    assert(state.hidden == 1 && (state.locked & state.hidden) == 0);
+  }
+  put(0x80402043, 0, 1);
+  // A seat whose pad the game has not registered covers nothing: a panel over
+  // our own book would make the down unplayable. Only a pad-less spectator
+  // (and nobody in a 2-4 player room is one) covers both books.
+  configure({{0, 1}, {1, 0}});
+  assert(PC::Read(memory, 1U << 2).hidden == 0);
+  assert(PC::Read(memory, 1U << 3).hidden == 0);
+  assert(PC::Read(memory, 0).hidden == 3);
+  // A pad the registry maps to both sides stays unresolved, and so stays visible.
+  configure({{0, 1}, {0, 0}, {1, 0}});
+  assert(PC::Read(memory, 1U << 0).hidden == 0);
+  assert(PC::Read(memory, 1U << 1).hidden == 2);
+}
+
 int main()
 {
   TestPlayCover();
+  TestPlayCoverPlayerCounts();
   TestMenuDelay();
   TestPlayCalls();
   TestHandoffInputDelay();

@@ -94,7 +94,17 @@ inline State Read(const NSRGameStats::Memory& memory, std::uint32_t local_pads)
   const auto phase = *memory.UInt(*flow);
   if (phase != 2 && phase != 5)
     return {};
-  const auto opponents = 3U & ~LocalSides(memory, local_pads);
+  // 2-, 3- and 4-player safety: only a positively resolved side is ever covered.
+  // Each netplay seat owns exactly one pad (pad == player index), so a resolved
+  // mask names our team however many seats a room has. A local player whose pad
+  // is not in the native registry yet would otherwise get a panel over their own
+  // book, making the down unplayable; the native card panel is not theirs until
+  // that registration happens. Covering both books stays reserved for a
+  // configured spectator, which passes no local pad at all.
+  const auto mine = LocalSides(memory, local_pads);
+  if (local_pads != 0 && mine == 0)
+    return {};
+  const auto opponents = 3U & ~mine;
   // Native fn_8017DD68/8017DDDC toggles per-team audible menus at these bytes.
   // Prediction submenu fn_8017DFA8/8017E01C uses the next per-team array.
   // Both can expose choices during lineup; ordinary lineup remains uncovered.
