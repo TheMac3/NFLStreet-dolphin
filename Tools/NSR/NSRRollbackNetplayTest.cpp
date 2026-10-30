@@ -173,6 +173,15 @@ static void TestHandoffAgreement()
 static void TestRebornStatsLogBounds()
 {
   using NSRNetplay::RollbackLogic::RebornStatsLogOffset;
+  // No disc code is stored as a unit fixture. Unknown/short/long footprints
+  // must never enable the fixed-address hook; the private image qualification
+  // verifies the known footprint and every single-bit mutation of its words.
+  std::array<u32, 19> unknown{};
+  assert(!NSRNetplay::RollbackLogic::KnownRebornStatsLogger(unknown));
+  assert(!NSRNetplay::RollbackLogic::KnownRebornStatsLogger(
+      std::span<const u32>(unknown).first(18)));
+  assert(!NSRNetplay::RollbackLogic::KnownRebornStatsLogger(
+      std::span<const u32>(unknown).first(17)));
   constexpr u32 base = 0x803FE5A0;
   constexpr u32 end = base + 1024;
   for (u32 record = 0; record < 4096; ++record)
@@ -2180,7 +2189,7 @@ static void TestMenuDelay()
   assert(RN::MenuInputDelay(10000, 10000) == RN::MENU_DELAY_MAX);
   assert(RN::MenuInputDelay(std::numeric_limits<double>::infinity(), 0) == 2);
   assert(!RN::MenuMedian(std::array<std::uint32_t, 5>{1, 2, 3, 4, 5}));
-  assert(RN::MenuMedian(std::array<std::uint32_t, 7>{70, 71, 69, 72, 68, 70, 1800}) == 70);
+  assert(RN::MenuMedian(std::array<std::uint32_t, 7>{70, 71, 69, 72, 68, 70, 1800}) == 70u);
   for (const auto kind : {RN::HandoffKind::StartMenus, RN::HandoffKind::LeaveRollback})
   {
     RN::HandoffAgreement host(3, 0, kind, 3, 4000, 0, {}, 0, 0, 0, 0, 0, 7, 750, 100);

@@ -18,6 +18,7 @@
 #include "Core/HLE/HLE_Misc.h"
 #include "Core/HLE/HLE_OS.h"
 #include "Core/NSR/NSRNetplay.h"
+#include "Core/NSR/NSRRollbackLogic.h"
 #include "Core/NSR/NSRContent.h"
 #include "Core/HW/Memmap.h"
 #include "Core/Host.h"
@@ -166,14 +167,13 @@ void PatchFixedFunctions(Core::System& system)
       Patch(system, 0x8020d334, "NSR_ContentDatabase");
     // nextgame: GN7E69-r0 Reborn's stats diagnostics start at803FE5A0,
     // but the shipped wrap mask reaches8040259F and overwrites added code.
-    // Recognize the index/base/address/store/mask footprint before changing
-    // the offset register; leave image bytes and native stats stores intact.
-    const auto& memory = system.GetMemory();
-    if (memory.Read_U32(0x803fe4f0) == 0x60e7e578 &&
-        memory.Read_U32(0x803fe4fc) == 0x6129e5a0 &&
-        memory.Read_U32(0x803fe500) == 0x7d294214 &&
-        memory.Read_U32(0x803fe504) == 0x90a90000 &&
-        memory.Read_U32(0x803fe518) == 0x71083ff0)
+    // Recognize the complete logger, including register operands and native
+    // stats write/return, before changing an offset register. Guest image
+    // bytes remain untouched; another footprint installs no logger hook.
+    std::array<u32, 18> logger{};
+    for (u32 offset = 0; offset < 72; offset += 4)
+      logger[offset / 4] = system.GetMemory().Read_U32(0x803fe4e0 + offset);
+    if (NSRNetplay::RollbackLogic::KnownRebornStatsLogger(logger))
       Patch(system, 0x803fe500, "NSR_RebornStatsLog");
     Patch(system, NSRNetplay::RB_POLL_STUB, "NSR_RollbackPoll");
     Patch(system, NSRNetplay::RB_TICK_STUB, "NSR_RollbackTick");
