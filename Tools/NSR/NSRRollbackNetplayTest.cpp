@@ -296,6 +296,15 @@ static void TestHandoffAgreement()
 static void TestRebornStatsLogBounds()
 {
   using NSRNetplay::RollbackLogic::RebornStatsLogOffset;
+  // No disc code is stored as a unit fixture. Unknown/short/long footprints
+  // must never enable the fixed-address hook; the private image qualification
+  // verifies the known footprint and every single-bit mutation of its words.
+  std::array<u32, 19> unknown{};
+  assert(!NSRNetplay::RollbackLogic::KnownRebornStatsLogger(unknown));
+  assert(!NSRNetplay::RollbackLogic::KnownRebornStatsLogger(
+      std::span<const u32>(unknown).first(18)));
+  assert(!NSRNetplay::RollbackLogic::KnownRebornStatsLogger(
+      std::span<const u32>(unknown).first(17)));
   constexpr u32 base = 0x803FE5A0;
   constexpr u32 end = base + 1024;
   for (u32 record = 0; record < 4096; ++record)

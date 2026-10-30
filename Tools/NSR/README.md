@@ -1,10 +1,10 @@
 # NFLStreetRollback launcher (vendored)
 
-Copied from the NFLStreet repo (`tools/`, commit 8c126a2) by
+Copied from the NFLStreet repo (`tools/`, commit cf4b76c) by
 `scripts/sync-launcher-to-fork.sh`. Don't edit here; edit in NFLStreet and
 re-sync. The Windows CI workflow (`.github/workflows/nsr-windows.yml`)
 builds `nsr_launcher.py` (with `nsr_controllers.py`, `nsr_gamestats.py`, `nsr_textures.py`, the content-update
-modules `nsr_content.py`/`rsasig.py`/`eadb.py`/`discpatch.py`/`ratingsplit.py`,
+modules `nsr_content.py`/`nsr_roster.py`/`rsasig.py`/`eadb.py`/`discpatch.py`/`ratingsplit.py`,
 `draftmodes.py` for Pickup policies, and the bundled
 `nsr_launcher_ui.html` web UI, shown through pywebview/WebView2) into
 "NFLStreetRollback.exe" and `nsr_patcher.py` into NFLStreetRollback-Patcher.exe with

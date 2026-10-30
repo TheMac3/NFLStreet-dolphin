@@ -74,7 +74,7 @@ def _extract(rec: bytes, f: Field):
     """Decode one MSB-first field without changing adjacent packed fields."""
     if f.type == 0:  # string, byte-aligned
         start = f.bit_offset // 8
-        return rec[start:start + f.bits // 8].split(b"\0", 1)[0].decode("latin-1")
+        return rec[start:start + f.bits // 8].split(b"\0", 1)[0].decode("cp1252")
     total = len(rec) * 8
     v = (int.from_bytes(rec, "big") >> (total - f.bit_offset - f.bits)) & ((1 << f.bits) - 1)
     if f.type == 2 and v >> (f.bits - 1):  # signed (guess): two's complement
@@ -153,8 +153,8 @@ def load(path: str) -> list[tuple[int, dict[str, Table] | None]]:
 
 
 
-# The editor exposes known attributes only; identity/appearance fields and unknown
-# type-1/type-4 encodings stay read-only until their semantics are established.
+# Native attributes and separately described character fields are allowlisted;
+# unknown identity/appearance fields and type-1/type-4 encodings remain read-only.
 ATTRIBUTES = {
     "POVR": "Overall", "PSPD": "Speed", "PAGI": "Agility", "PCTH": "Catching",
     "PTAK": "Tackling", "PBLK": "Blocking", "PBTK": "Break tackle",
@@ -163,6 +163,13 @@ ATTRIBUTES = {
     "PHGT": "Height (inches)",
     "PPVL": "Pass velocity (0 inherit; 1–99 native curve)",
 }
+CHARACTER_FIELDS = {
+    "PFNA": "First name",
+    "PLNA": "Last name",
+}
+ROLE_CHOICES = ((0, "QB"), (1, "RB"), (2, "WR"), (11, "DB"),
+                (4, "OL"), (9, "LB"), (7, "DL"))
+ROLE_VALUES = {value for value, _label in ROLE_CHOICES}
 PACK_COLUMNS = ("first_name", "last_name", "field", "value", "expected",
                 "template_sha256", "base_sha256")
 LOCAL = Path(__file__).resolve().parents[1] / "local"
@@ -254,6 +261,12 @@ def name_key(first: str, last: str) -> tuple[str, str]:
     return first.strip().casefold(), last.strip().casefold()
 
 
+def validate_name(value: str, max_bytes: int) -> str:
+    """Require printable trimmed CP1252 text; either name may be empty."""
+    import nsr_roster
+    return nsr_roster.name(value, max_bytes)
+
+
 def read_pack(text: str) -> list[dict]:
     """Parse edit-only CSV; reject table exports and ambiguous column layouts."""
     reader = csv.DictReader(io.StringIO(text.lstrip("\ufeff")))
@@ -291,6 +304,8 @@ def apply_edits(buf: bytes, edits: list[dict], entry: int = 2,
         raise ValueError("selected database has no PLAY table")
     table = tables["PLAY"]
     fields = {f.name: f for f in table.fields}
+    character_fields = {name: fields[name] for name in CHARACTER_FIELDS if name in fields
+                        and fields[name].type == 0 and fields[name].bits % 8 == 0}
     digest = hashlib.sha256(buf).hexdigest()
     errors, actions, seen = [], [], set()
     for line, row in enumerate(edits, 2):
@@ -302,23 +317,32 @@ def apply_edits(buf: bytes, edits: list[dict], entry: int = 2,
                 raise ValueError("player name is required")
             key = name_key(first, last)
             tag = row["field"]
-            if tag not in ATTRIBUTES or tag not in fields:
+            if (tag not in ATTRIBUTES and tag not in character_fields and tag != "PBPO") or tag not in fields:
                 raise ValueError(f"unsupported attribute {tag}")
             if (key, tag) in seen:
                 raise ValueError("duplicate player/field edit")
             seen.add((key, tag))
             f = fields[tag]
-            value = integer(row["value"])
-            lo, hi = field_range(f)
-            if not lo <= value <= hi:
-                raise ValueError(f"{tag} must be {lo}..{hi}")
+            if tag in character_fields:
+                value = validate_name(row["value"], f.bits // 8 - 1)
+            else:
+                value = integer(row["value"])
+                lo, hi = field_range(f)
+                if not lo <= value <= hi:
+                    raise ValueError(f"{tag} must be {lo}..{hi}")
+                if tag == "PBPO" and value not in ROLE_VALUES:
+                    raise ValueError("PBPO must be one of 0, 1, 2, 11, 4, 9, 7")
             matches = [i for i, r in enumerate(table.records)
                        if name_key(r.get("PFNA", ""), r.get("PLNA", "")) == key]
             if not matches:
                 raise ValueError(f"stale: player {first} {last} was not found")
             old = sorted({table.records[i][tag] for i in matches})
-            if str(row.get("expected", "")):
-                expected = sorted({integer(v) for v in str(row["expected"]).split("|")})
+            if ("expected" in row if tag in character_fields else str(row.get("expected", ""))):
+                if tag in character_fields:
+                    expected = sorted({validate_name(v, f.bits // 8 - 1)
+                                       for v in str(row["expected"]).split("|")})
+                else:
+                    expected = sorted({integer(v) for v in str(row["expected"]).split("|")})
                 if old != expected:
                     raise ValueError(f"stale: {first} {last} {tag} expected {expected}, found {old}")
             if row.get("template_sha256") and row["template_sha256"] != digest:
@@ -331,15 +355,38 @@ def apply_edits(buf: bytes, edits: list[dict], entry: int = 2,
             errors.append(f"row {line}: {exc}")
     if errors:
         raise PackError(errors)
+
+    # Compute every resulting identity from the original rows before writing. This
+    # permits coordinated renames while rejecting collisions between source groups.
+    resulting = {}
+    for i, record in enumerate(table.records):
+        names = [record.get("PFNA", ""), record.get("PLNA", "")]
+        for matches, f, value, _old, _first, _last in actions:
+            if f.name in character_fields and i in matches:
+                names[0 if f.name == "PFNA" else 1] = value
+        key = name_key(*names)
+        source = name_key(record.get("PFNA", ""), record.get("PLNA", ""))
+        if not any(key) and any(source):
+            raise PackError(["resulting player name is empty"])
+        if key in resulting and resulting[key] != source:
+            raise PackError([f"resulting player name collision: {' '.join(names)}"])
+        resulting[key] = source
+
     out, report = bytearray(buf), []
     for matches, f, value, old, first, last in actions:
-        shift = table.record_bytes * 8 - f.bit_offset - f.bits
-        mask = ((1 << f.bits) - 1) << shift
         for i in matches:
             start = table.records_offset + i * table.record_bytes
-            raw = int.from_bytes(out[start:start + table.record_bytes], "big")
-            raw = (raw & ~mask) | ((value & ((1 << f.bits) - 1)) << shift)
-            out[start:start + table.record_bytes] = raw.to_bytes(table.record_bytes, "big")
+            if f.name in character_fields:
+                encoded = value.encode("cp1252")
+                width = f.bits // 8
+                out[start + f.bit_offset // 8:start + f.bit_offset // 8 + width] = (
+                    encoded + b"\0" + bytes(width - len(encoded) - 1))
+            else:
+                shift = table.record_bytes * 8 - f.bit_offset - f.bits
+                mask = ((1 << f.bits) - 1) << shift
+                raw = int.from_bytes(out[start:start + table.record_bytes], "big")
+                raw = (raw & ~mask) | ((value & ((1 << f.bits) - 1)) << shift)
+                out[start:start + table.record_bytes] = raw.to_bytes(table.record_bytes, "big")
         report.append({"first_name": first, "last_name": last, "field": f.name,
                        "before": old, "value": value, "matches": len(matches)})
     return bytes(out), report
@@ -349,6 +396,14 @@ def editable(buf: bytes, entry: int = 2) -> dict:
     """Return private editor data grouped by name, including team membership."""
     tables = roster_tables(buf, entry)
     table = tables["PLAY"]
+    character_fields = [{"name": f.name, "label": CHARACTER_FIELDS[f.name],
+                         "bytes": f.bits // 8, "max_bytes": f.bits // 8 - 1}
+                        for f in table.fields if f.name in CHARACTER_FIELDS and f.type == 0
+                        and f.bits % 8 == 0]
+    if "PBPO" in {f.name for f in table.fields}:
+        character_fields.append({"name": "PBPO", "label": "Role",
+                                 "choices": [{"value": value, "label": label}
+                                             for value, label in ROLE_CHOICES]})
     fields = [{"name": f.name, "label": ATTRIBUTES[f.name], "min": field_range(f)[0],
                "max": field_range(f)[1], "bits": f.bits}
               for f in table.fields if f.name in ATTRIBUTES and f.type in (2, 3)]
@@ -364,11 +419,15 @@ def editable(buf: bytes, entry: int = 2) -> dict:
         group["teams"][team] = teams.get(team) or f"Team {team}"
         for f in fields:
             group["values"].setdefault(f["name"], set()).add(r[f["name"]])
+        for f in character_fields:
+            if f["name"] in r:
+                group["values"].setdefault(f["name"], set()).add(r[f["name"]])
     players = list(groups.values())
     for p in players:
         p["values"] = {k: sorted(v) for k, v in p["values"].items()}
         p["teams"] = [{"id": k, "name": v} for k, v in sorted(p["teams"].items())]
-    return {"template_sha256": hashlib.sha256(buf).hexdigest(), "fields": fields, "players": players}
+    return {"template_sha256": hashlib.sha256(buf).hexdigest(), "fields": fields,
+            "character_fields": character_fields, "players": players}
 
 
 def write_export(buf: bytes, output: Path, entry: int = 2, as_csv: bool = False):

@@ -20,6 +20,21 @@
 
 namespace NSRNetplay::RollbackLogic
 {
+// Identify the complete 72-byte GN7E69-r0 diagnostic logger without
+// redistributing its implementation. Hash bytes in guest instruction order,
+// independently of host endianness. Any different footprint is left alone.
+// This is a version guard, not a trust boundary; image agreement is separate.
+constexpr bool KnownRebornStatsLogger(std::span<const std::uint32_t> instructions)
+{
+  if (instructions.size() != 18)
+    return false;
+  std::uint64_t hash = 14695981039346656037ULL;
+  for (const std::uint32_t word : instructions)
+    for (int shift = 24; shift >= 0; shift -= 8)
+      hash = (hash ^ ((word >> shift) & 0xFFu)) * 1099511628211ULL;
+  return hash == 0x622AC05FC532D1BDULL;
+}
+
 // GN7E69-r0 Reborn stats diagnostics: 16-byte records begin at803FE5A0.
 // The shipped 16KiB wrap crosses added code at80400000. Bound the offset
 // before its address calculation to the documented 1KiB diagnostic ring;
