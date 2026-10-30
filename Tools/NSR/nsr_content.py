@@ -17,7 +17,7 @@ Wire format (served read-only by services/telemetry at /v1/content/...):
              "serial": n, "issued": "...Z", "release": {...}}
   release   {"version", "published", "changelog", "recipe", "min_launcher",
              "packs": [{"sha256", "size", "name"}],
-             "builds": {"<reborn sha256>": {"label", "base_sha256", "roster_file",
+             "builds": {"<source sha256>": {"label", "base_sha256", "roster_file",
                                             "template_sha256", "output_sha256"}}}
   pack      canonical JSON {"format": PACK_FORMAT, "name", "edits": [{"first_name",
              "last_name", "field", "value", "expected": [ints]}]}, fetched by its

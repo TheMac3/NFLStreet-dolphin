@@ -563,7 +563,7 @@ class Launcher:
         self._clock = clock
         self._checked_at = None   # clock() of the last successful manifest check
         self._runtime_content = None  # installed, signed runtime release (also used offline)
-        self._source_sha = ""     # SHA-256 of the Reborn image nsr-net.iso was built from
+        self._source_sha = ""     # SHA-256 of the selected source used to build nsr-net.iso
         self._proc = None         # the Dolphin we started, to avoid rebuilding under it
         self._quality_generation = 0  # a new lobby invalidates the previous reader
         self.rev = 0
