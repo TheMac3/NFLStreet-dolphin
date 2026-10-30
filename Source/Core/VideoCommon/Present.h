@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "Core/NSR/NSRPlayCover.h"
 #include "Common/Flag.h"
 #include "Common/MathUtil.h"
 
@@ -38,6 +39,11 @@ public:
   void ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height, u64 ticks,
               TimePoint presentation_time);
   void ImmediateSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height);
+
+  // Immutable CPU-observed metadata, applied on the GPU swap queue.
+  void SetPlayCover(NSRPlayCover::State state) { m_play_cover = state; }
+  NSRPlayCover::State GetPlayCover() const { return m_play_cover; }
+  void DrawPlayCoverForDump(u32 width, u32 height);
 
   void SetNextSwapEstimatedTime(u64 ticks, TimePoint host_time);
 
@@ -101,6 +107,8 @@ public:
   const MathUtil::Rectangle<int>& GetTargetRectangle() const { return m_target_rectangle; }
 
 private:
+  NSRPlayCover::State m_play_cover;
+
   // Fetches the XFB texture from the texture cache.
   // Returns true the contents have changed since last time
   bool FetchXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height, u64 ticks);

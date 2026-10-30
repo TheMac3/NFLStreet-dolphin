@@ -146,6 +146,7 @@ int main()
 #include "Core/NSR/NSRGameStatsRead.h"
 #include "Core/NSR/NSRDraftLog.h"
 #include "Core/NSR/NSRPlayCalls.h"
+#include "Core/NSR/NSRPlayCover.h"
 #include "Core/NSR/NSRPadSource.h"
 #include "Core/NSR/NSRContentRead.h"
 #include "Core/NSR/NSRDraft.h"
@@ -2668,8 +2669,130 @@ static void TestPlayCalls()
   assert(bounded.Snaps().back().events.size() == 127);
 }
 
+// Synthetic GN7E69-r0 RAM exercises ownership independent of pad order,
+// possession, teammate count, malformed pointers and the locked/snap boundary.
+static void TestPlayCover()
+{
+  namespace PC = NSRPlayCover;
+  std::vector<std::uint8_t> ram(0x1800000);
+  const auto put = [&](std::uint32_t address, std::uint32_t value, unsigned size = 4) {
+    for (unsigned i = 0; i < size; ++i)
+      ram.at(address - 0x80000000 + i) = static_cast<std::uint8_t>(value >> ((size - i - 1) * 8));
+  };
+  const NSRGameStats::Memory memory{ram, {}};
+  put(0x803eb2ac, 0x0f);
+  put(0x803eab60, 0x80400000);
+  put(0x80400000, 0x80400100);
+  put(0x80400004, 4, 1);
+  // p0 and p2 share native side 1 (left); p1 and p3 side 0 (right).
+  for (std::uint32_t i = 0; i < 4; ++i)
+  {
+    put(0x80400100 + i * 12, (i % 2) ^ 1, 1);
+    put(0x802eacac + i * 4, i);
+  }
+  assert(PC::LocalSides(memory, 1) == 2);
+  assert(PC::LocalSides(memory, 2) == 1);
+  assert(PC::LocalSides(memory, 5) == 2);
+  assert(PC::LocalSides(memory, 3) == 3);  // couch humans on both sides
+  assert(PC::LocalSides(memory, 0) == 0);  // spectator
+  put(0x803eaad4, 0x80401000);
+  put(0x80401000, 5);
+  put(0x803ea58c, 0x80402000);
+  assert((PC::Read(memory, 1) == PC::State{1, 0}));
+  assert((PC::Read(memory, 2) == PC::State{2, 0}));
+  assert(PC::Read(memory, 3).hidden == 0);
+  assert(PC::Read(memory, 0).hidden == 3);
+  put(0x80402042, 1, 1);
+  assert((PC::Read(memory, 1) == PC::State{1, 1}));
+  put(0x8040204a, 1, 1);  // flipped calls stay covered
+  assert(PC::Read(memory, 1).hidden == 1);
+  put(0x80401004, 1);
+  put(0x80401000, 5);  // the normal card state includes lock-in
+  assert(PC::Read(memory, 1).hidden == 1);
+  for (const auto flow : {0U, 1U, 2U, 3U, 4U, 0xffffffffU})
+  {
+    put(0x80401000, flow);
+    assert(PC::Read(memory, 1).hidden == 0);
+  }
+  // Regression: later downs enter card state 5 from 4, not from initial state 1.
+  // A second match reallocates flow state and swaps sides; no history is latched.
+  put(0x80402042, 0, 1);
+  for (std::uint32_t match = 0; match < 2; ++match)
+  {
+    const auto flow_address = 0x80401000U + match * 0x100U;
+    put(0x803eb2ac, 0);
+    assert(PC::Read(memory, 1).hidden == 0);  // stale previous-match flow is ignored
+    put(0x803eb2ac, 0x0f);
+    put(0x803eaad4, flow_address);
+    put(0x80400100, match == 0 ? 1U : 0U, 1);
+    put(0x8040010c, match == 0 ? 0U : 1U, 1);
+    for (std::uint32_t down = 0; down < 4; ++down)
+    {
+      put(flow_address + 4, down == 0 ? 1U : 4U);
+      put(flow_address, 5);
+      assert(PC::Read(memory, 1).hidden == (match == 0 ? 1U : 2U));
+      put(flow_address, 3);
+      assert(PC::Read(memory, 1).hidden == 0);
+      put(flow_address, 4);
+      assert(PC::Read(memory, 1).hidden == 0);
+    }
+  }
+  put(0x803eaad4, 0x80401000);
+  put(0x80400100, 1, 1);
+  put(0x8040010c, 0, 1);
+  put(0x80401000, 5);
+  put(0x803eb4a0, 1, 1);  // native selection suppression clears the card cover
+  assert(PC::Read(memory, 1).hidden == 0);
+  put(0x803eb4a0, 0, 1);
+  // Same-side co-op uses a full-width panel, including for a remote spectator.
+  put(0x80401000, 5);
+  put(0x80400004, 2, 1);
+  put(0x8040010c, 1, 1);
+  put(0x8040204e, 4, 1);
+  assert(PC::Read(memory, 1).hidden == 0);
+  assert(PC::Read(memory, 2).hidden == 0);
+  assert(PC::Read(memory, 0).hidden == 3);
+  assert(PC::Read(memory, 0).layout == PC::Layout::Shared);
+  put(0x8040204e, 2, 1);
+  put(0x80400004, 4, 1);
+  put(0x8040010c, 0, 1);
+  put(0x80401000, 2);
+  put(0x803eb48c, 1, 1);  // remote audible/flip menu during lineup
+  assert(PC::Read(memory, 1).hidden == 1);
+  assert(PC::Read(memory, 1).layout == PC::Layout::Audible);
+  assert(PC::Read(memory, 2).hidden == 0);
+  put(0x803eb48c, 0, 1);
+  put(0x803eb490, 1, 1);  // R opens the defense prediction submenu
+  assert(PC::Read(memory, 1).hidden == 1);
+  assert(PC::Read(memory, 2).hidden == 0);
+  put(0x803eb491, 1, 1);
+  assert(PC::Read(memory, 0).hidden == 3);
+  put(0x80401000, 3);  // stale menu flag never covers a live play
+  assert(PC::Read(memory, 1).hidden == 0);
+  put(0x80401000, 5);
+  put(0x803ea58c, 0x817ffff0);
+  assert(PC::Read(memory, 1).hidden == 0);
+  put(0x80400004, 11, 1);
+  assert(PC::LocalSides(memory, 1) == 0);
+  put(0x803eab60, 0xfffffff0);
+  assert(PC::LocalSides(memory, 1) == 0);
+  const auto left = PC::SideRegion(1);
+  const auto right = PC::SideRegion(0);
+  assert(left.left == 0.15f && left.right == 0.49f);
+  assert(right.left == 0.51f && right.right == 0.85f);
+  assert(left.top == 0.275f && left.bottom == 0.875f);
+  assert(right.top == left.top && right.bottom == left.bottom);
+  const float area = (left.right - left.left) * (left.bottom - left.top);
+  assert(area > 0.20f && area < 0.21f);  // about 20%, instead of half the frame
+  const auto audible = PC::SideRegion(1, PC::Layout::Audible);
+  assert(audible.top < left.top && audible.bottom < left.bottom);
+  const auto shared = PC::SideRegion(0, PC::Layout::Shared);
+  assert(shared.left < left.left && shared.right > right.right);
+}
+
 int main()
 {
+  TestPlayCover();
   TestMenuDelay();
   TestPlayCalls();
   TestHandoffInputDelay();

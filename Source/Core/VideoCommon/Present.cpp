@@ -133,6 +133,15 @@ bool Presenter::Initialize()
     g_gfx->PresentBackbuffer();
   }
 
+  // Headless OpenGL/Vulkan still need the common ImGui pipeline for private
+  // frame dumps. Null/software renderers have no utility drawing capability.
+  if (g_gfx->IsHeadless() && g_gfx->SupportsUtilityDrawing())
+  {
+    m_onscreen_ui = std::make_unique<OnScreenUI>();
+    if (!m_onscreen_ui->Initialize(640, 480, 1.0f))
+      return false;
+  }
+
   return true;
 }
 
@@ -251,6 +260,13 @@ void Presenter::SetNextSwapEstimatedTime(u64 ticks, TimePoint host_time)
 {
   m_next_swap_estimated_ticks = ticks;
   m_next_swap_estimated_time = host_time;
+}
+
+// Called only with a private host capture framebuffer bound.
+void Presenter::DrawPlayCoverForDump(u32 width, u32 height)
+{
+  if (m_onscreen_ui)
+    m_onscreen_ui->DrawPlayCoverForDump(width, height, m_play_cover);
 }
 
 void Presenter::ProcessFrameDumping(u64 ticks) const

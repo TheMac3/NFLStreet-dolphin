@@ -12,6 +12,7 @@
 //   - dedicated menu timing probes and host-agreed per-match input delay.
 
 #include "Core/NSR/NSRNetplay.h"
+#include "Core/NSR/NSRPlayCover.h"
 #include "Core/NSR/NSRBootSync.h"
 #include "Core/NSR/NSRQuickstart.h"
 #include "Core/NSR/NSRBootAgreement.h"
@@ -4663,6 +4664,26 @@ void LogMemHit(u32 pc, u32 lr, bool write, size_t size, u64 value, u32 addr)
       s_rb.live, s_rb.cursor, s_rb.rolled, pc, lr, write ? "write" : "read", size * 8, value, addr,
       Core::System::GetInstance().GetPPCState().gpr[1],
       Core::System::GetInstance().GetMemory().Read_U32(0x800000E4));
+}
+
+// Presentation reads stay on the CPU thread. The immutable result travels with
+// the swap request, so the GPU never races guest RAM or takes a CPU guard.
+NSRPlayCover::State CapturePlayCover()
+{
+  if (!Config::Get(Config::MAIN_NSR_HIDE_OPPONENT_PLAY_CALLS))
+    return {};
+  const auto& s = s_session;
+  const bool spectator = static_cast<bool>(s_follow);
+  if ((!s.enabled || s.failed) &&
+      !(spectator && Config::Get(Config::MAIN_NSR_HIDE_SPECTATOR_PLAY_CALLS)))
+    return {};
+  auto& memory = Core::System::GetInstance().GetMemory();
+  const auto* ram = memory.GetRAM();
+  if (!ram || memory.GetRamSizeReal() < 8 ||
+      std::memcmp(ram, "GN7E69", 6) != 0 || ram[7] != 0)
+    return {};
+  return NSRPlayCover::Read({{ram, memory.GetRamSizeReal()}, {}},
+                            spectator ? 0U : (1U << s.me));
 }
 
 bool IsEnabled()
