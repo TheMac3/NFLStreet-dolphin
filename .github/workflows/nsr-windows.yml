@@ -246,8 +246,8 @@ jobs:
           New-Item -ItemType Directory -Force $pkg | Out-Null
           # Fail before staging/uploading any player's imported asset store.
           $privateDirs = Get-ChildItem -Recurse -Directory Binary/x64 | Where-Object {
-            $_.Name -in 'Assets','User','NSRTextures','GN7E69','prompt-packages' }
-          if ($privateDirs) { throw "Local Reborn assets must never be packaged" }
+            $_.Name -in 'Assets','User','NSRTextures','GN7E69','prompt-packages','GameSources','TexturePacks','ButtonIcons','local' }
+          if ($privateDirs) { throw "Private game assets/config must never be packaged" }
           Copy-Item -Recurse Binary/x64/* $pkg
           # Dolphin's self-updater would offer to replace this fork with an
           # official Dolphin build (no rollback netplay); friends get updates as a
@@ -276,21 +276,25 @@ jobs:
 
           Version: $sha, built $date (see VERSION.txt).
           This download has NO game in it. You use your own copy of
-          NFL Street Reborn, and nothing in your Reborn install is changed.
+          NFL Street 2 (USA revision 0) disc image, or your Reborn install.
+          Your source is only read and is never changed.
 
-          1. Install NFL Street Reborn from its official site and start it once
-             to make sure it works. Then close it.
+          1. Have your own NFL Street 2 (USA revision 0) ISO, CISO or RVZ ready,
+             or install Reborn from its official site. Reborn is optional.
 
           2. Unzip this whole folder somewhere you can write to, for example
              your Desktop or Documents (not inside Program Files, and not
              inside the Reborn folder). Keep all the files together.
 
           3. Double-click NFLStreetRollback.exe. The first time (and after an
-             update that needs it) it finds Reborn and builds this folder's own
-             game copy by itself (nsr-net.iso, about 1.4 GB, takes a minute),
-             then shows a fingerprint. Expected: $fp
-             If it can't find Reborn, use "Browse for NSR.iso..." (Reborn
-             folder\content\games\NSR.iso). NFLStreetRollback-Patcher.exe does
+             update that needs it) it prepares the game automatically. Reborn
+             is preferred when available. To use your disc, open Settings >
+             Advanced > Game source > My own disc image > Browse. The first
+             setup reads/converts and verifies your disc, then builds a private
+             copy (about 1.4 GB; compressed sources also need temporary space).
+             Reborn reference fingerprint: $fp
+             Owned copies keep their separate files in local/GameSources/owned/.
+             NFLStreetRollback-Patcher.exe does
              the same build on its own and is only needed for troubleshooting.
              If NFLStreetRollback.exe disappears after unzipping, Windows
              Security quarantined it (unsigned test build): Windows Security ->
@@ -299,9 +303,9 @@ jobs:
           4. In NFLStreetRollback.exe:
              - Settings: type your name.
              - Controllers: nothing to do if your controller works in
-               NFL Street Reborn. NFLStreetRollback copies your Reborn controller
-               setup (from Reborn's launcher, Controllers page) every time it
-               starts a game. Your controller is always Port 1. Plug it in
+               NFL Street Reborn when using that source. For your own disc,
+               click "Set up controllers..." and map Port 1 in our Dolphin.
+               Your controller is always Port 1. Plug it in
                before you start.
                To change it: change it in Reborn's launcher, then click
                "Use my Reborn controller settings". Or click "Set up
@@ -338,13 +342,21 @@ jobs:
           so he can fix lag. Never your button presses or any files. Untick it
           to send nothing.
 
-          First launch imports textures and button icons into Assets/ using
-          your own Reborn install. Later launches use this local store and
+          With Reborn, first launch imports textures and button icons into
+          Assets/ using your own Reborn install. Later launches use this local
+          store and
           nsr-net.iso even if Reborn is removed. Settings > Advanced > Re-import
           from Reborn refreshes it; rebuilding the game image needs Reborn's
           NSR.iso again. Nothing is sent anywhere during local import.
 
-          Never share game files: not nsr-net.iso, NSR.iso, Assets/, User/,
+          With your own disc, the original game look is the default. Optional
+          player-installed packs load alphabetically from TexturePacks/GN7E69/<pack>/.
+          ButtonIcons/GN7E69/playstation/ and ButtonIcons/GN7E69/xbox/ hold
+          optional local button packs; matching controller icons load last.
+          Missing icon packs keep the original game art. No art is downloaded.
+          Friends must choose the same source and have identical game copies.
+
+          Never share game files: not local/, nsr-net.iso, NSR.iso, Assets/, User/,
           or anything from Reborn. Everyone imports their own copy in step 3.
 
           If something breaks, tell Mason what the window said, and send the
@@ -357,7 +369,7 @@ jobs:
             ($_.Name -like 'tex1_*') -or
             $_.Name -in 'nsr-telemetry.txt','nsr-net.iso','nsr-image.json','nsr-reborn.txt','nsr-launcher.json','nsr-launcher.log','GCPadNew.ini.before-reborn-import' }
           if ($bad) { $bad | ForEach-Object { Write-Error "unexpected file in package: $($_.FullName)" }; exit 1 }
-          foreach ($f in 'Dolphin.exe','NFLStreetRollback.exe','NFLStreetRollback-Patcher.exe','README-FIRST.txt','VERSION.txt','SOURCE.txt','portable.txt') {
+          foreach ($f in 'Dolphin.exe','DolphinTool.exe','NFLStreetRollback.exe','NFLStreetRollback-Patcher.exe','README-FIRST.txt','VERSION.txt','SOURCE.txt','portable.txt') {
             if (-not (Test-Path "$pkg/$f")) { throw "missing $f" }
           }
           if (Test-Path "$pkg/nsr-netplay.bat") { throw "stale lockstep nsr-netplay.bat in package" }

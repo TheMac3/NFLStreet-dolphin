@@ -530,7 +530,7 @@ class Content:
         import eadb
         build = self.build_for(source_sha)
         if build is None:
-            raise ContentError("Runtime content does not support this Reborn image.")
+            raise ContentError("Runtime content does not support this game source.")
         template = discpatch.read_file(image, build["roster_file"])
         if hashlib.sha256(template).hexdigest() != build["template_sha256"]:
             raise ContentError("Runtime content needs the unedited rollback roster; rebuild the base once.")
