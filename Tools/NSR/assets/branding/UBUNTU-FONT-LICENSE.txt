@@ -1,4 +1,6 @@
-Ubuntu Sans, unmodified variable font.
+Ubuntu Sans, unmodified source variable TTF.
+UI derivative: Ubuntu Sans derivative NSRB, lossless WOFF2 container conversion
+and name-record change only; glyphs, hinting and variation data unchanged.
 Copyright 2011, 2022, 2023 Canonical Ltd.
 Source: https://github.com/canonical/Ubuntu-Sans-fonts
 

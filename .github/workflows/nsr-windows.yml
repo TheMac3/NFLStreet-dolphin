@@ -107,6 +107,7 @@ jobs:
           $env:NSR_APP_DIR = (New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/nsr-selftest").FullName
           python -c "import sys; sys.path.insert(0, 'Tools/NSR'); import nsr_launcher as L; print('WebView2 Runtime:', L.webview2_version(), '-> UI:', L.choose_ui(webview2=L.webview2_version()))"
           # Web UI: the page must load in WebView2 and render a real snapshot.
+          python -c "import os,sys; sys.path.insert(0,'Tools/NSR'); import nsr_branding as b; from pathlib import Path; p=b.decorate_html(Path('Tools/NSR/nsr_launcher_ui.html').read_text(encoding='utf-8'),os.environ['NSR_APP_DIR']); print('HTML UTF-16 bytes:',len(p.encode('utf-16-le')))"
           python Tools/NSR/nsr_launcher.py --selftest
           if ($LASTEXITCODE -ne 0) { throw "launcher web UI selftest failed" }
           # The tkinter fallback (PCs without WebView2) must still come up.
@@ -116,6 +117,7 @@ jobs:
           # The font plus a raw PNG hero can exceed NavigateToString's 2 MB limit.
           # RUNNER_TEMP is not an input to PyInstaller or the staged package.
           python -c "import os, pathlib; from PIL import Image; p=pathlib.Path(os.environ['NSR_APP_DIR'])/'local/Branding/jsn.png'; p.parent.mkdir(parents=True, exist_ok=True); Image.effect_noise((2160,1616),80).convert('RGB').save(p)"
+          python -c "import os,sys; sys.path.insert(0,'Tools/NSR'); import nsr_branding as b; from pathlib import Path; p=b.decorate_html(Path('Tools/NSR/nsr_launcher_ui.html').read_text(encoding='utf-8'),os.environ['NSR_APP_DIR']); print('HTML UTF-16 bytes:',len(p.encode('utf-16-le')))"
           python Tools/NSR/nsr_launcher.py --selftest
           if ($LASTEXITCODE -ne 0) { throw "launcher synthetic private atlas selftest failed" }
 
@@ -127,7 +129,7 @@ jobs:
           # atlas is runtime-only, never an input to PyInstaller or this artifact.
           $active = (Get-Content Tools/NSR/assets/branding/generated/system.json | ConvertFrom-Json).active
           $icon = "Tools/NSR/assets/branding/generated/$active/app.ico"
-          $allowed = @('branding/NOTICE.txt', 'branding/UbuntuSans.ttf', 'branding/UBUNTU-FONT-LICENSE.txt', 'branding/generated/system.json')
+          $allowed = @('branding/NOTICE.txt', 'branding/generated/UbuntuSans-derivative-NSRB.woff2', 'branding/UBUNTU-FONT-LICENSE.txt', 'branding/generated/system.json')
           $allowed += @('cover.png','loading.png','hero.png','mark-32.png','mark-128.png','mark-256.png','app.ico') | ForEach-Object { "branding/generated/redline/$_" }
           if ($active -ne 'redline') { throw "Only the chosen Redline identity ships" }
           $assetRoot = (Resolve-Path Tools/NSR/assets).Path

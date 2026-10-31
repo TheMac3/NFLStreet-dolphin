@@ -7,8 +7,10 @@ that GPL grant. A modified fork must remove or replace these marks rather than
 suggesting that it is the original project or endorsed by it. This notice
 reserves the product identity separately from the program's source code.
 
-Ubuntu Sans is unmodified and remains under Ubuntu Font Licence 1.0; its
-copyright and licence are in assets/branding/UBUNTU-FONT-LICENSE.txt. Archived
+Ubuntu Sans remains under Ubuntu Font Licence 1.0; its source TTF is
+unmodified. The lossless WOFF2 UI container is renamed Ubuntu Sans derivative
+NSRB as required by that licence; glyphs and variation data are unchanged.
+Copyright and licence are in assets/branding/UBUNTU-FONT-LICENSE.txt. Archived
 DejaVu font notices remain in assets/branding/FONT-LICENSE.txt. Fonts retain
 their own licences independently of the generated product compositions.
 Procedural background textures are original, with no third-party image input.
