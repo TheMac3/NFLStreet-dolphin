@@ -378,7 +378,7 @@ def _owned_destination(root: Path, path: Path) -> None:
         raise ImportError("Owned texture destination escapes the owned game folder.")
     if ((path.is_file() and path.stat().st_nlink != 1)
             or any(p.is_symlink() for p in (path, *path.parents) if p.is_relative_to(root))):
-        raise ImportError("Owned texture destinations must not contain symbolic links.")
+        raise ImportError("Owned texture destinations must not contain links.")
 
 
 def read_store(folder: str, *, validate: bool = True, owned: bool = False) -> dict:
@@ -529,13 +529,14 @@ def _inventory(install: str, env, version: str, *, owned: bool = False) -> dict:
             "layers": layers, "files": files, "probes": probes, "warnings": ts.warnings}
 
 
-def _check_space(path: Path, required: int) -> None:
+def _check_space(path: Path, required: int, *, owned: bool = False) -> None:
     """Leave room for remaining copies and metadata; resumable work is retained."""
     free = shutil.disk_usage(path).free
     if free < required:
+        action = "Copy my Reborn HD art for my own disc" if owned else "Re-import from Reborn"
         raise ImportError(f"Not enough disk space to import Reborn textures: need "
                           f"{required / (1 << 20):.1f} MB free, have {free / (1 << 20):.1f} MB. "
-                          "Free space in the NFLStreetRollback drive and click Re-import from Reborn. "
+                          f"Free space in the NFLStreetRollback drive and click {action}. "
                           "Completed files will be resumed; your existing game copy is kept.")
 
 
@@ -580,7 +581,7 @@ def ensure_store(folder: str, install: str | None, env=os.environ, *, force: boo
     ancestor = root
     while not ancestor.exists():
         ancestor = ancestor.parent
-    _check_space(ancestor, SPACE_RESERVE)
+    _check_space(ancestor, SPACE_RESERVE, owned=owned)
     if owned:
         _owned_destination(Path(folder).resolve(), dest)
     dest.mkdir(parents=True, exist_ok=True)
@@ -655,12 +656,18 @@ def ensure_store(folder: str, install: str | None, env=os.environ, *, force: boo
                         os.link(f["source"], tmp)
                     except OSError:
                         method = "copied"
-                        _check_space(dest, max(f["size"], remaining) + SPACE_RESERVE)
+                        _check_space(dest, max(f["size"], remaining) + SPACE_RESERVE, owned=owned)
                         try:
                             shutil.copyfile(f["source"], tmp)
                             digest = _digest(Path(f["source"]))
-                            if tmp.stat().st_size != f["size"] or _digest(tmp) != digest:
-                                raise ImportError("Texture copy verification failed; retry Re-import from Reborn.")
+                            # A forced owned generation also pins the source hash
+                            # before copying. Same-size/timestamp-preserving edits
+                            # during the copy must not publish mixed provenance.
+                            expected = plan.get("forced_sha256", {}).get(f["source"], digest)
+                            if (tmp.stat().st_size != f["size"] or _digest(tmp) != digest
+                                    or (owned and digest != expected)):
+                                action = "the HD copy action in Advanced" if owned else "Re-import from Reborn"
+                                raise ImportError(f"Texture copy verification failed; retry {action}.")
                         except BaseException:
                             tmp.unlink(missing_ok=True)
                             raise

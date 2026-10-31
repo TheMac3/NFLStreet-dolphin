@@ -186,6 +186,9 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
   border: 1px solid #2d2d35; box-shadow: 0 16px 40px rgba(0,0,0,.5); opacity: 0; transform: translateY(10px); transition: all .2s; pointer-events: none; white-space: pre-line; }
 .toast.show { opacity: 1; transform: none; pointer-events: auto; }
 .toast.error { border-color: rgba(227,38,47,.6); }
+/* Long owned-image fingerprints must wrap inside Advanced at both window sizes. */
+.card, .sgrid > *, .head > * { min-width:0; }
+.fp, .path, #sourcePath { overflow-wrap:anywhere; }
 /* Original identity tokens and art share the active generator direction. */
 :root { --red: __NSRB_ACCENT__; --brand-paper: __NSRB_PAPER__; --brand-dark: __NSRB_DARK__; }
 .hero { background: var(--brand-dark); padding-top: 430px; }
