@@ -7,10 +7,10 @@
   A view only: every action calls the Python Launcher (tools/nsr_launcher.py)
   through window.pywebview.api, and the page re-renders from api.snapshot()
   (polled; the snapshot carries a revision so unchanged state costs nothing).
-  Styled as a sibling of NFL Street Reborn's launcher (dark, red accent,
-  sidebar, rounded cards) with no Reborn artwork, logos or trademarks: text
-  and simple self-drawn icons only. Self-contained (no network, no fonts) so
-  it works offline and bundles into the PyInstaller exe as one data file.
+  Redline is the product identity: paper on near-black, one red accent,
+  condensed Ubuntu Sans, registration rules and descending ticks. Original
+  graphics and the licensed font are embedded locally; no network requests.
+  The optional private mascot atlas never enters the packaged executable.
 
   Player names come from other machines: they are only ever set with
   textContent, never innerHTML.
@@ -24,17 +24,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NFLStreetRollback</title>
 <style>
+@font-face { font-family: "Redline Sans"; src: url("__NSRB_FONT__") format("woff2"); font-weight: 100 1000; font-stretch: 75% 125%; font-display: swap; }
 :root {
-  --bg: #0b0b0e; --side: #0f0f13; --line: #1f1f26; --panel: #15151a; --panel2: #1b1b21;
-  --text: #f4f4f6; --muted: #9b9ba7; --faint: #6b6b76;
-  --red: #e3262f; --red2: #b81b23; --blue: #1d4fc4; --green: #187a43; --ok: #2fd27a; --warn: #f5b942;
-  --radius: 14px;
+  --bg: __NSRB_DARK__; --side: #0e0e11; --line: #303034; --panel: #151518; --panel2: #202024;
+  --text: __NSRB_PAPER__; --muted: #b0aeb4; --faint: #908e96;
+  --red: __NSRB_ACCENT__; --red2: #96161c; --blue: #1d4fc4; --green: #187a43; --ok: #2fd27a; --warn: #f5b942;
+  --radius: 4px;
   color-scheme: dark;
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
-  font: 14px/1.45 "Segoe UI", "Segoe UI Variable", system-ui, -apple-system, Roboto, Arial, sans-serif;
+  font: 14px/1.45 "Redline Sans", "Segoe UI", "Segoe UI Variable", system-ui, -apple-system, Roboto, Arial, sans-serif;
   -webkit-font-smoothing: antialiased; user-select: none; overflow: hidden; }
 button, input { font: inherit; color: inherit; }
 .app { display: grid; grid-template-columns: 200px 1fr; height: 100vh; }
@@ -89,27 +90,14 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
 
 /* play hero */
 #page-play { padding: 0; }
-.hero { position: relative; display: flex; flex-direction: column; padding: 56px 56px 32px; min-height: 100vh;
-  background:
-    radial-gradient(900px 480px at 85% 20%, rgba(70,48,140,.55), transparent 70%),
-    radial-gradient(700px 400px at 10% 90%, rgba(227,38,47,.18), transparent 70%),
-    repeating-linear-gradient(90deg, transparent 0 118px, rgba(255,255,255,.035) 118px 120px),
-    linear-gradient(180deg, #121120, #0b0b0e);
-  overflow: hidden; }
-.hero::after { content: ""; position: absolute; right: -80px; top: 40px; width: 520px; height: 520px; border-radius: 50%;
-  border: 2px solid rgba(255,255,255,.05); box-shadow: inset 0 0 0 60px rgba(255,255,255,.015); }
-.hero .user { position: absolute; top: 22px; right: 26px; }
-.logo { position: relative; z-index: 1; margin: auto 0 34px; padding-top: 40px; }
-.logo .nsr { font-size: 96px; line-height: .9; font-weight: 900; font-style: italic; letter-spacing: -6px;
-  background: linear-gradient(180deg, #ffffff 30%, #c9c9d6); -webkit-background-clip: text; background-clip: text; color: transparent;
-  filter: drop-shadow(0 6px 0 rgba(227,38,47,.9)) drop-shadow(0 18px 30px rgba(0,0,0,.6)); }
-.logo .np { display: inline-block; margin-top: 10px; padding: 5px 16px 5px 14px; background: var(--red); transform: skewX(-12deg);
-  font-weight: 900; letter-spacing: 6px; font-size: 20px; }
-.logo .np span { display: inline-block; transform: skewX(12deg); }
-.logo .tagline { margin-top: 16px; color: #c4c4d0; font-size: 15px; max-width: 520px; }
-.cta { position: relative; z-index: 1; display: flex; gap: 12px; align-items: center; }
-.status { margin: 14px 0 48px; display: flex; gap: 8px; align-items: center; font-weight: 600; font-size: 13px; position: relative; z-index: 1; }
-.tiles { position: relative; z-index: 1; display: grid; grid-template-columns: repeat(3, 1fr); margin-top: auto; background: rgba(21,21,26,.92);
+.hero { position:relative; display:flex; flex-direction:column; min-height:100vh; background:var(--bg); padding:0 0 20px; }
+.brand-hero { display:block; width:100%; height:auto; }
+.hero .user { position:absolute; top:20px; right:24px; }
+.logo { margin:0; }
+.sr-only { position:absolute; width:1px; height:1px; padding:0; overflow:hidden; clip:rect(0,0,0,0); }
+.cta { margin:18px 32px 0; position: relative; z-index: 1; display: flex; gap: 12px; align-items: center; }
+.status { margin: 8px 32px 12px; display: flex; gap: 8px; align-items: center; font-weight: 600; font-size: 13px; position: relative; z-index: 1; }
+.tiles { position: relative; z-index: 1; display: grid; grid-template-columns: repeat(2, 1fr); margin: auto 32px 0; background: rgba(21,21,26,.92);
   border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
 .tile { all: unset; cursor: pointer; padding: 16px 20px; border-right: 1px solid var(--line); display: flex; align-items: center; gap: 12px; }
 .tile:last-child { border-right: 0; }
@@ -188,12 +176,47 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
   border: 1px solid #2d2d35; box-shadow: 0 16px 40px rgba(0,0,0,.5); opacity: 0; transform: translateY(10px); transition: all .2s; pointer-events: none; white-space: pre-line; }
 .toast.show { opacity: 1; transform: none; pointer-events: auto; }
 .toast.error { border-color: rgba(227,38,47,.6); }
+/* Long owned-image fingerprints must wrap inside Advanced at both window sizes. */
+.card, .sgrid > *, .head > * { min-width:0; }
+.fp, .path, #sourcePath { overflow-wrap:anywhere; }
+/* Redline rules carry through every page, including forms and room controls. */
+.side { border-top:7px solid var(--red); padding-top:16px; }
+.brand { padding-bottom:28px; }
+.mark { background:none; box-shadow:none; width:32px; height:32px; flex:none; border-radius:0; }
+.brand b, h1, h2, .code, .fp, .btn.big { font-family:"Redline Sans",sans-serif; font-variation-settings:"wdth" 75,"wght" 800; }
+.brand b { font-size:18px; line-height:1; text-transform:uppercase; letter-spacing:.4px; }
+.brand span { color:var(--red); font-weight:700; margin-top:6px; }
+h1 { text-transform:uppercase; font-size:38px; border-bottom:3px solid var(--red); padding-bottom:10px; }
+.page:not(#page-play) { background:linear-gradient(115deg,#ffffff02,transparent 45%); }
+.head { position:relative; }
+.head::after { content:""; flex:none; width:48px; height:64px; margin-left:auto; background:repeating-linear-gradient(0deg,transparent 0 5px,var(--red) 5px 7px); clip-path:polygon(0 0,100% 0,65% 100%,0 100%); }
+.side-footer { margin:28px 8px 2px; color:var(--text); font-weight:800; font-stretch:condensed; letter-spacing:1px; }
+.side-footer::before { content:""; display:block; width:58px; height:50px; margin-bottom:12px; background:repeating-linear-gradient(0deg,transparent 0 5px,var(--red) 5px 7px); clip-path:polygon(0 0,100% 0,65% 100%,0 100%); }
+.nav button, .btn, .btn.big, .field, .seg, .seg button, .bind, .draft-settings select, .tag { border-radius:4px; }
+.nav button.on { background:#e3262f18; }
+.nav button.on::before { border-radius:0; }
+.btn { background:var(--panel2); border-color:var(--line); }
+.btn.red { background:var(--red); color:var(--text); border-color:var(--red); box-shadow:none; }
+.btn.big { font-size:20px; padding:12px 22px; }
+.card { border-top:2px solid #643035; }
+.label { color:var(--muted); font-weight:700; }
+.mode.red, .mode.blue, .mode.green { background:linear-gradient(150deg,#2b1b1e,var(--panel) 80%); }
+.mode.sel { border-top:4px solid var(--red); }
+.pill { background:#0a0a0ce8; color:var(--text); border-radius:4px; }
+.bar i { background:var(--red); }
+@media (max-width:1050px) {
+  .page { padding:24px; }
+  .cta { margin-left:24px; margin-right:24px; gap:10px; }
+  .status { margin-left:24px; margin-right:24px; }
+  .tiles { margin-left:24px; margin-right:24px; }
+  .btn.big { min-width:210px; padding:12px 18px; }
+}
 </style>
 </head>
 <body>
 <div class="app">
   <aside class="side">
-    <div class="brand"><div class="mark">NSRB</div><div><b>NFLStreetRollback</b><span>Netplay</span></div></div>
+    <div class="brand"><div class="mark"><img src="__NSRB_MARK__" width="32" height="32" alt="NSRB return mark"></div><div><b>NFL Street /<br>Rollback</b><span>Local / Netplay</span></div></div>
     <nav class="nav" id="nav">
       <button data-page="play" class="on"><svg viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg>Play</button>
       <button data-page="host"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="2.5"/><path d="M7.8 7.8a6 6 0 0 0 0 8.4M16.2 7.8a6 6 0 0 1 0 8.4M4.9 4.9a10 10 0 0 0 0 14.2M19.1 4.9a10 10 0 0 1 0 14.2"/></svg>Host</button>
@@ -205,17 +228,19 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
       <button data-page="settings"><svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>Settings<i class="badge" id="gameBadge" hidden></i></button>
       <button data-page="help"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.6 2.6 0 1 1 3.6 2.4c-.7.3-1.1.9-1.1 1.6v.5M12 17h.01"/></svg>Help</button>
     </nav>
+    <div class="side-footer">RUN IT BACK</div>
   </aside>
 
   <main class="main">
     <!-- PLAY -->
     <section class="page on" id="page-play">
       <div class="hero">
+        <img class="brand-hero" src="__NSRB_HERO__" alt="NFL Street / Rollback. IT’S MY HOUSE. Run it back.">
         <div class="user pill"><span class="dot" id="userDot"></span><span id="userName">Player</span><span class="faint">· Port 1</span></div>
         <div class="logo">
-          <div class="nsr">NFLSTREET</div>
-          <div class="np"><span>ROLLBACK</span></div>
-          <div class="tagline">Play NFL Street 2 online with friends: 2 to 4 players, rollback netcode, room codes. Use your own disc or Reborn.</div>
+          <h1 class="sr-only">NFL Street Rollback — IT’S MY HOUSE.</h1>
+
+          <div class="tagline sr-only">Play NFL Street 2 online with friends: 2 to 4 players, rollback netcode, room codes. Use your own disc or Reborn.</div>
         </div>
         <div class="cta">
           <button class="btn red big" id="playHost"><svg viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg>Host a game</button>
@@ -385,6 +410,10 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
             <button class="btn" id="btnBrowse">Browse…</button>
             <button class="btn" id="btnReimport">Re-import from Reborn</button>
           </div>
+          <div class="row" style="margin-top:16px"><button class="btn" id="btnOwnedHd">Copy my Reborn HD art for my own disc</button></div>
+          <div class="info" id="ownedHdResult" aria-live="polite"></div>
+          <div class="note">Optional, this PC only. Requires your own Reborn install. Without one, nothing changes. Copies HD textures only; your disc and Reborn stay unchanged. Import results appear in the notification below.</div>
+          <label class="note"><input type="checkbox" id="brandedArt" checked> Use NSRB loading artwork when HD art is in use</label>
           <div class="note">Use Reborn or your own NFL Street 2 USA revision 0 disc (ISO, CISO or RVZ). Your source stays unchanged. Friends must pick the same source. Own-disc players get the original game look; add optional packs under TexturePacks/GN7E69/&lt;pack&gt;/ and button icons under ButtonIcons/GN7E69/&lt;playstation or xbox&gt;/.</div>
         </details>
         <div class="card">
@@ -579,6 +608,8 @@ function render(s) {
   $("gameStats").classList.toggle("on", !!gs.enabled);
   setText("gameStatsText", gs.enabled ? (gs.text || "") : "");
   setText("gameFp", g.fingerprint || "–");
+  setText("ownedHdResult", (s.owned_hd || {}).text || "");
+  $("brandedArt").checked = s.branded_art !== false;
   const source = s.source || {kind:"reborn", path:""};
   $("gameSource").value = source.kind;
   $("gameSource").disabled = !!g.busy || !!s.content.busy || h.state !== "idle" || j.state !== "idle";
@@ -651,6 +682,8 @@ function wire() {
   $("fullscreenToggle").onclick = () => call("set_fullscreen", !(S.snap && S.snap.fullscreen !== false));
   // Stage both choices together; the backend clears readiness until rebuilt.
   $("draftOrder").onchange = $("draftFirst").onchange = () => call("set_draft", $("draftOrder").value, $("draftFirst").value);
+  $("brandedArt").onchange = e => call("set_branded_art", e.target.checked);
+  $("btnOwnedHd").onclick = () => call("import_owned_hd");
   $("btnReimport").onclick = () => call("reimport_reborn");
   $("btnFind").onclick = () => call("find_game");
   $("btnUpdates").onclick = () => call("check_updates");

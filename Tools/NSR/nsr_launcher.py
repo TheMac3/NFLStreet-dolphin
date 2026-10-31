@@ -86,6 +86,7 @@ import nsr_content  # noqa: E402
 import nsr_lobby as lobby  # noqa: E402
 import nsr_patcher as patcher  # noqa: E402
 import nsr_textures as textures  # noqa: E402
+import nsr_branding as branding
 
 APP_TITLE = "NFLStreetRollback"  # window title; user-facing product name
 CONFIG_NAME = "nsr-launcher.json"
@@ -212,7 +213,7 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
                     telemetry: bool = True, quickstart: str = "manual", icons: str = "auto",
                     resolution: int = 0, fullscreen: bool = True,
                     volume: int = DEFAULT_VOLUME, hd_textures: bool = True,
-                    hide_play_calls: bool = True, app_folder: str | None = None) -> tuple[list[str], dict[str, str]]:
+                    hide_play_calls: bool = True, branded_art: bool = False, app_folder: str | None = None) -> tuple[list[str], dict[str, str]]:
     """Command line and environment for the netplay Dolphin.
 
     start=None: practice offline. open_ui=True: just open Dolphin's window
@@ -250,11 +251,17 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     # packs; writing this list also clears disabled/stale overlays before boot.
     tex = (textures.compose_owned(app_folder or folder, icons, pad.kind, game_folder=folder) if retail else
            textures.compose(folder, icons, pad.kind))
+    # Preserve the native owned HiresTextures decision before adding app branding.
+    # Presentation never enters content/room agreement or mutates an image.
+    hires = hd_textures and (bool(tex.folders()) if retail else True)
+    brand = branding.overlay(app_folder or folder, folder, branded_art) if hires else None
+    tex.brand = brand
+    branding.custom_cover(app_folder or folder, folder, branded_art)
     textures.write_list(os.path.join(folder, "User"), tex)
     env["NSR_TEXTURES"] = tex.summary()  # logged by the launcher; the fork ignores it
     if tex.warnings and hd_textures:
         env["NSR_TEXTURES_WARNING"] = " ".join(tex.warnings)
-    args += ["-C", f"Graphics.Settings.HiresTextures={hd_textures and (bool(tex.folders()) if retail else True)}",
+    args += ["-C", f"Graphics.Settings.HiresTextures={hires}",
              "-C", "Graphics.Settings.CacheHiresTextures=False"]
     if resolution in RESOLUTIONS[1:]:
         args += ["-C", f"Graphics.Settings.InternalResolution={resolution}"]
@@ -580,6 +587,8 @@ class Launcher:
         first = first if first in draftmodes.FIRSTS else "stock"
         self.state = {
             "app": APP_TITLE, "folder": self.folder,
+            "branded_art": cfg.get("branded_art", True) is not False,
+            "owned_hd": {"text": "No HD import requested. Your disc uses its original art and any packs you install."},
             "source": {"kind": self._source_kind, "path": self.cfg.get("owned_iso", "")},
             "name": str(cfg.get("name", env.get("USERNAME", "Player")))[:24],
             "telemetry": bool(cfg.get("telemetry", True)),
@@ -810,6 +819,8 @@ class Launcher:
         ts = (textures.compose_owned(self.folder, self._icons_setting(), pad.kind, game_folder=self.game_dir)
               if self._source_kind == "owned" or retail else
               textures.compose(self.folder, self._icons_setting(), pad.kind))
+        if ts.base_kind == "owned-import" and self.state["owned_hd"]["text"].startswith("No HD import requested"):
+            self._set("owned_hd", text="Using your previously copied local Reborn HD art. Reborn is not needed to play.")
         self._set("textures", icons=self._icons_setting(), effective=ts.icons, why=ts.icons_why,
                   base_kind=ts.base_kind, base=ts.base or "",
                   packages=[f"{p.id} {p.version}" for p in ts.packages],
@@ -1442,6 +1453,7 @@ class Launcher:
                                         icons=self._icons_setting(), resolution=self._resolution_setting(),
                                         fullscreen=self._fullscreen_setting(), volume=self._volume_setting(),
                                         hd_textures=self.cfg.get("hd_textures", True) is not False,
+                                        branded_art=self.cfg.get("branded_art", True) is not False,
                                         hide_play_calls=self.cfg.get("hide_play_calls", True) is not False,
                                         app_folder=self.folder)
         except (OSError, ValueError) as e:
@@ -1888,6 +1900,53 @@ class Launcher:
         finally:
             self._set("game", busy=False)
 
+    def set_branded_art(self, on) -> None:
+        """Local presentation toggle; the next launch recomposes the ordered list."""
+        self._set(branded_art=bool(on))
+        self.cfg["branded_art"] = bool(on)
+        self._save()
+        self.notify("NSRB loading artwork " + ("enabled when HD art is in use." if on else "disabled; the underlying art returns next launch."))
+
+    def import_owned_hd(self) -> None:
+        """Explicit Advanced action; startup and launch never call this method."""
+        self._spawn(self._import_owned_hd_now)
+
+    def _import_owned_hd_now(self) -> None:
+        """Serialize a copy-only base-library import without changing game readiness."""
+        with self._lock:
+            if (self._source_kind != "owned" or self._dolphin_running()
+                    or self.state["content"]["busy"] or self.state["host"]["state"] != "idle"
+                    or self.state["join"]["state"] != "idle"):
+                self.notify("Select your own disc, close the game and leave your room before importing HD art.", "error")
+                return
+            before = self._claim_build("Copying your Reborn HD art for your own disc…")
+            if before is None:
+                return
+        try:
+            # The ordinary reborn_install() deliberately returns None for owned
+            # families. Discovery is allowed only inside this explicit action.
+            install = self.cfg.get("reborn_install") or self._patcher.saved_reborn_install(self.folder)
+            if not install or not os.path.isdir(install):
+                source = self._patcher.find_reborn_iso()
+                install = self._patcher.reborn_install_of(source) if source else None
+            if not install:
+                message = "No Reborn install found. Install your own copy from the official Reborn site first. Your disc and current art are kept."
+                self._set("owned_hd", text=message)
+                self.notify(message, "error")
+                return
+            manifest = textures.ensure_store(self.game_dir, install, self._env, force=True, owned=True, app_root=self.folder,
+                progress=lambda d, t: self._set("game", progress=round(d * 100 / max(t, 1))))
+            textures.write_list(self.user_dir, self.refresh_textures())
+            message = f"Copied {len(manifest['files'])} HD textures ({manifest['bytes'] / (1 << 20):.1f} MB) from your local Reborn {manifest['version']}. Only this PC's art changes; Reborn stays unchanged."
+            self._set("owned_hd", text=message)
+            self.notify(message)
+        except (OSError, ValueError) as e:
+            message = f"HD import stopped: {e} Your existing disc and art are kept."
+            self._set("owned_hd", text=message)
+            self.notify(message, "error")
+        finally:
+            self._set("game", **{**before, "busy": False, "progress": None})
+
     def reimport_reborn(self) -> None:
         """Settings → Advanced: refresh assets, preserving our ISO and controls."""
         if self._source_kind == "owned":
@@ -1978,6 +2037,8 @@ class WebApi:
     def set_quickstart(self, selected): self._l.set_quickstart(selected)
     def set_button_icons(self, choice): self._l.set_button_icons(str(choice))
     def set_hd_textures(self, on): self._l.set_hd_textures(bool(on))
+    def import_owned_hd(self): self._l.import_owned_hd()
+    def set_branded_art(self, on): self._l.set_branded_art(bool(on))
     def set_resolution(self, value): self._l.set_resolution(value)
     def set_hide_play_calls(self, on): self._l.set_hide_play_calls(on)
     def set_fullscreen(self, on): self._l.set_fullscreen(on)
@@ -2023,10 +2084,10 @@ def run_web(launcher: Launcher, selftest: bool = False) -> int:
     so run_gui can fall back to tkinter."""
     import webview
     with open(resource_path(UI_HTML), encoding="utf-8") as f:
-        html = f.read()
+        html = branding.decorate_html(f.read(), launcher.folder)
     api = WebApi(launcher)
     window = webview.create_window(APP_TITLE, html=html, js_api=api, width=1200, height=780,
-                                   min_size=(980, 660), background_color="#0b0b0e")
+                                   min_size=(980, 660), background_color="#0a0a0c")
     api._window = window
     result = {"code": 0}
 
@@ -2054,9 +2115,13 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     from tkinter import filedialog, messagebox, ttk
 
     root = tk.Tk()
+    try:
+        root.iconbitmap(str(branding.bundled()/branding.direction()/'app.ico'))
+    except tk.TclError:
+        pass  # Non-Windows Tk may not support ICO; the packaged exe has the mark.
     root.title(APP_TITLE)
     root.minsize(620, 600)
-    bg, panel, fg, accent, muted = "#0b0b0e", "#15151a", "#f2f2f2", "#e3262f", "#9b9ba7"
+    bg, panel, fg, accent, muted = "#0a0a0c", "#151518", "#eeece8", "#e3262f", "#b0aeb4"
     root.configure(bg=bg)
     style = ttk.Style(root)
     style.theme_use("clam")
@@ -2078,7 +2143,13 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
 
     outer = ttk.Frame(root, padding=16)
     outer.pack(fill="both", expand=True)
-    ttk.Label(outer, text="NFLSTREET ROLLBACK", style="Title.TLabel").pack(anchor="w")
+    # Keep the native fallback legible without requiring the WebView's font engine.
+    masthead = ttk.Frame(outer)
+    masthead.pack(anchor="w", pady=(0, 6))
+    root.nsr_mark = tk.PhotoImage(file=str(branding.bundled()/branding.direction()/'mark-32.png'))
+    ttk.Label(masthead, image=root.nsr_mark).grid(row=0, column=0, rowspan=2, padx=(0, 12))
+    ttk.Label(masthead, text="NFL STREET / ROLLBACK", style="Title.TLabel").grid(row=0, column=1, sticky="w")
+    ttk.Label(masthead, text="IT’S MY HOUSE.  /  RUN IT BACK", foreground=accent).grid(row=1, column=1, sticky="w")
     status = ttk.Label(outer, text="", foreground=muted)
     status.pack(anchor="w", pady=(0, 8))
 
@@ -2219,6 +2290,12 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     source_box.grid(row=13, column=1, columnspan=3, sticky="w")
     source_box.bind("<<ComboboxSelected>>", lambda _: launcher.set_source(source_names[source_var.get()]))
     label(sp, 14).configure(text="Own disc: ISO/CISO/RVZ of NFL Street 2 USA rev 0. Optional packs: TexturePacks/GN7E69/<pack>/; icons: ButtonIcons/GN7E69/<kind>/.")
+    ttk.Button(sp, text="Copy my Reborn HD art for my own disc", command=launcher.import_owned_hd).grid(row=15, column=0, columnspan=4, sticky="w")
+    label(sp, 16).configure(text="Optional, this PC only. Requires your own Reborn install; without one nothing changes. Copies HD textures only; your disc and Reborn stay unchanged.")
+    brand_var = tk.BooleanVar(value=launcher.cfg.get("branded_art", True))
+    ttk.Checkbutton(sp, text="Use NSRB loading artwork when HD art is in use", variable=brand_var,
+                    command=lambda: launcher.set_branded_art(brand_var.get())).grid(row=17, column=0, columnspan=4, sticky="w")
+    owned_hd_text = label(sp, 18)
     content_text = label(sp, 9, pady=(14, 4))
     b_updates = ttk.Button(sp, text="Check for updates", command=launcher.check_updates)
     b_updates.grid(row=10, column=0, sticky="w")
@@ -2269,6 +2346,7 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
         if s is not None:
             seen["rev"] = s["rev"]
             perf_hint.configure(text=s["performance_hint"])
+            owned_hd_text.configure(text=s["owned_hd"]["text"])
             hd_var.set(s["hd_textures"])
             res_var.set(str(s["resolution"]))
             g, h, j, c = s["game"], s["host"], s["join"], s["controllers"]

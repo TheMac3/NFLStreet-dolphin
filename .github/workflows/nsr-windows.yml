@@ -102,22 +102,44 @@ jobs:
       # Edge WebView2 backend.
       - name: Check the vendored launcher tools (Tools/NSR)
         run: |
-          python -m pip install pyinstaller "pywebview==6.2.1"
+          python -m pip install pyinstaller "pywebview==6.2.1" "pillow==12.0.0"
           python -c "import sys; sys.path.insert(0, 'Tools/NSR'); import isopatch, nsr_patcher, nsr_lobby; isopatch.check_patch_set(set(isopatch.NETPLAY_SET)); assert nsr_patcher.NETPLAY_MODE == nsr_lobby.RELEASE_MODE == 'rollback'; print(nsr_patcher.ROLLBACK_RECIPE)"
           $env:NSR_APP_DIR = (New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/nsr-selftest").FullName
           python -c "import sys; sys.path.insert(0, 'Tools/NSR'); import nsr_launcher as L; print('WebView2 Runtime:', L.webview2_version(), '-> UI:', L.choose_ui(webview2=L.webview2_version()))"
           # Web UI: the page must load in WebView2 and render a real snapshot.
+          python -c "import os,sys; sys.path.insert(0,'Tools/NSR'); import nsr_branding as b; from pathlib import Path; p=b.decorate_html(Path('Tools/NSR/nsr_launcher_ui.html').read_text(encoding='utf-8'),os.environ['NSR_APP_DIR']); print('HTML UTF-16 bytes:',len(p.encode('utf-16-le')))"
           python Tools/NSR/nsr_launcher.py --selftest
           if ($LASTEXITCODE -ne 0) { throw "launcher web UI selftest failed" }
           # The tkinter fallback (PCs without WebView2) must still come up.
           python Tools/NSR/nsr_launcher.py --selftest --tk
           if ($LASTEXITCODE -ne 0) { throw "launcher tkinter selftest failed" }
+          # Exercise the optional atlas route with synthetic noise, never a photo.
+          # The font plus a raw PNG hero can exceed NavigateToString's 2 MB limit.
+          # RUNNER_TEMP is not an input to PyInstaller or the staged package.
+          python -c "import os, pathlib; from PIL import Image; p=pathlib.Path(os.environ['NSR_APP_DIR'])/'local/Branding/jsn.png'; p.parent.mkdir(parents=True, exist_ok=True); Image.effect_noise((2160,1616),80).convert('RGB').save(p)"
+          python -c "import os,sys; sys.path.insert(0,'Tools/NSR'); import nsr_branding as b; from pathlib import Path; p=b.decorate_html(Path('Tools/NSR/nsr_launcher_ui.html').read_text(encoding='utf-8'),os.environ['NSR_APP_DIR']); print('HTML UTF-16 bytes:',len(p.encode('utf-16-le')))"
+          python Tools/NSR/nsr_launcher.py --selftest
+          if ($LASTEXITCODE -ne 0) { throw "launcher synthetic private atlas selftest failed" }
 
       - name: Build the NFLStreetRollback launcher and patcher
         run: |
           # --collect-all: pywebview's WebView2 DLLs and pythonnet's runtime
           # are data/binaries PyInstaller would otherwise miss.
-          pyinstaller --noconfirm --noupx --workpath pyi-build --distpath pyi-dist --onefile --windowed --name NFLStreetRollback --paths Tools/NSR --add-data "Tools/NSR/nsr_launcher_ui.html;." --collect-all webview --collect-all pythonnet --collect-all clr_loader Tools/NSR/nsr_launcher.py
+          # The bundle contains only tracked figure-free graphics. A local JSN
+          # atlas is runtime-only, never an input to PyInstaller or this artifact.
+          $active = (Get-Content Tools/NSR/assets/branding/generated/system.json | ConvertFrom-Json).active
+          $icon = "Tools/NSR/assets/branding/generated/$active/app.ico"
+          $allowed = @('branding/NOTICE.txt', 'branding/generated/UbuntuSans-derivative-NSRB.woff2', 'branding/UBUNTU-FONT-LICENSE.txt', 'branding/generated/system.json')
+          $allowed += @('cover.png','loading.png','hero.png','mark-32.png','mark-128.png','mark-256.png','app.ico') | ForEach-Object { "branding/generated/redline/$_" }
+          if ($active -ne 'redline') { throw "Only the chosen Redline identity ships" }
+          $assetRoot = (Resolve-Path Tools/NSR/assets).Path
+          Get-ChildItem -Recurse Tools/NSR/assets -File | ForEach-Object {
+            $relative = $_.FullName.Substring($assetRoot.Length + 1).Replace('\','/')
+            if ($relative -notin $allowed) { throw "Unapproved bundled asset: $relative" }
+          }
+          if ((Get-Content Tools/NSR/assets/branding/generated/system.json | ConvertFrom-Json).photo) { throw "Photo-derived branding must never be bundled" }
+          if (Get-ChildItem -Recurse Tools/NSR/assets -File | Where-Object { $_.Name -eq 'jsn.png' -or $_.Name -like 'tex1_*' }) { throw "Private presentation input in bundled assets" }
+          pyinstaller --noconfirm --noupx --workpath pyi-build --distpath pyi-dist --onefile --windowed --icon $icon --add-data "Tools/NSR/assets;assets" --name NFLStreetRollback --paths Tools/NSR --add-data "Tools/NSR/nsr_launcher_ui.html;." --collect-all webview --collect-all pythonnet --collect-all clr_loader Tools/NSR/nsr_launcher.py
           pyinstaller --noconfirm --noupx --workpath pyi-build --distpath pyi-dist --onefile --console --name NFLStreetRollback-Patcher --paths Tools/NSR Tools/NSR/nsr_patcher.py
           pyi-dist\NFLStreetRollback-Patcher.exe --help
           if ($LASTEXITCODE -ne 0) { throw "NFLStreetRollback-Patcher.exe --help failed" }
@@ -246,7 +268,7 @@ jobs:
           New-Item -ItemType Directory -Force $pkg | Out-Null
           # Fail before staging/uploading any player's imported asset store.
           $privateDirs = Get-ChildItem -Recurse -Directory Binary/x64 | Where-Object {
-            $_.Name -in 'Assets','User','NSRTextures','GN7E69','prompt-packages','GameSources','TexturePacks','ButtonIcons','local' }
+            $_.Name -in 'Assets','User','NSRTextures','GN7E69','prompt-packages','GameSources','TexturePacks','ButtonIcons','Branding','local' }
           if ($privateDirs) { throw "Private game assets/config must never be packaged" }
           Copy-Item -Recurse Binary/x64/* $pkg
           # Dolphin's self-updater would offer to replace this fork with an
@@ -353,6 +375,13 @@ jobs:
           player-installed packs load alphabetically from TexturePacks/GN7E69/<pack>/.
           ButtonIcons/GN7E69/playstation/ and ButtonIcons/GN7E69/xbox/ hold
           optional local button packs; matching controller icons load last.
+          Settings > Advanced > Copy my Reborn HD art for my own disc is an
+          optional, explicit copy-only import from your own local Reborn install.
+          Without Reborn, no import happens. Source files remain unchanged.
+          No imported art is uploaded or shared; every PC keeps its own textures.
+          NSRB loading art composes last when HD art is enabled; turn it off in
+          Advanced to restore the underlying art. local/Branding/jsn.png is a
+          private optional mascot atlas (2160x1616 PNG), never part of this zip.
           Missing icon packs keep the original game art. No art is downloaded.
           Friends must choose the same source and have identical game copies.
 
@@ -366,8 +395,8 @@ jobs:
           # Contents guard: no game images, saves, memory cards, dumps or secrets.
           $bad = Get-ChildItem -Recurse -File $pkg | Where-Object {
             $_.Extension -in '.iso','.gcm','.rvz','.wbfs','.ciso','.gcz','.nkit','.gci','.sav','.dtm','.env','.pem','.key' -or
-            ($_.Name -like 'tex1_*') -or
-            $_.Name -in 'nsr-telemetry.txt','nsr-net.iso','nsr-image.json','nsr-reborn.txt','nsr-launcher.json','nsr-launcher.log','GCPadNew.ini.before-reborn-import' }
+            ($_.Name -like 'tex1_*') -or $_.Name -eq 'jsn.png' -or
+            $_.Name -in 'nsr-telemetry.txt','nsr-net.iso','nsr-image.json','nsr-reborn.txt','nsr-launcher.json','nsr-launcher.log','GCPadNew.ini.before-reborn-import','nsr-net.cover.png','nsr-brand-cover.json' }
           if ($bad) { $bad | ForEach-Object { Write-Error "unexpected file in package: $($_.FullName)" }; exit 1 }
           foreach ($f in 'Dolphin.exe','DolphinTool.exe','NFLStreetRollback.exe','NFLStreetRollback-Patcher.exe','README-FIRST.txt','VERSION.txt','SOURCE.txt','portable.txt') {
             if (-not (Test-Path "$pkg/$f")) { throw "missing $f" }

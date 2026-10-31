@@ -1,0 +1,26 @@
+{
+  "active": "redline",
+  "directions": {
+    "redline": {
+      "accent": "#e3262f",
+      "paper": "#eeece8",
+      "dark": "#0a0a0c"
+    }
+  },
+  "sizes": {
+    "cover": [
+      880,
+      1222
+    ],
+    "loading": [
+      1280,
+      896
+    ],
+    "hero": [
+      1280,
+      720
+    ]
+  },
+  "photo": false,
+  "line": "IT\u2019S MY HOUSE."
+}
