@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import io
 import os
 import shutil
 import sys
@@ -100,7 +101,19 @@ def custom_cover(folder: str, game_folder: str, enabled=True) -> None:
 def decorate_html(html: str, folder: str) -> str:
     """Embed local images into the existing WebView HTML; no web server or upload."""
     source=bundled();key=direction();system=json.loads((source/'system.json').read_text());palette=system['directions'][key]
-    for token,path in {'HERO':artwork(folder)['hero'],'MARK':source/key/'mark-32.png'}.items():
-        html=html.replace('__NSRB_'+token+'__','data:image/png;base64,'+base64.b64encode(path.read_bytes()).decode())
     html=html.replace('__NSRB_FONT__','data:font/ttf;base64,'+base64.b64encode((source.parent/'UbuntuSans.ttf').read_bytes()).decode())
-    return html.replace('__NSRB_ACCENT__',palette['accent']).replace('__NSRB_PAPER__',palette['paper']).replace('__NSRB_DARK__',palette['dark'])
+    html=html.replace('__NSRB_MARK__','data:image/png;base64,'+base64.b64encode((source/key/'mark-32.png').read_bytes()).decode())
+    html=html.replace('__NSRB_ACCENT__',palette['accent']).replace('__NSRB_PAPER__',palette['paper']).replace('__NSRB_DARK__',palette['dark'])
+    hero=artwork(folder)['hero']
+    page=html.replace('__NSRB_HERO__','data:image/png;base64,'+base64.b64encode(hero.read_bytes()).decode())
+    # WebView2 NavigateToString rejects HTML above 2 MB. Keep the full local
+    # font and frame; only the embedded UI preview may need JPEG compression.
+    # The approved atlas, GX loading PNG and custom cover remain lossless.
+    if len(page.encode('utf-8'))<1_950_000:return page
+    from PIL import Image
+    with Image.open(hero) as im:
+        for quality in (95,85,70,50,30):
+            data=io.BytesIO();im.convert('RGB').save(data,format='JPEG',quality=quality,subsampling=0)
+            page=html.replace('__NSRB_HERO__','data:image/jpeg;base64,'+base64.b64encode(data.getvalue()).decode())
+            if len(page.encode('utf-8'))<1_950_000:return page
+    raise ValueError('Launcher presentation exceeds the WebView2 HTML limit')

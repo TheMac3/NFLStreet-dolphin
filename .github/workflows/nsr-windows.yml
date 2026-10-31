@@ -112,6 +112,12 @@ jobs:
           # The tkinter fallback (PCs without WebView2) must still come up.
           python Tools/NSR/nsr_launcher.py --selftest --tk
           if ($LASTEXITCODE -ne 0) { throw "launcher tkinter selftest failed" }
+          # Exercise the optional atlas route with synthetic noise, never a photo.
+          # The font plus a raw PNG hero can exceed NavigateToString's 2 MB limit.
+          # RUNNER_TEMP is not an input to PyInstaller or the staged package.
+          python -c "import os, pathlib; from PIL import Image; p=pathlib.Path(os.environ['NSR_APP_DIR'])/'local/Branding/jsn.png'; p.parent.mkdir(parents=True, exist_ok=True); Image.effect_noise((2160,1616),80).convert('RGB').save(p)"
+          python Tools/NSR/nsr_launcher.py --selftest
+          if ($LASTEXITCODE -ne 0) { throw "launcher synthetic private atlas selftest failed" }
 
       - name: Build the NFLStreetRollback launcher and patcher
         run: |

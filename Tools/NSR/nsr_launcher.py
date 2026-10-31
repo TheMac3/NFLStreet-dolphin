@@ -2085,7 +2085,7 @@ def run_web(launcher: Launcher, selftest: bool = False) -> int:
         html = branding.decorate_html(f.read(), launcher.folder)
     api = WebApi(launcher)
     window = webview.create_window(APP_TITLE, html=html, js_api=api, width=1200, height=780,
-                                   min_size=(980, 660), background_color="#0b0b0e")
+                                   min_size=(980, 660), background_color="#0a0a0c")
     api._window = window
     result = {"code": 0}
 
