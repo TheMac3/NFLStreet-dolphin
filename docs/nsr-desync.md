@@ -4,6 +4,9 @@ This records a reproducible correctness blocker without changing the digest or g
 
 ## 2026-10-30: desync investigation — stream diagnostic record, no repair
 
+Task bases: NFLStreet `9e54352`, fork `58be5b4f99`; later mainline changes
+from other lanes are outside this investigation.
+
 GN7E69 revision 0, Reborn 2026.09.12, rollback image fingerprint
 `B57A-8270-68C2`. The fixed seed `0x26dabb33`, automatic delay 3,
 40 ms / 8 ms jitter / 2% loss / 2% reorder, proxy seed `0x4E5352`
@@ -12,8 +15,8 @@ A replay on the retained exact-mainline control first reports frame 2344;
 read/write instrumentation reports frame 2343. Timing shifts the first
 reported frame without eliminating the original failure.
 
-The boot-time I/O-root hypothesis is not supported by the writer. Disassembly
-of **all DOL sections**, including executable code stored in `data2`, finds
+The boot-time I/O-root hypothesis is not supported by the writer. A static
+scan across **all DOL sections**, including executable code in `data2`, finds
 `0x801CB4EC` branching to `0x802C8780`, a stream-read diagnostic trampoline.
 It records arguments in a ring at `0x802C8860`, then, when the destination
 interval crosses `0x811A9B54`, copies five words to `0x802C8A20`:
@@ -34,11 +37,22 @@ load at `0x802CB084` does not read `0x802C8A24` in the observed case.
 Do not describe this record as wholly unread, or a direct-reference scan as
 proof that no indirect gameplay reader exists.
 
+The task-base both-peer watch supplies the causal timing control: peer 1
+copies destination/file offset `0x811A5540/0x0CE86B80` at frame 2343, while
+peer 0 copies the same pair at 2348. Their next identical pair,
+`0x811A5480/0x0CF4EB80`, is copied at frames 4218 and 4223 respectively.
+All four updates run on audio thread `0x803AA828`, with the same writer PCs
+and LR. Thus a frame can compare two different last-read diagnostic records,
+then a later checkpoint agrees again after both streams update the record.
+Neither disputed word has a guest read in this watched match on either peer.
+This explains the narrow transient mismatch; it does not prove every possible
+reader in other lifecycle paths is harmless.
+
 `IO_ROOT_WORDS` drives **enclosing heap-block** classification through
 `IoObjectBlocks`; it does not exclude the static root words themselves.
 The destination already lies in a peer-agreed audio allocation and the next
-word is a file offset. Adding either to that table would not remove this
-static-record mismatch and could misinterpret the offset as a pointer.
+word is a file offset that fails the MEM1 pointer check. Adding these to the
+root table would not remove the static-record mismatch.
 No root, checksum mask, fixed-address window, guest-state patch, protocol or
 simulation change was made. **Digest range version remains 11.**
 
