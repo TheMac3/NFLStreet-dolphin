@@ -59,6 +59,7 @@ catches every content mismatch, just with the generic message).
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import socket
 import threading
@@ -184,7 +185,6 @@ def family_reason(host: str | None, ours: str | None) -> str | None:
 
 def _family_rejected(msg: dict, fingerprint: str) -> RoomRejected:
     """Translate an old service's fingerprint rejection too, without changing its wire protocol."""
-    import re
     reason = str(msg.get("reason", "Refused."))
     match = re.search(r"yours is (.*?), the host's is (.*?)\.", reason)
     if match:

@@ -1,0 +1,44 @@
+{
+  "active": "redline",
+  "directions": {
+    "redline": {
+      "name": "01 / REDLINE",
+      "accent": "#e3262f",
+      "paper": "#f4eee3",
+      "dark": "#101014",
+      "intent": "Street-built precision: take the next frame back.",
+      "seed": 17
+    },
+    "flypaper": {
+      "name": "02 / FLYPAPER",
+      "accent": "#d8ff35",
+      "paper": "#fff4d6",
+      "dark": "#161b18",
+      "intent": "A pickup invitation pasted on the fence: anyone can run it back.",
+      "seed": 81
+    },
+    "undertow": {
+      "name": "03 / UNDERTOW",
+      "accent": "#51d6e5",
+      "paper": "#dae5e5",
+      "dark": "#0b1621",
+      "intent": "Night-court momentum: connection that never breaks your stride.",
+      "seed": 39
+    }
+  },
+  "sizes": {
+    "cover": [
+      880,
+      1222
+    ],
+    "loading": [
+      1280,
+      896
+    ],
+    "hero": [
+      1280,
+      720
+    ]
+  },
+  "photo": false
+}

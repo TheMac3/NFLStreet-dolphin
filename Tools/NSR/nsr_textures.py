@@ -99,6 +99,7 @@ class TextureSet:
     icons_why: str = "auto:none"
     prompt: Package | None = None
     warnings: list[str] = field(default_factory=list)
+    brand: str | None = None  # App-owned presentation composes after player prompts.
 
     def folders(self) -> list[str]:
         """Lowest precedence first (the order the list file records)."""
@@ -106,6 +107,8 @@ class TextureSet:
         out += [p.folder for p in self.packages]
         if self.prompt:
             out.append(self.prompt.folder)
+        if self.brand:
+            out.append(self.brand)
         return out
 
     def summary(self) -> str:
@@ -318,6 +321,7 @@ def write_list(our_user_dir: str, ts: TextureSet) -> str | None:
 # --- private, per-player asset store ------------------------------------------
 STORE_SCHEMA = "nsrb.local-assets.v1"
 STORE_REL = os.path.join("Assets", GAME_ID)
+OWNED_STORE_REL = os.path.join("TexturePacks", GAME_ID, "reborn-hd")
 SPACE_RESERVE = 16 << 20  # manifest, filesystem metadata and copy temporary file
 
 
@@ -364,11 +368,26 @@ def _local_path(root: Path, relative: str) -> Path:
     return p
 
 
-def read_store(folder: str, *, validate: bool = True) -> dict:
+def _owned_destination(root: Path, path: Path) -> None:
+    """Refuse every symlink hop, including existing journals and temporary files.
+
+    The copy policy is deliberately stronger than Reborn's own-store policy:
+    published owned art must never share a mutable Reborn inode or escape its root.
+    """
+    if not path.resolve().is_relative_to(root):
+        raise ImportError("Owned texture destination escapes the owned game folder.")
+    if ((path.is_file() and path.stat().st_nlink != 1)
+            or any(p.is_symlink() for p in (path, *path.parents) if p.is_relative_to(root))):
+        raise ImportError("Owned texture destinations must not contain symbolic links.")
+
+
+def read_store(folder: str, *, validate: bool = True, owned: bool = False) -> dict:
     """Read only local metadata; validate file presence/sizes before trusting it."""
-    root = Path(folder) / STORE_REL
+    root = Path(folder).resolve() / (OWNED_STORE_REL if owned else STORE_REL)
     m = _read_json(str(root / "manifest.json"))
     try:
+        if owned:
+            _owned_destination(Path(folder).resolve(), root / "manifest.json")
         if not isinstance(m, dict) or m.get("schema") != STORE_SCHEMA or not m["files"]:
             return {}
         if not isinstance(m["install"], str) or not isinstance(m["probes"], dict):
@@ -385,6 +404,8 @@ def read_store(folder: str, *, validate: bool = True) -> dict:
             if not _local_path(root, layer["local"]).is_dir():
                 return {}
         for f in m["files"]:
+            if owned and f["method"] != "copied":
+                return {}
             if f["method"] not in ("copied", "hardlinked") or not isinstance(f["size"], int):
                 return {}
             if not isinstance(f["source"], str) or not isinstance(f["stamp"], list):
@@ -392,6 +413,8 @@ def read_store(folder: str, *, validate: bool = True) -> dict:
             if not isinstance(f["sha256"], str) or (f["method"] == "copied" and len(f["sha256"]) != 64):
                 return {}
             p = _local_path(root, f["local"])
+            if owned:
+                _owned_destination(Path(folder).resolve(), p)
             if validate:
                 s = p.stat()
                 if not stat.S_ISREG(s.st_mode) or s.st_size != f["size"]:
@@ -408,7 +431,7 @@ def _source_changed(m: dict) -> bool:
     return any(_stamp(p) != value for p, value in m["probes"].items())
 
 
-def _inventory(install: str, env, version: str) -> dict:
+def _inventory(install: str, env, version: str, *, owned: bool = False) -> dict:
     """Discover source layers and watch paths only on first/changed/forced import.
 
     Import both prompt sets so a controller/icon switch never needs Reborn.
@@ -420,11 +443,11 @@ def _inventory(install: str, env, version: str) -> dict:
         raise ImportError("Reborn's HD texture library was not found. Locate your Reborn install to import it.")
     layers = [{"kind": "base", "folder": ts.base, "name": "base", "version": "",
                "id": "", "base_kind": ts.base_kind}]
-    for pkg in ts.packages:
+    for pkg in ([] if owned else ts.packages):
         layers.append({"kind": "mod", "folder": pkg.folder, "name": f"mods/{pkg.id}",
                        "id": pkg.id, "version": pkg.version})
     packages = find_packages(install, env)
-    for pid in PROMPT_PACKAGES.values():
+    for pid in ([] if owned else PROMPT_PACKAGES.values()):
         pkg = newest(packages.get(pid, {}))
         if pkg:
             layers.append({"kind": "prompt", "folder": pkg.folder, "name": f"prompts/{pkg.id}",
@@ -494,6 +517,8 @@ def _inventory(install: str, env, version: str) -> dict:
                 p = Path(directory) / name
                 if p.is_symlink() or not p.is_file():
                     raise ImportError("Reborn textures must be regular local files.")
+                if owned and not (p.name.startswith("tex1_") and p.suffix.lower() in (".png", ".dds")):
+                    continue  # The owned opt-in imports HD art only, never mods/prompts/config.
                 watch(p)
                 rel = (Path(layer["name"]) / p.relative_to(source)).as_posix()
                 files.append({"source": str(p), "relative": rel, "size": p.stat().st_size,
@@ -515,15 +540,19 @@ def _check_space(path: Path, required: int) -> None:
 
 
 def ensure_store(folder: str, install: str | None, env=os.environ, *, force: bool = False,
-                 version: str = "unknown", progress=None) -> dict:
+                 version: str = "unknown", progress=None, owned: bool = False) -> dict:
     """Import locally if needed; resume verified files after interruption.
 
     Old generations stay intact on failure. No automatic deletion: future disk
     reclamation needs an explicit player action, especially with multiple users.
-    Only this function writes Assets; callers serialize imports against gameplay.
+    Reborn uses Assets; owned=True uses the owned TexturePacks store, only base
+    HD PNG/DDS files and verified independent copies, including resumed files.
+    Callers serialize imports against gameplay; owned startup never calls here.
     """
-    root = Path(folder) / STORE_REL
-    old = read_store(folder)
+    root = Path(folder).resolve() / (OWNED_STORE_REL if owned else STORE_REL)
+    if owned:
+        _owned_destination(Path(folder).resolve(), root)
+    old = read_store(folder, owned=owned)
     if old and not force and (not install or os.path.abspath(install) == old["install"]) and not _source_changed(old):
         return old
     install = install or old.get("install")
@@ -534,7 +563,9 @@ def ensure_store(folder: str, install: str | None, env=os.environ, *, force: boo
     if any(root.resolve().is_relative_to(Path(source_root).resolve())
            for source_root in controllers.data_roots(install, env)):
         raise ImportError("Keep NFLStreetRollback in its own folder outside Reborn before importing.")
-    plan = _inventory(install, env, version)
+    plan = _inventory(install, env, version, owned=owned)
+    if owned:
+        plan["provenance"] = "player-initiated local Reborn HD library copy"
     if force:
         # Explicit re-import catches same-size edits with preserved timestamps.
         # Include hashes in the generation ID, so repair never rewrites the
@@ -548,8 +579,12 @@ def ensure_store(folder: str, install: str | None, env=os.environ, *, force: boo
     while not ancestor.exists():
         ancestor = ancestor.parent
     _check_space(ancestor, SPACE_RESERVE)
+    if owned:
+        _owned_destination(Path(folder).resolve(), dest)
     dest.mkdir(parents=True, exist_ok=True)
     journal = dest / "completed.jsonl"
+    if owned:
+        _owned_destination(Path(folder).resolve(), journal)
     completed = {}
     try:
         for line in journal.read_text(encoding="utf-8").splitlines():
@@ -573,10 +608,15 @@ def ensure_store(folder: str, install: str | None, env=os.environ, *, force: boo
         log.write("\n")  # separate any torn last record before appending new ones
         for f in plan["files"]:
             out = _local_path(dest, f["relative"])
+            if owned:
+                _owned_destination(Path(folder).resolve(), out)
             out.parent.mkdir(parents=True, exist_ok=True)
             previous = completed.get(f["relative"], {})
             valid = False
-            if out.is_file() and out.stat().st_size == f["size"] and previous.get("stamp") == f["stamp"]:
+            if (out.is_file() and out.stat().st_size == f["size"] and previous.get("stamp") == f["stamp"]
+                    and (not owned or (previous.get("method") == "copied"
+                         and previous.get("sha256") == plan.get("forced_sha256", {}).get(f["source"], previous.get("sha256"))
+                         and not os.path.samefile(f["source"], out)))):
                 valid = (_digest(out) == previous.get("sha256") if previous.get("method") == "copied"
                          else os.path.samefile(f["source"], out))
             if valid:
@@ -584,6 +624,8 @@ def ensure_store(folder: str, install: str | None, env=os.environ, *, force: boo
             else:
                 tmp = out.with_name(out.name + ".partial")
                 # Only our unpublished temporary file is removed, never a source.
+                if owned:
+                    _owned_destination(Path(folder).resolve(), tmp)
                 tmp.unlink(missing_ok=True)
                 method, digest = "hardlinked", ""
                 cached = old_files.get(f["source"], {})
@@ -591,7 +633,7 @@ def ensure_store(folder: str, install: str | None, env=os.environ, *, force: boo
                 # own previous copy avoids copying an 8 GB base on a tiny mod
                 # update, even when Reborn is on another volume.
                 reused = False
-                if cached.get("stamp") == f["stamp"]:
+                if not owned and cached.get("stamp") == f["stamp"]:
                     local = _local_path(root, cached["local"])
                     digest = cached["sha256"]
                     checked = (_digest(local) == digest if cached["method"] == "copied"
@@ -606,6 +648,8 @@ def ensure_store(folder: str, install: str | None, env=os.environ, *, force: boo
                 if not reused:
                     method, digest = "hardlinked", ""
                     try:
+                        if owned:
+                            raise OSError("Owned imports always use verified independent copies")
                         os.link(f["source"], tmp)
                     except OSError:
                         method = "copied"
@@ -638,6 +682,10 @@ def ensure_store(folder: str, install: str | None, env=os.environ, *, force: boo
         layer["local"] = f"sets/{generation}/{layer['name']}"
     m = {**plan, "schema": STORE_SCHEMA, "files": records, "bytes": total,
          "imported": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    if owned:
+        m["generation"] = generation
+        _owned_destination(Path(folder).resolve(), root / "manifest.json")
+        _owned_destination(Path(folder).resolve(), root / "manifest.tmp")
     _atomic_json(root / "manifest.json", m)
     return m
 
@@ -751,6 +799,7 @@ def compose_owned(folder: str, icons_setting: str | None, pad_kind: str | None,
                   *, game_folder: str | None = None) -> TextureSet:
     """Use native art plus player-dropped packs; never discover/import Reborn assets.
 
+    A player-initiated base HD import, when present, loads before these packs.
     Packs load alphabetically under TexturePacks/GN7E69/<pack> (later wins).
     Optional ButtonIcons/GN7E69/<controller-kind> loads last. Symlinks are
     refused so an owned launch cannot accidentally traverse a Reborn store.
@@ -770,6 +819,13 @@ def compose_owned(folder: str, icons_setting: str | None, pad_kind: str | None,
         return any(p.is_file() and p.name.startswith("tex1_") and p.suffix.lower() in (".png", ".dds")
                    and not p.is_symlink() and not any(a.is_symlink() for a in p.parents if a != root)
                    for p in files)
+    owned_folder = game_folder or str(root / "local/GameSources/owned")
+    imported = read_store(owned_folder, owned=True)
+    if imported and imported.get("provenance") == "player-initiated local Reborn HD library copy":
+        for layer in imported["layers"]:
+            path = Path(owned_folder).resolve() / OWNED_STORE_REL / layer["local"]
+            if layer["kind"] == "base" and usable(path):
+                ts.base, ts.base_kind = str(path), "owned-import"
     packs = root / "TexturePacks" / GAME_ID
     if packs.is_dir() and not packs.is_symlink():
         for path in sorted(packs.iterdir(), key=lambda p: p.name.casefold()):
