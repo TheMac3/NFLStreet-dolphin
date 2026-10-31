@@ -82,7 +82,7 @@ def custom_cover(folder: str, game_folder: str, enabled=True) -> None:
     root=Path(folder).resolve();dest=Path(game_folder).resolve()
     out=dest/'nsr-net.cover.png';receipt=dest/'nsr-brand-cover.json'
     if not enabled and not receipt.exists():return
-    dest.mkdir(parents=True,exist_ok=True)
+    _safe(root,dest);dest.mkdir(parents=True,exist_ok=True)
     for path in (out,receipt,receipt.with_suffix('.tmp'),out.with_suffix('.tmp')):_safe(root,path)
     try:
         old=json.loads(receipt.read_text()) if receipt.is_file() else {}

@@ -384,10 +384,10 @@ def _owned_destination(root: Path, path: Path) -> None:
 def read_store(folder: str, *, validate: bool = True, owned: bool = False) -> dict:
     """Read only local metadata; validate file presence/sizes before trusting it."""
     root = Path(folder).resolve() / (OWNED_STORE_REL if owned else STORE_REL)
-    m = _read_json(str(root / "manifest.json"))
     try:
         if owned:
             _owned_destination(Path(folder).resolve(), root / "manifest.json")
+        m = _read_json(str(root / "manifest.json"))
         if not isinstance(m, dict) or m.get("schema") != STORE_SCHEMA or not m["files"]:
             return {}
         if not isinstance(m["install"], str) or not isinstance(m["probes"], dict):
@@ -540,7 +540,7 @@ def _check_space(path: Path, required: int) -> None:
 
 
 def ensure_store(folder: str, install: str | None, env=os.environ, *, force: bool = False,
-                 version: str = "unknown", progress=None, owned: bool = False) -> dict:
+                 version: str = "unknown", progress=None, owned: bool = False, app_root: str | None = None) -> dict:
     """Import locally if needed; resume verified files after interruption.
 
     Old generations stay intact on failure. No automatic deletion: future disk
@@ -549,6 +549,8 @@ def ensure_store(folder: str, install: str | None, env=os.environ, *, force: boo
     HD PNG/DDS files and verified independent copies, including resumed files.
     Callers serialize imports against gameplay; owned startup never calls here.
     """
+    if owned and app_root is not None:
+        _owned_destination(Path(app_root).resolve(), Path(folder).absolute())
     root = Path(folder).resolve() / (OWNED_STORE_REL if owned else STORE_REL)
     if owned:
         _owned_destination(Path(folder).resolve(), root)
@@ -820,7 +822,11 @@ def compose_owned(folder: str, icons_setting: str | None, pad_kind: str | None,
                    and not p.is_symlink() and not any(a.is_symlink() for a in p.parents if a != root)
                    for p in files)
     owned_folder = game_folder or str(root / "local/GameSources/owned")
-    imported = read_store(owned_folder, owned=True)
+    try:
+        _owned_destination(root, Path(owned_folder).absolute())
+        imported = read_store(owned_folder, owned=True)
+    except ImportError:
+        imported = {}  # Never even read metadata through a redirected owned root.
     if imported and imported.get("provenance") == "player-initiated local Reborn HD library copy":
         for layer in imported["layers"]:
             path = Path(owned_folder).resolve() / OWNED_STORE_REL / layer["local"]

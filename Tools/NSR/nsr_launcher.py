@@ -817,6 +817,8 @@ class Launcher:
         ts = (textures.compose_owned(self.folder, self._icons_setting(), pad.kind, game_folder=self.game_dir)
               if self._source_kind == "owned" or retail else
               textures.compose(self.folder, self._icons_setting(), pad.kind))
+        if ts.base_kind == "owned-import" and self.state["owned_hd"]["text"].startswith("No HD import requested"):
+            self._set("owned_hd", text="Using your previously copied local Reborn HD art. Reborn is not needed to play.")
         self._set("textures", icons=self._icons_setting(), effective=ts.icons, why=ts.icons_why,
                   base_kind=ts.base_kind, base=ts.base or "",
                   packages=[f"{p.id} {p.version}" for p in ts.packages],
@@ -1919,13 +1921,18 @@ class Launcher:
             if before is None:
                 return
         try:
-            install = self.reborn_install(search=True)
+            # The ordinary reborn_install() deliberately returns None for owned
+            # families. Discovery is allowed only inside this explicit action.
+            install = self.cfg.get("reborn_install") or self._patcher.saved_reborn_install(self.folder)
+            if not install or not os.path.isdir(install):
+                source = self._patcher.find_reborn_iso()
+                install = self._patcher.reborn_install_of(source) if source else None
             if not install:
                 message = "No Reborn install found. Install your own copy from the official Reborn site first. Your disc and current art are kept."
                 self._set("owned_hd", text=message)
                 self.notify(message, "error")
                 return
-            manifest = textures.ensure_store(self.game_dir, install, self._env, force=True, owned=True,
+            manifest = textures.ensure_store(self.game_dir, install, self._env, force=True, owned=True, app_root=self.folder,
                 progress=lambda d, t: self._set("game", progress=round(d * 100 / max(t, 1))))
             textures.write_list(self.user_dir, self.refresh_textures())
             message = f"Copied {len(manifest['files'])} HD textures ({manifest['bytes'] / (1 << 20):.1f} MB) from your local Reborn {manifest['version']}. Only this PC's art changes; Reborn stays unchanged."
@@ -2280,6 +2287,7 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     brand_var = tk.BooleanVar(value=launcher.cfg.get("branded_art", True))
     ttk.Checkbutton(sp, text="Use NSRB loading artwork when HD art is in use", variable=brand_var,
                     command=lambda: launcher.set_branded_art(brand_var.get())).grid(row=17, column=0, columnspan=4, sticky="w")
+    owned_hd_text = label(sp, 18)
     content_text = label(sp, 9, pady=(14, 4))
     b_updates = ttk.Button(sp, text="Check for updates", command=launcher.check_updates)
     b_updates.grid(row=10, column=0, sticky="w")
@@ -2330,6 +2338,7 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
         if s is not None:
             seen["rev"] = s["rev"]
             perf_hint.configure(text=s["performance_hint"])
+            owned_hd_text.configure(text=s["owned_hd"]["text"])
             hd_var.set(s["hd_textures"])
             res_var.set(str(s["resolution"]))
             g, h, j, c = s["game"], s["host"], s["join"], s["controllers"]
