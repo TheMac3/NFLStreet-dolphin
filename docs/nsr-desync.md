@@ -10,7 +10,7 @@ from other lanes are outside this investigation.
 GN7E69 revision 0, Reborn 2026.09.12, rollback image fingerprint
 `B57A-8270-68C2`. The fixed seed `0x26dabb33`, automatic delay 3,
 40 ms / 8 ms jitter / 2% loss / 2% reorder, proxy seed `0x4E5352`
-reproduces the eight differing bytes at `0x802C8A24..0x802C8A2C`.
+reproduces the two-word/eight-byte span at `0x802C8A24..0x802C8A2C`.
 A replay on the retained exact-mainline control first reports frame 2344;
 read/write instrumentation reports frame 2343. Timing shifts the first
 reported frame without eliminating the original failure.
@@ -69,3 +69,30 @@ words boot-time I/O roots as a substitute for that work.
 
 Exact commands, source/image identities, watches, paired snapshots and
 qualification results live in the private `local/work/codex/desync/REPORT.md`.
+
+## 2026-10-31: desync qualification complete, blocker unchanged
+
+The task-base build (fork `58be5b4f99`, NFLStreet `9e54352`) still fails the
+original fixed-seed case at frame 2342, in the same eight-byte span at
+`0x802C8A24..0x802C8A2C` (GN7E69 rev 0). The paired watch explains the
+asynchronous diagnostic copies; global reader ownership is still incomplete.
+**No repair, mask change or version bump: digest remains 11.**
+
+Common gate 1 passes: misprediction 3 and random depth 44 each match all
+12,708 reference RNG frames, with zero hangs and zero game bytes at frames
+5000/7000 against a fresh no-rollback reference; ownership, used VMEM and ARAM
+agree. Historical v12 MEM1 also matches, but its missing sidecars cannot
+qualify those additional address spaces. Common gate 2 passes with zero
+uncorrectable inputs and full RAM/ownership/VMEM/ARAM agreement.
+
+The fresh random-seed full matrix passes: **8 passed / 0 failed / 1 skipped** with
+`--timeout 5400 --max-dolphins 2`. The four-player smoke is explicitly
+skipped under the task's two-Dolphin limit; it is not a four-player pass.
+Strict GCC C++20 warnings-as-errors, actual MSVC `/W4 /WX` and all **595**
+Python tests pass. The [Windows/Linux unit run](https://github.com/TheMac3/NFLStreet-dolphin/actions/runs/41162181720)
+uses identical C++ source bytes to the delivered documentation topics.
+
+These other controls do not repair or qualify the failing original seed.
+The private `local/work/codex/desync/REPORT.md` retains all exact commands,
+results, the interrupted first reference, source/image hashes, paired
+snapshots and remaining ownership work. No mainline merge or deployment.
