@@ -397,6 +397,8 @@ def read_store(folder: str, *, validate: bool = True, owned: bool = False) -> di
         if not any(layer["kind"] == "base" for layer in m["layers"]):
             return {}
         for layer in m["layers"]:
+            if owned and (layer["kind"] != "base" or layer.get("base_kind") not in ("library", "install")):
+                return {}
             if layer["kind"] not in ("base", "mod", "prompt"):
                 return {}
             if not all(isinstance(layer[k], str) for k in ("id", "version", "local")):
@@ -441,6 +443,8 @@ def _inventory(install: str, env, version: str, *, owned: bool = False) -> dict:
     ts = discover_reborn(install, "gamecube", None, env)
     if not ts.base:
         raise ImportError("Reborn's HD texture library was not found. Locate your Reborn install to import it.")
+    if owned and ts.base_kind not in ("library", "install"):
+        raise ImportError("A standalone Reborn HD library was not found. Its composed profile may contain mods or button packs, so nothing was imported.")
     layers = [{"kind": "base", "folder": ts.base, "name": "base", "version": "",
                "id": "", "base_kind": ts.base_kind}]
     for pkg in ([] if owned else ts.packages):
