@@ -121,6 +121,14 @@ jobs:
           # atlas is runtime-only, never an input to PyInstaller or this artifact.
           $active = (Get-Content Tools/NSR/assets/branding/generated/system.json | ConvertFrom-Json).active
           $icon = "Tools/NSR/assets/branding/generated/$active/app.ico"
+          $allowed = @('branding/NOTICE.txt', 'branding/UbuntuSans.ttf', 'branding/UBUNTU-FONT-LICENSE.txt', 'branding/generated/system.json')
+          $allowed += @('cover.png','loading.png','hero.png','mark-32.png','mark-128.png','mark-256.png','app.ico') | ForEach-Object { "branding/generated/redline/$_" }
+          if ($active -ne 'redline') { throw "Only the chosen Redline identity ships" }
+          $assetRoot = (Resolve-Path Tools/NSR/assets).Path
+          Get-ChildItem -Recurse Tools/NSR/assets -File | ForEach-Object {
+            $relative = $_.FullName.Substring($assetRoot.Length + 1).Replace('\','/')
+            if ($relative -notin $allowed) { throw "Unapproved bundled asset: $relative" }
+          }
           if ((Get-Content Tools/NSR/assets/branding/generated/system.json | ConvertFrom-Json).photo) { throw "Photo-derived branding must never be bundled" }
           if (Get-ChildItem -Recurse Tools/NSR/assets -File | Where-Object { $_.Name -eq 'jsn.png' -or $_.Name -like 'tex1_*' }) { throw "Private presentation input in bundled assets" }
           pyinstaller --noconfirm --noupx --workpath pyi-build --distpath pyi-dist --onefile --windowed --icon $icon --add-data "Tools/NSR/assets;assets" --name NFLStreetRollback --paths Tools/NSR --add-data "Tools/NSR/nsr_launcher_ui.html;." --collect-all webview --collect-all pythonnet --collect-all clr_loader Tools/NSR/nsr_launcher.py

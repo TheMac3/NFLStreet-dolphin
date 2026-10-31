@@ -102,4 +102,5 @@ def decorate_html(html: str, folder: str) -> str:
     source=bundled();key=direction();system=json.loads((source/'system.json').read_text());palette=system['directions'][key]
     for token,path in {'HERO':artwork(folder)['hero'],'MARK':source/key/'mark-32.png'}.items():
         html=html.replace('__NSRB_'+token+'__','data:image/png;base64,'+base64.b64encode(path.read_bytes()).decode())
-    return html.replace('__NSRB_INK__',palette['paper'] if key=='redline' else palette['dark']).replace('__NSRB_ACCENT__',palette['accent']).replace('__NSRB_PAPER__',palette['paper']).replace('__NSRB_DARK__',palette['dark'])
+    html=html.replace('__NSRB_FONT__','data:font/ttf;base64,'+base64.b64encode((source.parent/'UbuntuSans.ttf').read_bytes()).decode())
+    return html.replace('__NSRB_ACCENT__',palette['accent']).replace('__NSRB_PAPER__',palette['paper']).replace('__NSRB_DARK__',palette['dark'])

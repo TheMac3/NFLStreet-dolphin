@@ -2119,7 +2119,7 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
         pass  # Non-Windows Tk may not support ICO; the packaged exe has the mark.
     root.title(APP_TITLE)
     root.minsize(620, 600)
-    bg, panel, fg, accent, muted = "#0b0b0e", "#15151a", "#f2f2f2", "#e3262f", "#9b9ba7"
+    bg, panel, fg, accent, muted = "#0a0a0c", "#151518", "#eeece8", "#e3262f", "#b0aeb4"
     root.configure(bg=bg)
     style = ttk.Style(root)
     style.theme_use("clam")
@@ -2141,7 +2141,13 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
 
     outer = ttk.Frame(root, padding=16)
     outer.pack(fill="both", expand=True)
-    ttk.Label(outer, text="NFLSTREET ROLLBACK", style="Title.TLabel").pack(anchor="w")
+    # Keep the native fallback legible without requiring the WebView's font engine.
+    masthead = ttk.Frame(outer)
+    masthead.pack(anchor="w", pady=(0, 6))
+    root.nsr_mark = tk.PhotoImage(file=str(branding.bundled()/branding.direction()/'mark-32.png'))
+    ttk.Label(masthead, image=root.nsr_mark).grid(row=0, column=0, rowspan=2, padx=(0, 12))
+    ttk.Label(masthead, text="NFL STREET / ROLLBACK", style="Title.TLabel").grid(row=0, column=1, sticky="w")
+    ttk.Label(masthead, text="IT’S MY HOUSE.  /  RUN IT BACK", foreground=accent).grid(row=1, column=1, sticky="w")
     status = ttk.Label(outer, text="", foreground=muted)
     status.pack(anchor="w", pady=(0, 8))
 
