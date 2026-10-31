@@ -44,10 +44,18 @@ background textures are original, with no third-party image input.
 What this repository does not contain or license
 ------------------------------------------------
 
-No game is included here and none is licensed by this project. The packaged
-default contains no photograph, no Reborn artwork and no game texture. The
-optional local player-photo composition is private to the machine that built
-it and carries no redistribution grant from this notice.
+No game is included here and none is licensed by this project. The package
+contains no Reborn artwork and no game texture.
+
+The launcher's presentation art is composed from a photograph of a
+professional athlete, used here without a licence from its photographer or any
+rights holder, and this notice grants no rights in it. It is present because
+the project's owner chose to include it; it is not original to this project and
+must not be treated as licensed by LICENSE or redistributed on that basis.
+Anyone forking or redistributing this project should replace
+`assets/branding/generated/redline/jsn.png` with their own artwork. Removing
+that file alone restores the figure-free composition the generator produces by
+default.
 
 NFL Street and NFL Street 2 are the property of Electronic Arts Inc. NFL,
 team names, team marks and player likenesses are the property of the National

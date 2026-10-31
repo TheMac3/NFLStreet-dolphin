@@ -125,20 +125,28 @@ jobs:
         run: |
           # --collect-all: pywebview's WebView2 DLLs and pythonnet's runtime
           # are data/binaries PyInstaller would otherwise miss.
-          # The bundle contains only tracked figure-free graphics. A local JSN
-          # atlas is runtime-only, never an input to PyInstaller or this artifact.
+          # The bundle carries the tracked Redline graphics, including the
+          # photographic jsn.png atlas Mason chose to ship. The allowlist is
+          # still exhaustive: anything in assets that is not named here fails
+          # the build, so a stray texture, dump or second identity cannot ride
+          # along just because one photograph is now approved.
           $active = (Get-Content Tools/NSR/assets/branding/generated/system.json | ConvertFrom-Json).active
           $icon = "Tools/NSR/assets/branding/generated/$active/app.ico"
           $allowed = @('branding/NOTICE.txt', 'branding/generated/UbuntuSans-derivative-NSRB.woff2', 'branding/UBUNTU-FONT-LICENSE.txt', 'branding/generated/system.json')
-          $allowed += @('cover.png','loading.png','hero.png','mark-32.png','mark-128.png','mark-256.png','app.ico') | ForEach-Object { "branding/generated/redline/$_" }
+          $allowed += @('cover.png','loading.png','hero.png','mark-32.png','mark-128.png','mark-256.png','app.ico','jsn.png') | ForEach-Object { "branding/generated/redline/$_" }
           if ($active -ne 'redline') { throw "Only the chosen Redline identity ships" }
           $assetRoot = (Resolve-Path Tools/NSR/assets).Path
           Get-ChildItem -Recurse Tools/NSR/assets -File | ForEach-Object {
             $relative = $_.FullName.Substring($assetRoot.Length + 1).Replace('\','/')
             if ($relative -notin $allowed) { throw "Unapproved bundled asset: $relative" }
           }
-          if ((Get-Content Tools/NSR/assets/branding/generated/system.json | ConvertFrom-Json).photo) { throw "Photo-derived branding must never be bundled" }
-          if (Get-ChildItem -Recurse Tools/NSR/assets -File | Where-Object { $_.Name -eq 'jsn.png' -or $_.Name -like 'tex1_*' }) { throw "Private presentation input in bundled assets" }
+          # The source photograph and any imported game texture still must not
+          # ship; only the composed atlas does, and only at its approved path.
+          if (Get-ChildItem -Recurse Tools/NSR/assets -File | Where-Object { $_.Name -like 'tex1_*' -or $_.Extension -in '.jpg','.jpeg' }) { throw "Private presentation input in bundled assets" }
+          $atlas = "Tools/NSR/assets/branding/generated/redline/jsn.png"
+          if (-not (Test-Path $atlas)) { throw "missing branding atlas: $atlas" }
+          python -c "import sys; from PIL import Image; im=Image.open(sys.argv[1]); sys.exit(0 if im.size==(2160,1616) and im.mode in ('RGB','RGBA') else 1)" $atlas
+          if ($LASTEXITCODE -ne 0) { throw "branding atlas must be 2160x1616 RGB/RGBA" }
           pyinstaller --noconfirm --noupx --workpath pyi-build --distpath pyi-dist --onefile --windowed --icon $icon --add-data "Tools/NSR/assets;assets" --name NFLStreetRollback --paths Tools/NSR --add-data "Tools/NSR/nsr_launcher_ui.html;." --collect-all webview --collect-all pythonnet --collect-all clr_loader Tools/NSR/nsr_launcher.py
           pyinstaller --noconfirm --noupx --workpath pyi-build --distpath pyi-dist --onefile --console --name NFLStreetRollback-Patcher --paths Tools/NSR Tools/NSR/nsr_patcher.py
           pyi-dist\NFLStreetRollback-Patcher.exe --help
@@ -271,6 +279,11 @@ jobs:
             $_.Name -in 'Assets','User','NSRTextures','GN7E69','prompt-packages','GameSources','TexturePacks','ButtonIcons','Branding','local' }
           if ($privateDirs) { throw "Private game assets/config must never be packaged" }
           Copy-Item -Recurse Binary/x64/* $pkg
+          # The launcher reads the atlas from <app>/local/Branding/jsn.png at
+          # runtime. Staged here, after the private-directory check above has
+          # already passed over Binary/x64, so that guard keeps its meaning.
+          New-Item -ItemType Directory -Force "$pkg/local/Branding" | Out-Null
+          Copy-Item "Tools/NSR/assets/branding/generated/redline/jsn.png" "$pkg/local/Branding/jsn.png"
           # Dolphin's self-updater would offer to replace this fork with an
           # official Dolphin build (no rollback netplay); friends get updates as a
           # new zip from Mason instead.
@@ -380,8 +393,8 @@ jobs:
           Without Reborn, no import happens. Source files remain unchanged.
           No imported art is uploaded or shared; every PC keeps its own textures.
           NSRB loading art composes last when HD art is enabled; turn it off in
-          Advanced to restore the underlying art. local/Branding/jsn.png is a
-          private optional mascot atlas (2160x1616 PNG), never part of this zip.
+          Advanced to restore the underlying art. local/Branding/jsn.png holds
+          the launcher's artwork; delete it for the plain version.
           Missing icon packs keep the original game art. No art is downloaded.
           Friends must choose the same source and have identical game copies.
 
@@ -395,7 +408,7 @@ jobs:
           # Contents guard: no game images, saves, memory cards, dumps or secrets.
           $bad = Get-ChildItem -Recurse -File $pkg | Where-Object {
             $_.Extension -in '.iso','.gcm','.rvz','.wbfs','.ciso','.gcz','.nkit','.gci','.sav','.dtm','.env','.pem','.key' -or
-            ($_.Name -like 'tex1_*') -or $_.Name -eq 'jsn.png' -or
+            ($_.Name -like 'tex1_*') -or
             $_.Name -in 'nsr-telemetry.txt','nsr-net.iso','nsr-image.json','nsr-reborn.txt','nsr-launcher.json','nsr-launcher.log','GCPadNew.ini.before-reborn-import','nsr-net.cover.png','nsr-brand-cover.json' }
           if ($bad) { $bad | ForEach-Object { Write-Error "unexpected file in package: $($_.FullName)" }; exit 1 }
           foreach ($f in 'Dolphin.exe','DolphinTool.exe','NFLStreetRollback.exe','NFLStreetRollback-Patcher.exe','README-FIRST.txt','VERSION.txt','SOURCE.txt','portable.txt') {
