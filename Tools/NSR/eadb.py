@@ -126,21 +126,54 @@ def parse_db(buf: bytes, base: int = 0) -> dict[str, Table]:
 
 
 def terf_entries(buf: bytes) -> list[tuple[int, int]]:
-    """Return absolute (offset, size) for every TERF/DIR1 slot (size 0 = empty)."""
-    if len(buf) < 0x48 or buf[:4] != b"TERF" or buf[0x40:0x44] != b"DIR1":
+    """Return absolute (offset, size) for every TERF/DIR1 slot (size 0 = empty).
+
+    `template.dat` puts DIR1 immediately after the 0x40-byte header, but the
+    container is not fixed there: `pathfind.dat` (the PathFinder audio data,
+    whose index carries the `PFDx` section table) has a 0x800-byte header with
+    DIR1 at 0x800. Entry offsets are relative to the end of the directory in
+    both, so locate DIR1 instead of assuming its position. Only 4-byte-aligned
+    positions in the first 64 KiB are considered, and a candidate is accepted
+    only if its directory and every entry it declares fit the file, so a stray
+    "DIR1" inside payload bytes cannot be mistaken for the directory.
+    """
+    if len(buf) < 0x48 or buf[:4] != b"TERF":
+        raise ValueError("not a TERF/DIR1 file")
+    starts = []
+    at = 0x40 if buf[0x40:0x44] == b"DIR1" else -1
+    if at >= 0:
+        starts.append(at)
+    search = 0
+    while len(starts) < 8:
+        at = buf.find(b"DIR1", search, 0x10000)
+        if at < 0:
+            break
+        search = at + 4
+        if at % 4 == 0 and at not in starts:
+            starts.append(at)
+    if not starts:
         raise ValueError("not a TERF/DIR1 file")
     (count,) = struct.unpack_from(">H", buf, 0x0E)
-    (dir_size,) = struct.unpack_from(">I", buf, 0x44)
-    base = 0x40 + dir_size
-    if dir_size < 8 + count * 8 or base > len(buf):
-        raise ValueError("invalid TERF directory size")
-    out = []
-    for i in range(count):
-        off, size = struct.unpack_from(">II", buf, 0x48 + i * 8)
-        if size and base + off + size > len(buf):
-            raise ValueError(f"TERF entry {i} extends beyond file")
-        out.append((base + off, size))
-    return out
+    errors = []
+    for dir1 in starts:
+        if dir1 + 8 + count * 8 > len(buf):
+            continue
+        (dir_size,) = struct.unpack_from(">I", buf, dir1 + 4)
+        base = dir1 + dir_size
+        if dir_size < 8 + count * 8 or base > len(buf):
+            errors.append(f"DIR1 at 0x{dir1:X}: invalid directory size")
+            continue
+        out = []
+        for i in range(count):
+            off, size = struct.unpack_from(">II", buf, dir1 + 8 + i * 8)
+            if size and base + off + size > len(buf):
+                errors.append(f"DIR1 at 0x{dir1:X}: entry {i} extends beyond file")
+                out = None
+                break
+            out.append((base + off, size))
+        if out is not None:
+            return out
+    raise ValueError("invalid TERF directory size" + (f" ({errors[0]})" if errors else ""))
 
 
 def load(path: str) -> list[tuple[int, dict[str, Table] | None]]:
@@ -242,13 +275,43 @@ def roster_tables(buf: bytes, entry: int = 2) -> dict[str, Table]:
     return tables
 
 
+# The gameplay ratings are 7-bit fields, so the container holds 0..127, but EA
+# shipped a 0..100 scale inside it and the engine's movement curves are
+# normalized so that 99 is exactly multiplier 1.00 - above that they
+# extrapolate past the range they were written for (docs/roster-editing.md).
+# So the product caps the ratings at 100 and says so with one number everywhere:
+# the editor's slider and label, CSV import, and the build-time check all read
+# editable_range(). field_range() stays the storage truth for anything that needs
+# to know what the field itself can hold.
+RATING_CAP = 100
+# Not 0..100 ratings and therefore not capped: height is inches and weight is
+# stored pounds minus 160. They get a plausible human range rather than the
+# cap - and rather than the raw field width, which would offer a 10-inch player.
+# These are the same bounds signed content releases enforce
+# (nsr_content.ATTRIBUTE_LIMITS), so the editor cannot accept a value the
+# publisher would later refuse; tests/test_eadb.py asserts they stay equal.
+PHYSICAL_RANGES = {"PHGT": (48, 96), "PWGT": (0, 255)}
+PHYSICAL_FIELDS = tuple(PHYSICAL_RANGES)
+# Zero means "inherit the native value", so these stop one short of the cap.
+INHERIT_FIELDS = ("PPVL", "PCEL")
+
+
 def field_range(f: Field) -> tuple[int, int]:
     """Return storage bounds; signed fields use the parser's two's complement."""
     if f.type not in (2, 3) or not f.bits:
         raise ValueError(f"{f.name}: unsupported numeric field type")
-    if f.name in ("PPVL", "PCEL"):
-        return 0, 99
     return (-(1 << (f.bits - 1)), (1 << (f.bits - 1)) - 1) if f.type == 2 else (0, (1 << f.bits) - 1)
+
+
+def editable_range(f: Field) -> tuple[int, int]:
+    """Return the range the editor offers and a build accepts, cap included."""
+    lo, hi = field_range(f)
+    if f.name in INHERIT_FIELDS:
+        return 0, 99
+    if f.name in PHYSICAL_RANGES:
+        low, high = PHYSICAL_RANGES[f.name]
+        return max(lo, low), min(hi, high)
+    return lo, min(hi, RATING_CAP)
 
 
 def integer(value) -> int:
@@ -329,7 +392,7 @@ def apply_edits(buf: bytes, edits: list[dict], entry: int = 2,
                 value = validate_name(row["value"], f.bits // 8 - 1)
             else:
                 value = integer(row["value"])
-                lo, hi = field_range(f)
+                lo, hi = editable_range(f)
                 if not lo <= value <= hi:
                     raise ValueError(f"{tag} must be {lo}..{hi}")
                 if tag == "PBPO" and value not in ROLE_VALUES:
@@ -406,8 +469,8 @@ def editable(buf: bytes, entry: int = 2) -> dict:
         character_fields.append({"name": "PBPO", "label": "Role",
                                  "choices": [{"value": value, "label": label}
                                              for value, label in ROLE_CHOICES]})
-    fields = [{"name": f.name, "label": ATTRIBUTES[f.name], "min": field_range(f)[0],
-               "max": field_range(f)[1], "bits": f.bits}
+    fields = [{"name": f.name, "label": ATTRIBUTES[f.name], "min": editable_range(f)[0],
+               "max": editable_range(f)[1], "bits": f.bits}
               for f in table.fields if f.name in ATTRIBUTES and f.type in (2, 3)]
     teams = {r["TGID"]: " ".join(str(r.get(k, "")).strip() for k in ("TDNA", "TLNA")).strip()
              for r in tables["TEAM"].records} if "TEAM" in tables else {}

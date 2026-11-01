@@ -88,16 +88,20 @@ MAX_VERSION = 1_000_000
 MAX_SERIAL = 2**31 - 1
 
 # Editable attributes (tools/eadb.py ATTRIBUTES) and the values a release may
-# set. Ratings are 0..127 (the editor's 7-bit storage range for the rating
-# fields); height is inches; weight is stored as pounds minus 160. These are
-# deliberately a little wider than sensible gameplay values: the exact
-# per-field storage range is enforced again by eadb.apply_edits against the
-# real template at build time, and the publisher refuses anything outside
-# this table, so a valid release never fails here.
-_RATING = (0, 127)
+# set. Ratings stop at eadb.RATING_CAP, the shipped 0..100 scale, even though the
+# field itself is 7 bits wide; height is inches; weight is stored as pounds minus
+# 160. This module stays free of the database parser so the launcher side can
+# import it alone, so the cap is repeated here rather than imported - and
+# tests/test_eadb.py asserts this table and eadb.editable_range agree field for
+# field, so the two cannot drift apart silently. The exact per-field range is
+# enforced again by eadb.apply_edits against the real template at build time, and
+# the publisher refuses anything outside this table, so a valid release never
+# fails here.
+_RATING = (0, 100)  # == (0, eadb.RATING_CAP)
 ATTRIBUTE_LIMITS = {
     "POVR": _RATING, "PSPD": _RATING, "PCEL": (0, 99), "PAGI": _RATING, "PJUM": _RATING,
     "PCTH": _RATING, "PPSS": _RATING, "PCOV": _RATING, "PTAK": _RATING, "PBLK": _RATING,
+    # == eadb.PHYSICAL_RANGES; the editor offers exactly these, not the field width.
     "PBTK": _RATING, "PHGT": (48, 96), "PWGT": (0, 255),
     "PPVL": (0, 99), "PBPO": (0, 13),
 }
@@ -386,9 +390,16 @@ def trusted_keys(keys=None) -> dict[str, tuple[int, int]]:
     return out
 
 
-def sign_manifest(payload: dict, kid: str, sign) -> bytes:
-    """Envelope bytes for a payload; sign(message) -> signature bytes (server side)."""
-    body = canonical(validate_payload(payload))
+def sign_manifest(payload: dict, kid: str, sign, validate=None) -> bytes:
+    """Envelope bytes for a payload; sign(message) -> signature bytes (server side).
+
+    `validate` is the payload schema, defaulting to this module's content
+    manifest. Application updates (tools/nsr_update.py) pass their own so they
+    share this trust anchor, envelope and size limit instead of growing a
+    second signing scheme; their payload carries a different `format` string,
+    so neither kind of manifest can ever be accepted as the other.
+    """
+    body = canonical((validate or validate_payload)(payload))
     envelope = {"format": ENVELOPE_FORMAT, "kid": kid, "payload": b64encode(body),
                 "sig": b64encode(sign(body))}
     raw = canonical(envelope)
@@ -397,9 +408,12 @@ def sign_manifest(payload: dict, kid: str, sign) -> bytes:
     return raw
 
 
-def verify_manifest(raw: bytes, keys=None) -> dict:
+def verify_manifest(raw: bytes, keys=None, validate=None) -> dict:
     """Check the signature with a trusted key, then the payload schema. Returns
-    the payload. Raises ContentError on anything unexpected."""
+    the payload. Raises ContentError on anything unexpected.
+
+    `validate` is the payload schema (see sign_manifest); the default accepts
+    only a content manifest."""
     if not isinstance(raw, (bytes, bytearray)) or len(raw) > MAX_MANIFEST_BYTES:
         raise ContentError("manifest is missing or too large")
     env = _keys(strict_loads(bytes(raw)), "manifest envelope", {"format", "kid", "payload", "sig"})
@@ -416,7 +430,7 @@ def verify_manifest(raw: bytes, keys=None) -> dict:
     n, e = trusted[env["kid"]]
     if not rsasig.rsa_pkcs1v15_sha256_verify(n, e, body, sig):
         raise ContentError("manifest signature is invalid")
-    payload = validate_payload(strict_loads(body))
+    payload = (validate or validate_payload)(strict_loads(body))
     if canonical(payload) != body:
         raise ContentError("manifest payload is not in canonical form")
     return payload
