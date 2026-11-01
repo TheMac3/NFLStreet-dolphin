@@ -5654,8 +5654,8 @@ struct PerMachineRange
 // sidecar order: audio heap blocks, live OS objects (every thread, alarm, DVD
 // and ARQ request, audio callback node, tick accumulator, disc staging/stream
 // destinations, GX FIFO), boot-time disc/stream I/O objects, PathFinder audio
-// data blocks, the UI command stack, then each audio-touched heap's
-// counters and free blocks.
+// data blocks, the UI command stack, every heap's free block payloads, then
+// each audio-touched heap's counters and free blocks.
 // `io_blocks` / `audio_data` replace the I/O objects / audio data blocks found
 // from the current state, and `with_heaps` = false leaves out the heap
 // counters/free blocks (the state digest passes its fixed sets and applies a
@@ -5703,6 +5703,15 @@ static std::vector<PerMachineRange> PerMachineRanges(Core::System& system, const
   // are found by walking the heap's block chain from its start (+0x14) to its
   // end (+0x18) through each header's next link; a header whose "used" byte
   // is clear is free.
+  // Stale bytes inside freed heap blocks follow each machine's finished work
+  // rather than the simulation, and the handoff barrier hashes all of MEM1.
+  // Mason's 2026-10-31 handoff abort was four such words in one free main-heap
+  // block; see RollbackLogic::HeapFreePayloads for the evidence and for why
+  // only free payloads are safe to drop. Classified before the with_heaps
+  // return because the state digest needs it as much as the sidecars do.
+  for (const auto& range : RollbackLogic::HeapFreePayloads(
+           {ram, system.GetMemory().GetRamSizeReal()}))
+    out.push_back({0x80000000 | range.lo, 0x80000000 | range.hi, "heap-free-payload"});
   if (!with_heaps)
     return out;
   std::set<u32> heaps;

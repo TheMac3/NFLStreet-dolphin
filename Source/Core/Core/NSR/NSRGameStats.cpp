@@ -69,6 +69,8 @@ struct ReadyResult
 {
   Object object;
   std::uint32_t observed_frame, ordinal;
+  // Reported once if the capture anchor never arrives; see PublishConfirmed.
+  bool anchor_wait_logged = false;
 };
 
 struct State
@@ -673,7 +675,24 @@ void PublishConfirmed(std::optional<std::uint32_t> confirmed_through)
     return;
   const auto anchor = s.capture_anchors.find(s.ready->ordinal);
   if (anchor == s.capture_anchors.end())
+  {
+    // Only the host records an anchor locally (see the Capture site); every
+    // other peer waits for peer 0's anchor to arrive over the wire. If it
+    // never does, this result is held for the rest of the session and no file
+    // is ever written. That silence is why "results exist but did not upload"
+    // and "results were never written" could not be told apart from a PC, so
+    // name the stranded result once rather than returning quietly.
+    if (!s.ready->anchor_wait_logged)
+    {
+      s.ready->anchor_wait_logged = true;
+      StatsNote("[NSR stats] result for match %u confirmed at frame %u is waiting on a "
+                "capture anchor (me %u, netplay %u, anchors held %zu); nothing is written "
+                "until it arrives\n",
+                s.ready->ordinal, s.ready->observed_frame, s.me,
+                static_cast<unsigned>(s.netplay), s.capture_anchors.size());
+    }
     return;
+  }
   Save(std::move(s.ready->object), anchor->second);
   s.ready.reset();
 }

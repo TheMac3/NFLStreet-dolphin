@@ -1387,6 +1387,97 @@ static void TestInGameHeapNamePadding()
   assert(!RL::InGameHeapNamePadding(std::span<const std::uint8_t>(ram).first(DESC + 0xFF)));
 }
 
+// Freed heap payloads are the only thing the handoff barrier may ignore:
+// used payloads, block headers and aligned pre-headers stay hashed, and a
+// malformed table or chain yields nothing rather than a guess.
+static void TestHeapFreePayloads()
+{
+  constexpr std::uint32_t ENTRY = 0x00384C20;  // the table's top slot
+  constexpr std::uint32_t DESC = 0x00390000;
+  constexpr std::uint32_t START = 0x80392000;
+  constexpr std::uint32_t END = 0x803A0000;
+  std::vector<std::uint8_t> ram(0x400000);
+  const auto write = [&](std::uint32_t offset, std::uint32_t value) {
+    for (std::uint32_t i = 0; i < 4; ++i)
+      ram[offset + i] = static_cast<std::uint8_t>(value >> (24 - 8 * i));
+  };
+  write(ENTRY, START);
+  write(ENTRY + 4, END);
+  write(ENTRY + 8, 1);
+  write(ENTRY + 12, 0x80000000 + DESC);
+  write(DESC + 4, 0x80000000 + DESC);
+  write(DESC + 0x14, START);
+  write(DESC + 0x18, END);
+  // A used block, a free block, an aligned free block, then a used block
+  // whose next link reaches the heap end and stops the walk.
+  const auto header = [&](std::uint32_t block, std::uint32_t next, bool used) {
+    write(block - 0x80000000 + 4, used ? 0x00000100u : 0u);
+    write(block - 0x80000000 + 8, 0x80000000 + DESC);
+    write(block - 0x80000000 + 0xC, next);
+  };
+  header(0x80392000, 0x80392100, true);
+  header(0x80392100, 0x80392300, false);
+  // Aligned block: 16-byte pre-header {back link, 0x001C0000, 0, 0} first.
+  write(0x392300, 0x80392100);
+  write(0x392304, 0x001C0000);
+  write(0x392308, 0);
+  write(0x39230C, 0);
+  header(0x80392310, 0x80392500, false);
+  header(0x80392500, END, true);
+  const std::vector<RL::Range> expected{{0x392110, 0x392300}, {0x392320, 0x392500}};
+  assert(RL::HeapFreePayloads(ram) == expected);
+  // Ownership, identity and extent all fail closed to no ranges at all.
+  for (const auto offset : {DESC + 4, DESC + 0x14, DESC + 0x18, ENTRY + 12})
+  {
+    ram[offset] ^= 0x40;
+    assert(RL::HeapFreePayloads(ram).empty());
+    ram[offset] ^= 0x40;
+  }
+  assert(RL::HeapFreePayloads(ram) == expected);
+  assert(RL::HeapFreePayloads({}).empty());
+  assert(RL::HeapFreePayloads(std::span<const std::uint8_t>(ram).first(DESC + 0xFF)).empty());
+  // The active heap appears twice while one is pushed: dedupe, do not double.
+  write(ENTRY - 16, START);
+  write(ENTRY - 16 + 4, END);
+  write(ENTRY - 16 + 8, 1);
+  write(ENTRY - 16 + 12, 0x80000000 + DESC);
+  assert(RL::HeapFreePayloads(ram) == expected);
+  // A second heap in an older slot contributes its own free payload.
+  constexpr std::uint32_t DESC2 = 0x003B0000;
+  constexpr std::uint32_t START2 = 0x803C0000;
+  constexpr std::uint32_t END2 = 0x803C8000;
+  write(ENTRY - 32, START2);
+  write(ENTRY - 32 + 4, END2);
+  write(ENTRY - 32 + 8, 4);
+  write(ENTRY - 32 + 12, 0x80000000 + DESC2);
+  write(DESC2 + 4, 0x80000000 + DESC2);
+  write(DESC2 + 0x14, START2);
+  write(DESC2 + 0x18, END2);
+  write(0x3C0004, 0);
+  write(0x3C0008, 0x80000000 + DESC2);
+  write(0x3C000C, END2);
+  assert(RL::HeapFreePayloads(ram).size() == 3);
+  write(ENTRY - 32 + 12, 0);
+  assert(RL::HeapFreePayloads(ram) == expected);
+  // One bad slot never hides a heap another valid slot still names.
+  ram[ENTRY + 12] ^= 0x40;
+  assert(RL::HeapFreePayloads(ram) == expected);
+  ram[ENTRY + 12] ^= 0x40;
+  // A block claimed by another heap ends the walk instead of being trusted.
+  write(0x392108, 0x80000000 + DESC + 0x20);
+  assert(RL::HeapFreePayloads(ram).empty());
+  write(0x392108, 0x80000000 + DESC);
+  // A backward link terminates the walk rather than looping forever.
+  write(0x39210C, 0x80392000);
+  assert(RL::HeapFreePayloads(ram).empty());
+  write(0x39210C, 0x80392300);
+  assert(RL::HeapFreePayloads(ram) == expected);
+  // A link past the heap end is refused, so the free payload before it stands
+  // and the unterminated remainder is never claimed.
+  write(0x39230C + 0x10, END + 0x10);
+  assert((RL::HeapFreePayloads(ram) == std::vector<RL::Range>{{0x392110, 0x392300}}));
+}
+
 // Lifecycle canonicalization drops only an expired busy-poll generation;
 // it must retain same-frame progress that controls audio-loader catch-up.
 static void TestAudioPollFrame()
@@ -3029,6 +3120,7 @@ int main()
   TestMispredictedPlayers();
   TestStreetEventRankingPadding();
   TestInGameHeapNamePadding();
+  TestHeapFreePayloads();
   TestAudioPollFrame();
   TestWindowUndoLog();
   TestTelemetryLockstepEvidence();

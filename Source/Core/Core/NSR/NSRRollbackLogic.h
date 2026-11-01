@@ -239,6 +239,104 @@ inline std::vector<Range> MergeRanges(std::vector<Range> ranges)
   return merged;
 }
 
+// GN7E69 rev 0: a freed heap block's leftover bytes are not game state, but
+// the handoff barrier hashes all of MEM1, so they get compared anyway. Once a
+// match is torn down its released arena still holds whatever the finished
+// match left there, and audio and stream code writes on audio time, so that
+// leftover legitimately differs between peers.
+//
+// Mason's 2026-10-31 session ended on exactly this. Generation 3 played clean
+// (3528/3570 rollbacks, uncorrectable 0, lockstep_desyncs 0), then the lockstep
+// handoff into the fourth game aborted with three contiguous 64 KiB units
+// differing at guest 0x81130000-0x81160000. Those units hold four differing
+// words, all inside one 3.98 MB *free* block of the main heap (descriptor
+// 0x804CB810): three pointers to early main-heap nodes and one 0x7F audio
+// level, left behind by the match that had just ended. A paired capture
+// reproduces it, and masking these ranges makes all three units agree.
+//
+// What makes the exclusion safe is that the allocator's structure is
+// deterministic shared state while only the dead payload is per-machine: both
+// peers derive byte-identical free extents from their own memory. So exclude
+// each free block's payload and nothing else. Block headers, aligned
+// pre-headers and every used payload stay hashed, which is what still catches
+// a divergence in the allocator itself - and a structural difference also
+// changes the exclusion set, which peers compare separately from the digest.
+// This is narrower than the audio-heap rule in DigestExclusions, which also
+// excludes headers and counters because audio allocation timing moves them.
+//
+// Heaps come from the game's heap table: 16-byte entries
+// {start, end, index, descriptor} in a stack ending at the slot
+// InGameHeapNamePadding validates. Validate every entry and descriptor the
+// same way so a short or unbooted image yields nothing rather than a guess,
+// and dedupe descriptors, because the table holds the active heap twice while
+// one is pushed. Returns physical ranges, for the digest and the dump
+// sidecars alike. Revisit the window or the block layout only with allocator
+// evidence; never widen this to a used payload.
+inline std::vector<Range> HeapFreePayloads(std::span<const std::uint8_t> ram)
+{
+  constexpr std::uint32_t BASE = 0x80000000;
+  constexpr std::uint32_t TOP_ENTRY = 0x80384C20;  // see InGameHeapNamePadding
+  constexpr std::uint32_t ENTRIES = 16;            // bounded window, deduped
+  constexpr std::uint32_t MIN_ADDRESS = BASE + 0x3100;
+  constexpr int MAX_BLOCKS = 200000;               // as the runtime walk bounds
+  const auto fits = [&](std::uint32_t address, std::uint32_t size) {
+    if (address < MIN_ADDRESS || (address & 3) != 0)
+      return false;
+    const std::size_t offset = address - BASE;
+    return offset <= ram.size() && size <= ram.size() - offset;
+  };
+  const auto read = [&](std::uint32_t address) {
+    const std::size_t offset = address - BASE;
+    return (std::uint32_t{ram[offset]} << 24) | (std::uint32_t{ram[offset + 1]} << 16) |
+           (std::uint32_t{ram[offset + 2]} << 8) | ram[offset + 3];
+  };
+  std::vector<Range> ranges;
+  std::vector<std::uint32_t> seen;
+  for (std::uint32_t slot = 0; slot < ENTRIES; ++slot)
+  {
+    const std::uint32_t entry = TOP_ENTRY - slot * 16;
+    if (!fits(entry, 16))
+      continue;
+    const std::uint32_t start = read(entry);
+    const std::uint32_t end = read(entry + 4);
+    const std::uint32_t descriptor = read(entry + 12);
+    if ((descriptor & 15) != 0 || !fits(descriptor, 0x100) ||
+        read(descriptor + 4) != descriptor)
+      continue;
+    if (read(descriptor + 0x14) != start || read(descriptor + 0x18) != end)
+      continue;
+    if (start >= end || !fits(start, end - start))
+      continue;
+    if (std::find(seen.begin(), seen.end(), descriptor) != seen.end())
+      continue;
+    seen.push_back(descriptor);
+    // Walk the chain as the runtime's audio-heap walk does: an aligned block
+    // (size class 0x1C) starts with a 16-byte pre-header whose real header
+    // follows it, and a header whose used byte is clear is free.
+    std::uint32_t block = start;
+    for (int walked = 0; walked < MAX_BLOCKS; ++walked)
+    {
+      if (block < start || block + 0x20 > end || !fits(block, 0x20))
+        break;
+      std::uint32_t header = block;
+      if (read(block + 8) != descriptor && read(block + 0xC) == 0 &&
+          (read(block + 4) & 0xFFFF0000) == 0x001C0000)
+        header = block + 0x10;
+      if (!fits(header, 0x10))
+        break;
+      const std::uint32_t next = read(header + 0xC);
+      if (read(header + 8) != descriptor || next <= header + 0x10 || next > end)
+        break;
+      if ((read(header + 4) & 0xFF00) == 0)
+        ranges.push_back({header + 0x10 - BASE, next - BASE});
+      if (next <= block)
+        break;
+      block = next;
+    }
+  }
+  return MergeRanges(std::move(ranges));
+}
+
 // Pure audio-model arithmetic. Wrapping subtraction matches the guest's u32
 // frame clock and therefore remains correct across frame-number rollover.
 constexpr std::uint32_t AudioNow(std::uint32_t frame, std::uint32_t in_frame_waits,
