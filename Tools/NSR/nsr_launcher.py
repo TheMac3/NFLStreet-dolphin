@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026 Mason Blanchard
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""nsr_launcher.py: "NFLStreetRollback", the friend-facing launcher for NFLStreet netplay
-("NFLStreetRollback.exe"; short form "NSRB"; the module, NSR_* variables and
+"""nsr_launcher.py: "NFLStreetRemastered", the friend-facing launcher for NFLStreet netplay
+("NFLStreetRemastered.exe"; short form "NSRM"; the module, NSR_* variables and
 nsr-*.json/.txt file names keep their old internal names on purpose).
 
 A window that replaces command lines and .bat files. It lives in the
@@ -13,7 +13,7 @@ NFLStreet-dolphin folder (next to Dolphin.exe) and handles these workflows:
      a private rollback copy. Settings → Advanced owns source selection;
      each family keeps separate image/config/content paths and room identity. An image from an older (lockstep) download is detected and
      must be rebuilt.
-  2. Play: Host (Create room: shows a code like NSRB-4K7QX, lists who joined,
+  2. Play: Host (Create room: shows a code like NSRM-4K7QX, lists who joined,
      Start) or Join (type the code, wait for Start), via the rendezvous server
      (room codes + hole punching, so usually no router setup). "Host by IP
      address" / typing an IP is the advanced fallback. Then it starts the
@@ -88,7 +88,7 @@ import nsr_patcher as patcher  # noqa: E402
 import nsr_textures as textures  # noqa: E402
 import nsr_branding as branding
 
-APP_TITLE = "NFLStreetRollback"  # window title; user-facing product name
+APP_TITLE = "NFLStreetRemastered"  # window title; user-facing product name
 CONFIG_NAME = "nsr-launcher.json"
 # Rollback input delay, the same for every player (the host's choice is sent
 # to all). AUTO_DELAY (the default) lets the host's Dolphin choose 1..4 frames
@@ -164,7 +164,7 @@ def app_dir() -> str:
     return os.getcwd()
 
 
-GAME_STATS_NOTE = ("Final scores and box-score stats of the games you finish in NFLStreetRollback (the "
+GAME_STATS_NOTE = ("Final scores and box-score stats of the games you finish in NFLStreetRemastered (the "
                    "files its Dolphin saves after the Game Stats/MVP screens), your name above and a random "
                    "ID for this install. Never other files, folder paths, or your PC's name. Untick to upload "
                    "nothing.")
@@ -558,6 +558,10 @@ class Launcher:
         self._loop_spawn = loop_spawn or (lambda fn: threading.Thread(target=fn, daemon=True).start())
         self._stop = threading.Event()
         self._stats_wake = threading.Event()
+        # Last logged uploader outcome. Only transitions reach the log: the loop
+        # runs every few minutes, and a stuck state used to be invisible there
+        # because nothing was written unless a file was actually sent.
+        self._stats_logged = None
         self.uploader = gamestats.Uploader(self.folder, **({"post": stats_post} if stats_post else {}))
         self.rv_server = rendezvous_server(self.folder)
         # Content updates: fetch(url, limit) -> bytes and the trusted keys are
@@ -1050,7 +1054,7 @@ class Launcher:
     # -- controllers --
     def reborn_install(self, search: bool = False) -> str | None:
         """Reborn's install folder: from the last image build, else (search=True)
-        found on disk like NFLStreetRollback-Patcher does."""
+        found on disk like NFLStreetRemastered-Patcher does."""
         if self._source_kind == "owned" or patcher.read_manifest(self.game_dir).get("base_family") == patcher.ownimage_build.FAMILY:
             return None
         install = self.cfg.get("reborn_install") or self._patcher.saved_reborn_install(self.folder)
@@ -1075,7 +1079,7 @@ class Launcher:
             source = None
             synced = record.get("written") == controllers.text_hash(controllers.read_text(own_pad) or "")
             res = controllers.SyncResult("up-to-date" if synced else "kept-yours", record,
-                                         "Using your saved NFLStreetRollback controller settings.")
+                                         "Using your saved NFLStreetRemastered controller settings.")
         else:
             source = controllers.find_reborn_source(self.reborn_install(search), self._env)
             res = controllers.sync_controllers(self.user_dir, source, record, force)
@@ -1279,7 +1283,7 @@ class Launcher:
             return self._content("current", f"Up to date: {what}")
         if not self._usable(payload):
             return self._content("blocked", f"Game content v{release['version']} needs a newer "
-                                            "NFLStreetRollback download. Ask Mason for it.")
+                                            "NFLStreetRemastered download. Ask Mason for it.")
         if not user and not self.state["content"]["auto"]:
             return self._content("available", f"Update available: {what}. Click “Check for updates” to install it.")
         if not user and installed is None and self.state["game"]["state"] == "ready":
@@ -1840,6 +1844,16 @@ class Launcher:
         self._set("game_stats", state=res["state"], text=text, sent=res["total_sent"], pending=res["pending"])
         if res.get("sent"):
             log(self.folder, f"game stats: sent {res['sent']}, {res['pending']} pending")
+        # A state that never changes is the interesting case: "no-token" or an
+        # absent GameStats folder can persist for weeks while the only symptom
+        # is that no results arrive.  Log every transition once, with the facts
+        # needed to tell those apart, and never the upload key itself.
+        mark = (res["state"], bool(dirs), bool(url), res["pending"])
+        if mark != self._stats_logged:
+            self._stats_logged = mark
+            log(self.folder, f"game stats: {res['state']}, {res['pending']} pending, "
+                             f"captures folder {'found' if dirs else 'missing'}, "
+                             f"server {'known' if url else 'unknown'}")
         return res
 
     def _stats_loop(self) -> None:
@@ -1905,7 +1919,7 @@ class Launcher:
         self._set(branded_art=bool(on))
         self.cfg["branded_art"] = bool(on)
         self._save()
-        self.notify("NSRB loading artwork " + ("enabled when HD art is in use." if on else "disabled; the underlying art returns next launch."))
+        self.notify("NSRM loading artwork " + ("enabled when HD art is in use." if on else "disabled; the underlying art returns next launch."))
 
     def import_owned_hd(self) -> None:
         """Explicit Advanced action; startup and launch never call this method."""
@@ -2293,7 +2307,7 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     ttk.Button(sp, text="Copy my Reborn HD art for my own disc", command=launcher.import_owned_hd).grid(row=15, column=0, columnspan=4, sticky="w")
     label(sp, 16).configure(text="Optional, this PC only. Requires your own Reborn install; without one nothing changes. Copies HD textures only; your disc and Reborn stay unchanged.")
     brand_var = tk.BooleanVar(value=launcher.cfg.get("branded_art", True))
-    ttk.Checkbutton(sp, text="Use NSRB loading artwork when HD art is in use", variable=brand_var,
+    ttk.Checkbutton(sp, text="Use NSRM loading artwork when HD art is in use", variable=brand_var,
                     command=lambda: launcher.set_branded_art(brand_var.get())).grid(row=17, column=0, columnspan=4, sticky="w")
     owned_hd_text = label(sp, 18)
     content_text = label(sp, 9, pady=(14, 4))

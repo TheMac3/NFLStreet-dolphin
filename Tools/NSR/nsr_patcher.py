@@ -8,7 +8,7 @@ verified recipe. Native builds currently require an output under local/ and
 stock content/draft policy; the standalone launcher uses local/GameSources/owned
 without requiring a repository. See docs/ownimage.md for qualification scope. Conflicting file references fail closed.
 
-For friends testing the POC. Double-click NFLStreetRollback-Patcher.exe (built from this file
+For friends testing the POC. Double-click NFLStreetRemastered-Patcher.exe (built from this file
 with PyInstaller) inside the NFLStreet netplay Dolphin folder, and it:
 
   1. finds the NFL Street Reborn game image (<Reborn install>/content/games/
@@ -38,7 +38,7 @@ rewrites the roster file inside the fresh copy and requires the result to
 match the fingerprint the signed manifest predicts for this Reborn input. The
 patched image is each player's own copy, made from their own install.
 
-Usage: NFLStreetRollback-Patcher.exe [path\\to\\NSR.iso]      (no argument: search, then ask)
+Usage: NFLStreetRemastered-Patcher.exe [path\\to\\NSR.iso]      (no argument: search, then ask)
        python3 tools/nsr_patcher.py [NSR.iso] [--out DIR] [--no-pause]
 """
 from __future__ import annotations
@@ -210,7 +210,7 @@ def reborn_install_of(iso: str) -> str | None:
 def saved_reborn_install(out_dir: str) -> str | None:
     """The Reborn install recorded next to nsr-net.iso by the last build
     (REBORN_PATH_NAME), if it still exists. Lets the launcher use Reborn's HD
-    textures when the image was built by NFLStreetRollback-Patcher.exe rather than by the
+    textures when the image was built by NFLStreetRemastered-Patcher.exe rather than by the
     launcher itself."""
     try:
         with open(os.path.join(out_dir, REBORN_PATH_NAME)) as f:
@@ -323,7 +323,7 @@ def prepare_owned_image(image: str, out_dir: str, progress=None) -> Prepared:
     if not converter and Path("/usr/games/dolphin-tool").is_file():
         converter = "/usr/games/dolphin-tool"
     if not converter:
-        raise ValueError("This download is missing DolphinTool. Use the complete NFLStreetRollback download or an ISO copy of your own disc.")
+        raise ValueError("This download is missing DolphinTool. Use the complete NFLStreetRemastered download or an ISO copy of your own disc.")
     with tempfile.TemporaryDirectory(prefix="convert-", dir=out_dir) as scratch:
         normalized = os.path.join(scratch, "source.iso")
         if progress:
@@ -397,7 +397,7 @@ def prepare_image(iso: str, out_dir: str, progress=None, content: "nsr_content.C
                                 "Locate Reborn in Settings → Advanced. Your existing game copy is kept.")
     install = reborn_install_of(iso)
     if install and Path(out_dir).resolve().is_relative_to(Path(install).resolve()):
-        raise ValueError("Keep NFLStreetRollback in its own folder outside Reborn before building/importing.")
+        raise ValueError("Keep NFLStreetRemastered in its own folder outside Reborn before building/importing.")
     if content and (ratingsplit.requires_runtime(content.edits) or
                     content.release["recipe"] == ratingsplit.RUNTIME_RECIPE):
         raise nsr_content.ContentError(
@@ -417,7 +417,7 @@ def prepare_image(iso: str, out_dir: str, progress=None, content: "nsr_content.C
         content = None
     expected_recipe = ratingsplit.RECIPE if content and ratingsplit.enabled(content.edits) else ROLLBACK_RECIPE
     if build and content.release["recipe"] != expected_recipe:
-        raise nsr_content.ContentError("this update is for a different NFLStreetRollback version")
+        raise nsr_content.ContentError("this update is for a different NFLStreetRemastered version")
     if build and known and known[1] != build["base_sha256"]:
         raise nsr_content.ContentError("this update was made for a different patch build")
     out = os.path.join(out_dir, OUTPUT_NAME)
@@ -551,13 +551,13 @@ def image_fingerprint(out_dir: str, progress=None) -> str | None:
 
 def run(iso: str | None, out_dir: str, draft_order="alternating", draft_first="stock") -> int:
     """Build the chosen image recipe and show its room compatibility fingerprint."""
-    print("NFLStreetRollback netplay image builder\n")
+    print("NFLStreetRemastered netplay image builder\n")
     if not iso:
         print("Looking for NFL Street Reborn...")
         iso = find_reborn_iso() or ask_for_iso()
     if not iso or not os.path.isfile(iso):
         print("Couldn't find Reborn's NSR.iso. Run this again with its path, e.g.\n"
-              '  NFLStreetRollback-Patcher.exe "C:\\...\\NFL Street Reborn\\content\\games\\NSR.iso"')
+              '  NFLStreetRemastered-Patcher.exe "C:\\...\\NFL Street Reborn\\content\\games\\NSR.iso"')
         return 1
     print(f"Source image: {iso}\n")
     started = time.time()
@@ -600,7 +600,7 @@ def run(iso: str | None, out_dir: str, draft_order="alternating", draft_first="s
     if r.reborn_install:
         print("The launcher will import textures locally from your Reborn install on first start.")
     print("\nYour source image was only read, never changed.")
-    print(f"Next: start a game with the NFLStreetRollback launcher (it uses {os.path.join(game_dir, OUTPUT_NAME)}).")
+    print(f"Next: start a game with the NFLStreetRemastered launcher (it uses {os.path.join(game_dir, OUTPUT_NAME)}).")
     return 0
 
 

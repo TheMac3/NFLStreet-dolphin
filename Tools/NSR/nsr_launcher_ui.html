@@ -2,7 +2,7 @@
 <!-- Copyright (C) 2026 Mason Blanchard
      SPDX-License-Identifier: GPL-2.0-or-later -->
 <!--
-  nsr_launcher_ui.html: the "NFLStreetRollback" window (pywebview / Edge WebView2).
+  nsr_launcher_ui.html: the "NFLStreetRemastered" window (pywebview / Edge WebView2).
 
   A view only: every action calls the Python Launcher (tools/nsr_launcher.py)
   through window.pywebview.api, and the page re-renders from api.snapshot()
@@ -22,7 +22,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NFLStreetRollback</title>
+<title>NFLStreetRemastered</title>
 <style>
 @font-face { font-family: "Redline Sans"; src: url("__NSRB_FONT__") format("woff2"); font-weight: 100 1000; font-stretch: 75% 125%; font-display: swap; }
 :root {
@@ -216,7 +216,7 @@ h1 { text-transform:uppercase; font-size:38px; border-bottom:3px solid var(--red
 <body>
 <div class="app">
   <aside class="side">
-    <div class="brand"><div class="mark"><img src="__NSRB_MARK__" width="32" height="32" alt="NSRB return mark"></div><div><b>NFL Street /<br>Rollback</b><span>Local / Netplay</span></div></div>
+    <div class="brand"><div class="mark"><img src="__NSRB_MARK__" width="32" height="32" alt="NSRM return mark"></div><div><b>NFL Street /<br>Remastered</b><span>Local / Netplay</span></div></div>
     <nav class="nav" id="nav">
       <button data-page="play" class="on"><svg viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg>Play</button>
       <button data-page="host"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="2.5"/><path d="M7.8 7.8a6 6 0 0 0 0 8.4M16.2 7.8a6 6 0 0 1 0 8.4M4.9 4.9a10 10 0 0 0 0 14.2M19.1 4.9a10 10 0 0 1 0 14.2"/></svg>Host</button>
@@ -235,10 +235,10 @@ h1 { text-transform:uppercase; font-size:38px; border-bottom:3px solid var(--red
     <!-- PLAY -->
     <section class="page on" id="page-play">
       <div class="hero">
-        <img class="brand-hero" src="__NSRB_HERO__" alt="NFL Street / Rollback. IT’S MY HOUSE. Run it back.">
+        <img class="brand-hero" src="__NSRB_HERO__" alt="NFL Street / Remastered. IT’S MY HOUSE. Run it back.">
         <div class="user pill"><span class="dot" id="userDot"></span><span id="userName">Player</span><span class="faint">· Port 1</span></div>
         <div class="logo">
-          <h1 class="sr-only">NFL Street Rollback — IT’S MY HOUSE.</h1>
+          <h1 class="sr-only">NFL Street Remastered — IT’S MY HOUSE.</h1>
 
           <div class="tagline sr-only">Play NFL Street 2 online with friends: 2 to 4 players, rollback netcode, room codes. Use your own disc or Reborn.</div>
         </div>
@@ -264,7 +264,7 @@ h1 { text-transform:uppercase; font-size:38px; border-bottom:3px solid var(--red
             <div class="mode red sel" id="modeRoom">
               <span class="corner pill" id="hostCount"><span class="dot"></span><span>0 joined</span></span>
               <div class="label" style="color:#ffb3b6">Room code</div>
-              <div class="code empty" id="roomCode">NSRB-·····</div>
+              <div class="code empty" id="roomCode">NSRM-·····</div>
               <h2 id="roomTitle">Create a room</h2>
               <p id="roomHint">No router setup needed. Up to 4 players.</p>
               <div class="row" style="margin-top:16px">
@@ -313,7 +313,7 @@ h1 { text-transform:uppercase; font-size:38px; border-bottom:3px solid var(--red
       <div class="grid">
         <div class="card" style="padding:26px">
           <div class="label" style="margin-bottom:8px">Room code (or host IP address)</div>
-          <input class="field code-in" id="joinCode" placeholder="NSRB-XXXXX" maxlength="64" spellcheck="false" autocomplete="off">
+          <input class="field code-in" id="joinCode" placeholder="NSRM-XXXXX" maxlength="64" spellcheck="false" autocomplete="off">
           <div class="row" style="margin-top:16px">
             <button class="btn red big" id="btnJoin">Join room</button>
             <button class="btn" id="btnLeave" disabled>Leave</button>
@@ -344,7 +344,7 @@ h1 { text-transform:uppercase; font-size:38px; border-bottom:3px solid var(--red
           <div class="path" id="ctlSource"></div>
         </div>
         <div class="card"><div class="label">Port 1 buttons</div><div class="binds" id="binds"></div>
-          <div class="note">Click “Set up controllers…” to map Port 1 in NFLStreetRollback’s own Dolphin. Your mapping is kept. Reborn players can also import their existing setup.</div></div>
+          <div class="note">Click “Set up controllers…” to map Port 1 in NFLStreetRemastered’s own Dolphin. Your mapping is kept. Reborn players can also import their existing setup.</div></div>
       </div>
       <div class="card" style="margin-top:20px"><div class="label" style="margin-bottom:8px">Button icons in the game</div>
         <div class="seg" id="iconSeg"></div>
@@ -367,7 +367,7 @@ h1 { text-transform:uppercase; font-size:38px; border-bottom:3px solid var(--red
             <div class="note" style="margin-top:4px">Connection and rollback counters, your name and the room code, to help fix netplay. Never your button presses, files, or game data. Off: nothing is sent or kept.</div></div></div>
           <div style="height:14px"></div>
           <div class="toggle" id="gameStats"><div class="switch"></div><div><b>Upload game results to Mason's server</b>
-            <div class="note" style="margin-top:4px">For the shared Stats page: final scores and box-score stats of the games you finish in NFLStreetRollback (saved after the Game Stats/MVP screens), your name and a random ID for this install. Never other files, folder paths, or your PC's name. Off: nothing is uploaded.</div>
+            <div class="note" style="margin-top:4px">For the shared Stats page: final scores and box-score stats of the games you finish in NFLStreetRemastered (saved after the Game Stats/MVP screens), your name and a random ID for this install. Never other files, folder paths, or your PC's name. Off: nothing is uploaded.</div>
             <div class="note" id="gameStatsText" style="margin-top:4px"></div></div></div>
         </div>
         <div class="card"><div class="label">Play-call privacy</div>
@@ -413,7 +413,7 @@ h1 { text-transform:uppercase; font-size:38px; border-bottom:3px solid var(--red
           <div class="row" style="margin-top:16px"><button class="btn" id="btnOwnedHd">Copy my Reborn HD art for my own disc</button></div>
           <div class="info" id="ownedHdResult" aria-live="polite"></div>
           <div class="note">Optional, this PC only. Requires your own Reborn install. Without one, nothing changes. Copies HD textures only; your disc and Reborn stay unchanged. Import results appear in the notification below.</div>
-          <label class="note"><input type="checkbox" id="brandedArt" checked> Use NSRB loading artwork when HD art is in use</label>
+          <label class="note"><input type="checkbox" id="brandedArt" checked> Use NSRM loading artwork when HD art is in use</label>
           <div class="note">Use Reborn or your own NFL Street 2 USA revision 0 disc (ISO, CISO or RVZ). Your source stays unchanged. Friends must pick the same source. Own-disc players get the original game look; add optional packs under TexturePacks/GN7E69/&lt;pack&gt;/ and button icons under ButtonIcons/GN7E69/&lt;playstation or xbox&gt;/.</div>
         </details>
         <div class="card">
@@ -439,7 +439,7 @@ h1 { text-transform:uppercase; font-size:38px; border-bottom:3px solid var(--red
         <div class="card"><h3>Playing</h3><ol>
           <li>Settings: type your name. Advanced → Game source lets you choose Reborn or browse to your own disc. The first start gets the game ready automatically.</li>
           <li>Controllers: set up Port 1 in our Dolphin. Reborn players can use their existing mapping.</li>
-          <li>Host: Create room, send friends the NSRB-XXXXX code, Start when everyone is listed.</li>
+          <li>Host: Create room, send friends the NSRM-XXXXX code, Start when everyone is listed.</li>
           <li>Join: type the code, click Join, wait for the host to start.</li>
         </ol></div>
         <div class="card"><h3>If something's wrong</h3><ol>
@@ -532,7 +532,7 @@ function render(s) {
   setText("roomsText", s.rooms ? "Room codes on" : "Room codes off in this download");
   const open = h.state === "open" || h.state === "starting";
   const roomCode = h.mode === "room" ? h.code : (h.mode === "ip" ? "BY IP" : "");
-  setText("roomCode", roomCode || "NSRB-·····"); $("roomCode").classList.toggle("empty", !roomCode);
+  setText("roomCode", roomCode || "NSRM-·····"); $("roomCode").classList.toggle("empty", !roomCode);
   setText("roomTitle", open ? (h.mode === "ip" ? "Lobby open (by IP)" : "Room open") : h.state === "opening" ? "Creating…" : "Create a room");
   setText("roomHint", open ? "Send the code, then Start when everyone's listed." : "No router setup needed. Up to 4 players.");
   show("btnOpen", !open); enable("btnOpen", s.rooms && h.state === "idle");
@@ -721,11 +721,11 @@ function renderSeg(id, items, current, pick) {
 }
 
 function demoApi(page) {
-  const names = { host: ["Mason", "Tuna", "wolfspeedy"], join: ["Marcus", "Mason"] };
-  const base = { rev: 1, name: "Mason", telemetry: true, delay: 1,
+  const names = { host: ["PlayerOne", "PlayerTwo", "PlayerThree"], join: ["PlayerFour", "PlayerOne"] };
+  const base = { rev: 1, name: "PlayerOne", telemetry: true, delay: 1,
     quickstart: "pickup", game_modes: { "quick-play": "Quick Play", pickup: "Pickup Game", manual: "Manual (menus)" },
     game_stats: { enabled: true, state: "ok", text: "14 game result files sent.", sent: 14, pending: 0 }, max_delay: 4, last_host: "", rooms: true,
-    folder: "C:\\Users\\mason\\Desktop\\NFLStreetRollback",
+    folder: "C:\\Users\\you\\Desktop\\NFLStreetRemastered",
     game: { draft_order: "snake", draft_first: "team-two", state: "ready", text: "Ready for rollback netplay.", fingerprint: "7F3A-29C4", note: "", progress: null, busy: false, content: { version: 3, serial: 4 } },
     content: { state: "current", text: "Up to date: content v3 — Week 6 speed tweaks", version: 3, latest: 3,
       changelog: "Week 6 speed tweaks", auto: true, busy: false },
@@ -739,13 +739,13 @@ function demoApi(page) {
           ["C up","Axis Zr-"],["C down","Axis Zr+"],["C left","Axis Z-"],["C right","Axis Z+"],["D-pad up","Hat 0 N"],["D-pad down","Hat 0 S"],
           ["D-pad left","Hat 0 W"],["D-pad right","Hat 0 E"]].map(([control, input]) => ({ control, input })) } },
     textures: { icons: "auto", effective: "playstation", why: "auto:playstation", base_kind: "library",
-      base: "C:\\Users\\mason\\AppData\\Roaming\\NFL Street Reborn\\library\\textures\\GN7E69", packages: [], warning: "" },
+      base: "C:\\Users\\you\\AppData\\Roaming\\NFL Street Reborn\\library\\textures\\GN7E69", packages: [], warning: "" },
     resolution: 0, fullscreen: true, volume: 40, hide_play_calls: true,
     notice: null };
-  if (page === "host") Object.assign(base.host, { state: "open", mode: "room", code: "NSRB-4K7QX", players: names.host, can_start: true,
+  if (page === "host") Object.assign(base.host, { state: "open", mode: "room", code: "NSRM-4K7QX", players: names.host, can_start: true,
     info: "Room open. Give your friends this code; click Start when everyone's listed." });
-  if (page === "join") base.last_host = "NSRB-4K7QX";
-  if (page === "join") Object.assign(base.join, { state: "waiting", players: names.join, info: "Joined NSRB-4K7QX… waiting for the host to start." });
+  if (page === "join") base.last_host = "NSRM-4K7QX";
+  if (page === "join") Object.assign(base.join, { state: "waiting", players: names.join, info: "Joined NSRM-4K7QX… waiting for the host to start." });
   if (page === "settings") Object.assign(base.game, { state: "building", text: "Building the netplay copy…", fingerprint: "", progress: 62, busy: true });
   return new Proxy({ snapshot: async (since) => since === base.rev ? null : base }, { get: (t, k) => t[k] || (async () => null) });
 }

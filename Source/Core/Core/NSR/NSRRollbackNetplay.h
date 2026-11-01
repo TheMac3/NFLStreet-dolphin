@@ -21,7 +21,9 @@
 
 namespace NSRNetplay::RollbackNet
 {
-constexpr std::uint32_t MAGIC = 0x4E535242;  // 'NSRB'
+constexpr std::uint32_t MAGIC = 0x4E535242;  // 'NSRB', the wire magic;
+// these bytes predate the NFLStreetRemastered rename and do not follow it,
+// because changing them would stop older peers speaking to newer ones.
 constexpr std::uint32_t HANDOFF_MAGIC = 0x4E535248;  // 'NSRH'
 // VERSION 5: the checksum field carries the canonical state digest (see
 // NSRNetplay's StateDigest) instead of the nine-word semantic hash, and every

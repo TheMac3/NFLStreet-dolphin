@@ -5,7 +5,7 @@
 Reborn's own Dolphin writes one JSON capture per finished game (schema
 nsr.game.v1) into `GameStats/` in its Dolphin user folder, and Reborn's
 launcher moves captures into `<data root>/stats/queue/` for its Stats page.
-The NFLStreetRollback launcher uses this module to send new captures to Mason's
+The NFLStreetRemastered launcher uses this module to send new captures to Mason's
 telemetry server (POST /v1/games, docs/stats.md), so everyone's games land in
 one place without anybody copying files around.
 
@@ -15,7 +15,7 @@ by content hash in `nsr-gamestats.json` next to the launcher, so moving a file
 from GameStats/ into the queue never uploads it twice; the server dedupes too.
 
 Pure helpers plus a small Uploader with an injectable HTTP poster, so tests
-need no network. Stdlib only (bundled into "NFLStreetRollback.exe").
+need no network. Stdlib only (bundled into "NFLStreetRemastered.exe").
 """
 from __future__ import annotations
 

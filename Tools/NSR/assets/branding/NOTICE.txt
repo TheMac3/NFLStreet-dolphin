@@ -1,4 +1,4 @@
-NFLStreetRollback
+NFLStreetRemastered
 Copyright (C) 2026 Mason Blanchard
 
 This program is free software; see LICENSE (GNU General Public License,
@@ -20,7 +20,7 @@ which terms apply to which file.
 Names and marks
 ---------------
 
-The NFLStreetRollback name, logotype, wordmark and icon are NOT licensed
+The NFLStreetRemastered name, logotype, wordmark and icon are NOT licensed
 under the GPL and are not covered by LICENSE. You may redistribute and modify
 the code under the GPL, but a modified version must not use these marks in a
 way that suggests it is the original project or endorsed by it. Remove or

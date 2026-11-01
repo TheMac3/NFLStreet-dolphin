@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026 Mason Blanchard
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""nsr_textures.py: the HD texture set NFLStreetRollback's Dolphin shows, built from
+"""nsr_textures.py: the HD texture set NFLStreetRemastered's Dolphin shows, built from
 the player's own NFL Street Reborn install.
 
 Why: Reborn's game image draws placeholder art ("MISSING TEXTURES" title and menu
@@ -311,7 +311,7 @@ def write_list(our_user_dir: str, ts: TextureSet) -> str | None:
             pass
         return None
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    text = ("# Written by NFLStreetRollback before each launch; lowest precedence first.\n"
+    text = ("# Written by NFLStreetRemastered before each launch; lowest precedence first.\n"
             f"# {ts.summary()}\n" + "".join(os.path.abspath(f) + "\n" for f in folders))
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as f:
@@ -542,7 +542,7 @@ def _check_space(path: Path, required: int, *, owned: bool = False) -> None:
         action = "Copy my Reborn HD art for my own disc" if owned else "Re-import from Reborn"
         raise ImportError(f"Not enough disk space to import Reborn textures: need "
                           f"{required / (1 << 20):.1f} MB free, have {free / (1 << 20):.1f} MB. "
-                          f"Free space in the NFLStreetRollback drive and click {action}. "
+                          f"Free space in the NFLStreetRemastered drive and click {action}. "
                           "Completed files will be resumed; your existing game copy is kept.")
 
 
@@ -571,7 +571,7 @@ def ensure_store(folder: str, install: str | None, env=os.environ, *, force: boo
         raise ImportError("Reborn is needed for this import. Your existing local game and textures are kept.")
     if any(root.resolve().is_relative_to(Path(source_root).resolve())
            for source_root in controllers.data_roots(install, env)):
-        raise ImportError("Keep NFLStreetRollback in its own folder outside Reborn before importing.")
+        raise ImportError("Keep NFLStreetRemastered in its own folder outside Reborn before importing.")
     plan = _inventory(install, env, version, owned=owned)
     if owned:
         plan["provenance"] = "player-initiated local Reborn HD library copy"

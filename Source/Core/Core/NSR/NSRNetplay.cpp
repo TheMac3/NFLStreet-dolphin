@@ -887,7 +887,7 @@ void HandleBootPacket(const ENetPacket* packet, u32 source)
       std::string names;
       for (const auto& name : differences)
         names += (names.empty() ? "" : ", ") + name;
-      Log("boot sync mismatch from player {} BEFORE boot: {}. Use the same NFLStreetRollback build "
+      Log("boot sync mismatch from player {} BEFORE boot: {}. Use the same NFLStreetRemastered build "
           "and session settings on every PC.", sender, names);
       NSRTelemetry::Event(NSRTelemetry::EventKind::ConfigMismatch, 0,
                           {NSRTelemetry::Int("player", sender)}, "boot settings: " + names);
@@ -5075,7 +5075,7 @@ bool PrepareBoot()
     return true;
   }
   Log("boot sync failed BEFORE boot (incompatible peer, disconnected peer or timeout). "
-      "All players must use the same NFLStreetRollback build; inspect the named mismatch above.");
+      "All players must use the same NFLStreetRemastered build; inspect the named mismatch above.");
   NSRTelemetry::Event(NSRTelemetry::EventKind::TransportFailure, 0, {},
                       "boot agreement failed or timed out before guest boot");
   s.failed = true;

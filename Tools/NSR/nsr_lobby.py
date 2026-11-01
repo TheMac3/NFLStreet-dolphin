@@ -6,7 +6,7 @@
 Two ways to meet:
   - Room codes (default): through the rendezvous server
     (services/rendezvous/nsr_rendezvous.py). The host gets a code like
-    NSRB-4K7QX, friends type it in, and Dolphin hole-punches the game traffic,
+    NSRM-4K7QX, friends type it in, and Dolphin hole-punches the game traffic,
     so usually nobody forwards ports. See RoomHost / join_room below.
   - Direct (advanced fallback): the host's PC runs the lobby itself and
     friends join by IP address; the host forwards TCP+UDP 51515. LobbyHost /
@@ -91,7 +91,7 @@ def quickstart_id(value=None) -> str:
     if value is None:
         return "manual"
     if not isinstance(value, str) or value not in QUICKSTARTS:
-        raise ConnectionError("Unknown game mode. Everyone needs the latest NFLStreetRollback download.")
+        raise ConnectionError("Unknown game mode. Everyone needs the latest NFLStreetRemastered download.")
     return value
 
 
@@ -113,7 +113,7 @@ def draft_settings(value=None) -> dict:
     if (not isinstance(value, dict) or set(value) != {"order", "first"}
             or value["order"] not in ("alternating", "snake", "cocky")
             or value["first"] not in ("stock", "team-one", "team-two")):
-        raise ConnectionError("Unknown Pickup draft setup. Update NFLStreetRollback.")
+        raise ConnectionError("Unknown Pickup draft setup. Update NFLStreetRemastered.")
     return dict(value)
 
 
@@ -145,7 +145,7 @@ def _agreed_mode(msg: dict, expected: str, who: str) -> str:
         raise ConnectionError(f"{who} selected an unknown netplay mode.")
     if mode != expected:
         raise ConnectionError(f"{who} started a {mode} game, but this launcher plays {expected}. "
-                              "Everyone needs the same NFLStreetRollback download.")
+                              "Everyone needs the same NFLStreetRemastered download.")
     return mode
 
 
@@ -170,7 +170,7 @@ def image_family(fingerprint: str, declared=None) -> str:
     """Keep protocol v2: infer legacy Reborn and existing owned identities when absent."""
     inferred = OWNED_FAMILY if str(fingerprint).startswith("retail:") else REBORN_FAMILY
     if declared is not None and declared != inferred:
-        raise ConnectionError("Unknown or inconsistent game source. Update NFLStreetRollback and rebuild your game copy.")
+        raise ConnectionError("Unknown or inconsistent game source. Update NFLStreetRemastered and rebuild your game copy.")
     return inferred
 
 
@@ -181,7 +181,7 @@ def family_reason(host: str | None, ours: str | None) -> str | None:
             return "Host uses Reborn's game; you use your own disc — pick the same source in Settings → Advanced."
         if host == OWNED_FAMILY and ours == REBORN_FAMILY:
             return "Host uses their own disc; you use Reborn's game — pick the same source in Settings → Advanced."
-        return "This room uses an unknown game source. Update NFLStreetRollback."
+        return "This room uses an unknown game source. Update NFLStreetRemastered."
     return None
 
 
@@ -220,7 +220,7 @@ class StartInfo:
     key: str = ""         # our per-player secret for UDP registration
     seed: int = 0x13579BDF  # per-match RNG seed, identical for every player
     mode: str = RELEASE_MODE  # "rollback": stage-4 lockstep menus + rollback matches
-    room_code: str = ""   # "NSRB-4K7QX" (display only; telemetry header)
+    room_code: str = ""   # "NSRM-4K7QX" (display only; telemetry header)
     telemetry_url: str = ""    # ingest endpoint granted by the room server
     telemetry_token: str = ""  # per-session/per-player token (docs/telemetry.md)
     quickstart: str = "manual"  # optional game-mode route, independent of netplay mode
@@ -345,17 +345,17 @@ class LobbyHost:
         content = nsr_content.room_content_reason(self.content, hello.get("content"))
         if hello.get("type") != "hello" or hello.get("version") != PROTOCOL_VERSION:
             reason = ("Your launcher is a different version from the host's. "
-                      "Everyone needs the same NFLStreetRollback download.")
+                      "Everyone needs the same NFLStreetRemastered download.")
         elif hello.get("mode", "lockstep") != self.mode:
             reason = (f"Your launcher plays {hello.get('mode', 'lockstep')} netplay; this lobby is "
-                      f"{self.mode}. Everyone needs the same NFLStreetRollback download.")
+                      f"{self.mode}. Everyone needs the same NFLStreetRemastered download.")
         elif why := family_reason(self.image_family or image_family(self.fingerprint),
                                    peer_family):
             reason = why
         elif self.quickstart != "manual" and hello.get("quickstart_version") != QUICKSTART_VERSION:
-            reason = "This room uses quickstart. Update NFLStreetRollback or ask the host for Manual (menus)."
+            reason = "This room uses quickstart. Update NFLStreetRemastered or ask the host for Manual (menus)."
         elif self.draft != draft_settings() and hello.get("draft_version") != DRAFT_VERSION:
-            reason = "This room uses custom Pickup drafting. Update NFLStreetRollback."
+            reason = "This room uses custom Pickup drafting. Update NFLStreetRemastered."
         elif content:
             reason, action = content
         elif hello.get("fingerprint") != self.fingerprint:

@@ -5,7 +5,7 @@
 Shared by two verifiers that must not grow a third-party dependency:
   - services/ratings/access.py checks Cloudflare Access JWTs (RS256);
   - tools/nsr_content.py checks signed content-update manifests inside the
-    friends' launcher (NFLStreetRollback.exe is a PyInstaller build whose
+    friends' launcher (NFLStreetRemastered.exe is a PyInstaller build whose
     pip installs are kept to pyinstaller + pywebview; see docs/content-updates.md
     "Why RSA and not Ed25519").
 

@@ -78,7 +78,7 @@ std::pair<std::string, bool> GetNameArbPair(const TextureInfo& texture_info)
 }
 
 // --- NSR: ordered texture folders (feat/textures, 2026-10-23) ---------------
-// NFLStreetRollback's launcher composes the player's texture set from their NFL
+// NFLStreetRemastered's launcher composes the player's texture set from their NFL
 // Street Reborn install without copying or modifying it: Reborn's pristine HD
 // library, the mod packages the player turned on in Reborn, then the button-icon
 // package matching their controller. It lists those folders, lowest precedence

@@ -1,6 +1,6 @@
 # Copyright (C) 2026 Mason Blanchard
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""nsr_content.py: signed content-update format for NFLStreetRollback (roster/rating updates).
+"""nsr_content.py: signed content-update format for NFLStreetRemastered (roster/rating updates).
 
 What a content release is (docs/content-updates.md): OUR edit data only, never
 game bytes. A release names one or more ratings packs (JSON lists of
@@ -57,7 +57,7 @@ MANIFEST_FORMAT = "nsrb.content.v1"
 PACK_FORMAT = "nsrb.ratings-pack.v1"
 CHANNEL = "friends"
 # Content format this launcher understands. A release with a larger
-# min_launcher needs a newer NFLStreetRollback download (it may use fields or
+# min_launcher needs a newer NFLStreetRemastered download (it may use fields or
 # build steps this code doesn't know); bump when the release format changes.
 LAUNCHER_CONTENT_FORMAT = 5  # v5: bounded roster names/roles and signed presentation art
 
@@ -448,7 +448,7 @@ def _atomic_write(path: str, data: bytes) -> None:
 
 def http_get(url: str, limit: int, timeout: float = 6.0) -> bytes:
     """GET with a byte cap. Raises OSError (offline/HTTP error) or ContentError (too big)."""
-    req = urllib.request.Request(url, headers={"User-Agent": "NFLStreetRollback-content/1",
+    req = urllib.request.Request(url, headers={"User-Agent": "NFLStreetRemastered-content/1",
                                                "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 (https checked by caller)

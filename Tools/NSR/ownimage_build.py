@@ -119,7 +119,7 @@ def output_path(output: str | Path, *, private_root: str | Path | None = None) -
             raise ValueError("owned output must be in local/GameSources/owned")
         if any((parent / "content/games/NSR.iso").exists() or
                (parent / "app/content/games/NSR.iso").exists() for parent in (root, *root.parents)):
-            raise ValueError("keep NFLStreetRollback outside the Reborn install")
+            raise ValueError("keep NFLStreetRemastered outside the Reborn install")
     return output
 
 

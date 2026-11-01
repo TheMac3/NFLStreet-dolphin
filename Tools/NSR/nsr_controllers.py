@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026 Mason Blanchard
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""nsr_controllers.py: use the player's NFL Street Reborn controller setup in NFLStreetRollback.
+"""nsr_controllers.py: use the player's NFL Street Reborn controller setup in NFLStreetRemastered.
 
 Reborn ships its own Dolphin ("NFL Street Reborn Dolphin.exe" in <install>/runtime)
 and its launcher's Controllers page writes the player's real mapping into that
@@ -426,7 +426,7 @@ def sync_controllers(our_user_dir: str, source: RebornSource | None, record: dic
         action = "first-import"
     elif ours is not None and ours_hash != record["written"]:
         return SyncResult("kept-yours", record,
-                          "Using the mapping you made in NFLStreetRollback's controller setup.")
+                          "Using the mapping you made in NFLStreetRemastered's controller setup.")
     elif ours_hash == wanted_hash:
         # Same mapping, but the port device (e.g. switching to the USB adapter,
         # which needs no mapping) lives in Dolphin.ini: keep that in step too.
