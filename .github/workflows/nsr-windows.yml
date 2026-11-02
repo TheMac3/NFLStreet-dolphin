@@ -151,6 +151,21 @@ jobs:
           pyinstaller --noconfirm --noupx --workpath pyi-build --distpath pyi-dist --onefile --console --name NFLStreetRemastered-Patcher --paths Tools/NSR Tools/NSR/nsr_patcher.py
           pyi-dist\NFLStreetRemastered-Patcher.exe --help
           if ($LASTEXITCODE -ne 0) { throw "NFLStreetRemastered-Patcher.exe --help failed" }
+          # The one-file bootstrapper (docs/autoupdate.md step 6): what Mason
+          # hands out once, instead of a zip every time. It installs the signed
+          # release into its own folder and starts it. The release channel is
+          # baked in from the NSR_BUILD_URL variable so it really is one file;
+          # without that variable it still builds and asks for --channel.
+          if ("${{ vars.NSR_BUILD_URL }}" -ne "") {
+            Set-Content -Encoding ascii Tools/NSR/nsr-channel.txt "${{ vars.NSR_BUILD_URL }}"
+            pyinstaller --noconfirm --noupx --workpath pyi-build --distpath pyi-dist --onefile --console --icon $icon --name NFLStreetRemastered-Setup --paths Tools/NSR --add-data "Tools/NSR/nsr-channel.txt;." Tools/NSR/nsr_bootstrap.py
+            Remove-Item Tools/NSR/nsr-channel.txt
+          } else {
+            pyinstaller --noconfirm --noupx --workpath pyi-build --distpath pyi-dist --onefile --console --icon $icon --name NFLStreetRemastered-Setup --paths Tools/NSR Tools/NSR/nsr_bootstrap.py
+          }
+          pyi-dist\NFLStreetRemastered-Setup.exe --help
+          if ($LASTEXITCODE -ne 0) { throw "NFLStreetRemastered-Setup.exe --help failed" }
+          "NFLStreetRemastered-Setup.exe: {0:N1} MB" -f ((Get-Item "pyi-dist/NFLStreetRemastered-Setup.exe").Length / 1MB)
           # The frozen launcher must find its bundled page and WebView2 too.
           $env:NSR_APP_DIR = (New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/nsr-selftest-exe").FullName
           $p = Start-Process -FilePath "pyi-dist/NFLStreetRemastered.exe" -ArgumentList "--selftest" -Wait -PassThru
@@ -256,6 +271,7 @@ jobs:
           # Emulator folder (or any other Dolphin's settings, e.g. Reborn's).
           Set-Content -Encoding ascii Binary/x64/portable.txt ""
           Copy-Item "pyi-dist/NFLStreetRemastered.exe" Binary/x64/
+          Copy-Item "pyi-dist/NFLStreetRemastered-Setup.exe" Binary/x64/
           Copy-Item "pyi-dist/NFLStreetRemastered-Patcher.exe" Binary/x64/
 
       - name: Room server address (if configured)
@@ -331,6 +347,9 @@ jobs:
              Owned copies keep their separate files in local/GameSources/owned/.
              NFLStreetRemastered-Patcher.exe does
              the same build on its own and is only needed for troubleshooting.
+             NFLStreetRemastered-Setup.exe is the one-file installer: you do
+             not need it when you have this folder, and running it here just
+             checks for a newer version and starts the launcher.
              If NFLStreetRemastered.exe disappears after unzipping, Windows
              Security quarantined it (unsigned test build): Windows Security ->
              Virus & threat protection -> Protection history -> Restore.
@@ -411,7 +430,7 @@ jobs:
             ($_.Name -like 'tex1_*') -or
             $_.Name -in 'nsr-telemetry.txt','nsr-net.iso','nsr-image.json','nsr-reborn.txt','nsr-launcher.json','nsr-launcher.log','GCPadNew.ini.before-reborn-import','nsr-net.cover.png','nsr-brand-cover.json' }
           if ($bad) { $bad | ForEach-Object { Write-Error "unexpected file in package: $($_.FullName)" }; exit 1 }
-          foreach ($f in 'Dolphin.exe','DolphinTool.exe','NFLStreetRemastered.exe','NFLStreetRemastered-Patcher.exe','README-FIRST.txt','VERSION.txt','SOURCE.txt','portable.txt') {
+          foreach ($f in 'Dolphin.exe','DolphinTool.exe','NFLStreetRemastered.exe','NFLStreetRemastered-Patcher.exe','NFLStreetRemastered-Setup.exe','README-FIRST.txt','VERSION.txt','SOURCE.txt','portable.txt') {
             if (-not (Test-Path "$pkg/$f")) { throw "missing $f" }
           }
           if (Test-Path "$pkg/nsr-netplay.bat") { throw "stale lockstep nsr-netplay.bat in package" }

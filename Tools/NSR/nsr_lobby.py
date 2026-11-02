@@ -70,6 +70,7 @@ from typing import Callable
 
 import nsr_content
 import nsr_playbooks as books
+import nsr_update
 
 PORT = 51515
 MAX_PLAYERS = 4
@@ -151,11 +152,20 @@ def _agreed_mode(msg: dict, expected: str, who: str) -> str:
 
 class RoomRejected(ConnectionError):
     """Refused by the host/room. action names what fixes it (e.g.
-    nsr_content.UPDATE_ACTION) when the server says so, else ""."""
+    nsr_content.UPDATE_ACTION) when the server says so, else "".
+
+    The allowed set is a whitelist on purpose: a refusal arrives from
+    whatever is on the other end of the socket, and the launcher acts on this
+    field, so an unrecognised action becomes "" rather than something the
+    peer gets to name.
+    """
+
+    ACTIONS = (nsr_content.UPDATE_ACTION, nsr_content.HOST_UPDATE_ACTION,
+               nsr_update.BUILD_UPDATE_ACTION, nsr_update.HOST_BUILD_UPDATE_ACTION)
 
     def __init__(self, reason: str, action: str = ""):
         super().__init__(reason)
-        self.action = action if action in (nsr_content.UPDATE_ACTION, nsr_content.HOST_UPDATE_ACTION) else ""
+        self.action = action if action in self.ACTIONS else ""
 
 
 def _rejected(msg: dict, default: str) -> RoomRejected:
@@ -196,8 +206,14 @@ def _family_rejected(msg: dict, fingerprint: str) -> RoomRejected:
     return _rejected(msg, "Refused.")
 
 
-def _with_content(msg: dict, content: dict | None) -> dict:
-    """Retain the verified simulation digest on direct and room-code requests."""
+def _with_content(msg: dict, content: dict | None, build: dict | None = None) -> dict:
+    """Retain the verified simulation digest on direct and room-code requests.
+
+    `build` is the peer's application version (`nsr_update.build_descriptor`).
+    It is optional in the protocol: a launcher from before build updates sends
+    none, and an absent descriptor means "do not compare" rather than a
+    refusal, so adding this does not lock anyone out of a room.
+    """
     if "fingerprint" in msg:
         msg["image_family"] = image_family(msg["fingerprint"])
     if content is not None:
@@ -205,6 +221,11 @@ def _with_content(msg: dict, content: dict | None) -> dict:
         if checked is None:
             raise ValueError("invalid installed content descriptor")
         msg["content"] = checked
+    if build is not None:
+        checked = nsr_update.parse_build_descriptor(build)
+        if checked is None:
+            raise ValueError("invalid installed build descriptor")
+        msg["build"] = checked
     return msg
 
 
@@ -269,6 +290,7 @@ class LobbyHost:
     bind: str = ""
     mode: str = RELEASE_MODE
     content: dict | None = None  # our nsr_content descriptor (None: don't compare)
+    build: dict | None = None    # our nsr_update build descriptor (None: don't compare)
     quickstart: str = "manual"
     draft: dict | None = None
     playbook: dict | None = None
@@ -343,6 +365,7 @@ class LobbyHost:
                 sock.close()
             return
         content = nsr_content.room_content_reason(self.content, hello.get("content"))
+        build = nsr_update.room_build_reason(self.build, hello.get("build"))
         if hello.get("type") != "hello" or hello.get("version") != PROTOCOL_VERSION:
             reason = ("Your launcher is a different version from the host's. "
                       "Everyone needs the same NFLStreetRemastered download.")
@@ -356,6 +379,12 @@ class LobbyHost:
             reason = "This room uses quickstart. Update NFLStreetRemastered or ask the host for Manual (menus)."
         elif self.draft != draft_settings() and hello.get("draft_version") != DRAFT_VERSION:
             reason = "This room uses custom Pickup drafting. Update NFLStreetRemastered."
+        elif build:
+            # Before content and fingerprint: a build difference explains those
+            # too, and "restart the launcher" is the one instruction that fixes
+            # all three. Saying "your ratings are old" to someone on last
+            # week's download sends them to the wrong button.
+            reason, action = build
         elif content:
             reason, action = content
         elif hello.get("fingerprint") != self.fingerprint:
@@ -441,7 +470,8 @@ def join(host: str, name: str, fingerprint: str,
          on_game_mode: Callable[[str], None] = lambda selected: None,
          on_draft: Callable[[dict], None] = lambda selected: None,
          playbook: dict | None = None,
-         on_playbooks: Callable[[list], None] = lambda selected: None) -> StartInfo:
+         on_playbooks: Callable[[list], None] = lambda selected: None,
+         build: dict | None = None) -> StartInfo:
     """Connect to a host's lobby and wait for Start. Raises ConnectionError
     with a readable reason if refused, closed, or unreachable."""
     if ":" in host:
@@ -458,7 +488,7 @@ def join(host: str, name: str, fingerprint: str,
     _send(sock, _with_content({"type": "hello", "name": name, "fingerprint": fingerprint,
                                "version": PROTOCOL_VERSION, "mode": mode,
                                "quickstart_version": QUICKSTART_VERSION, "draft_version": DRAFT_VERSION,
-                               "playbook": playbook, "books_version": books.VERSION}, content))
+                               "playbook": playbook, "books_version": books.VERSION}, content, build))
     buf = b""
     shown_draft = None
     shown_books = []
@@ -544,6 +574,7 @@ class RoomHost:
     on_error: Callable[[str], None] = lambda reason: None
     mode: str = RELEASE_MODE
     content: dict | None = None  # our nsr_content descriptor (sent with create)
+    build: dict | None = None    # our nsr_update build descriptor (sent with create)
     quickstart: str = "manual"
     draft: dict | None = None
     playbook: dict | None = None
@@ -571,7 +602,7 @@ class RoomHost:
                                          "draft": self.draft, "draft_version": DRAFT_VERSION,
                                          "playbook": self.playbook, "books_version": books.VERSION,
                                          "image_family": self.image_family},
-                                        self.content))
+                                        self.content, self.build))
         lines = _lines(self._sock)
         first = next(lines, None)
         if not first or first.get("type") != "room":
@@ -677,7 +708,8 @@ def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
               on_game_mode: Callable[[str], None] = lambda selected: None,
               on_draft: Callable[[dict], None] = lambda selected: None,
               playbook: dict | None = None,
-              on_playbooks: Callable[[list], None] = lambda selected: None) -> StartInfo:
+              on_playbooks: Callable[[list], None] = lambda selected: None,
+              build: dict | None = None) -> StartInfo:
     """Join a room by code and wait for the host's Start. Raises
     ConnectionError with a readable reason if refused, closed, or unreachable."""
     host, port = _split(rendezvous, RENDEZVOUS_PORT)
@@ -690,7 +722,7 @@ def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
     _send(sock, _with_content({"type": "join", "code": code, "name": name, "fingerprint": fingerprint,
                                "version": RENDEZVOUS_VERSION, "mode": mode,
                                "quickstart_version": QUICKSTART_VERSION, "draft_version": DRAFT_VERSION,
-                               "playbook": playbook, "books_version": books.VERSION}, content))
+                               "playbook": playbook, "books_version": books.VERSION}, content, build))
     buf = b""
     shown_draft = None
     shown_books = []

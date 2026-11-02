@@ -429,6 +429,18 @@ h1 { text-transform:uppercase; font-size:38px; border-bottom:3px solid var(--red
           <div class="toggle" id="runtimeContent"><div class="switch"></div><div><b>Apply ratings at game start</b>
             <div class="note" style="margin-top:4px">Off: rebuild the game image for each update. Click Check for updates after changing this setting.</div></div></div>
         </div>
+        <div class="card">
+          <div class="label">Launcher version</div>
+          <div class="info" id="buildText" style="margin-top:6px">–</div>
+          <div class="note" id="buildLog" style="margin-top:4px;white-space:pre-line"></div>
+          <div class="row" style="margin-top:16px">
+            <button class="btn" id="btnBuild">Check for launcher updates</button>
+            <button class="btn" id="btnRebuild" style="display:none">Rebuild game copy</button>
+          </div>
+          <div style="height:14px"></div>
+          <div class="toggle" id="autoBuild"><div class="switch"></div><div><b>Keep NFLStreetRemastered up to date</b>
+            <div class="note" style="margin-top:4px">Downloads signed updates to the launcher itself and restarts it. Only the files that changed are fetched. Never during a room or a game. If an update doesn't start properly, the previous version comes back by itself. Off: updates are only shown here.</div></div></div>
+        </div>
       </div>
     </section>
 
@@ -637,6 +649,14 @@ function render(s) {
   setText("contentText", ct.text || (ct.version ? "Game content v" + ct.version : "No game updates installed."));
   setText("contentLog", ct.latest && ct.changelog && ct.state !== "off" ? "v" + ct.latest + ": " + ct.changelog : "");
   $("autoUpdates").classList.toggle("on", !!ct.auto);
+  const bd = s.build || {};
+  setText("buildText", bd.text || (bd.label ? "Version " + bd.label : "Version not recorded yet."));
+  setText("buildLog", bd.latest && bd.changelog && bd.state !== "off" ? bd.latest + ": " + bd.changelog : "");
+  $("autoBuild").classList.toggle("on", !!bd.auto);
+  enable("btnBuild", !bd.busy && !g.busy);
+  setText("btnBuild", bd.busy ? "Working…" : "Check for launcher updates");
+  $("btnRebuild").style.display = bd.rebuild ? "" : "none";
+  enable("btnRebuild", !bd.busy && !g.busy);
   enable("btnUpdates", !ct.busy && !g.busy);
   setText("btnUpdates", ct.busy ? "Checking…" : "Check for updates");
   setText("folderPath", "This folder: " + (s.folder || ""));
@@ -689,6 +709,9 @@ function wire() {
   $("btnUpdates").onclick = () => call("check_updates");
   $("runtimeContent").onclick = () => call("set_content_runtime", !(S.snap && S.snap.content && S.snap.content.runtime));
   $("autoUpdates").onclick = () => call("set_auto_updates", !(S.snap && S.snap.content && S.snap.content.auto));
+  $("btnBuild").onclick = () => call("check_build_updates");
+  $("btnRebuild").onclick = () => call("rebuild_for_recipe");
+  $("autoBuild").onclick = () => call("set_build_updates", !(S.snap && S.snap.build && S.snap.build.auto));
   $("gameSource").onchange = () => call("set_source", $("gameSource").value);
   $("btnBrowse").onclick = () => call("browse_iso");
   document.addEventListener("contextmenu", (e) => { if (!(e.target instanceof HTMLInputElement)) e.preventDefault(); });

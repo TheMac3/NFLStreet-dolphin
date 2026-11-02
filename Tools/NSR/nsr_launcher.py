@@ -85,6 +85,8 @@ import nsr_playbooks as books
 import nsr_content  # noqa: E402
 import nsr_lobby as lobby  # noqa: E402
 import nsr_patcher as patcher  # noqa: E402
+import nsr_selfupdate as selfupdate  # noqa: E402
+import nsr_update as appupdate  # noqa: E402
 import nsr_textures as textures  # noqa: E402
 import nsr_branding as branding
 
@@ -541,7 +543,8 @@ class Launcher:
 
     def __init__(self, folder: str | None = None, spawn=None, popen=None, lobby_mod=None,
                  patcher_mod=None, env=os.environ, loop_spawn=None, stats_post=None,
-                 content_fetch=None, content_keys=None, clock=time.monotonic):
+                 content_fetch=None, content_keys=None, clock=time.monotonic,
+                 build_fetch=None, relaunch=None):
         self.folder = folder or app_dir()
         self.cfg = load_config(self.folder)
         self._spawn = spawn or (lambda fn: threading.Thread(target=fn, daemon=True).start())
@@ -567,6 +570,17 @@ class Launcher:
         # Content updates: fetch(url, limit) -> bytes and the trusted keys are
         # injectable so tests run the whole flow against a fake server.
         self._content_fetch = content_fetch or nsr_content.http_get
+        # Application updates. The manifest fetch and the relaunch are both
+        # injectable so the whole flow runs in tests without a network or a
+        # second process; a `relaunch` that returns False means we could not
+        # restart ourselves, and the player is told to do it instead.
+        self._build_fetch = build_fetch or nsr_content.http_get
+        self._relaunch = relaunch or self._relaunch_default
+        # Settle whatever the last run left behind before anything else reads
+        # the folder: an interrupted swap, or a build that never confirmed
+        # itself, has to be resolved before we report a version or look for a
+        # newer one.
+        self._pending_build = selfupdate.resolve_pending(self.folder)
         self._content_keys = content_keys
         self._book_cache = books.Cache(self.folder, content_keys, self._content_fetch)
         self._source_kind = self.cfg.get("game_source", "reborn")
@@ -582,6 +596,7 @@ class Launcher:
         self.rev = 0
         self._notice_id = 0
         cfg = self.cfg
+        _build_now = selfupdate.installed(self.folder)
         import draftmodes
         order, first = (("alternating", "stock") if self._source_kind == "owned" else
                         (cfg.get("draft_order", "alternating"), cfg.get("draft_first", "stock")))
@@ -615,6 +630,13 @@ class Launcher:
             "content": {"state": "idle", "text": "", "version": None, "latest": None, "changelog": "",
                         "auto": bool(cfg.get("content_auto", True)), "busy": False,
                         "runtime": bool(cfg.get("content_runtime", True))},
+            # Application updates (the launcher itself). state: idle|off|
+            # checking|downloading|installing|current|available|offline|
+            # blocked|error|deferred. `rebuild` means the installed build's
+            # recipe is newer than the image's, so the game copy needs one.
+            "build": {"state": "idle", "text": "", "version": _build_now["version"],
+                      "label": _build_now["label"], "latest": None, "changelog": "",
+                      "auto": bool(cfg.get("build_auto", True)), "busy": False, "rebuild": False},
             "playbook": {"text": books.label([cfg.get("playbook")]), "link_code": ""},
             "host": {"state": "idle", "mode": "", "code": "", "players": [], "can_start": False,
                      "info": "" if self.rv_server else "Room codes aren't set up in this download "
@@ -1339,6 +1361,207 @@ class Launcher:
             return self._content("current", f"Up to date: {what}")
         return self._content("error", f"Couldn't install {what}; your previous game copy was kept.")
 
+    # -- application updates (the launcher itself) --
+    def _build(self, state: str, text: str, **kw) -> str:
+        self._set("build", state=state, text=text, **kw)
+        return state
+
+    def _build_descriptor(self) -> dict | None:
+        """What rooms compare. None before a version is known, which means
+        "do not compare" rather than refusing anyone."""
+        record = selfupdate.installed(self.folder)
+        if record["version"] < 1:
+            return None
+        return appupdate.build_descriptor(record["version"],
+                                          self.cfg.get("build_room_min", 1) or 1)
+
+    def set_build_updates(self, on: bool) -> None:
+        self.cfg["build_auto"] = bool(on)
+        self._save()
+        self._set("build", auto=bool(on))
+        if on:
+            self._spawn(lambda: self.update_build_now(user=False))
+
+    def check_build_updates(self) -> None:
+        """The "Check for launcher updates" button (an explicit request)."""
+        self._spawn(lambda: self.update_build_now(user=True))
+
+    def confirm_build(self) -> None:
+        """Called once the UI is up: this build works, so stop watching it.
+
+        Until this runs, a newly installed build is on trial and a couple of
+        starts that never get this far will put the previous one back. That is
+        the whole protection against shipping something that does not start,
+        so it is deliberately tied to the window actually coming up rather
+        than to the process merely launching.
+        """
+        if self._pending_build == "on-trial":
+            selfupdate.confirm(self.folder)
+            self._pending_build = ""
+            log(self.folder, "update: this build started cleanly; previous copy released")
+
+    def update_build_now(self, user: bool = False) -> str:
+        """One application-update check, installing when allowed.
+
+        Wrapped exactly like `update_content_now`: an update must never be
+        able to break the launcher, so any unexpected failure is logged and
+        reported as a kept-working-version state.
+        """
+        with self._lock:
+            if self.state["build"]["busy"]:
+                return "busy"
+            self._set("build", busy=True)
+        try:
+            return self._build_update(user)
+        except Exception as e:  # noqa: BLE001  (updates must never break the launcher)
+            log(self.folder, f"build update crashed: {e!r}")
+            return self._build("error", "Update check failed; keeping this version.")
+        finally:
+            self._set("build", busy=False)
+
+    def _build_update(self, user: bool) -> str:
+        base = selfupdate.channel_url(self.folder, self._env)
+        if not base or not nsr_content.trusted_keys(self._content_keys):
+            return self._build("off", "Automatic launcher updates aren't set up in this download.")
+        record = selfupdate.installed(self.folder)
+        self._build("checking", "Checking for a newer version…")
+        try:
+            payload, _raw = selfupdate.fetch_manifest(base, self._build_fetch, self._content_keys)
+        except OSError as e:
+            log(self.folder, f"build check offline: {e}")
+            return self._build("offline", "Couldn't check for a newer version (offline?). "
+                                          f"Using {record['label'] or 'this version'}.")
+        except nsr_content.ContentError as e:
+            log(self.folder, f"build manifest rejected: {e}")
+            return self._build("error", "A version list was found but couldn't be verified, so it "
+                                        "was ignored. Nothing was downloaded.")
+        build = payload["build"]
+        self._set("build", latest=build["version"], changelog=build["changelog"])
+        # The image's own manifest is the authority on what recipe it was
+        # built with; our record can be absent on a fresh unzip.
+        plan = appupdate.plan(payload, installed_version=record["version"],
+                              installed_recipe=selfupdate.installed_recipe(self.game_dir, self._patcher),
+                              have=appupdate.inventory(self.folder,
+                                                       only={f["path"] for f in build["files"]}),
+                              launcher_format=appupdate.LAUNCHER_FORMAT,
+                              last_serial=record["serial"])
+        if plan.blocked:
+            # A revoked installed version is the one case where staying put is
+            # also wrong, so say so even though this manifest cannot fix it.
+            if plan.revoked_installed:
+                return self._build("blocked", f"This version shouldn't be used any more, and "
+                                              f"{plan.blocked}. Ask Mason for a current download.")
+            # Which refusal fired is a detail; what the player needs to know is
+            # whether they are behind. A re-offered serial for the version they
+            # already run is "up to date", not a problem - reporting it as
+            # blocked would read as a fault when nothing is wrong.
+            if record["version"] >= build["version"]:
+                return self._build("current", f"Up to date: {appupdate.describe(build)}",
+                                   version=record["version"], label=record["label"])
+            return self._build("blocked", plan.blocked)
+        what = appupdate.describe(build)
+        if plan.up_to_date:
+            # Nothing to fetch: the files already match, which is what a fresh
+            # unzip of this very build looks like. Record it and stop asking.
+            selfupdate.write_record(self.folder, build, payload["serial"])
+            return self._build("current", f"Up to date: {what}", version=build["version"],
+                               label=build["label"])
+        if not user and not self.state["build"]["auto"]:
+            return self._build("available", f"{what} is available. Click “Check for launcher "
+                                            "updates” to install it.")
+        defer = selfupdate.defer_reason(
+            in_room=(self.state["host"]["state"] != "idle" or self.state["join"]["state"] != "idle"),
+            game_running=self._dolphin_running(),
+            building_image=self.state["game"]["busy"])
+        if defer:
+            return self._build("deferred", f"{what} is ready to install. {defer}")
+        megabytes = plan.bytes_to_fetch / (1 << 20)
+        self._build("downloading", f"Downloading {what} ({megabytes:.0f} MB)…")
+        try:
+            staging = selfupdate.stage(payload, plan, self.folder, base,
+                                       progress=lambda i, total, path: self._set(
+                                           "build", text=f"Downloading {what} ({i} of {total})…"))
+        except OSError as e:
+            log(self.folder, f"build download failed: {e}")
+            return self._build("offline", "Couldn't download the update; this version is unchanged.")
+        except selfupdate.UpdateError as e:
+            log(self.folder, f"build staging rejected: {e}")
+            return self._build("error", str(e))
+        # Re-check the deferral: downloading tens of megabytes takes long
+        # enough for the player to have started a game or opened a room, and
+        # the swap is the part that cannot be interrupted.
+        defer = selfupdate.defer_reason(
+            in_room=(self.state["host"]["state"] != "idle" or self.state["join"]["state"] != "idle"),
+            game_running=self._dolphin_running(),
+            building_image=self.state["game"]["busy"])
+        if defer:
+            return self._build("deferred", f"{what} is downloaded and ready. {defer}")
+        self._build("installing", f"Installing {what}…")
+        try:
+            selfupdate.swap_in(payload, staging, self.folder, replace=plan.fetch)
+        except selfupdate.UpdateError as e:
+            log(self.folder, f"build swap failed: {e}")
+            return self._build("error", str(e))
+        selfupdate.write_record(self.folder, build, payload["serial"])
+        selfupdate.begin_trial(self.folder, build)
+        log(self.folder, f"update: installed v{build['version']} ({build['label']}), "
+                         f"{len(plan.fetch)} files; on trial until it starts")
+        self._set("build", version=build["version"], label=build["label"],
+                  rebuild=selfupdate.needs_rebuild(self.folder, self.game_dir, self._patcher))
+        if self._relaunch():
+            return self._build("installing", f"Installed {what}. Restarting…")
+        self.notify(f"Installed {what}. Close NFLStreetRemastered and start it again to use it.")
+        return self._build("current", f"Installed {what}. Restart NFLStreetRemastered to use it.",
+                           version=build["version"], label=build["label"])
+
+    def _relaunch_default(self) -> bool:
+        """Start the newly installed executable and ask this one to close.
+
+        The new build is on trial at this point, so if it fails to come up the
+        next start puts the previous one back. Returning False is a normal
+        outcome, not an error: the player is simply told to restart.
+
+        **Windows is the case that matters and is not yet demonstrated.** The
+        self-replace rests on Windows permitting a running executable to be
+        renamed, which `docs/autoupdate.md` flags as needing a real test.
+        Nothing here can establish it from Linux.
+        """
+        entry = os.path.join(self.folder, "NFLStreetRemastered.exe")
+        if sys.platform != "win32" or not os.path.isfile(entry):
+            return False
+        try:
+            self._popen([entry], close_fds=True,
+                        creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+        except (OSError, subprocess.SubprocessError) as e:
+            log(self.folder, f"update: couldn't start the new version ({e}); asking the player to")
+            return False
+        self._stop.set()
+        return True
+
+    def rebuild_for_recipe(self) -> None:
+        """Rebuild the game copy because the installed build wants a newer recipe.
+
+        Deliberately a separate step from installing the build, and run by the
+        *new* launcher: the recipe belongs to the new code, so an old launcher
+        rebuilding at a new recipe's request would produce an image from the
+        old patcher - the one combination nobody has qualified.
+        """
+        if not selfupdate.needs_rebuild(self.folder, self.game_dir, self._patcher):
+            self._set("build", rebuild=False)
+            return
+        iso = self._reborn_iso() if self._source_kind == "reborn" else self.cfg.get("owned_iso")
+        if not iso or not os.path.isfile(iso):
+            self.notify("This version needs a new game copy. Set up your game source in "
+                        "Settings → Advanced to rebuild it.", "error")
+            return
+        before = self._claim_build("This version needs a new game copy. Building it…")
+        if before is None:
+            return
+        log(self.folder, "update: recipe changed; rebuilding the game copy")
+        if self._run_build(iso, self._known_content(), strict=False, restore=before):
+            self._set("build", rebuild=False)
+            self.notify("Game copy rebuilt for this version.")
+
     def _preflight_update(self) -> None:
         """Before hosting/joining with auto updates on: catch an update published
         since the last check, so the room doesn't have to reject us."""
@@ -1668,7 +1891,8 @@ class Launcher:
             self._preflight_update()
             h = self._lobby.RoomHost(self.rv_server, self.state["name"], self.state["game"]["fingerprint"],
                                      on_change=self._roster, on_error=lambda why: self._set("host", info=why),
-                                     content=self._content_descriptor(), quickstart=self.state["quickstart"],
+                                     content=self._content_descriptor(), build=self._build_descriptor(),
+                                     quickstart=self.state["quickstart"],
                                      draft=self.draft_settings(), playbook=self.cfg.get("playbook"),
                                      on_playbooks=lambda refs: self._room_books("host", refs))
             try:
@@ -1690,7 +1914,8 @@ class Launcher:
             h = self._lobby.LobbyHost(self.state["name"], self.state["game"]["fingerprint"],
                                       on_change=self._roster,
                                       on_reject=lambda who, why: self._set("host", info=f"Refused {who}: {why}"),
-                                      content=self._content_descriptor(), quickstart=self.state["quickstart"],
+                                      content=self._content_descriptor(), build=self._build_descriptor(),
+                                      quickstart=self.state["quickstart"],
                                       draft=self.draft_settings(), playbook=self.cfg.get("playbook"),
                                      on_playbooks=lambda refs: self._room_books("host", refs))
             h.open()
@@ -1770,6 +1995,7 @@ class Launcher:
 
         def attempt():
             kw = {"on_lobby": on_lobby, "cancel": cancel, "content": self._content_descriptor(),
+                  "build": self._build_descriptor(),
                   "on_game_mode": lambda selected: self._set("join", quickstart=selected),
                   "on_draft": lambda selected: self._set("join", draft_label=lobby.draft_label(selected)),
                   "playbook": self.cfg.get("playbook"),
@@ -1987,7 +2213,24 @@ class Launcher:
             self._set("game", busy=False)
         if self.state["game"]["state"] == "ready":
             self._import_assets_setup()
+        # What the previous run left behind, resolved in __init__ before
+        # anything read the folder; report it here where the UI can see it.
+        if self._pending_build == "reverted-interrupted":
+            self.notify("An update didn't finish installing, so the previous version was put back.",
+                        "error")
+            log(self.folder, "update: an interrupted install was rolled back")
+        elif self._pending_build == "reverted-failed-start":
+            self.notify("The last update didn't start properly, so the previous version was put back.",
+                        "error")
+            log(self.folder, "update: a build that never confirmed itself was rolled back")
+        if selfupdate.needs_rebuild(self.folder, self.game_dir, self._patcher):
+            self._set("build", rebuild=True)
+            self.rebuild_for_recipe()
         self.update_content_now(user=False)  # auto: install; manual: just report
+        # The launcher's own update is checked after the game copy, so a
+        # player whose game is not ready yet sees that first. It never blocks
+        # play: every refusal and failure leaves this version running.
+        self.update_build_now(user=False)
         # One-click start: a missing or outdated game copy is built right away
         # from the Reborn install we can find (what "Find Reborn automatically"
         # does), so players never need to run the separate patcher first. If
@@ -2040,13 +2283,20 @@ class WebApi:
     def ui_ready(self, info=None):
         self._ready_info = dict(info or {})
         self._ready.set()
+        # The window came up, so a newly installed build has proved itself.
+        # Tied to this rather than to the process starting: a build that
+        # launches and then fails to render is exactly what the trial is for.
+        self._l.confirm_build()
 
     def set_name(self, name): self._l.set_name(name)
     def set_telemetry(self, on): self._l.set_telemetry(bool(on))
     def set_game_stats(self, on): self._l.set_game_stats(bool(on))
     def set_auto_updates(self, on): self._l.set_auto_updates(bool(on))
+    def set_build_updates(self, on): self._l.set_build_updates(bool(on))
     def set_content_runtime(self, on): self._l.set_content_runtime(bool(on))
     def check_updates(self): self._l.check_updates()
+    def check_build_updates(self): self._l.check_build_updates()
+    def rebuild_for_recipe(self): self._l.rebuild_for_recipe()
     def set_delay(self, delay): self._l.set_delay(delay)
     def set_quickstart(self, selected): self._l.set_quickstart(selected)
     def set_button_icons(self, choice): self._l.set_button_icons(str(choice))
@@ -2322,6 +2572,18 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     ttk.Checkbutton(sp, text="Apply ratings at game start (off: rebuild the image)",
                     variable=runtime_var, command=lambda: launcher.set_content_runtime(runtime_var.get())) \
         .grid(row=12, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+    # The launcher's own updates. This fallback window is what a PC without
+    # WebView2 gets, so it needs the same controls rather than silently
+    # leaving those players unable to update.
+    # Rows 9-18 of this frame are taken (content updates, then the Advanced
+    # game-source block and its notes), so these go below them.
+    ttk.Button(sp, text="Check for launcher updates", command=launcher.check_build_updates) \
+        .grid(row=19, column=0, sticky="w", pady=(12, 0))
+    build_var = tk.BooleanVar(value=launcher.state["build"]["auto"])
+    ttk.Checkbutton(sp, text="Keep NFLStreetRemastered up to date (signed; restarts the launcher)",
+                    variable=build_var, command=lambda: launcher.set_build_updates(build_var.get())) \
+        .grid(row=20, column=0, columnspan=4, sticky="w", pady=(6, 0))
     ttk.Label(hp, text="Pickup draft / first team").grid(row=8, column=0, sticky="w", pady=(12, 0))
     draft_order = tk.StringVar(value=launcher.state["game"]["draft_order"])
     draft_first = tk.StringVar(value=launcher.state["game"]["draft_first"])
