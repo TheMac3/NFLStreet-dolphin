@@ -149,8 +149,17 @@ def strict_loads(raw: bytes):
         raise ContentError(f"malformed JSON: {exc}") from None
 
 
-def b64decode(value) -> bytes:
-    if not isinstance(value, str) or not value or len(value) > 2 * MAX_MANIFEST_BYTES \
+def b64decode(value, max_bytes=None) -> bytes:
+    """Decode a base64url field, bounded. `max_bytes` is the *decoded* budget.
+
+    The default is a content manifest's, and an application manifest needs its
+    own: ~2565 shipped files is a 380 KiB payload, half a megabyte encoded,
+    against a 128 KiB cap here. This bound is separate from the envelope's and
+    was missed when that one became per-kind - the publisher's verify-after-sign
+    caught it, which is what that step is for.
+    """
+    limit = 2 * (max_bytes or MAX_MANIFEST_BYTES)
+    if not isinstance(value, str) or not value or len(value) > limit \
             or not _B64URL.fullmatch(value):
         raise ContentError("invalid base64url value")
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
@@ -429,7 +438,9 @@ def verify_manifest(raw: bytes, keys=None, validate=None, max_bytes=None) -> dic
         raise ContentError("this download has no content-signing key")
     if env["kid"] not in trusted:
         raise ContentError("manifest is signed by an unknown key")
-    body, sig = b64decode(env["payload"]), b64decode(env["sig"])
+    # The signature keeps the default bound (RSA-3072 is 384 bytes); only the
+    # payload is legitimately large.
+    body, sig = b64decode(env["payload"], max_bytes), b64decode(env["sig"])
     n, e = trusted[env["kid"]]
     if not rsasig.rsa_pkcs1v15_sha256_verify(n, e, body, sig):
         raise ContentError("manifest signature is invalid")
