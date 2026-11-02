@@ -52,27 +52,39 @@ from nsr_content import ContentError
 CHANNEL_FILE = "nsr-build.txt"
 MANIFEST_NAME = "nsr-build-manifest.json"
 
-# Release files are fetched by content hash from one flat namespace, never by
-# their install path and never under a prefix. The reason is the release host:
-# Mason's decision is GitHub Releases, which serves
-# `/releases/latest/download/<asset>` where <asset> is a single file name - so
-# neither `Sys/totaldb.dsy` nor `files/<hash>` is addressable there. A static
-# host serves a flat directory just as happily, so flat costs nothing and is
-# the only layout that works on both. `nsr_content` already distributes its
-# packs by hash for the same reason.
+# Release files are fetched by content hash, sharded across 16 groups by the
+# hash's first character. The channel is the root those groups sit under, and
+# one file lives at `<channel>/nsr-obj-<N>/<sha256>`.
 #
-# Within one package, two identical files collapse to one asset. Across
-# releases they do not, when the host is GitHub Releases: `latest/download`
-# only sees the newest release's assets, so every release carries its full
-# set. Clients still download only what changed - the upload is Mason's cost,
-# the download is his friends'.
+# The shard is not decoration. GitHub Releases - Mason's hosting decision -
+# allows **1000 assets per release**, and the real package is ~2500 objects, so
+# a single release cannot hold one. It also cannot hold a path: an asset name
+# has no "/" in it, so neither `Sys/totaldb.dsy` nor `files/<hash>` is
+# addressable. Sixteen shards of ~160 give room for 16,000 objects, and the URL
+# shape works unchanged on either host - the shard is a release tag on GitHub
+# and a directory on a static host, so this does not commit the project to
+# GitHub Releases.
 #
-# The manifest still carries each install path. That is where the bytes go and
-# it is validated against Windows' rules; the hash decides only what to ask
-# the host for.
+# Objects accumulate: a new version uploads only the hashes that are new,
+# typically the two or three executables that changed. The manifest lives in
+# its own group, since it is the one asset not named by a hash.
+SHARDS = 16
+OBJECT_TAG = "nsr-obj"
+MANIFEST_TAG = "nsr-build"
+
+
+def shard_of(sha256: str) -> str:
+    """The group a hash belongs to: `nsr-obj-0` .. `nsr-obj-f`."""
+    return f"{OBJECT_TAG}-{sha256[0]}"
+
+
+def manifest_url(base: str) -> str:
+    return f"{base.rstrip('/')}/{MANIFEST_TAG}/{MANIFEST_NAME}"
+
+
 def file_url(base: str, sha256: str) -> str:
-    """Where one release file lives: flat, content-addressed, hostable."""
-    return f"{base.rstrip('/')}/{sha256}"
+    """Where one release file lives, content-addressed within its shard."""
+    return f"{base.rstrip('/')}/{shard_of(sha256)}/{sha256}"
 
 # The installed build's identity. A fresh zip install has no such file, which
 # reads as version 0 - see `installed()` for why that is safe rather than a
@@ -239,7 +251,7 @@ def fetch_to_file(url: str, dest: str, *, size: int, sha256: str, opener=_open,
 def fetch_manifest(base: str, fetch=None, keys=None) -> tuple[dict, bytes]:
     """Fetch and verify the channel's signed manifest. (payload, raw bytes)."""
     fetch = fetch or content.http_get
-    raw = fetch(base.rstrip("/") + "/" + MANIFEST_NAME, update.MAX_MANIFEST_BYTES)
+    raw = fetch(manifest_url(base), update.MAX_MANIFEST_BYTES)
     return update.verify(raw, keys=keys), raw
 
 
