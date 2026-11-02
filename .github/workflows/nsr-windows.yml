@@ -15,6 +15,9 @@ name: NFLStreetRemastered Windows build
 on:
   push:
     branches: [nsr-netplay]
+    # A tag is what reaches friends. Pushing the branch still builds and leaves
+    # an artifact for testing; only a tag publishes a release and its objects.
+    tags: ['v*']
   workflow_dispatch:
 
 jobs:
@@ -454,3 +457,113 @@ jobs:
           name: NFLStreetRemastered-windows-x64
           path: package
           if-no-files-found: error
+
+  # Publishing a tag: the zip friends download, and the content-addressed
+  # objects the auto-updater fetches. Deliberately a separate Linux job - the
+  # upload is a bash/gh loop and has nothing to do with building on Windows.
+  #
+  # **The signing key never comes here.** CI publishes objects only, and that
+  # is safe because of what content addressing buys: every file a client
+  # installs is checked against a hash in the manifest Mason signs on his own
+  # machine, so CI cannot forge an object that matches a hash it did not
+  # choose. A corrupted or substituted object is refused by the client, not
+  # installed. Until that signed manifest is uploaded by hand, no launcher
+  # sees the release at all - the objects just sit there.
+  publish:
+    needs: windows-x64
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: false }
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: NFLStreetRemastered-windows-x64
+          path: package
+
+      - name: Stage the upload set
+        run: |
+          set -euo pipefail
+          test -d package/NFLStreetRemastered || { echo "artifact layout changed" >&2; exit 1; }
+          python3 Tools/NSR/nsr_publish_build.py \
+            --package package/NFLStreetRemastered --stage-only --assets upload
+
+      - name: Zip for people who install by hand
+        run: |
+          set -euo pipefail
+          label="${GITHUB_REF_NAME#v}"
+          (cd package && zip -q -r "../NFLStreetRemastered-$label.zip" NFLStreetRemastered)
+          ls -lh "NFLStreetRemastered-$label.zip"
+
+      - name: Publish objects and the zip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          label="${GITHUB_REF_NAME#v}"
+
+          # The object and manifest releases are permanent fixtures shared by
+          # every version; create any that do not exist yet.
+          for s in 0 1 2 3 4 5 6 7 8 9 a b c d e f; do
+            gh release view "nsr-obj-$s" --repo "$repo" >/dev/null 2>&1 || \
+              gh release create "nsr-obj-$s" --repo "$repo" --title "Update objects $s" \
+                --notes "Content-addressed release files. Not a download; the launcher fetches from here." >/dev/null
+          done
+          gh release view nsr-build --repo "$repo" >/dev/null 2>&1 || \
+            gh release create nsr-build --repo "$repo" --title "Update manifest" \
+              --notes "The signed release manifest the launcher checks." >/dev/null
+
+          # Upload only objects the channel does not already have. Unchanged
+          # files keep their hash between releases, so after the first tag this
+          # is a handful of executables. Paced: GitHub applies a secondary rate
+          # limit to rapid writes that no amount of waiting reliably clears.
+          new=0
+          for d in upload/nsr-obj-*; do
+            tag=$(basename "$d")
+            gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name' 2>/dev/null | sort > have.txt || : > have.txt
+            ls "$d" | sort > want.txt
+            miss=$(comm -13 have.txt want.txt || true)
+            [ -z "$miss" ] && continue
+            count=$(echo "$miss" | wc -l)
+            new=$((new + count))
+            echo "== $tag: $count new"
+            echo "$miss" | sed "s|^|$d/|" | tr '\n' '\0' \
+              | xargs -0 -r -n 20 sh -c 'gh release upload "$0" --repo '"$repo"' "$@" && sleep 4' "$tag"
+          done
+          echo "uploaded $new new objects"
+
+          # Every object the manifest will name must be present before anyone
+          # can be told the release exists. Checked here rather than trusted,
+          # because a manifest naming an absent object strands a download.
+          find upload -type f -printf '%f\n' | sort > want-all.txt
+          for s in 0 1 2 3 4 5 6 7 8 9 a b c d e f; do
+            gh release view "nsr-obj-$s" --repo "$repo" --json assets --jq '.assets[].name' 2>/dev/null || true
+          done | sort > online.txt
+          missing=$(comm -13 online.txt want-all.txt | wc -l)
+          echo "staged $(wc -l < want-all.txt), online $(wc -l < online.txt), missing $missing"
+          [ "$missing" -eq 0 ] || { echo "objects are incomplete; re-run this job" >&2; exit 1; }
+
+          # The tag's own release carries the zip. It is a draft until Mason
+          # publishes it, so a half-finished tag is never visible, and it
+          # carries no signed manifest - that is still his to upload, and
+          # until he does no launcher offers this version to anyone.
+          gh release view "$GITHUB_REF_NAME" --repo "$repo" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --repo "$repo" --draft \
+              --title "NFLStreetRemastered $label" \
+              --notes "Unzip the whole folder somewhere you can write to (not Program Files), then run NFLStreetRemastered.exe. Automatic updates go live for this version once the signed manifest is uploaded." >/dev/null
+          gh release upload "$GITHUB_REF_NAME" --repo "$repo" --clobber "NFLStreetRemastered-$label.zip"
+          echo "draft release $GITHUB_REF_NAME holds the zip; objects are live"
+
+      - name: What is left to do by hand
+        run: |
+          echo "Objects for ${GITHUB_REF_NAME} are published."
+          echo "To make this version live, on your own machine:"
+          echo "  1. download this run's artifact"
+          echo "  2. nsr_publish_build.py ... --version <N> --label ${GITHUB_REF_NAME#v} ..."
+          echo "  3. gh release upload nsr-build --clobber nsr-build-manifest.json"
+          echo "The key never comes here, so no launcher sees this version until step 3." 

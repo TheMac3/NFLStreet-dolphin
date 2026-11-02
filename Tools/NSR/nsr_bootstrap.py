@@ -47,6 +47,9 @@ import nsr_update as update  # noqa: E402
 # no such file and `--channel` or `NSR_BUILD_URL` supplies it instead.
 CHANNEL_RESOURCE = "nsr-channel.txt"
 
+# What the installed launcher reads. Same name `nsr_selfupdate` looks for.
+CHANNEL_NAME = selfupdate.CHANNEL_FILE
+
 
 def bundled_channel() -> str:
     """The channel compiled into this executable, or ""."""
@@ -112,8 +115,34 @@ def install(folder: str, channel: str, *, keys=None, fetch=None, stream=None,
     out("Installing…")
     selfupdate.swap_in(payload, staging, folder, replace=plan.fetch)
     selfupdate.write_record(folder, build, payload["serial"])
+    _leave_channel(folder, channel, build)
     out(f"Installed {build['label']}.")
     return build
+
+
+def _leave_channel(folder: str, channel: str, build: dict) -> None:
+    """Tell the launcher we just installed where to look for updates.
+
+    Only the bootstrapper has a channel compiled in; the launcher reads
+    `nsr-build.txt` beside itself. Without this, a one-file install produced a
+    launcher that reported "automatic launcher updates aren't set up in this
+    download" - having just been installed by an updater that knew the channel
+    perfectly well.
+
+    Skipped when the package ships its own copy, which newer builds do: that
+    file is then the manifest's, and rewriting it would leave the install
+    differing from what was signed and re-fetched on the next check.
+    """
+    if any(f["path"] == CHANNEL_NAME for f in build["files"]):
+        return
+    path = os.path.join(folder, CHANNEL_NAME)
+    if os.path.exists(path):
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(channel.rstrip("/") + "\n")
+    except OSError:
+        pass          # an install that works without updates beats no install
 
 
 def start(folder: str, build: dict, popen=subprocess.Popen) -> bool:
