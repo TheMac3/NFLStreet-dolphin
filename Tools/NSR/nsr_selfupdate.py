@@ -400,6 +400,14 @@ def swap_in(payload: dict, staging: str, install_root: str, *, replace=None,
                               "version didn't finish. Start the launcher again to complete it.") from None
         raise UpdateError(f"Couldn't install the update ({exc}); your previous version was kept") from None
     os.remove(_journal_path(install_root))
+    # The control directory is ours, not the manifest's, so an empty one is
+    # litter in the player's install folder. `begin_trial` recreates it if a
+    # trial follows (`_atomic_write` makes the directory), and on a first
+    # install none does.
+    try:
+        os.rmdir(os.path.join(install_root, CONTROL_DIR))
+    except OSError:
+        pass
     shutil.rmtree(staging, ignore_errors=True)
     if not _retained(install_root):
         # A first install replaces nothing, so there is nothing to undo and no
