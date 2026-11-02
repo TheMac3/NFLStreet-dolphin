@@ -52,6 +52,25 @@ from nsr_content import ContentError
 CHANNEL_FILE = "nsr-build.txt"
 MANIFEST_NAME = "nsr-build-manifest.json"
 
+# Release files are fetched by content hash under one flat prefix, never by
+# their install path. The reason is the release host: Mason's decision is
+# GitHub Releases, and an asset name cannot contain "/", so a nested path like
+# `Sys/totaldb.dsy` is not addressable there at all. `nsr_content` already
+# fetches its packs this way (`{base}/packs/{sha256}.json`), so this follows
+# the scheme that is in service rather than inventing a second one.
+#
+# Two properties fall out of it. A file that did not change between releases is
+# the same object, so it needs no second upload; and two identical files in one
+# package are one asset. The manifest still carries the install path - that is
+# where the bytes go, and it is checked against Windows' rules - so the hash
+# decides only what to ask the host for.
+FILE_PREFIX = "files"
+
+
+def file_url(base: str, sha256: str) -> str:
+    """Where one release file lives: flat, content-addressed, hostable."""
+    return f"{base.rstrip('/')}/{FILE_PREFIX}/{sha256}"
+
 # The installed build's identity. A fresh zip install has no such file, which
 # reads as version 0 - see `installed()` for why that is safe rather than a
 # reason to re-download everything.
@@ -253,7 +272,7 @@ def stage(payload: dict, plan: update.Plan, install_root: str, base: str, *,
         entry = wanted[rel]
         if progress:
             progress(index, len(plan.fetch), rel)
-        fetch(base.rstrip("/") + "/" + rel, _dest(staging, rel),
+        fetch(file_url(base, entry["sha256"]), _dest(staging, rel),
               size=entry["size"], sha256=entry["sha256"])
     if reuse:
         for rel in plan.reuse:
