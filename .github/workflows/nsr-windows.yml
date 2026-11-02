@@ -279,6 +279,15 @@ jobs:
         shell: pwsh
         run: Set-Content -Encoding ascii Binary/x64/nsr-rendezvous.txt "${{ vars.NSR_RENDEZVOUS }}"
 
+      # The update channel, for people who install from the zip. The
+      # bootstrapper has it compiled in, but a zip install reads this file -
+      # without it the launcher reports that updates are not set up in this
+      # download and never checks, which is the opposite of the point.
+      - name: Update channel (if configured)
+        if: ${{ vars.NSR_BUILD_URL != '' }}
+        shell: pwsh
+        run: Set-Content -Encoding ascii Binary/x64/nsr-build.txt "${{ vars.NSR_BUILD_URL }}"
+
       - name: Package (README-FIRST, VERSION, licenses, contents check)
         shell: pwsh
         run: |
