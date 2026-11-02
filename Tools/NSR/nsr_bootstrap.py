@@ -73,8 +73,14 @@ def resolve_channel(args, folder: str, env=os.environ) -> str:
     return ""
 
 
+def _say(*parts) -> None:
+    """Print and flush. A download of this size takes minutes, and buffered
+    output means a player (or a log) sees nothing at all until it ends."""
+    print(*parts, flush=True)
+
+
 def install(folder: str, channel: str, *, keys=None, fetch=None, stream=None,
-            out=print) -> dict:
+            out=_say) -> dict:
     """Install the channel's current release into `folder`. Returns the build.
 
     Raises `selfupdate.UpdateError` for anything that should leave the folder

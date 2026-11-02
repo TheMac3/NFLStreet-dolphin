@@ -199,8 +199,14 @@ def verify(raw: bytes, keys=None) -> dict:
 
 
 def describe(build: dict) -> str:
-    """'update 2026.11.01 — <first changelog line>' for the launcher."""
+    """'update 2026.11.01 — <first changelog line>' for the launcher.
+
+    The trailing full stop is dropped: callers embed this mid-sentence
+    ("Installed {what}. Restart ...") and a changelog line that ends in one -
+    most do - rendered as "Automatic updates.. Restart".
+    """
     first = build["changelog"].strip().splitlines()[0][:120] if build["changelog"].strip() else ""
+    first = first.rstrip().rstrip(".")
     return f"update {build['label']}" + (f" — {first}" if first else "")
 
 
