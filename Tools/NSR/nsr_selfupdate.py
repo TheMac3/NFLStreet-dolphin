@@ -52,24 +52,27 @@ from nsr_content import ContentError
 CHANNEL_FILE = "nsr-build.txt"
 MANIFEST_NAME = "nsr-build-manifest.json"
 
-# Release files are fetched by content hash under one flat prefix, never by
-# their install path. The reason is the release host: Mason's decision is
-# GitHub Releases, and an asset name cannot contain "/", so a nested path like
-# `Sys/totaldb.dsy` is not addressable there at all. `nsr_content` already
-# fetches its packs this way (`{base}/packs/{sha256}.json`), so this follows
-# the scheme that is in service rather than inventing a second one.
+# Release files are fetched by content hash from one flat namespace, never by
+# their install path and never under a prefix. The reason is the release host:
+# Mason's decision is GitHub Releases, which serves
+# `/releases/latest/download/<asset>` where <asset> is a single file name - so
+# neither `Sys/totaldb.dsy` nor `files/<hash>` is addressable there. A static
+# host serves a flat directory just as happily, so flat costs nothing and is
+# the only layout that works on both. `nsr_content` already distributes its
+# packs by hash for the same reason.
 #
-# Two properties fall out of it. A file that did not change between releases is
-# the same object, so it needs no second upload; and two identical files in one
-# package are one asset. The manifest still carries the install path - that is
-# where the bytes go, and it is checked against Windows' rules - so the hash
-# decides only what to ask the host for.
-FILE_PREFIX = "files"
-
-
+# Within one package, two identical files collapse to one asset. Across
+# releases they do not, when the host is GitHub Releases: `latest/download`
+# only sees the newest release's assets, so every release carries its full
+# set. Clients still download only what changed - the upload is Mason's cost,
+# the download is his friends'.
+#
+# The manifest still carries each install path. That is where the bytes go and
+# it is validated against Windows' rules; the hash decides only what to ask
+# the host for.
 def file_url(base: str, sha256: str) -> str:
     """Where one release file lives: flat, content-addressed, hostable."""
-    return f"{base.rstrip('/')}/{FILE_PREFIX}/{sha256}"
+    return f"{base.rstrip('/')}/{sha256}"
 
 # The installed build's identity. A fresh zip install has no such file, which
 # reads as version 0 - see `installed()` for why that is safe rather than a
