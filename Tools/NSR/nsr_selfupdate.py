@@ -287,6 +287,16 @@ def stage(payload: dict, plan: update.Plan, install_root: str, base: str, *,
         entry = wanted[rel]
         if progress:
             progress(index, len(plan.fetch), rel)
+        if entry["size"] == 0:
+            # Nothing to transfer: an empty file's content is fully determined,
+            # and `validate_build` has already pinned its digest. A release
+            # host will not even store a 0-byte asset - GitHub answers "Bad
+            # Content-Length" - so this is written rather than fetched. The
+            # real package has 36 of them, all one object after dedup.
+            os.makedirs(os.path.dirname(_dest(staging, rel)) or ".", exist_ok=True)
+            with open(_dest(staging, rel), "wb"):
+                pass
+            continue
         fetch(file_url(base, entry["sha256"]), _dest(staging, rel),
               size=entry["size"], sha256=entry["sha256"])
     if reuse:

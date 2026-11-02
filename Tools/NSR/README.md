@@ -6,7 +6,7 @@ and link none of its code - and carry the same license so that no file in this
 tree is left without one. The NFLStreetRemastered name and marks are not
 licensed under it; see the NFLStreet repository's NOTICE.
 
-Copied from the NFLStreet repo (`tools/`, commit 5f3f92f) by
+Copied from the NFLStreet repo (`tools/`, commit 43db09a) by
 `scripts/sync-launcher-to-fork.sh`. Don't edit here; edit in NFLStreet and
 re-sync. The Windows CI workflow (`.github/workflows/nsr-windows.yml`)
 builds `nsr_launcher.py` (with `nsr_controllers.py`, `nsr_gamestats.py`, `nsr_textures.py`, `nsr_branding.py` and its original figure-free assets, the content-update

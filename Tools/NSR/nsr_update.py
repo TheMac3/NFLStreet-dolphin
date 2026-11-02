@@ -38,6 +38,14 @@ from nsr_content import ContentError, canonical, _hex64, _int, _keys, _stamp, _t
 
 MANIFEST_FORMAT = "nsrb.build.v1"
 
+# sha256 of nothing. A package legitimately contains empty files - Dolphin's
+# `Sys/Load/GraphicMods` has 36 placeholder .txt files - and they are a special
+# case twice over: a release host will not store a 0-byte asset (GitHub returns
+# "Bad Content-Length"), and there is nothing to transfer anyway, since the
+# content is entirely determined by the size. So they are never uploaded and
+# the client writes them.
+EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
 # What this launcher understands, compared against a manifest's `min_launcher`.
 # Raise it only when the install steps or manifest fields actually change: a
 # build stamped above a friend's launcher format is refused outright, which
@@ -146,6 +154,12 @@ def validate_build(obj) -> dict:
         path = valid_path(f["path"])
         _hex64(f["sha256"], f"file entry {i} sha256")
         total += _int(f["size"], f"file entry {i} size", 0, MAX_FILE_BYTES)
+        # An empty file's hash is not a free choice, and the client creates it
+        # rather than downloading it (nothing to transfer), so a manifest that
+        # paired size 0 with some other digest would describe a file no client
+        # could ever produce.
+        if f["size"] == 0 and f["sha256"] != EMPTY_SHA256:
+            raise ContentError(f"file entry {i} is empty but does not have the empty digest")
         # Windows paths are case-insensitive, so two entries differing only in
         # case are one file there: a release like that is ambiguous, not clever.
         folded = path.lower()
