@@ -239,7 +239,7 @@ def fetch_to_file(url: str, dest: str, *, size: int, sha256: str, opener=_open,
 def fetch_manifest(base: str, fetch=None, keys=None) -> tuple[dict, bytes]:
     """Fetch and verify the channel's signed manifest. (payload, raw bytes)."""
     fetch = fetch or content.http_get
-    raw = fetch(base.rstrip("/") + "/" + MANIFEST_NAME, content.MAX_MANIFEST_BYTES)
+    raw = fetch(base.rstrip("/") + "/" + MANIFEST_NAME, update.MAX_MANIFEST_BYTES)
     return update.verify(raw, keys=keys), raw
 
 

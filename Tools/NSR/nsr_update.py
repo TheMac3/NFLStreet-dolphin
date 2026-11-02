@@ -44,10 +44,16 @@ MANIFEST_FORMAT = "nsrb.build.v1"
 # strands them with no way forward but a fresh download.
 LAUNCHER_FORMAT = 5
 
-# Limits. The shipped package is ~92.6 MB across a few dozen files; these are
-# generous for that and still small enough that a hostile or broken release
-# cannot make a launcher enumerate or hold much before anything is verified.
-MAX_FILES = 512
+# Limits. The shipped package is ~92.6 MB across roughly 2700 files - Dolphin's
+# `Sys/` alone is 2506 of them - so these are sized from a real package rather
+# than from the "few dozen" the design sketch assumed, and still small enough
+# that a hostile or broken release cannot make a launcher enumerate or hold
+# much before anything is verified.
+MAX_FILES = 8192
+
+# An application manifest lists every shipped file, so it does not fit a
+# content manifest's 64 KiB: ~2700 entries of ~148 bytes is about 390 KiB.
+MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_FILE_BYTES = 256 * 1024 * 1024
 MAX_TOTAL_BYTES = 1024 * 1024 * 1024
 MAX_REVOKED = 64
@@ -60,11 +66,28 @@ MAX_DEPTH = 6
 # separator, no "." or ".." element, no trailing dot or space on any element
 # (Windows silently strips them, which would let two entries land on one file),
 # and no reserved device name.
-_PATH_ELEMENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+ -]{0,63}")
+#
+# This is a blocklist of what Windows actually forbids, not an allowlist of
+# what seemed likely. The allowlist here was guesswork and it was wrong: it
+# rejected 359 files of the first real package, every one of them a legitimate
+# Dolphin theme asset named `...@2x.png`, plus an apostrophe elsewhere. Both
+# are perfectly legal filenames. Guessing the permitted set means rediscovering
+# it one refused release at a time, so the rule now names the characters
+# Windows reserves - <>:"/\|?* and the control range - and allows the rest of
+# printable ASCII. Non-ASCII is still refused: it is not needed here, and two
+# Unicode spellings of one name could normalize onto a single file.
+_FORBIDDEN = set(r'<>:"/\|?*') | {chr(c) for c in range(32)} | {chr(127)}
+_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}")
 _RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)),
              *(f"lpt{i}" for i in range(1, 10))}
-_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}")
 _COMMIT = re.compile(r"[0-9a-f]{40}")
+
+
+def _valid_element(part: str) -> bool:
+    """One path element: printable ASCII, nothing Windows reserves."""
+    if not 1 <= len(part) <= 64 or not part.isascii():
+        return False
+    return not any(ch in _FORBIDDEN for ch in part)
 
 
 def valid_path(value) -> str:
@@ -77,7 +100,7 @@ def valid_path(value) -> str:
     if not 1 <= len(parts) <= MAX_DEPTH:
         raise ContentError(f"manifest file path is too deep: {value!r}")
     for part in parts:
-        if not _PATH_ELEMENT.fullmatch(part) or part in (".", ".."):
+        if not _valid_element(part) or part.strip(".") == "":
             raise ContentError(f"manifest file path is malformed: {value!r}")
         if part != part.rstrip(". "):
             raise ContentError(f"manifest file path element is unsafe: {value!r}")
@@ -151,12 +174,14 @@ def validate_payload(obj) -> dict:
 
 def sign(payload: dict, kid: str, sign_bytes) -> bytes:
     """Signed envelope for an application manifest (publisher side)."""
-    return content.sign_manifest(payload, kid, sign_bytes, validate=validate_payload)
+    return content.sign_manifest(payload, kid, sign_bytes, validate=validate_payload,
+                                 max_bytes=MAX_MANIFEST_BYTES)
 
 
 def verify(raw: bytes, keys=None) -> dict:
     """Payload of a signed application manifest, or raise. Client side."""
-    return content.verify_manifest(raw, keys=keys, validate=validate_payload)
+    return content.verify_manifest(raw, keys=keys, validate=validate_payload,
+                                   max_bytes=MAX_MANIFEST_BYTES)
 
 
 def describe(build: dict) -> str:

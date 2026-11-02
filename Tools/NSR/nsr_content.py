@@ -390,7 +390,7 @@ def trusted_keys(keys=None) -> dict[str, tuple[int, int]]:
     return out
 
 
-def sign_manifest(payload: dict, kid: str, sign, validate=None) -> bytes:
+def sign_manifest(payload: dict, kid: str, sign, validate=None, max_bytes=None) -> bytes:
     """Envelope bytes for a payload; sign(message) -> signature bytes (server side).
 
     `validate` is the payload schema, defaulting to this module's content
@@ -403,18 +403,21 @@ def sign_manifest(payload: dict, kid: str, sign, validate=None) -> bytes:
     envelope = {"format": ENVELOPE_FORMAT, "kid": kid, "payload": b64encode(body),
                 "sig": b64encode(sign(body))}
     raw = canonical(envelope)
-    if len(raw) > MAX_MANIFEST_BYTES:
+    if len(raw) > (max_bytes or MAX_MANIFEST_BYTES):
         raise ContentError("manifest is too large")
     return raw
 
 
-def verify_manifest(raw: bytes, keys=None, validate=None) -> dict:
+def verify_manifest(raw: bytes, keys=None, validate=None, max_bytes=None) -> dict:
     """Check the signature with a trusted key, then the payload schema. Returns
     the payload. Raises ContentError on anything unexpected.
 
     `validate` is the payload schema (see sign_manifest); the default accepts
-    only a content manifest."""
-    if not isinstance(raw, (bytes, bytearray)) or len(raw) > MAX_MANIFEST_BYTES:
+    only a content manifest. `max_bytes` overrides the size cap for a kind of
+    manifest that is legitimately larger: an application manifest lists every
+    shipped file, and the real package is ~2700 of them, so it does not fit a
+    content manifest's budget."""
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) > (max_bytes or MAX_MANIFEST_BYTES):
         raise ContentError("manifest is missing or too large")
     env = _keys(strict_loads(bytes(raw)), "manifest envelope", {"format", "kid", "payload", "sig"})
     if env["format"] != ENVELOPE_FORMAT:
