@@ -501,6 +501,11 @@ jobs:
           echo "launcher at $(git -C "$work" rev-parse --short HEAD)"
 
       - name: Sign and publish
+        env:
+          # A channel counts its own versions. Set this when moving channels so
+          # the new one starts above whatever clients already have, or they
+          # refuse everything it serves until it catches up.
+          NSR_MIN_VERSION: ${{ vars.NSR_MIN_VERSION }}
         run: |
           set -euo pipefail
           test -d package/NFLStreetRemastered || { echo "artifact layout changed" >&2; exit 1; }
