@@ -256,9 +256,23 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     # Preserve the native owned HiresTextures decision before adding app branding.
     # Presentation never enters content/room agreement or mutates an image.
     hires = hd_textures and (bool(tex.folders()) if retail else True)
-    brand = branding.overlay(app_folder or folder, folder, branded_art) if hires else None
+    # Branding is cosmetic and must never be the reason a game does not start.
+    # It reads art bundled inside the executable, and on Windows that lives in
+    # PyInstaller's temporary unpack directory - which an antivirus can empty
+    # while the launcher is still running. That turned a missing loading
+    # screen into "Couldn't prepare the local texture list. Close the game and
+    # retry", with no way past it. A `_safe` refusal lands here too, which is
+    # also right: the answer to "this write would leave the app folder" is to
+    # skip the write, not to withhold the game.
+    brand = None
+    try:
+        if hires:
+            brand = branding.overlay(app_folder or folder, folder, branded_art)
+        branding.custom_cover(app_folder or folder, folder, branded_art)
+    except (OSError, ValueError) as exc:
+        brand = None
+        tex.warnings.append(f"app artwork unavailable ({exc}); the game's own art is used")
     tex.brand = brand
-    branding.custom_cover(app_folder or folder, folder, branded_art)
     textures.write_list(os.path.join(folder, "User"), tex)
     env["NSR_TEXTURES"] = tex.summary()  # logged by the launcher; the fork ignores it
     if tex.warnings and hd_textures:
@@ -592,6 +606,10 @@ class Launcher:
         self._runtime_content = None  # installed, signed runtime release (also used offline)
         self._source_sha = ""     # SHA-256 of the selected source used to build nsr-net.iso
         self._proc = None         # the Dolphin we started, to avoid rebuilding under it
+        # How this window closes itself, set by whichever UI is running. Until
+        # one does, an update must not relaunch: it would leave two launchers.
+        self.on_quit = None
+        self._build_lock = None   # held while this process builds the game copy
         self._quality_generation = 0  # a new lobby invalidates the previous reader
         self.rev = 0
         self._notice_id = 0
@@ -636,7 +654,16 @@ class Launcher:
             # recipe is newer than the image's, so the game copy needs one.
             "build": {"state": "idle", "text": "", "version": _build_now["version"],
                       "label": _build_now["label"], "latest": None, "changelog": "",
-                      "auto": bool(cfg.get("build_auto", True)), "busy": False, "rebuild": False},
+                      # Off by default until the Windows self-replace has been
+                      # demonstrated. It has not: its first real run installed
+                      # unprompted, relaunched without closing the old window,
+                      # and left two processes building the game copy. Checking
+                      # and reporting still happen on every start, and one click
+                      # installs - what is withheld is applying an unproven
+                      # swap to a friend's install while they are trying to
+                      # play. Flip this back to True once a Windows cycle has
+                      # actually been through update, relaunch and revert.
+                      "auto": bool(cfg.get("build_auto", False)), "busy": False, "rebuild": False},
             "playbook": {"text": books.label([cfg.get("playbook")]), "link_code": ""},
             "host": {"state": "idle", "mode": "", "code": "", "players": [], "can_start": False,
                      "info": "" if self.rv_server else "Room codes aren't set up in this download "
@@ -709,6 +736,7 @@ class Launcher:
                 self._check_game_now()
                 self.sync_controllers_now(search=True)
             finally:
+                self._release_build_lock()
                 self._set("game", busy=False)
             if image or self.state["game"]["state"] in ("missing", "stale"):
                 self.find_game()
@@ -952,18 +980,77 @@ class Launcher:
                     self._set("game", state="missing", fingerprint="", progress=None,
                               text="Choose your game source in Settings → Advanced, then Browse to your disc image or locate Reborn.")
             finally:
+                self._release_build_lock()
                 self._set("game", busy=False)
         self._spawn(work)
 
     def _claim_build(self, text: str) -> dict | None:
         """Mark the game copy busy (one build at a time). Returns the previous
-        game state to restore if a content update fails, or None if busy."""
+        game state to restore if a content update fails, or None if busy.
+
+        The claim is held across *processes*, not just threads. Two launchers
+        in one folder each decided the game copy was missing and began
+        building it into the same output - seen for real when an update
+        relaunched without closing the old window. Even with that fixed, a
+        player who double-clicks twice would do the same thing, and two
+        builds writing one 1.4 GB image is not something to leave to luck.
+        """
         with self._lock:
             if self.state["game"]["busy"]:
+                return None
+            if not self._take_build_lock():
+                log(self.folder, "build: another NFLStreetRemastered is already building "
+                                 "the game copy in this folder; leaving it to that one")
+                self._set("game", state="building", progress=None,
+                          text="Another NFLStreetRemastered window is building the game copy.")
                 return None
             before = dict(self.state["game"])
             self._set("game", busy=True, state="building", fingerprint="", progress=0, text=text)
             return before
+
+    def _take_build_lock(self) -> bool:
+        """Claim the folder's build lock for this process, or return False.
+
+        An exclusive file lock rather than a pid file: the kernel releases it
+        if we are killed, so a crashed build cannot leave the folder wedged
+        with nothing able to build again.
+        """
+        if self._build_lock is not None:
+            return True
+        path = os.path.join(self.folder, ".nsr-build.lock")
+        try:
+            handle = open(path, "w")
+        except OSError:
+            return True       # an unwritable folder has bigger problems than this
+        try:
+            if sys.platform == "win32":
+                import msvcrt  # noqa: PLC0415
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl  # noqa: PLC0415
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return False
+        self._build_lock = handle
+        return True
+
+    def _release_build_lock(self) -> None:
+        handle, self._build_lock = self._build_lock, None
+        if handle is None:
+            return
+        try:
+            if sys.platform == "win32":
+                import msvcrt  # noqa: PLC0415
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl  # noqa: PLC0415
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            handle.close()
 
     def _run_build(self, iso: str, content=None, strict: bool = False, restore: dict | None = None) -> bool:
         """Build nsr-net.iso (with a content update if given) after _claim_build.
@@ -1044,6 +1131,7 @@ class Launcher:
             self._fail_build(restore, f"Couldn't build the game copy: {e}"
                              + (" (Is the game still running?)" if isinstance(e, PermissionError) else ""), recheck=built)
         finally:
+            self._release_build_lock()
             self._set("game", busy=False)
         return False
 
@@ -1529,6 +1617,18 @@ class Launcher:
         entry = os.path.join(self.folder, "NFLStreetRemastered.exe")
         if sys.platform != "win32" or not os.path.isfile(entry):
             return False
+        # Check we can actually close before starting anything. Setting
+        # `self._stop` only tells the background loops to wind down - it does
+        # not close the window - so an earlier version started the new build
+        # and then carried on running, leaving the player with two launchers
+        # and, worse, two processes that each decided the game copy was
+        # missing and began building it. If there is no way to close this
+        # window, the honest outcome is to leave the new build for the next
+        # start and say so, not to add a second one.
+        if self.on_quit is None:
+            log(self.folder, "update: installed, but this window cannot close itself; "
+                             "asking the player to restart")
+            return False
         try:
             self._popen([entry], close_fds=True,
                         creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
@@ -1536,6 +1636,11 @@ class Launcher:
             log(self.folder, f"update: couldn't start the new version ({e}); asking the player to")
             return False
         self._stop.set()
+        try:
+            self.on_quit()
+        except Exception as e:  # noqa: BLE001  (we have already started the replacement)
+            log(self.folder, f"update: the new version is running but this window would not "
+                             f"close ({e!r}); close it manually")
         return True
 
     def rebuild_for_recipe(self) -> None:
@@ -2138,6 +2243,7 @@ class Launcher:
                 self._set("game", state="error", fingerprint="", text=str(e), progress=None)
             log(self.folder, f"local texture import: {e}")
         finally:
+            self._release_build_lock()
             self._set("game", busy=False)
 
     def set_branded_art(self, on) -> None:
@@ -2210,6 +2316,7 @@ class Launcher:
             self._check_game_now()
             self.sync_controllers_now(search=True)
         finally:
+            self._release_build_lock()
             self._set("game", busy=False)
         if self.state["game"]["state"] == "ready":
             self._import_assets_setup()
@@ -2353,6 +2460,9 @@ def run_web(launcher: Launcher, selftest: bool = False) -> int:
     window = webview.create_window(APP_TITLE, html=html, js_api=api, width=1200, height=780,
                                    min_size=(980, 660), background_color="#0a0a0c")
     api._window = window
+    # So an applied update can close this window instead of leaving it beside
+    # the new one. pywebview is thread-safe for destroy().
+    launcher.on_quit = window.destroy
     result = {"code": 0}
 
     def probe():  # selftest: the page must render a real snapshot, then close
@@ -2684,6 +2794,10 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
+    # As in the web UI: an applied update closes this window rather than
+    # leaving it running beside the one it just started. Tk is not thread-safe,
+    # so the close is marshalled onto its own loop.
+    launcher.on_quit = lambda: root.after(0, root.destroy)
     launcher.startup()
     render()
     if selftest:
