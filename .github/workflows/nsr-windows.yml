@@ -298,7 +298,7 @@ jobs:
           $date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'")
           $nfl = (Select-String -Path Tools/NSR/README.md -Pattern 'commit ([0-9a-f]+)').Matches[0].Groups[1].Value
           $recipe = (python -c "import sys; sys.path.insert(0, 'Tools/NSR'); import nsr_patcher as p; print(p.ROLLBACK_RECIPE)").Trim()
-          $fp = (python -c "import sys; sys.path.insert(0, 'Tools/NSR'); import nsr_patcher as p; print(' '.join(p.fingerprint(o) for _, o in p.KNOWN_INPUTS.values()))").Trim()
+          $fp = (python -c "import sys; sys.path.insert(0, 'Tools/NSR'); import nsr_patcher as p; print('; '.join('%s = %s' % (lbl, p.fingerprint(o)) for lbl, o in p.KNOWN_INPUTS.values()))").Trim()
           $repo = "${{ github.server_url }}/${{ github.repository }}"
           $pkg = "package/NFLStreetRemastered"
           New-Item -ItemType Directory -Force $pkg | Out-Null
@@ -326,7 +326,7 @@ jobs:
           Launcher from:  NFLStreet commit $nfl
           Netplay:        rollback (menus in lockstep, matches in rollback)
           Image recipe:   $recipe
-          Expected game fingerprint (Reborn 2026.09.12): $fp
+          Game fingerprint, by Reborn version: $fp
           "@ | Set-Content -Encoding utf8 "$pkg/VERSION.txt"
           @"
           This package contains a modified build of Dolphin (GPL-2.0-or-later).
@@ -355,7 +355,11 @@ jobs:
              Advanced > Game source > My own disc image > Browse. The first
              setup reads/converts and verifies your disc, then builds a private
              copy (about 1.4 GB; compressed sources also need temporary space).
-             Reborn reference fingerprint: $fp
+             Each Reborn version builds a different game fingerprint:
+             $fp
+             Everyone playing together needs the same one, so let Reborn
+             finish updating before the first build and don't update it
+             mid-session.
              Owned copies keep their separate files in local/GameSources/owned/.
              NFLStreetRemastered-Patcher.exe does
              the same build on its own and is only needed for troubleshooting.
@@ -382,7 +386,9 @@ jobs:
                (NSRM-XXXXX) -> "Start game" when everyone is listed.
              - Join: Join -> type the code -> "Join room" -> wait for the host.
              Everyone must use this same download and have the same game
-             fingerprint; the room tells you if someone doesn't.
+             fingerprint; the room tells you if someone doesn't. The usual
+             reason it differs is one person's Reborn being a version ahead
+             or behind - see the fingerprint list in step 3.
              If the window looks plain (no sidebar), Windows is missing the
              Microsoft Edge WebView2 Runtime; everything still works.
 
