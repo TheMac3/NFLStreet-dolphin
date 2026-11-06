@@ -19,8 +19,12 @@ import discpatch
 import eadb
 import isopatch as ip
 
-RECIPE = "gn7e69-r0-rollback-ratingsplit-v1"  # legacy opt-in baked PPVL
-RUNTIME_RECIPE = "gn7e69-r0-rollback-ratingsplit-runtime-v2"
+# Both name images that also carry isopatch's rollback patches, so both were
+# bumped on 2026-11-06 when the rollback cave moved off 0x80416900; see
+# nsr_patcher.ROLLBACK_RECIPE. The runtime variant injects at the content hook
+# rather than baking, but the image underneath it still changed.
+RECIPE = "gn7e69-r0-rollback-ratingsplit-v2"  # legacy opt-in baked PPVL
+RUNTIME_RECIPE = "gn7e69-r0-rollback-ratingsplit-runtime-v3"
 
 
 def name_hash(first: str, last: str) -> int:

@@ -156,8 +156,9 @@ def find_reborn(explicit: str | None) -> str:
                 inner = candidate.joinpath(*layout)
                 if inner.is_file():
                     return str(inner)
+            layouts = ", ".join("/".join(layout) for layout in nsr_patcher.LAYOUTS)
             raise RosterImportError(f"{candidate} is not a Reborn install "
-                               "(no content/games/NSR.iso inside it)")
+                               f"(none of {layouts} inside it)")
         if candidate.is_file():
             return str(candidate)
         raise RosterImportError(f"no such path: {candidate}")

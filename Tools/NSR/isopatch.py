@@ -71,13 +71,14 @@ Patches (GN7E69 rev 0, Reborn 3.0 main.dol `6dccf385…`):
           IDs: see TRACE_FUNCS.
   rollback POC milestone 2 (needs freeze; replaces input/netplay at the poll
           and profile/stress at the sim calls; needs NFLStreet-dolphin, see
-          docs/poc-milestone2.md). Uses free data at 0x80416900..0x80416A80
-          (zero in every dump, unreferenced). Four HLE stubs (0x80416900 poll,
-          0x80416904 tick, 0x80416908 tick end, 0x8041690C time; plain
-          `blr` here).
+          docs/poc-milestone2.md). Uses the free data cave at RB_BASE
+          (0x80414D00..0x80414F00; see RB_BASE for why it moved off
+          0x80416900 and how the replacement was audited). Four HLE stubs
+          (0x80414D00 poll, 0x80414D04 tick, 0x80414D08 tick end,
+          0x80414D0C time; plain `blr` here).
           Poll: the tail of fn_801E26FC (0x801E271C..0x801E2730) becomes one
           call to a routine that does what the tail did (clear, PADRead,
-          Reborn's remap + PADClamp) on a scratch buffer (0x80416920) and
+          Reborn's remap + PADClamp) on a scratch buffer (0x80414D20) and
           calls the poll stub twice (r3 = scratch, r4 = retrace counter,
           r5 = 0 before the remap, 1 after). Dolphin copies the processed
           pads into the game's pad buffer, except during re-simulation.
@@ -85,15 +86,15 @@ Patches (GN7E69 rev 0, Reborn 3.0 main.dol `6dccf385…`):
           0x80028654/0x8002865C) becomes a routine that loops: call the tick
           stub (r3 = pad buffer; Dolphin may restore an earlier state and
           write that tick's pads), run sim part 1 and part 2, call the
-          tick-end stub (0x80416908), repeat while bit 1 of the stub's r3 is
+          tick-end stub (0x80414D08), repeat while bit 1 of the stub's r3 is
           set.
           Frame: the only call of InGame::fn_8002854C (0x800326D0) goes to
-          a frame routine (0x80416A80) that loops frame stub (0x80416914),
-          InGame, frame-end stub (0x80416918) while Dolphin asks, so a
+          a frame routine (0x80414E80) that loops frame stub (0x80414D14),
+          InGame, frame-end stub (0x80414D18) while Dolphin asks, so a
           rollback re-runs whole frames (Slippi's model); Dolphin skips the
           present on re-simulated frames and fixes one tick per frame.
           Time: the direct `mftb r3` in game code at 0x80198924 calls the
-          time stub (0x8041690C) instead, so Dolphin can return tick-based
+          time stub (0x80414D0C) instead, so Dolphin can return tick-based
           time during ticks (re-simulation must see the same time).
 
   draft-snake / draft-cocky  Pickup-only accepted-pick order; requires rollback.
@@ -145,17 +146,43 @@ TRACE_FUNCS = [  # (id, address, label)
     (8, 0x801C60BC, "input flush B"),
     (9, 0x801C6280, "input handler register"),
 ]
-RB_POLL_STUB = 0x80416900    # must match NSRNetplay::RB_POLL_STUB
-RB_TICK_STUB = 0x80416904    # must match NSRNetplay::RB_TICK_STUB
-RB_TICK_END_STUB = 0x80416908  # must match NSRNetplay::RB_TICK_END_STUB
-RB_TIME_STUB = 0x8041690C    # must match NSRNetplay::RB_TIME_STUB
-RB_GATE_RETURN = 0x80416910  # HLE only (NSRNetplay::RB_GATE_RETURN)
-RB_FRAME_STUB = 0x80416914      # must match NSRNetplay::RB_FRAME_STUB
-RB_FRAME_END_STUB = 0x80416918  # must match NSRNetplay::RB_FRAME_END_STUB
-RB_FRAME_CODE = 0x80416A80      # frame routine (after the tick routine)
+# The rollback cave: seven HLE stubs, a pad scratch buffer, three routines,
+# and two trampolines Dolphin writes itself. Everything is an offset from one
+# base so a collision costs one line - but the base must stay matched with
+# NSRNetplay.h's RB_BASE, and moving it re-encodes the frame routine's
+# relative branches, which the fork's boot signature check pins word for word.
+#
+# It lived at 0x80416900 until Reborn 2026.10.09 put a UI string table there
+# (and a pointer table at 0x80416874 addressing it). The replacement was
+# picked by audit, not by looking at one dump: zero AND unreferenced - no
+# pointer word, lis/addi pair, branch target or small-data displacement - in
+# all 12 builds reconstructible from Reborn's xdelta chain. The original cave
+# passed the same reference check on the build it was chosen against, so
+# "unreferenced today" is necessary and not sufficient; what makes this one
+# safer is the history behind it. See docs/research-log.md, 2026-11-06.
+RB_BASE = 0x80414D00
+RB_SIZE = 0x200              # the cave is RB_BASE..RB_BASE + RB_SIZE
+RB_POLL_STUB = RB_BASE + 0x00    # must match NSRNetplay::RB_POLL_STUB
+RB_TICK_STUB = RB_BASE + 0x04    # must match NSRNetplay::RB_TICK_STUB
+RB_TICK_END_STUB = RB_BASE + 0x08  # must match NSRNetplay::RB_TICK_END_STUB
+RB_TIME_STUB = RB_BASE + 0x0C    # must match NSRNetplay::RB_TIME_STUB
+RB_GATE_RETURN = RB_BASE + 0x10  # HLE only (NSRNetplay::RB_GATE_RETURN)
+RB_FRAME_STUB = RB_BASE + 0x14      # must match NSRNetplay::RB_FRAME_STUB
+RB_FRAME_END_STUB = RB_BASE + 0x18  # must match NSRNetplay::RB_FRAME_END_STUB
+RB_FRAME_CODE = RB_BASE + 0x180     # frame routine (after the tick routine)
+# The last three words of the cave belong to Dolphin, which writes a `blr` at
+# each: NSRNetplay's SIM_WAIT_TRAMP (+0x1F4), MUSIC_TRAMP (+0x1F8) and
+# AC_RETURN_STUB (+0x1FC). The
+# frame routine has to stop short of them. The old bound here was
+# AUDIO_CLOCK_STATE, which is further on and would have let the routine grow
+# over both trampolines before any assertion fired.
+RB_TRAMPOLINES = RB_BASE + 0x1F4
 # NFLStreet-dolphin's audio clock keeps its model state (speech queues, virtual
 # sound handles, bank-upload waits) in this free data (zero in the image,
 # restored by rollback with the game). Patch code must stay below it.
+# Dolphin's own, not written here. It stays at its original address: the
+# 2026-11-06 audit found 0x80416B00..0x80417000 still zero and unreferenced in
+# all 12 builds, so only the code cave below it had to move.
 AUDIO_CLOCK_STATE = 0x80416B00  # must match NSRNetplay AC_BASE (..0x80417000)
 # The rollback unit is one main-loop iteration, fn_80026AD0 -> fn_801CBFA8:
 # it first dispatches queued messages (the whole draw traversal, UI and
@@ -176,10 +203,10 @@ VI_PRE_CB = 0x801F7DF4
 # a tick saw the first time, so it goes through Dolphin.
 MFTB_SITES = [0x80198924]
 MFTB_R3 = 0x7C6C42E6
-RB_SCRATCH = 0x80416920      # PADStatus[4] that PADRead fills in a rollback image
-RB_POLL_CODE = 0x80416960
-RB_TICK_CODE = 0x80416A10
-RB_END = 0x80416A80          # must match NSRNetplay RB_KEEP
+RB_SCRATCH = RB_BASE + 0x20  # PADStatus[4] that PADRead fills in a rollback image
+RB_POLL_CODE = RB_BASE + 0x60
+RB_TICK_CODE = RB_BASE + 0x110
+RB_END = RB_BASE + 0x180     # start of the frame routine; RB_BASE..here is NSRNetplay RB_KEEP's first half
 POLL_TAIL = 0x801E271C       # addi r3,r30,buf; bl clear; addi; bl PADRead; addi; bl remap
 POLL_CLEAR = 0x801D34D0
 PAD_READ = 0x8024734C
@@ -543,7 +570,7 @@ def rollback_frame_routine() -> list[int]:
     code[main] = b(a + 4 * main, MAIN_ITER, link=True)
     code[end] = b(a + 4 * end, RB_FRAME_END_STUB, link=True)
     code[bne_] = bc(a + 4 * bne_, a + 4 * loop, 4, 2)
-    assert a + 4 * len(code) <= AUDIO_CLOCK_STATE
+    assert a + 4 * len(code) <= RB_TRAMPOLINES
     return code
 
 

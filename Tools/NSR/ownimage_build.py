@@ -23,7 +23,9 @@ import isopatch as pp
 import ownimage
 
 FAMILY = "gn7e69-r0-retail"
-RECIPE = "gn7e69-r0-ownimage-rollback-v1"
+# v2 for the same reason as nsr_patcher.ROLLBACK_RECIPE: this family applies
+# isopatch's ROLLBACK_SET too, so the cave move changed its bytes as well.
+RECIPE = "gn7e69-r0-ownimage-rollback-v2"
 PAD_CLAMP = 0x802465BC
 ARENA_SET = 0x80239A10
 ARENA_SDA = -0x6148

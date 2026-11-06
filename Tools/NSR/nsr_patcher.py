@@ -73,7 +73,14 @@ MANIFEST_NAME = "nsr-image.json"  # sidecar describing nsr-net.iso (no paths)
 ROSTER_IMPORT_NAME = "nsr-roster-import.json"
 # Versioned name of the patch recipe friends build. Bump the suffix whenever
 # isopatch's rollback bytes change (then update KNOWN_INPUTS' outputs).
-ROLLBACK_RECIPE = "gn7e69-r0-rollback-v1"
+# v2 (2026-11-06): the rollback cave moved off 0x80416900, which Reborn
+# 2026.10.09 took for a UI string table. Every rollback patch byte moved with
+# it, so a v1 image and a v2 image are not interchangeable. Published content
+# releases carry the recipe they were built against and the channel checks it,
+# so the channel needs a release built from v2 before a v2 launcher can take
+# updates from it; everyone rebuilds either way, because the fingerprint
+# changes.
+ROLLBACK_RECIPE = "gn7e69-r0-rollback-v2"
 NETPLAY_MODE = "rollback"  # what this image plays (nsr_lobby.RELEASE_MODE)
 # Source install discovery for the first local texture/controller import.
 # Normal play uses our Assets store and does not require this path to exist.
@@ -84,35 +91,66 @@ REBORN_PATH_NAME = "nsr-reborn.txt"
 # patches still apply (isopatch's byte checks will refuse otherwise).
 KNOWN_INPUTS = {
     # Reborn 3.0.0 launcher, game-patch chain label "2026.09.12".
-    # Output = ROLLBACK_RECIPE (isopatch freeze seed rollback as of 67e0285,
-    # 2026-10-09): byte-identical to local/work/rb3.iso, the image every
-    # rollback/stage-4 test ran on. Fingerprint B57A-8270-68C2.
+    # Output = ROLLBACK_RECIPE v2, fingerprint 20BB-AB8A-9B79. Under v1 this
+    # base produced B57A-8270-68C2, byte-identical to local/work/rb3.iso, and
+    # that is the image every rollback/stage-4 run before 2026-11-06 used; the
+    # cave move re-made it. Qualification evidence recorded against rb3.iso
+    # therefore belongs to v1 and does not carry over on its own.
     "9a6fdedbdff2b2f4ebcc346ccf0bacc97e0489a15be80c648249d0b36c6270ce":
-        ("Reborn 2026.09.12", "b57a827068c2e4172dda3f863db9fb446982cefddcf45708b0df6c2ebb7c6a83"),
+        ("Reborn 2026.09.12", "20bbab8a9b797a853f3eb97fa8dacfcaae073e85541819dd09edb60ddbac7195"),
+    # Reborn 3.0.46, game-patch 2026.10.09 with roster 2026.10.13 applied -
+    # library/offline/NSR.iso, which is what the launcher points play at.
+    # Built 2026-11-06 after the rollback cave moved to isopatch's RB_BASE;
+    # patches applied cleanly and all 33 words of the fork's boot signature
+    # match the output. Fingerprint 498D-15A1-E8DA.
+    "08bfdeaadb2c082df70541a10c2dcf45c6708351c5ee5778de244a656fb44414":
+        ("Reborn 2026.10.09 roster 2026.10.13",
+         "498d15a1e8da15c8710e6eb9bcb4bb421f3bca334a7d0bd62c13a5cfd5bc42f6"),
 }
+# Note for whoever adds the next row: Reborn 3.x ships the roster as its own
+# component, applied on top of the game-patch chain, so the base image hash now
+# moves on a roster release as well as a game release. A row is therefore one
+# (game-patch, roster) pair, not one Reborn version, and friends on different
+# roster versions get different fingerprints and cannot share a room.
 # Images earlier launchers built, so an old nsr-net.iso is reported as stale
 # instead of "unrecognized". Milestone-1 lockstep (freeze seed input netplay)
 # from Reborn 2026.09.12, fingerprint F3FE-3498-D43D.
 LEGACY_OUTPUTS = {
     "f3fe3498d43d4e346419352b3b376810dbc675d82eb5cc1d1ee517e9193601d8": "lockstep (milestone 1)",
+    # Rollback v1 from the 2026.09.12 base: the cave at 0x80416900, before
+    # Reborn 2026.10.09 took that address. A friend still holding this image
+    # should be told it is stale, not that it is unrecognized.
+    "b57a827068c2e4172dda3f863db9fb446982cefddcf45708b0df6c2ebb7c6a83": "rollback v1 (cave at 0x80416900)",
 }
 
 
 def search_roots() -> list[str]:
     env = os.environ
+    # ~/.local/share is where the Linux build keeps its data root. It has to be
+    # named outright because _walk skips dot-directories, so no search from the
+    # home directory can ever descend into it.
+    xdg_data = env.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
     roots = [env.get("LOCALAPPDATA", ""), os.path.join(env.get("LOCALAPPDATA", ""), "Programs"),
              env.get("ProgramFiles", ""), env.get("ProgramFiles(x86)", ""), env.get("APPDATA", ""),
              os.path.expanduser("~"), os.path.join(os.path.expanduser("~"), "Desktop"),
-             os.path.join(os.path.expanduser("~"), "Downloads"), os.path.join(os.path.expanduser("~"), "Games")]
+             os.path.join(os.path.expanduser("~"), "Downloads"), os.path.join(os.path.expanduser("~"), "Games"),
+             xdg_data]
     for drive in "CDEFG":
         roots += [f"{drive}:\\", f"{drive}:\\Games"]
     return [r for r in dict.fromkeys(roots) if r and os.path.isdir(r)]
 
 
-# Where NSR.iso sits under a Reborn folder: the installed layout is
-# <install dir>/content/games/NSR.iso; an innoextract'ed installer shows the
-# install dir as app/.
-LAYOUTS = (("content", "games", "NSR.iso"), ("app", "content", "games", "NSR.iso"))
+# Where NSR.iso sits under a Reborn folder. Newest first, because a data root
+# that has been through an upgrade can still carry the older path:
+#
+# * library/offline/NSR.iso is the current build, patch chain already applied,
+#   and is what the launcher's own settings.json points play at;
+# * library/game-full/NSR.iso is the unpatched full download it was built from,
+#   so it is only a fallback;
+# * content/games/NSR.iso is the 3.0.0-era layout, with app/ prefixed when the
+#   installer has merely been innoextract'ed rather than installed.
+LAYOUTS = (("library", "offline", "NSR.iso"), ("library", "game-full", "NSR.iso"),
+           ("content", "games", "NSR.iso"), ("app", "content", "games", "NSR.iso"))
 
 
 def find_reborn_iso() -> str | None:
