@@ -2376,7 +2376,8 @@ class Launcher:
                 f"local {plan['theirs']['label'] or 'Reborn install'}"
                 + (f". {skipped} differences could not be applied" if skipped else "")
                 + f". Your game copy is now {applied['fingerprint']} - everyone in a room needs "
-                  "the same import. Rebuild game copy undoes it.")
+                  "the same import. Published roster updates need an unimported copy, so Rebuild "
+                  "game copy is what undoes this and lets them apply again.")
         except (roster_import.RosterImportError, discpatch.PatchError, OSError, ValueError) as e:
             self._roster_result(f"Roster import stopped: {e} Your game copy is unchanged.", True)
         finally:

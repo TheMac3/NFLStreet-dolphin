@@ -448,15 +448,17 @@ h1 { text-transform:uppercase; font-size:38px; border-bottom:3px solid var(--red
         </details>
         <div class="card">
           <div class="label">Reborn's roster</div>
-          <div class="note">Optional, this PC only. Reads the roster from your own NFL Street Reborn
-            install and writes its ratings into your game copy, while our roster editor catches up.
-            Reborn is only read; nothing is uploaded or shared.</div>
+          <div class="note">Usually you need nothing here: Mason publishes Reborn's roster updates
+            through Game updates above, so they arrive on their own. This button is for running
+            ahead of that with your own Reborn install, and it reads Reborn only.</div>
           <div class="row" style="margin-top:16px">
             <button class="btn" id="btnRosterImport">Import Reborn's roster</button>
           </div>
           <div class="info" id="rosterImportText" aria-live="polite"></div>
-          <div class="note">Everyone in a room needs the same import, or none — a room will say so
-            by name if they differ. Rebuild game copy below undoes it.</div>
+          <div class="note">Two things to know. Everyone in a room needs the same import, or none —
+            a room will say so by name if they differ. And published roster updates need an
+            unimported copy, so after importing, Rebuild game copy below is what lets them apply
+            again.</div>
         </div>
         <div class="card">
           <div class="label">Game updates</div>

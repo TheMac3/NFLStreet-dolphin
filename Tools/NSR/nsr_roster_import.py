@@ -402,13 +402,97 @@ def run_import(reborn: str | None, image: str, name: str, packs: Path = PACKS,
     saved = app.save(name, plan["rows"])
     receipt = plan["report"]
     receipt_path = write_receipt(packs, name, receipt)
-    result = {"pack": name, "receipt": str(receipt_path), "rows": saved, "report": receipt}
+    result = {"pack": name, "receipt": str(receipt_path), "rows": saved, "report": receipt,
+              # For the publish path: the roster the pack was validated against.
+              "rows_roster_file": plan["ours"]["roster_file"], "template": plan["ours"]["roster"]}
     if build:
         result["build"] = app.build(name)
         # The receipt travels with the image it was baked into, because that is
         # what the launcher has in hand when a room asks whose roster this is.
         # Written after the image so a failed build leaves no claim behind.
         result["sidecar"] = str(write_sidecar(Path(result["build"]["image"]).parent, receipt))
+    return result
+
+
+def publish_blockers(rows: list[dict]) -> list[str]:
+    """Reasons the signed channel would refuse this pack, checked before signing.
+
+    Both limits belong to the runtime boot bundle rather than to the pack
+    format, and both already fail closed later with actionable text. Checking
+    them here means the operator finds out before a release is cut rather than
+    after, which matters because a refused publish is a wasted signing step.
+    """
+    import nsr_content
+    blockers = []
+    if len(rows) > nsr_content.MAX_EDITS:
+        blockers.append(f"{len(rows)} attributes exceeds the {nsr_content.MAX_EDITS} a runtime "
+                        "release carries; publish a narrower pack or use image baking")
+    unusual = sorted({f"{r['first_name']} {r['last_name']}".strip() for r in rows
+                      if not all(32 <= ord(c) < 127 for c in r["first_name"] + r["last_name"])})
+    if unusual:
+        blockers.append(f"{len(unusual)} player name(s) are not ASCII, which game-start updates "
+                        f"do not carry yet (first: {unusual[0]!r}); use image baking")
+    return blockers
+
+
+def publish_changelog(receipt: dict) -> str:
+    """What players read, and the attribution the release carries.
+
+    Reborn is named with the roster's own digest, not just a version string,
+    because an unlabelled build is the usual case. A release must never read as
+    though these ratings were our work: see the dated exception in AGENTS.md.
+    """
+    source, counts = receipt["source"], receipt["counts"]
+    where = source["label"] or "an unreleased Reborn build"
+    return (f"Roster ratings imported from NFL Street Reborn ({where}, roster "
+            f"{source['roster_sha256'][:12]}): {counts['attributes']} attributes on "
+            f"{counts['players']} players. Ratings only, and the work is the Reborn team's, "
+            "not ours.")
+
+
+def run_publish(reborn: str | None, image: str, name: str, packs: Path = PACKS,
+                roster_file: str | None = None, root: str | None = None,
+                key: str | None = None, dry_run: bool = False) -> dict:
+    """Import, then publish the pack on our signed content channel.
+
+    This is an **operator** command and cannot be a launcher button: publishing
+    signs a release, and the signing key never leaves Mason's machine by design
+    (`tools/nsr_release.py`). Players only ever download.
+
+    `image` must be the unedited release base the channel publishes against -
+    the pack pins that image's digests, and `content_store.release_builds`
+    refuses anything else. Importing against an already-imported copy would
+    produce a pack nobody can apply.
+    """
+    result = run_import(reborn, image, name, packs, roster_file, build=False)
+    blockers = publish_blockers(result["rows"])
+    changelog = publish_changelog(result["report"])
+    result.update(blockers=blockers, changelog=changelog, published=False)
+    if blockers:
+        raise RosterImportError("this roster cannot be published as a game-start update: "
+                                + "; ".join(blockers))
+    sys.path.insert(0, str(REPO / "services" / "content"))
+    import content_store
+    import nsr_content
+    # Rehearsed through the publisher's own loading and builds code, not a
+    # paraphrase of it: the channel publishes only against an unedited release
+    # base it recognizes, and a dry run that skipped that check would look fine
+    # and then fail for real. Reading the pack back also proves the file on
+    # disk is what will be published, rather than the rows still in memory.
+    ours = result["report"]["target"]
+    pack_path = Path(packs) / (_editor().pack_name(name) + ".csv")
+    loaded = content_store._packs_from_csv([str(pack_path)], result["template"],
+                                           ours["image_sha256"])
+    result["builds"] = content_store.release_builds(
+        image, result["rows_roster_file"], result["template"],
+        nsr_content.eadb_rows(loaded), ours["image_sha256"])
+    if dry_run:
+        return result
+    argv = (["--root", root] if root else []) + (["--key", key] if key else []) + [
+        "publish", "--image", image, "--pack", str(pack_path), "--changelog", changelog]
+    if content_store.main(argv) != 0:
+        raise RosterImportError("the content channel refused the release; its message is above")
+    result["published"] = True
     return result
 
 
@@ -438,6 +522,12 @@ def _print_report(result: dict, sample: int = 10) -> None:
         print(f"  receipt beside it: {result['sidecar']}")
         print(f"  fingerprint: {result['build']['fingerprint']} - everyone in a room "
               "needs this same import")
+    elif "builds" in result:
+        # The publish path applies itself to everyone through the channel, so
+        # the local-apply advice would be wrong here.
+        for source, build in sorted(result["builds"].items()):
+            print(f"  {build['label']}: game copies become "
+                  f"{nsr_patcher.fingerprint(build['output_sha256'])}")
     else:
         print("  apply it with --build, or from the ratings editor; everyone in a room "
               "needs the same import")
@@ -456,6 +546,13 @@ def main(argv=None) -> int:
     imp.add_argument("--packs", default=str(PACKS), help="pack directory under local/")
     imp.add_argument("--build", action="store_true",
                      help="also bake a new image from the pack (a full rebuild)")
+    pub = sub.add_parser("publish", help="import, then publish it on our signed channel")
+    pub.add_argument("--name", default="Reborn roster", help="pack name")
+    pub.add_argument("--packs", default=str(PACKS), help="pack directory under local/")
+    pub.add_argument("--root", help="content directory (default: the content store's own)")
+    pub.add_argument("--key", help="signing key PEM (default: the content store's own)")
+    pub.add_argument("--dry-run", action="store_true",
+                     help="show what would be published and sign nothing")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "scan":
@@ -472,6 +569,14 @@ def main(argv=None) -> int:
             for key, value in skipped.items():
                 if value:
                     print(f"  {key}: {value}")
+            return 0
+        if a.cmd == "publish":
+            result = run_publish(a.reborn, a.image, a.name, Path(a.packs), a.roster_file,
+                                 a.root, a.key, a.dry_run)
+            _print_report(result)
+            print(f"  changelog: {result['changelog']}")
+            print("  published to the signed channel" if result["published"]
+                  else "  dry run: nothing was signed or published")
             return 0
         _print_report(run_import(a.reborn, a.image, a.name, Path(a.packs),
                                  a.roster_file, a.build))
