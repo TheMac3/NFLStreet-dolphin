@@ -452,7 +452,8 @@ def publish_changelog(receipt: dict) -> str:
 
 def run_publish(reborn: str | None, image: str, name: str, packs: Path = PACKS,
                 roster_file: str | None = None, root: str | None = None,
-                key: str | None = None, dry_run: bool = False) -> dict:
+                key: str | None = None, dry_run: bool = False,
+                first_release: bool = False) -> dict:
     """Import, then publish the pack on our signed content channel.
 
     This is an **operator** command and cannot be a launcher button: publishing
@@ -474,6 +475,21 @@ def run_publish(reborn: str | None, image: str, name: str, packs: Path = PACKS,
     sys.path.insert(0, str(REPO / "services" / "content"))
     import content_store
     import nsr_content
+    # A channel counts its own versions, so publishing into an *empty* store
+    # starts again at 1 - and friends already holding version 1 from the real
+    # store would be offered a different release under the same number. The
+    # live channel's store is on the server; a developer checkout has none, so
+    # the empty case is the mistake, not the normal case.
+    store_root = Path(root) if root else content_store.DEFAULT_ROOT
+    published = content_store.Store(store_root).current()
+    if published is None and not first_release:
+        raise RosterImportError(
+            f"{store_root} has no published release, so this would publish version 1. If the "
+            "channel friends use is already published, point --root at that store (it lives "
+            "with the serving host) or run this there. Pass --first-release only when this "
+            "really is a brand-new channel")
+    result["store"] = str(store_root)
+    result["next_version"] = (published["release"]["version"] + 1) if published else 1
     # Rehearsed through the publisher's own loading and builds code, not a
     # paraphrase of it: the channel publishes only against an unedited release
     # base it recognizes, and a dry run that skipped that check would look fine
@@ -553,6 +569,9 @@ def main(argv=None) -> int:
     pub.add_argument("--key", help="signing key PEM (default: the content store's own)")
     pub.add_argument("--dry-run", action="store_true",
                      help="show what would be published and sign nothing")
+    pub.add_argument("--first-release", action="store_true",
+                     help="allow publishing into an empty store (a brand-new channel only; "
+                          "otherwise point --root at the store friends already use)")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "scan":
@@ -572,8 +591,9 @@ def main(argv=None) -> int:
             return 0
         if a.cmd == "publish":
             result = run_publish(a.reborn, a.image, a.name, Path(a.packs), a.roster_file,
-                                 a.root, a.key, a.dry_run)
+                                 a.root, a.key, a.dry_run, a.first_release)
             _print_report(result)
+            print(f"  store: {result['store']} (publishing version {result['next_version']})")
             print(f"  changelog: {result['changelog']}")
             print("  published to the signed channel" if result["published"]
                   else "  dry run: nothing was signed or published")

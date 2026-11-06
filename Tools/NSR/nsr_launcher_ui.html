@@ -118,7 +118,7 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
 .mode h2 { margin: 0; font-size: 26px; font-weight: 800; letter-spacing: -.3px; }
 .mode p { margin: 4px 0 0; color: #d0d0da; font-size: 13px; }
 .mode .corner { position: absolute; top: 14px; right: 14px; }
-.code { font-size: 56px; font-weight: 900; letter-spacing: 2px; line-height: 1; margin: 6px 0 10px; font-family: "Segoe UI", system-ui, sans-serif; }
+.code { font-size: 56px; font-weight: 900; letter-spacing: 2px; line-height: 1; margin: 6px 0 10px; font-family: "Segoe UI", system-ui, sans-serif; user-select: all; }
 .code.empty { color: rgba(255,255,255,.28); }
 .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 .seg { display: inline-flex; background: #121216; border: 1px solid var(--line); border-radius: 11px; padding: 4px; }
@@ -743,7 +743,18 @@ function wire() {
   $("tilePractice").onclick = $("modePractice").onclick = () => call("play_offline");
   $("modeIp").onclick = () => call("host_ip");
   $("btnOpen").onclick = (e) => { e.stopPropagation(); call("host_room"); };
-  $("btnCopy").onclick = (e) => { e.stopPropagation(); if (S.snap) { call("copy_text", S.snap.host.code); toast("Copied " + S.snap.host.code); } };
+  // copy_text returns whether the clipboard actually took it. Claiming
+  // "Copied" regardless sent a player to paste nothing; the code is on screen
+  // and selectable, so the fallback is to read it off there.
+  $("btnCopy").onclick = async (e) => {
+    e.stopPropagation();
+    if (!S.snap) return;
+    const code = S.snap.host.code;
+    const ok = await call("copy_text", code);
+    if (ok === true) toast("Copied " + code);
+    // undefined means call() already showed the error it caught.
+    else if (ok === false) toast("Couldn't reach the clipboard. The code is " + code + " — select it above and copy it by hand.", "error");
+  };
   $("btnClose").onclick = (e) => { e.stopPropagation(); call("close_room"); };
   $("btnStart").onclick = () => call("start_game", S.delay != null ? S.delay : S.snap.delay);
   $("joinCode").oninput = () => { S.joinTyped = true; };
