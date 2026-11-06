@@ -155,8 +155,25 @@ h1 { font-size: 34px; line-height: 1.1; margin: 0; font-weight: 800; letter-spac
 .note.warnline { color: #ffb067; } .note.warnline:empty { display: none; }
 .path { font-size: 12px; color: var(--faint); word-break: break-all; margin-top: 6px; user-select: text; }
 
+/* The host page reads as three decisions in order: where, which mode, how
+   much delay. The ordinals are the page's own structure, not a wizard: every
+   control stays visible and reachable in any order. */
+.hstep { display: flex; align-items: center; gap: 10px; margin: 22px 0 12px; }
+.hstep:first-child { margin-top: 0; }
+.hstep .num { flex: none; width: 22px; height: 22px; border: 1px solid var(--red); color: var(--red);
+  font-size: 12px; font-weight: 700; display: grid; place-items: center; }
+.hstep h3 { margin: 0; font-size: 13px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+
 /* settings */
 .sgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start; }
+/* One group of settings at a time: eleven cards in a single column was more
+   than anyone reads, and nothing here needed removing to fix that. */
+.sgroup { display: none; } .sgroup.on { display: grid; }
+.subnav { display: flex; gap: 2px; margin: 0 0 20px; border-bottom: 1px solid var(--line); }
+.subnav button { background: none; border: 0; border-bottom: 2px solid transparent; padding: 10px 14px;
+  color: var(--muted); font-weight: 600; cursor: pointer; }
+.subnav button:hover { color: var(--text); }
+.subnav button.on { color: var(--text); border-bottom-color: var(--red); }
 .toggle { display: flex; gap: 14px; align-items: flex-start; cursor: pointer; }
 .switch { width: 44px; height: 26px; border-radius: 13px; background: #2c2c34; position: relative; flex: none; transition: background .15s; }
 .switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%; background: #fff; transition: left .15s; }
@@ -260,6 +277,7 @@ h1 { text-transform:uppercase; font-size:38px; border-bottom:3px solid var(--red
         <span class="pill"><span class="dot" id="roomsDot"></span><span id="roomsText">Room codes on</span></span></div>
       <div class="grid">
         <div>
+          <div class="hstep"><span class="num">1</span><h3>Where you're playing</h3></div>
           <div class="modes">
             <div class="mode red sel" id="modeRoom">
               <span class="corner pill" id="hostCount"><span class="dot"></span><span>0 joined</span></span>
@@ -276,23 +294,26 @@ h1 { text-transform:uppercase; font-size:38px; border-bottom:3px solid var(--red
             <div class="mode blue" id="modeIp"><h2>Host by IP</h2><p>Advanced: friends type your address. Needs port 51515 forwarded for internet play.</p></div>
             <div class="mode green" id="modePractice"><h2>Practice</h2><p>Same setup on this PC only, no network.</p></div>
           </div>
-          <div style="margin-top:18px">
-            <label class="label" for="gameMode">Game mode</label>
+          <div class="hstep"><span class="num">2</span><h3>Game mode</h3></div>
+          <div>
+            <label class="sr-only" for="gameMode">Game mode</label>
             <select id="gameMode" style="margin:8px 0;padding:10px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:8px">
               <option value="quick-play">Quick Play</option><option value="pickup">Pickup Game</option><option value="manual">Manual (menus)</option>
             </select>
             <div class="note">Quick Play or Pickup Game goes straight to Select Controller (pick sides, first pick / ball first). Practice uses this choice too. Manual keeps offline saves.</div>
           </div>
-        <div class="card">
-          <!-- Room/practice policy is frozen at creation and sent to every joiner. -->
+          <!-- Room/practice policy is frozen at creation and sent to every joiner.
+               Shown only for Pickup, the one mode it applies to. -->
+          <div class="card" id="draftCard" hidden>
           <div class="draft-settings">
             <label>Pickup draft <select id="draftOrder"><option value="alternating">Alternating (stock)</option><option value="snake">Snake (A,B,B,A…)</option><option value="cocky">Cocky (7 picks each)</option></select></label>
             <label>First team <select id="draftFirst"><option value="stock">Select Controller (native)</option><option value="team-one">Team One</option><option value="team-two">Team Two</option></select></label>
           </div>
-          <p class="muted">Team One/Two are in-game sides. The host’s choice applies to everyone. Stock uses Select Controller; an explicit team fixes first pick there. Applies only to Pickup.</p>
-        </div>
-          <div class="row" style="margin-top:18px">
-            <div><div class="label" style="margin-bottom:6px">Input delay (for everyone)</div><div class="seg" id="delaySeg"></div></div>
+            <p class="muted">Team One/Two are in-game sides. The host’s choice applies to everyone. Stock uses Select Controller; an explicit team fixes first pick there.</p>
+          </div>
+          <div class="hstep"><span class="num">3</span><h3>Input delay, then start</h3></div>
+          <div class="row">
+            <div><div class="label" style="margin-bottom:6px">For everyone in the room</div><div class="seg" id="delaySeg"></div></div>
             <div class="grow"></div>
             <button class="btn red big" id="btnStart" disabled>Start game</button>
           </div>
@@ -356,8 +377,13 @@ h1 { text-transform:uppercase; font-size:38px; border-bottom:3px solid var(--red
 
     <!-- SETTINGS -->
     <section class="page" id="page-settings">
-      <div class="head"><div class="grow"><h1>Settings</h1><div class="sub">Your name and what gets shared.</div></div></div>
-      <div class="sgrid">
+      <div class="head"><div class="grow"><h1>Settings</h1><div class="sub">Your name, how the game looks, and where its files come from.</div></div></div>
+      <div class="subnav" id="setNav">
+        <button data-group="you" class="on">You &amp; sharing</button>
+        <button data-group="picture">Picture &amp; sound</button>
+        <button data-group="files">Game files &amp; updates</button>
+      </div>
+      <div class="sgrid sgroup on" data-group="you">
         <div class="card">
           <div class="label" style="margin-bottom:8px">Your name</div>
           <input class="field" id="nameIn" maxlength="24" spellcheck="false" autocomplete="off">
@@ -379,6 +405,8 @@ h1 { text-transform:uppercase; font-size:38px; border-bottom:3px solid var(--red
           <div class="info" id="bookText"></div><code id="bookLink" style="display:block;overflow-wrap:anywhere;user-select:all"></code>
           <div class="row"><button class="btn" id="btnBookLink">Show private link code</button><button class="btn" id="btnBookFetch">Fetch my playbook</button><button class="btn" id="btnBookDefault">Use game default</button></div>
         </div>
+      </div>
+      <div class="sgrid sgroup" data-group="picture">
         <div class="card"><div class="label" style="margin-bottom:8px">Performance</div>
           <div class="toggle" id="hdToggle"><div class="switch"></div><div><b>HD textures</b>
             <div class="note" style="margin-top:4px">Turn off for the lightest graphics load and the game's original button icons.</div></div></div>
@@ -395,6 +423,8 @@ h1 { text-transform:uppercase; font-size:38px; border-bottom:3px solid var(--red
           <div class="label" style="margin:14px 0 6px">Game volume</div>
           <div class="seg" id="volSeg"></div>
           <div class="note">Applied every time the game starts. Only your PC changes.</div></div>
+      </div>
+      <div class="sgrid sgroup" data-group="files">
         <details class="card advanced">
           <summary class="label">Advanced: game files</summary>
           <div class="label" style="margin-top:16px">Game source</div>
@@ -493,6 +523,18 @@ function go(page) {
   document.querySelectorAll(".nav button").forEach(b => b.classList.toggle("on", b.dataset.page === page));
   document.querySelectorAll(".page").forEach(p => p.classList.toggle("on", p.id === "page-" + page));
   if (page === "controllers") call("refresh_controllers");
+  // Arriving at Settings because the game copy needs attention: open the group
+  // that holds the answer, rather than the one that happens to be first.
+  if (page === "settings") {
+    const g = (S.snap && S.snap.game) || {};
+    group(S.group || (g.state && g.state !== "ready" && g.state !== "checking" ? "files" : "you"));
+  }
+}
+
+function group(name) {
+  S.group = name;
+  document.querySelectorAll("#setNav button").forEach(b => b.classList.toggle("on", b.dataset.group === name));
+  document.querySelectorAll(".sgroup").forEach(g => g.classList.toggle("on", g.dataset.group === name));
 }
 
 function renderPlayers(listId, slotsId, players, max) {
@@ -539,6 +581,8 @@ function render(s) {
 
   setValue("gameMode", s.quickstart || "manual");
   $("gameMode").disabled = h.state !== "idle";
+  // Draft policy applies to Pickup alone, so it is shown only when it applies.
+  show("draftCard", (s.quickstart || "manual") === "pickup");
   // host
   $("roomsDot").className = "dot " + (s.rooms ? "" : "warn");
   setText("roomsText", s.rooms ? "Room codes on" : "Room codes off in this download");
@@ -676,6 +720,7 @@ async function poll() {
 function wire() {
   document.querySelectorAll(".nav button").forEach(b => b.onclick = () => go(b.dataset.page));
   document.querySelectorAll("[data-go]").forEach(b => b.onclick = () => go(b.dataset.go));
+  document.querySelectorAll("#setNav button").forEach(b => b.onclick = () => group(b.dataset.group));
   $("gameMode").onchange = () => call("set_quickstart", $("gameMode").value);
   $("playHost").onclick = () => go("host");
   $("playJoin").onclick = () => { go("join"); $("joinCode").focus(); };

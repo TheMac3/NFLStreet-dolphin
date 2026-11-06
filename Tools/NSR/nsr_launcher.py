@@ -801,7 +801,11 @@ class Launcher:
             self._stats_wake.set()
 
     def set_delay(self, delay) -> None:
-        self._set(delay=self._clamp_delay(delay))
+        """Save the local preference; joined games still use the host's StartInfo."""
+        delay = self._clamp_delay(delay)
+        self.cfg[DELAY_CONFIG_KEY] = delay
+        self._save()
+        self._set(delay=delay)
 
     def _icons_setting(self) -> str:
         v = self.cfg.get("button_icons", "auto")
@@ -964,9 +968,7 @@ class Launcher:
     def find_game(self) -> None:
         """Claim setup before scheduling; never fall back across selected families."""
         with self._lock:
-            if (self._dolphin_running() or self.state["content"]["busy"]
-                    or self.state["host"]["state"] != "idle" or self.state["join"]["state"] != "idle"):
-                self.notify("Close the game and leave your room before preparing a source.", "error")
+            if self._activity_blocked("preparing a source"):
                 return
             before = self._claim_build("Getting the game ready…")
             if before is None:
@@ -983,6 +985,18 @@ class Launcher:
                 self._release_build_lock()
                 self._set("game", busy=False)
         self._spawn(work)
+
+    def _activity_blocked(self, action: str) -> bool:
+        """Refuse conflicting play, rooms or content work with retry guidance.
+
+        Callers hold _lock through this check and their build/lobby claim.
+        Image-build contention stays with need_game and _claim_build.
+        """
+        if (self._dolphin_running() or self.state["content"]["busy"]
+                or self.state["host"]["state"] != "idle" or self.state["join"]["state"] != "idle"):
+            self.notify(f"Close the game, leave your room and wait for updates before {action}.", "error")
+            return True
+        return False
 
     def _claim_build(self, text: str) -> dict | None:
         """Mark the game copy busy (one build at a time). Returns the previous
@@ -1152,9 +1166,7 @@ class Launcher:
         """Build the game copy from a Reborn image the player picked/found,
         with the newest verified content update when one is known."""
         with self._lock:
-            if (self._dolphin_running() or self.state["content"]["busy"]
-                    or self.state["host"]["state"] != "idle" or self.state["join"]["state"] != "idle"):
-                self.notify("Close the game, leave your room and wait for updates before rebuilding.", "error")
+            if self._activity_blocked("rebuilding"):
                 return
             before = self._claim_build("Getting the game ready…")
             if before is None:
@@ -1654,14 +1666,17 @@ class Launcher:
         if not selfupdate.needs_rebuild(self.folder, self.game_dir, self._patcher):
             self._set("build", rebuild=False)
             return
-        iso = self._reborn_iso() if self._source_kind == "reborn" else self.cfg.get("owned_iso")
-        if not iso or not os.path.isfile(iso):
-            self.notify("This version needs a new game copy. Set up your game source in "
-                        "Settings → Advanced to rebuild it.", "error")
-            return
-        before = self._claim_build("This version needs a new game copy. Building it…")
-        if before is None:
-            return
+        with self._lock:
+            if self._activity_blocked("rebuilding"):
+                return
+            iso = self._reborn_iso() if self._source_kind == "reborn" else self.cfg.get("owned_iso")
+            if not iso or not os.path.isfile(iso):
+                self.notify("This version needs a new game copy. Set up your game source in "
+                            "Settings → Advanced to rebuild it.", "error")
+                return
+            before = self._claim_build("This version needs a new game copy. Building it…")
+            if before is None:
+                return
         log(self.folder, "update: recipe changed; rebuilding the game copy")
         if self._run_build(iso, self._known_content(), strict=False, restore=before):
             self._set("build", rebuild=False)
@@ -2011,10 +2026,14 @@ class Launcher:
         self._spawn(work)
 
     def host_ip(self) -> None:
-        if self.need_game() or self._host or self.state["host"]["state"] != "idle":
-            return
-        self._clear_link_quality()
-        self._set("host", state="opening", mode="ip", info="Opening a direct lobby…")
+        """Claim a direct lobby only after conflicting play and updates finish."""
+        with self._lock:
+            if self.need_game() or self._host or self.state["host"]["state"] != "idle":
+                return
+            if self._activity_blocked("hosting by IP"):
+                return
+            self._clear_link_quality()
+            self._set("host", state="opening", mode="ip", info="Opening a direct lobby…")
         try:
             h = self._lobby.LobbyHost(self.state["name"], self.state["game"]["fingerprint"],
                                       on_change=self._roster,
@@ -2364,12 +2383,13 @@ class Launcher:
 
 # --- web view (pywebview) ------------------------------------------------------------
 def copy_to_clipboard(text: str) -> bool:
+    """Report success only when the Windows clipboard helper exits successfully."""
     if sys.platform != "win32":
         return False
     try:  # clip.exe reads UTF-16 with a BOM correctly; room codes are ASCII anyway
-        subprocess.run(["clip"], input=("﻿" + text).encode("utf-16-le"), check=False,
-                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=5)
-        return True
+        result = subprocess.run(["clip"], input=("﻿" + text).encode("utf-16-le"), check=False,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=5)
+        return result.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
