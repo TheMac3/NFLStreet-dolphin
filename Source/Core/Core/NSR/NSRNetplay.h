@@ -144,19 +144,26 @@ constexpr unsigned int STUB_ADDRESS = 0x804119AC;
 // it; must match isopatch.py's SEED_WORD.
 constexpr unsigned int SEED_ADDRESS = 0x804114F4;
 
+// Base of the rollback cave in the patched image; must match isopatch.py's
+// RB_BASE, which documents why it moved off 0x80416900 (Reborn 2026.10.09 put
+// a UI string table there) and how the replacement was audited. Every address
+// below is an offset from it, so the two sides move together. Changing it also
+// changes the frame routine's encoded branches, which the boot signature check
+// below pins word for word, so regenerate those from isopatch.
+constexpr unsigned int RB_BASE = 0x80414D00;
 // Rollback image stubs; must match isopatch.py's RB_POLL_STUB / RB_TICK_STUB.
-constexpr unsigned int RB_POLL_STUB = 0x80416900;
-constexpr unsigned int RB_TICK_STUB = 0x80416904;
-constexpr unsigned int RB_TICK_END_STUB = 0x80416908;
-constexpr unsigned int RB_TIME_STUB = 0x8041690C;
+constexpr unsigned int RB_POLL_STUB = RB_BASE + 0x00;
+constexpr unsigned int RB_TICK_STUB = RB_BASE + 0x04;
+constexpr unsigned int RB_TICK_END_STUB = RB_BASE + 0x08;
+constexpr unsigned int RB_TIME_STUB = RB_BASE + 0x0C;
 // Frame mode (isopatch rollback, frame routine around the main-loop
 // iteration fn_80026AD0: message dispatch incl. the draw pass, then the group
 // updates incl. InGame::fn_8002854C): Dolphin is asked before and after every
 // main-loop frame; rollback re-runs whole frames (Slippi's model), skipping
 // the vsync wait and heavy world draws on re-simulated ones. (Wrapping only
 // InGame left the draw pass's state, e.g. camera smoothing, behind.)
-constexpr unsigned int RB_FRAME_STUB = 0x80416914;
-constexpr unsigned int RB_FRAME_END_STUB = 0x80416918;
+constexpr unsigned int RB_FRAME_STUB = RB_BASE + 0x14;
+constexpr unsigned int RB_FRAME_END_STUB = RB_BASE + 0x18;
 constexpr unsigned int TICK_COUNT_FN = 0x802378C8;  // fn_802378C8 (gated)
 constexpr unsigned int VI_WAIT_FOR_RETRACE = 0x80243B18;  // SDK (skipped in re-sim)
 // The world draw inside InGame's render pass (fn_802285CC -> node draw
@@ -241,7 +248,7 @@ constexpr unsigned int PRESENT_BREAKPT_RETURN = 0x801CE81C;
 constexpr unsigned int VI_POST_COUNTER_FN = 0x801F7B04;
 constexpr unsigned int VI_POST_COUNTER = 0x803EBE48;
 constexpr unsigned int VI_PRE_CB = 0x801F7DF4;
-constexpr unsigned int RB_FRAME_CODE = 0x80416A80;  // isopatch frame routine (calls VI_PRE_CB)
+constexpr unsigned int RB_FRAME_CODE = RB_BASE + 0x180;  // isopatch frame routine (calls VI_PRE_CB)
 void ViCallbackHook(const Core::CPUThreadGuard& guard);  // HookType::Gate
 // Called after each tick's sim part 2 (no arguments).
 void RollbackTickEndHook(const Core::CPUThreadGuard& guard);
@@ -292,7 +299,7 @@ constexpr std::array<unsigned int, 75> AUDIO_GATE_ENTRIES{{
     0x8027F3A4, 0x8027F77C, 0x8027F7B0, 0x8027F880, 0x8027F910, 0x8027FAB8,
     0x802856D8, 0x8028572C, 0x802857D8,
 }};
-constexpr unsigned int RB_GATE_RETURN = 0x80416910;  // gated calls return here (HLE)
+constexpr unsigned int RB_GATE_RETURN = RB_BASE + 0x10;  // gated calls return here (HLE)
 std::vector<unsigned int> AudioGateList();
 void AudioGateHook(const Core::CPUThreadGuard& guard);
 void AudioGateReturnHook(const Core::CPUThreadGuard& guard);
@@ -305,7 +312,7 @@ void AudioGateReturnHook(const Core::CPUThreadGuard& guard);
 // during the session (frame, re-simulated, entry, call site, wrapper call
 // site, r3..r5 -> r3 and out-parameters), plus RNG words at every frame
 // start, so a reference run and a rollback run can be compared call by call.
-constexpr unsigned int AC_RETURN_STUB = 0x80416AFC;  // `blr` written by Dolphin (free patch data)
+constexpr unsigned int AC_RETURN_STUB = RB_BASE + 0x1FC;  // `blr` written by Dolphin (free patch data)
 void AudioCallLogHook(const Core::CPUThreadGuard& guard);     // HookType::Start
 void AudioCallReturnHook(const Core::CPUThreadGuard& guard);  // HookType::Replace
 void AudioClockFrameLog(const Core::CPUThreadGuard& guard);
@@ -337,8 +344,8 @@ void MusicTrampHook(const Core::CPUThreadGuard& guard);     // HookType::Replace
 // retrace each (see NSRNetplay.cpp, SimWaitBegin).
 void AudioClockSimWait(const Core::CPUThreadGuard& guard);
 void SimWaitTrampHook(const Core::CPUThreadGuard& guard);  // HookType::Replace
-constexpr unsigned int SIM_WAIT_TRAMP_ADDR = 0x80416AF4;
-constexpr unsigned int MUSIC_TRAMP_ADDR = 0x80416AF8;
+constexpr unsigned int SIM_WAIT_TRAMP_ADDR = RB_BASE + 0x1F4;
+constexpr unsigned int MUSIC_TRAMP_ADDR = RB_BASE + 0x1F8;
 constexpr unsigned int MUSIC_PICK_SONG_FN = 0x80072424;
 std::vector<unsigned int> MusicDispatchers();
 // Per-machine sidecar (<dump>.permachine next to every MEM1 dump): the
