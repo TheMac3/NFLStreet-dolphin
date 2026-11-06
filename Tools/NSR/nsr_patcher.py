@@ -66,6 +66,11 @@ import ratingsplit  # noqa: E402  (runtime split policy and legacy PPVL image co
 OWNED_REL = os.path.join("local", "GameSources", "owned")
 OUTPUT_NAME = "nsr-net.iso"
 MANIFEST_NAME = "nsr-image.json"  # sidecar describing nsr-net.iso (no paths)
+# Sidecar written beside nsr-net.iso when a local Reborn roster import was baked
+# into it (tools/nsr_roster_import.py). Digests and counts only - no player
+# names or values, which would make it an exported roster. It exists so a room
+# can say "your rosters differ" instead of comparing fingerprints in the dark.
+ROSTER_IMPORT_NAME = "nsr-roster-import.json"
 # Versioned name of the patch recipe friends build. Bump the suffix whenever
 # isopatch's rollback bytes change (then update KNOWN_INPUTS' outputs).
 ROLLBACK_RECIPE = "gn7e69-r0-rollback-v1"
@@ -243,6 +248,20 @@ def write_manifest(out_dir: str, digest_in: str, label: str | None, digest_out: 
     with open(tmp, "w") as f:
         json.dump(manifest, f, indent=1)
     os.replace(tmp, os.path.join(out_dir, MANIFEST_NAME))
+
+
+def read_roster_import(out_dir: str) -> dict:
+    """The baked roster import beside nsr-net.iso, or {} when there is none.
+
+    Absent is the normal case and means "no import", never an error: the
+    unimported majority must not be refused a room by a missing file.
+    """
+    try:
+        with open(os.path.join(out_dir, ROSTER_IMPORT_NAME)) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) and data.get("format") == "nsr.roster-import.v1" else {}
 
 
 def read_manifest(out_dir: str) -> dict:

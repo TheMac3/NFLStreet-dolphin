@@ -1696,6 +1696,28 @@ class Launcher:
     def _content_descriptor(self) -> dict | None:
         return self.state["game"].get("content")
 
+    def _roster_descriptor(self) -> dict | None:
+        """The baked Reborn roster import, if this game copy has one.
+
+        None for everyone who has not imported a roster, which is almost
+        everyone, and means "do not compare" rather than refusing them. It only
+        improves the message: a mismatched import is already refused by the
+        fingerprint. See docs/local-import.md.
+        """
+        source = patcher.read_roster_import(self.game_dir).get("source") or {}
+        digest, label = source.get("roster_sha256"), source.get("label")
+        if not isinstance(digest, str):
+            return None
+        # The real module, not the injected one: this is shaping a descriptor,
+        # not opening a room. Validated here rather than trusted, because the
+        # room opens with ours and a corrupt file must mean "do not compare"
+        # rather than refusing this player a room at all.
+        checked = lobby.parse_roster(
+            lobby.roster_descriptor(digest, label if isinstance(label, str) else ""))
+        if checked is None:
+            log(self.folder, "roster import receipt is unusable; not comparing rosters")
+        return checked
+
     def show_playbook_link(self) -> None:
         """Show the private one-time pairing capability only inside Settings."""
         path = os.path.join(self.folder, "nsr-playbook-link.txt")
@@ -2012,6 +2034,7 @@ class Launcher:
             h = self._lobby.RoomHost(self.rv_server, self.state["name"], self.state["game"]["fingerprint"],
                                      on_change=self._roster, on_error=lambda why: self._set("host", info=why),
                                      content=self._content_descriptor(), build=self._build_descriptor(),
+                                     roster=self._roster_descriptor(),
                                      quickstart=self.state["quickstart"],
                                      draft=self.draft_settings(), playbook=self.cfg.get("playbook"),
                                      on_playbooks=lambda refs: self._room_books("host", refs))
@@ -2039,6 +2062,7 @@ class Launcher:
                                       on_change=self._roster,
                                       on_reject=lambda who, why: self._set("host", info=f"Refused {who}: {why}"),
                                       content=self._content_descriptor(), build=self._build_descriptor(),
+                                      roster=self._roster_descriptor(),
                                       quickstart=self.state["quickstart"],
                                       draft=self.draft_settings(), playbook=self.cfg.get("playbook"),
                                      on_playbooks=lambda refs: self._room_books("host", refs))
@@ -2119,7 +2143,7 @@ class Launcher:
 
         def attempt():
             kw = {"on_lobby": on_lobby, "cancel": cancel, "content": self._content_descriptor(),
-                  "build": self._build_descriptor(),
+                  "build": self._build_descriptor(), "roster": self._roster_descriptor(),
                   "on_game_mode": lambda selected: self._set("join", quickstart=selected),
                   "on_draft": lambda selected: self._set("join", draft_label=lobby.draft_label(selected)),
                   "playbook": self.cfg.get("playbook"),

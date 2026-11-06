@@ -21,7 +21,8 @@ Protocol: one TCP connection per joining player to the host, newline-delimited
 JSON messages.
 
   joiner -> host  {"type": "hello", "name": str, "fingerprint": str, "version": int,
-                   "mode": "rollback"|"lockstep", "content": {"version", "serial"}}
+                   "mode": "rollback"|"lockstep", "content": {"version", "serial"},
+                   "roster": {"source", "label"}}        (roster optional)
   host -> joiner  {"type": "reject", "reason": str, "action": str}  (then closes;
                                                                     action optional)
   host -> all     {"type": "lobby", "players": [name, ...]}          (on any change;
@@ -57,6 +58,15 @@ of a bare fingerprint mismatch; the reject then carries "action"
 The field is optional both ways: older launchers and room servers ignore
 it, and without it on both sides only the fingerprint decides (it still
 catches every content mismatch, just with the generic message).
+
+Imported rosters (docs/local-import.md). A player who baked a local import of
+their own Reborn roster also carries "roster": the imported roster's digest and
+a label for it (roster_descriptor). Host/room compare it after build and
+content and before the fingerprint, so a mismatch reads "your imported rosters
+differ" instead of naming Reborn versions and patches. The fingerprint already
+refused it; this only says why. Optional both ways and for the same reason:
+almost nobody has imported a roster, and absent means "do not compare" rather
+than a refusal.
 """
 from __future__ import annotations
 
@@ -195,6 +205,88 @@ def family_reason(host: str | None, ours: str | None) -> str | None:
     return None
 
 
+# --- imported rosters ------------------------------------------------------------
+# A baked roster import changes the image, so the fingerprint check below
+# already keeps mismatched peers apart. What it cannot do is say why: "Everyone
+# needs the same Reborn version, patches" sends someone looking at their Reborn
+# install when the difference is an import they made on top of it. These three
+# helpers are the same shape as the content and build descriptors - optional
+# both ways, absent means "do not compare" - so no new check is introduced and
+# an older launcher or room service is admitted on the strength of the rest.
+MAX_ROSTER_LABEL = 48
+
+
+def roster_descriptor(source: str, label: str = "") -> dict:
+    """What a launcher sends: which roster its game copy was imported from.
+
+    The digest rather than a version string, because the case worth naming is a
+    Reborn nobody has a label for - two players can still be told whether their
+    imports are the same thing. Never player names or values.
+    """
+    return {"source": str(source), "label": str(label)[:MAX_ROSTER_LABEL]}
+
+
+def parse_roster(value) -> dict | None:
+    """A peer's descriptor, or None for absent, malformed, or "no import".
+
+    None is the ordinary answer: nobody who has not imported a roster sends
+    one, and that must not refuse them.
+    """
+    if not isinstance(value, dict) or set(value) != {"source", "label"}:
+        return None
+    source, label = value.get("source"), value.get("label")
+    if not isinstance(source, str) or not re.fullmatch(r"[0-9a-f]{64}", source):
+        return None
+    if not isinstance(label, str) or len(label) > MAX_ROSTER_LABEL:
+        return None
+    return roster_descriptor(source, label)
+
+
+def _roster_text(descriptor: dict | None) -> str:
+    """Name a roster for a player: its label, or a short digest if unlabelled."""
+    if descriptor is None:
+        return "the roster their game came with"
+    return descriptor["label"] or f"an unrecognized Reborn ({descriptor['source'][:12]})"
+
+
+def roster_reason(room, joiner) -> str | None:
+    """Why two peers' imported rosters differ, or None when they do not.
+
+    Placed after the build and content checks and before the fingerprint: an
+    out-of-date launcher or content release explains a roster difference too,
+    and "restart the launcher" is the better instruction when it applies. This
+    message is for the case where both sides are current and one of them
+    imported a roster the other did not.
+    """
+    r, j = parse_roster(room), parse_roster(joiner)
+    if r == j or (r is None and j is None):
+        return None
+    if r is not None and j is not None and r["source"] == j["source"]:
+        return None
+    if j is None:
+        return (f"The host imported a Reborn roster ({_roster_text(r)}) and you have not. "
+                "Everyone in a room needs the same roster import.")
+    if r is None:
+        return (f"You imported a Reborn roster ({_roster_text(j)}) and the host has not. "
+                "Everyone in a room needs the same roster import, or none.")
+    return (f"Your imported rosters differ: yours is from {_roster_text(j)}, the host's from "
+            f"{_roster_text(r)}. Everyone in a room needs the same roster import.")
+
+
+def _checked_roster(value) -> dict | None:
+    """Validate our own descriptor when a room opens, not on every compare.
+
+    A malformed one of ours is a bug worth failing on; a malformed one from a
+    peer is only ignored, because the fingerprint still keeps images apart.
+    """
+    if value is None:
+        return None
+    checked = parse_roster(value)
+    if checked is None:
+        raise ValueError("invalid roster import descriptor")
+    return checked
+
+
 def _family_rejected(msg: dict, fingerprint: str) -> RoomRejected:
     """Translate an old service's fingerprint rejection too, without changing its wire protocol."""
     reason = str(msg.get("reason", "Refused."))
@@ -206,13 +298,16 @@ def _family_rejected(msg: dict, fingerprint: str) -> RoomRejected:
     return _rejected(msg, "Refused.")
 
 
-def _with_content(msg: dict, content: dict | None, build: dict | None = None) -> dict:
+def _with_content(msg: dict, content: dict | None, build: dict | None = None,
+                  roster: dict | None = None) -> dict:
     """Retain the verified simulation digest on direct and room-code requests.
 
-    `build` is the peer's application version (`nsr_update.build_descriptor`).
-    It is optional in the protocol: a launcher from before build updates sends
-    none, and an absent descriptor means "do not compare" rather than a
-    refusal, so adding this does not lock anyone out of a room.
+    `build` is the peer's application version (`nsr_update.build_descriptor`)
+    and `roster` its baked Reborn roster import (`roster_descriptor`). Both are
+    optional in the protocol: a launcher from before build updates sends no
+    build, a player who imported no roster sends no roster, and an absent
+    descriptor means "do not compare" rather than a refusal - so neither
+    addition locks anyone out of a room.
     """
     if "fingerprint" in msg:
         msg["image_family"] = image_family(msg["fingerprint"])
@@ -226,6 +321,11 @@ def _with_content(msg: dict, content: dict | None, build: dict | None = None) ->
         if checked is None:
             raise ValueError("invalid installed build descriptor")
         msg["build"] = checked
+    if roster is not None:
+        checked = parse_roster(roster)
+        if checked is None:
+            raise ValueError("invalid roster import descriptor")
+        msg["roster"] = checked
     return msg
 
 
@@ -291,6 +391,7 @@ class LobbyHost:
     mode: str = RELEASE_MODE
     content: dict | None = None  # our nsr_content descriptor (None: don't compare)
     build: dict | None = None    # our nsr_update build descriptor (None: don't compare)
+    roster: dict | None = None   # our baked roster import (None: no import, don't compare)
     quickstart: str = "manual"
     draft: dict | None = None
     playbook: dict | None = None
@@ -303,6 +404,7 @@ class LobbyHost:
 
     def open(self) -> None:
         self.image_family = image_family(self.fingerprint, self.image_family or None)
+        self.roster = _checked_roster(self.roster)
         self.quickstart = quickstart_id(self.quickstart)
         self.draft = draft_settings(self.draft)
         self._server = socket.create_server((self.bind, self.port), reuse_port=False)
@@ -324,6 +426,8 @@ class LobbyHost:
             try:
                 message = _quickstart_message({"type": "lobby", "players": names, "image_family": self.image_family}, self.quickstart)
                 message.update(playbooks=refs, books_version=books.VERSION)
+                if self.roster is not None:
+                    message["roster"] = self.roster
                 _send(j.sock, _draft_message(message, self.draft))
             except OSError:
                 pass
@@ -387,6 +491,13 @@ class LobbyHost:
             reason, action = build
         elif content:
             reason, action = content
+        elif why := roster_reason(self.roster, hello.get("roster")):
+            # After build and content: either of those explains a roster
+            # difference too, and "restart the launcher" is the better
+            # instruction when it applies. Before the fingerprint, which is
+            # what would otherwise refuse this - correctly, but without
+            # saying that an imported roster is the difference.
+            reason = why
         elif hello.get("fingerprint") != self.fingerprint:
             reason = (f"Game setup mismatch: yours is {hello.get('fingerprint')}, the host's is "
                       f"{self.fingerprint}. Everyone needs the same Reborn version, patches.")
@@ -440,9 +551,10 @@ class LobbyHost:
         refs = [self.playbook] + [j.playbook for j in joiners]
         seed = secrets.randbits(32)  # per-match RNG seed, sent to everyone
         for k, j in enumerate(joiners, start=1):
-            _send(j.sock, {"type": "start", "player": k, "players": players, "delay": delay,
-                           "seed": seed, "mode": mode, "quickstart": self.quickstart, "draft": self.draft,
-                           "playbooks": refs, "image_family": self.image_family})
+            _send(j.sock, _with_content(
+                {"type": "start", "player": k, "players": players, "delay": delay,
+                 "seed": seed, "mode": mode, "quickstart": self.quickstart, "draft": self.draft,
+                 "playbooks": refs, "image_family": self.image_family}, None, None, self.roster))
             j.sock.close()
         self._server.close()
         return StartInfo(0, players, delay, "", seed=seed, mode=mode,
@@ -471,7 +583,7 @@ def join(host: str, name: str, fingerprint: str,
          on_draft: Callable[[dict], None] = lambda selected: None,
          playbook: dict | None = None,
          on_playbooks: Callable[[list], None] = lambda selected: None,
-         build: dict | None = None) -> StartInfo:
+         build: dict | None = None, roster: dict | None = None) -> StartInfo:
     """Connect to a host's lobby and wait for Start. Raises ConnectionError
     with a readable reason if refused, closed, or unreachable."""
     if ":" in host:
@@ -488,7 +600,8 @@ def join(host: str, name: str, fingerprint: str,
     _send(sock, _with_content({"type": "hello", "name": name, "fingerprint": fingerprint,
                                "version": PROTOCOL_VERSION, "mode": mode,
                                "quickstart_version": QUICKSTART_VERSION, "draft_version": DRAFT_VERSION,
-                               "playbook": playbook, "books_version": books.VERSION}, content, build))
+                               "playbook": playbook, "books_version": books.VERSION},
+                              content, build, roster))
     buf = b""
     shown_draft = None
     shown_books = []
@@ -509,6 +622,11 @@ def join(host: str, name: str, fingerprint: str,
                 kind = msg.get("type")
                 if kind in ("lobby", "start"):
                     why = family_reason(msg.get("image_family"), image_family(fingerprint))
+                    if why:
+                        raise RoomRejected(why)
+                    # Checked here as well as by the host, so a room service
+                    # that drops the field cannot admit a mismatch in silence.
+                    why = roster_reason(msg.get("roster"), roster)
                     if why:
                         raise RoomRejected(why)
                 if kind == "lobby":
@@ -575,6 +693,7 @@ class RoomHost:
     mode: str = RELEASE_MODE
     content: dict | None = None  # our nsr_content descriptor (sent with create)
     build: dict | None = None    # our nsr_update build descriptor (sent with create)
+    roster: dict | None = None   # our baked roster import (sent with create; None: none)
     quickstart: str = "manual"
     draft: dict | None = None
     playbook: dict | None = None
@@ -588,6 +707,7 @@ class RoomHost:
 
     def open(self) -> str:
         self.image_family = image_family(self.fingerprint, self.image_family or None)
+        self.roster = _checked_roster(self.roster)
         self.draft = draft_settings(self.draft)
         host, port = _split(self.rendezvous, RENDEZVOUS_PORT)
         try:
@@ -602,7 +722,7 @@ class RoomHost:
                                          "draft": self.draft, "draft_version": DRAFT_VERSION,
                                          "playbook": self.playbook, "books_version": books.VERSION,
                                          "image_family": self.image_family},
-                                        self.content, self.build))
+                                        self.content, self.build, self.roster))
         lines = _lines(self._sock)
         first = next(lines, None)
         if not first or first.get("type") != "room":
@@ -709,7 +829,7 @@ def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
               on_draft: Callable[[dict], None] = lambda selected: None,
               playbook: dict | None = None,
               on_playbooks: Callable[[list], None] = lambda selected: None,
-              build: dict | None = None) -> StartInfo:
+              build: dict | None = None, roster: dict | None = None) -> StartInfo:
     """Join a room by code and wait for the host's Start. Raises
     ConnectionError with a readable reason if refused, closed, or unreachable."""
     host, port = _split(rendezvous, RENDEZVOUS_PORT)
@@ -722,7 +842,8 @@ def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
     _send(sock, _with_content({"type": "join", "code": code, "name": name, "fingerprint": fingerprint,
                                "version": RENDEZVOUS_VERSION, "mode": mode,
                                "quickstart_version": QUICKSTART_VERSION, "draft_version": DRAFT_VERSION,
-                               "playbook": playbook, "books_version": books.VERSION}, content, build))
+                               "playbook": playbook, "books_version": books.VERSION},
+                              content, build, roster))
     buf = b""
     shown_draft = None
     shown_books = []
@@ -743,6 +864,11 @@ def join_room(rendezvous: str, code: str, name: str, fingerprint: str,
                 kind = msg.get("type")
                 if kind in ("lobby", "start"):
                     why = family_reason(msg.get("image_family"), image_family(fingerprint))
+                    if why:
+                        raise RoomRejected(why)
+                    # Checked here as well as by the host, so a room service
+                    # that drops the field cannot admit a mismatch in silence.
+                    why = roster_reason(msg.get("roster"), roster)
                     if why:
                         raise RoomRejected(why)
                 if kind == "lobby":
