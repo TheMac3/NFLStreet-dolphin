@@ -447,6 +447,18 @@ h1 { text-transform:uppercase; font-size:38px; border-bottom:3px solid var(--red
           <div class="note">Use Reborn or your own NFL Street 2 USA revision 0 disc (ISO, CISO or RVZ). Your source stays unchanged. Friends must pick the same source. Own-disc players get the original game look; add optional packs under TexturePacks/GN7E69/&lt;pack&gt;/ and button icons under ButtonIcons/GN7E69/&lt;playstation or xbox&gt;/.</div>
         </details>
         <div class="card">
+          <div class="label">Reborn's roster</div>
+          <div class="note">Optional, this PC only. Reads the roster from your own NFL Street Reborn
+            install and writes its ratings into your game copy, while our roster editor catches up.
+            Reborn is only read; nothing is uploaded or shared.</div>
+          <div class="row" style="margin-top:16px">
+            <button class="btn" id="btnRosterImport">Import Reborn's roster</button>
+          </div>
+          <div class="info" id="rosterImportText" aria-live="polite"></div>
+          <div class="note">Everyone in a room needs the same import, or none — a room will say so
+            by name if they differ. Rebuild game copy below undoes it.</div>
+        </div>
+        <div class="card">
           <div class="label">Game updates</div>
           <div class="info" id="contentText" style="margin-top:6px">–</div>
           <div class="note" id="contentLog" style="margin-top:4px;white-space:pre-line"></div>
@@ -665,6 +677,8 @@ function render(s) {
   setText("gameStatsText", gs.enabled ? (gs.text || "") : "");
   setText("gameFp", g.fingerprint || "–");
   setText("ownedHdResult", (s.owned_hd || {}).text || "");
+  setText("rosterImportText", (s.roster_import || {}).text || "");
+  enable("btnRosterImport", !(s.game || {}).busy);
   $("brandedArt").checked = s.branded_art !== false;
   const source = s.source || {kind:"reborn", path:""};
   $("gameSource").value = source.kind;
@@ -749,6 +763,7 @@ function wire() {
   $("draftOrder").onchange = $("draftFirst").onchange = () => call("set_draft", $("draftOrder").value, $("draftFirst").value);
   $("brandedArt").onchange = e => call("set_branded_art", e.target.checked);
   $("btnOwnedHd").onclick = () => call("import_owned_hd");
+  $("btnRosterImport").onclick = () => call("import_reborn_roster");
   $("btnReimport").onclick = () => call("reimport_reborn");
   $("btnFind").onclick = () => call("find_game");
   $("btnUpdates").onclick = () => call("check_updates");

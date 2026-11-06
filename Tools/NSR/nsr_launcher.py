@@ -82,9 +82,11 @@ import isopatch  # noqa: E402
 import nsr_controllers as controllers  # noqa: E402
 import nsr_gamestats as gamestats  # noqa: E402
 import nsr_playbooks as books
+import discpatch  # noqa: E402  (its PatchError is the roster import's refusal)
 import nsr_content  # noqa: E402
 import nsr_lobby as lobby  # noqa: E402
 import nsr_patcher as patcher  # noqa: E402
+import nsr_roster_import as roster_import  # noqa: E402  (docs/local-import.md)
 import nsr_selfupdate as selfupdate  # noqa: E402
 import nsr_update as appupdate  # noqa: E402
 import nsr_textures as textures  # noqa: E402
@@ -626,6 +628,7 @@ class Launcher:
             "app": APP_TITLE, "folder": self.folder,
             "branded_art": cfg.get("branded_art", True) is not False,
             "owned_hd": {"text": "No HD import requested. Your disc uses its original art and any packs you install."},
+            "roster_import": {"text": "", "busy": False},
             "source": {"kind": self._source_kind, "path": self.cfg.get("owned_iso", "")},
             "name": str(cfg.get("name", env.get("USERNAME", "Player")))[:24],
             "telemetry": bool(cfg.get("telemetry", True)),
@@ -2336,6 +2339,55 @@ class Launcher:
         finally:
             self._set("game", **{**before, "busy": False, "progress": None})
 
+    def import_reborn_roster(self) -> None:
+        """Settings → Advanced: explicit, local, per-player roster import.
+
+        Never called by startup or by launch. See docs/local-import.md; the
+        boundary is the texture importer's - Reborn is read read-only, and
+        nothing leaves this PC.
+        """
+        self._spawn(self._import_reborn_roster_now)
+
+    def _import_reborn_roster_now(self) -> None:
+        """Plan the import, then write it into this player's own game copy."""
+        with self._lock:
+            if self.need_game():
+                self.notify("Get your game copy ready before importing a roster.", "error")
+                return
+            if self._activity_blocked("importing a roster"):
+                return
+            before = self._claim_build("Importing Reborn's roster…")
+            if before is None:
+                return
+        try:
+            source = self._reborn_iso() or self._patcher.find_reborn_iso()
+            if not source or not os.path.isfile(source):
+                self._roster_result("No Reborn install found. Install your own copy from the "
+                                    "official Reborn site first. Your game copy is unchanged.", True)
+                return
+            plan = roster_import.plan_import(source, os.path.join(self.game_dir, patcher.OUTPUT_NAME))
+            counts = plan["report"]["counts"]
+            applied = roster_import.apply_locally(
+                self.game_dir, plan,
+                progress=lambda d, total: self._set("game", progress=round(d * 100 / max(total, 1))))
+            skipped = sum(counts[k] for k in ("added_players", "inconsistent_copies", "out_of_range"))
+            self._roster_result(
+                f"Imported {counts['attributes']} ratings on {counts['players']} players from your "
+                f"local {plan['theirs']['label'] or 'Reborn install'}"
+                + (f". {skipped} differences could not be applied" if skipped else "")
+                + f". Your game copy is now {applied['fingerprint']} - everyone in a room needs "
+                  "the same import. Rebuild game copy undoes it.")
+        except (roster_import.RosterImportError, discpatch.PatchError, OSError, ValueError) as e:
+            self._roster_result(f"Roster import stopped: {e} Your game copy is unchanged.", True)
+        finally:
+            self._set("game", **{**before, "busy": False, "progress": None})
+            self._check_game_now()
+
+    def _roster_result(self, message: str, error: bool = False) -> None:
+        """One place for the outcome, so the card and the toast never disagree."""
+        self._set("roster_import", text=message, busy=False)
+        self.notify(message, "error" if error else "info")
+
     def reimport_reborn(self) -> None:
         """Settings → Advanced: refresh assets, preserving our ISO and controls."""
         if self._source_kind == "owned":
@@ -2453,6 +2505,7 @@ class WebApi:
     def set_button_icons(self, choice): self._l.set_button_icons(str(choice))
     def set_hd_textures(self, on): self._l.set_hd_textures(bool(on))
     def import_owned_hd(self): self._l.import_owned_hd()
+    def import_reborn_roster(self): self._l.import_reborn_roster()
     def set_branded_art(self, on): self._l.set_branded_art(bool(on))
     def set_resolution(self, value): self._l.set_resolution(value)
     def set_hide_play_calls(self, on): self._l.set_hide_play_calls(on)
@@ -2714,6 +2767,12 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
     ttk.Checkbutton(sp, text="Use NSRM loading artwork when HD art is in use", variable=brand_var,
                     command=lambda: launcher.set_branded_art(brand_var.get())).grid(row=17, column=0, columnspan=4, sticky="w")
     owned_hd_text = label(sp, 18)
+    ttk.Button(sp, text="Import Reborn's roster", command=launcher.import_reborn_roster) \
+        .grid(row=19, column=0, columnspan=4, sticky="w")
+    label(sp, 20).configure(text="Optional, this PC only. Reads your own Reborn install and writes its "
+                                 "ratings into your game copy. Everyone in a room needs the same import; "
+                                 "Rebuild game copy undoes it.")
+    roster_import_text = label(sp, 21)
     content_text = label(sp, 9, pady=(14, 4))
     b_updates = ttk.Button(sp, text="Check for updates", command=launcher.check_updates)
     b_updates.grid(row=10, column=0, sticky="w")
@@ -2777,6 +2836,7 @@ def run_tk(launcher: Launcher, selftest: bool = False) -> int:
             seen["rev"] = s["rev"]
             perf_hint.configure(text=s["performance_hint"])
             owned_hd_text.configure(text=s["owned_hd"]["text"])
+            roster_import_text.configure(text=s["roster_import"]["text"])
             hd_var.set(s["hd_textures"])
             res_var.set(str(s["resolution"]))
             g, h, j, c = s["game"], s["host"], s["join"], s["controllers"]

@@ -345,6 +345,30 @@ def read_pack(text: str) -> list[dict]:
     return rows
 
 
+def normalize_edits(template: bytes, edits: list[dict], base_sha256: str) -> list[dict]:
+    """Validate against the base and pin each changed field's original values.
+
+    Drop no-op rows except explicit nonzero PCEL activation (runtime policy v4).
+    All team copies share the requested value, with a set of expected originals
+    when copies differ.
+
+    Lives here rather than in the ratings service because it is pure
+    `apply_edits` plus a digest, and the launcher needs it without the editor's
+    HTTP, headshot and build machinery - which is not vendored into the shipped
+    package. `services.ratings.core` re-exports it.
+    """
+    if not isinstance(edits, list) or len(edits) > 10000:
+        raise ValueError("edits must be a list of at most 10000 rows")
+    _, report = apply_edits(template, edits, base_sha256=base_sha256)
+    digest = hashlib.sha256(template).hexdigest()
+    return [{"first_name": r["first_name"].strip(), "last_name": r["last_name"].strip(),
+             "field": r["field"], "value": r["value"],
+             "expected": "|".join(map(str, r["before"])), "template_sha256": digest,
+             "base_sha256": base_sha256}
+            for r in report if r["before"] != [r["value"]] or
+            (r["field"] == "PCEL" and isinstance(r["value"], int) and r["value"] > 0)]
+
+
 def pack_csv(rows: list[dict]) -> str:
     """Serialize edits and provenance only, never an extracted player table."""
     out = io.StringIO(newline="")
