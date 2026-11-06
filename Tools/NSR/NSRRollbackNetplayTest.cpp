@@ -2446,6 +2446,38 @@ static void TestQuickstartNavigation()
   stalled.Poll(1, 0xffffffff);
   stalled.Poll(18002, 0xffffffff);
   assert(stalled.Failed());
+
+  // The opening movies: no readable screen for well over a thousand retraces.
+  // A is mashed on a frame-keyed cadence until the title appears, the step
+  // never advances while it runs, and nothing is pressed before SKIP_FROM.
+  Navigator movies(Mode::QuickPlay);
+  int pressed = 0;
+  for (std::uint32_t frame = 1; frame < 1400; ++frame)
+  {
+    const auto result = movies.Poll(frame, 0xffffffff);
+    assert(result && movies.StepIndex() == 0 && !movies.OnRoute());
+    const bool a = (*result)[0] == 0x100;
+    const std::array<std::uint16_t, 4> expected{a ? std::uint16_t{0x100} : std::uint16_t{0}, 0, 0, 0};
+    assert((*result == expected));        // only port 1, only ever A
+    assert(!a || frame >= 220);           // nothing during the pre-movie screen
+    assert(a == (frame >= 220 && frame % 48 < 8));
+    pressed += a;
+  }
+  assert(pressed > 20);                   // a press per 48 retraces, not one
+  // The title ends the mashing for good, and the route takes over from there:
+  // it settles, presses START, and advances once a different screen answers.
+  std::uint32_t frame = 1400;
+  for (; frame < 1480; ++frame) movies.Poll(frame, 3);
+  assert(movies.OnRoute() && movies.StepIndex() == 0);
+  for (; frame < 1560; ++frame) movies.Poll(frame, 0x10003);
+  assert(movies.StepIndex() == 1);
+  // Later menu transitions also report no readable screen. They must not look
+  // like the movies again: a stray A there would confirm a menu item.
+  for (; frame < 1660; ++frame)
+  {
+    const auto result = movies.Poll(frame, 0xffffffff);
+    assert(result && (*result == std::array<std::uint16_t, 4>{}));
+  }
 }
 
 // fix/audio2: player 0's entry proposal carries the match input delay and
