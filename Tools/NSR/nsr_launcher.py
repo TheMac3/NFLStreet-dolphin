@@ -302,6 +302,13 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
     # which the game can tell apart (see controller_kind). NSR_PAD_KIND/DEVICE
     # are only logged, so "my controller isn't recognized" is diagnosable.
     env.update(pad.env())
+    # Every launch that boots the game gets a log, not just netplay: the fork
+    # writes its local-pad line from PrepareBoot, and "the game ignores my
+    # controller" is normally found in practice, which used to leave no
+    # evidence behind. Separate names so a practice run cannot overwrite a
+    # match's log. (The controller window returned above; it boots no game, so
+    # PrepareBoot never runs and there is nothing for it to write.)
+    env["NSR_LOG"] = os.path.join(folder, f"nsr-p{start.player}.log" if start else "nsr-practice.log")
     # Per-match RNG seed: agreed in the lobby for netplay; fresh per launch
     # offline, so Quick Play differs every time either way.
     env["NSR_SEED"] = str(start.seed if start else secrets.randbits(32))
@@ -321,7 +328,6 @@ def dolphin_command(folder: str, start: lobby.StartInfo | None, reborn_install: 
             "NSR_PORT": str(lobby.PORT),
             "NSR_TOPOLOGY": "star",
             "NSR_DELAY": str(start.delay or MENU_LOCKSTEP_DELAY),  # lockstep mode: Auto = 2
-            "NSR_LOG": os.path.join(folder, f"nsr-p{start.player}.log"),
         })
         if start.mode == "rollback":
             # Stage 4 keeps menus in lockstep and agrees match boundaries on
@@ -1847,7 +1853,7 @@ class Launcher:
         try:
             # The fork truncates this per-player log at connection setup. Clear
             # it here too so a failed launch cannot surface an older mismatch.
-            if start is not None and not open_ui:
+            if not open_ui:
                 with open(env["NSR_LOG"], "w", encoding="utf-8"):
                     pass
             if not open_ui:

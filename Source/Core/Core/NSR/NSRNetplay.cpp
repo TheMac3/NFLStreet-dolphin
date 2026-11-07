@@ -546,11 +546,26 @@ void SendPunches();
 void ConnectToHost();
 
 // --- NSR local pad log -------------------------------------------------------
+// Opening the session log, split out of Setup() because the local-pad line is
+// written on every launch and Setup() only runs for netplay. Idempotent.
+void OpenLog()
+{
+  Session& s = s_session;
+  if (const std::string path = Env("NSR_LOG"); !path.empty() && s.log == stderr)
+  {
+    if (FILE* f = std::fopen(path.c_str(), "w"))
+      s.log = f;
+  }
+}
+
 // "My controller isn't recognized" reports need to show what this machine
 // reads for port 1: the launcher's classification of the player's controller
 // (NSR_PAD_KIND/NSR_PAD_DEVICE; host-only, never in the boot manifest), the
 // effective SI device, whether the GCPad1 mapping's device is plugged in, and
-// the USB adapter source (Core/NSR/NSRPadSource.h). Logged once per session.
+// the USB adapter source (Core/NSR/NSRPadSource.h). Logged once per session,
+// from PrepareBoot, so offline practice records it too - a controller that
+// the game ignores is found there first, and this used to be the one launch
+// that left no evidence.
 void LogLocalPad()
 {
   std::string mapping = "none";
@@ -569,13 +584,8 @@ bool Setup()
 {
   Session& s = s_session;
   s.initialized = true;
-  if (const std::string path = Env("NSR_LOG"); !path.empty() && s.log == stderr)
-  {
-    if (FILE* f = std::fopen(path.c_str(), "w"))
-      s.log = f;
-  }
+  OpenLog();  // normally already open: PrepareBoot runs first and logs the pad
   std::vector<std::string> lower_peers;
-  LogLocalPad();
   const bool config_ok = ReadConfig(s, &lower_peers);
   if (!Env("NSR_NETPLAY").empty())
     TelemetryNetplayStart();  // NSR telemetry: header + windows from here on, not only in matches
@@ -5008,6 +5018,10 @@ static bool LockstepExchange(const Core::CPUThreadGuard& guard, u32 buf, u32 fra
 bool PrepareBoot()
 {
   Session& s = s_session;
+  // Before the first early return: every launch records what port 1 resolved
+  // to, netplay or not.
+  OpenLog();
+  LogLocalPad();
   const auto mode = NSRQuickstart::Parse(Env("NSR_QUICKSTART"));
   if (!mode)
     return false;

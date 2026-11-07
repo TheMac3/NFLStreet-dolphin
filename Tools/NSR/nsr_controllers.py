@@ -377,10 +377,28 @@ def _copy_profiles(source: RebornSource, our_user_dir: str, overwrite: bool) -> 
     return copied
 
 
+# record key for input_digest. Versioned because the digest's coverage
+# changed: a record written by the old one omits [SDL_Hints], so comparing it
+# against a new digest would read as "the player edited this" on every
+# existing install and quietly stop importing. An unknown key is treated as no
+# record, which re-imports once and writes the new form.
+INPUT_RECORD_KEY = "input_written_v2"
+
+
 def input_digest(dolphin_ini_text: str | None) -> str | None:
-    """Hash of the INPUT_KEYS values in a Dolphin.ini (what the sync manages)."""
+    """Hash of everything the sync manages in a Dolphin.ini.
+
+    That is the INPUT_KEYS values *and* [SDL_Hints]. The hints were left out
+    at first, which made the record dishonest in both directions: an edit to
+    them did not count as a player change, and the record claimed to describe
+    a file whose hint block it had never looked at. The hints are what let
+    Reborn's device strings resolve in our Dolphin, so a stale block is the
+    difference between a mapping that works and one the game ignores.
+    """
     sections = parse_ini(dolphin_ini_text or "")
     values = [f"{sec}.{key}={get_value(get_section(sections, sec), key)}" for sec, key in INPUT_KEYS]
+    values += [f"{SDL_SECTION}.{k}={v}" for k, v in get_section(sections, SDL_SECTION) or ()
+               if _SDL_NAME.match(k)]
     return text_hash("\n".join(values))
 
 
@@ -392,13 +410,14 @@ def _merge_dolphin_ini(our_user_dir: str, source: RebornSource, record: dict, fo
     remembers what we wrote."""
     dini_path = os.path.join(our_user_dir, "Config", DOLPHIN_INI)
     ours = read_text(dini_path)
-    written = record.get("input_written")
+    written = record.get(INPUT_RECORD_KEY)
     if not force and written and input_digest(ours) != written:
         return
     merged = merge_input_settings(ours, read_text(source.dolphin_ini) if source.dolphin_ini else None)
     if merged is not None and merged != ours:
         write_text(dini_path, merged)
-    record["input_written"] = input_digest(merged if merged is not None else ours)
+    record.pop("input_written", None)  # superseded; see INPUT_RECORD_KEY
+    record[INPUT_RECORD_KEY] = input_digest(merged if merged is not None else ours)
 
 
 def sync_controllers(our_user_dir: str, source: RebornSource | None, record: dict | None,
@@ -425,8 +444,18 @@ def sync_controllers(our_user_dir: str, source: RebornSource | None, record: dic
     elif not record.get("written"):
         action = "first-import"
     elif ours is not None and ours_hash != record["written"]:
+        # Deliberately returns before _merge_dolphin_ini: a mapping made in our
+        # Dolphin names devices as *our* enumeration sees them, and importing
+        # Reborn's [SDL_Hints] over it could stop those names resolving. So
+        # nothing here is refreshed - and the message has to say so, because
+        # this is the state that produces "the Controllers page shows my pad
+        # but the game ignores it": the page reads the stored file, which can
+        # name a device nothing resolves to at run time.
         return SyncResult("kept-yours", record,
-                          "Using the mapping you made in NFLStreetRemastered's controller setup.")
+                          "Using the mapping you made in NFLStreetRemastered's controller setup. "
+                          "Your Reborn settings aren't applied, including the controller-detection "
+                          "settings that make Reborn's device names work here. If the game ignores "
+                          "your controller, click \u201cUse my Reborn controller settings\u201d.")
     elif ours_hash == wanted_hash:
         # Same mapping, but the port device (e.g. switching to the USB adapter,
         # which needs no mapping) lives in Dolphin.ini: keep that in step too.
