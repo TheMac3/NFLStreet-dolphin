@@ -37,11 +37,14 @@ start rather than leaving a player stuck on something that does not run.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import shutil
+import threading
 import urllib.error
 import urllib.request
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import nsr_content as content
 import nsr_update as update
@@ -109,6 +112,9 @@ TRIAL_NAME = "trial.json"
 # memory stays flat regardless.
 CHUNK = 1 << 20
 FETCH_TIMEOUT = 30.0
+# Enough outstanding requests to hide CDN latency without opening thousands of
+# sockets. Small updates use only as many workers as they have files to fetch.
+FETCH_WORKERS = 16
 
 
 class UpdateError(RuntimeError):
@@ -215,8 +221,79 @@ def _open(url: str, timeout: float):
     return urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 (scheme checked by caller)
 
 
+class _KeepAliveHandler(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
+    """urllib redirects/proxies with worker-owned http.client connections.
+
+    urllib's default do_open explicitly closes the socket after every request.
+    Override that step, retaining its request/tunnel handling and the standard
+    redirect/error handlers (GitHub redirects assets to a separate CDN origin).
+    No connection or opener is shared between workers. There are no retries:
+    an unexpectedly dead keep-alive socket fails like any other network error.
+    """
+
+    def __init__(self):
+        """Initialize TLS with urllib's normal certificate checks."""
+        urllib.request.HTTPSHandler.__init__(self)
+        self.connections = {}
+
+    def do_open(self, http_class, req, **kwargs):
+        """Reuse a connection only for the same transport, proxy and tunnel."""
+        key = (http_class, req.host, req._tunnel_host)
+        headers = dict(req.unredirected_hdrs)
+        headers.update({k: v for k, v in req.headers.items() if k not in headers})
+        headers = {k.title(): v for k, v in headers.items()}
+        conn = self.connections.get(key)
+        if conn is None:
+            # Bound a worker's cache even if redirects visit many origins.
+            if len(self.connections) >= 4:
+                self.connections.pop(next(iter(self.connections))).close()
+            conn = http_class(req.host, timeout=req.timeout, **kwargs)
+            if req._tunnel_host:
+                auth = headers.pop("Proxy-Authorization", None)
+                conn.set_tunnel(req._tunnel_host,
+                                headers={"Proxy-Authorization": auth} if auth else {})
+            self.connections[key] = conn
+        elif req._tunnel_host:
+            headers.pop("Proxy-Authorization", None)
+        try:
+            conn.request(req.get_method(), req.selector, req.data, headers,
+                         encode_chunked=req.has_header("Transfer-encoding"))
+            response = conn.getresponse()
+        except (OSError, http.client.HTTPException) as exc:
+            conn.close()
+            raise urllib.error.URLError(exc) from None
+        response.url = req.get_full_url()
+        response.msg = response.reason
+        return response
+
+    def close(self):
+        """Release all sockets when this worker's stage ends, including errors."""
+        for conn in self.connections.values():
+            conn.close()
+        self.connections.clear()
+
+
+class _KeepAliveOpener:
+    """The fetch_to_file opener seam, backed by one worker's connection cache."""
+
+    def __init__(self):
+        """Keep standard urllib proxy, redirect and HTTP error behavior."""
+        self.handler = _KeepAliveHandler()
+        self.opener = urllib.request.build_opener(self.handler)
+
+    def __call__(self, url, timeout):
+        """Open a streamed response without requesting Connection: close."""
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "NFLStreetRemastered-update/1", "Accept": "application/octet-stream"})
+        return self.opener.open(req, timeout=timeout)
+
+    def close(self):
+        """Dispose of this worker's persistent connections."""
+        self.handler.close()
+
+
 def fetch_to_file(url: str, dest: str, *, size: int, sha256: str, opener=_open,
-                  timeout: float = FETCH_TIMEOUT) -> None:
+                  timeout: float = FETCH_TIMEOUT, cancel=None) -> None:
     """Stream one file to `dest`, hashing as it goes; raise unless it matches.
 
     Streaming rather than `nsr_content.http_get` because that returns bytes,
@@ -229,23 +306,45 @@ def fetch_to_file(url: str, dest: str, *, size: int, sha256: str, opener=_open,
     as in `verify_staged` - once while the bytes are in hand, once over the
     whole staging directory - because a file that fails now should not be left
     on disk looking plausible.
+
+    `cancel` is stage's internal stop flag. On cancellation this removes the
+    partial file and returns; stage suppresses completion and propagates the
+    sibling's original failure instead of replacing it with a cancellation error.
     """
-    digest, written = hashlib.sha256(), 0
+    digest, written, verified = hashlib.sha256(), 0, False
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     try:
-        with opener(url, timeout) as response, open(dest, "wb") as out:
-            while chunk := response.read(CHUNK):
-                written += len(chunk)
-                if written > size:
-                    raise UpdateError(f"{url} sent more than its manifest size")
-                digest.update(chunk)
-                out.write(chunk)
-    except urllib.error.HTTPError as exc:
-        raise OSError(f"HTTP {exc.code}") from None
-    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
-        raise OSError(str(getattr(exc, "reason", exc))) from None
-    if written != size or digest.hexdigest() != sha256:
-        raise UpdateError(f"{os.path.basename(dest)} did not match the signed manifest")
+        try:
+            with opener(url, timeout) as response, open(dest, "wb") as out:
+                # read1 returns after available network data, so cancellation
+                # does not wait for a full megabyte from a slow large asset.
+                read = getattr(response, "read1", response.read)
+                while True:
+                    if cancel is not None and cancel.is_set():
+                        return  # finally removes this incomplete file
+                    chunk = read(CHUNK)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > size:
+                        raise UpdateError(f"{url} sent more than its manifest size")
+                    digest.update(chunk)
+                    out.write(chunk)
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            raise OSError(f"HTTP {exc.code}") from None
+        except (urllib.error.URLError, TimeoutError, ValueError, http.client.HTTPException) as exc:
+            raise OSError(str(getattr(exc, "reason", exc))) from None
+        if written != size or digest.hexdigest() != sha256:
+            raise UpdateError(f"{os.path.basename(dest)} did not match the signed manifest")
+        # Only a fully streamed, matching file may survive this function.
+        verified = True
+    finally:
+        if not verified:
+            try:
+                os.remove(dest)
+            except FileNotFoundError:
+                pass
 
 
 def fetch_manifest(base: str, fetch=None, keys=None) -> tuple[dict, bytes]:
@@ -261,9 +360,100 @@ def _dest(root: str, rel: str) -> str:
     return os.path.join(root, *rel.split("/"))
 
 
+def _fetch_files(paths, wanted, staging, base, fetch, workers, progress):
+    """Bound work in flight, keep callbacks on the caller, stop on first error.
+
+    Injected fetchers are serial unless workers is explicitly supplied, since
+    existing test/embedded clients need not be thread safe. The normal fetcher
+    gets one connection cache per thread, disposed only after all workers have
+    stopped so a new staging attempt cannot race an old writer. Cancellation
+    stops submission immediately and active streams at their next read; a
+    blocked network read remains bounded by FETCH_TIMEOUT.
+    """
+    count = min(len(paths), workers if workers is not None else (
+        FETCH_WORKERS if fetch is fetch_to_file else 1))
+    if not paths:
+        return
+    if count < 1:
+        raise ValueError("workers must be at least 1")
+    stop = threading.Event()
+    local = threading.local()
+    openers = []
+    opener_lock = threading.Lock()
+
+    def one(rel):
+        """Fetch or create one manifest entry; signal errors before more work starts."""
+        try:
+            if stop.is_set():
+                return
+            entry = wanted[rel]
+            dest = _dest(staging, rel)
+            if entry["size"] == 0:
+                # Empty assets cannot be uploaded to GitHub. The manifest
+                # validator already pins the only possible hash for size 0.
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "wb"):
+                    pass
+            else:
+                kwargs = {}
+                if fetch is fetch_to_file:
+                    if not hasattr(local, "opener"):
+                        local.opener = _KeepAliveOpener()
+                        with opener_lock:
+                            openers.append(local.opener)
+                    kwargs = {"opener": local.opener, "cancel": stop}
+                fetch(file_url(base, entry["sha256"]), dest,
+                      size=entry["size"], sha256=entry["sha256"], **kwargs)
+        except BaseException:
+            stop.set()
+            raise
+
+    try:
+        if count == 1:
+            # Preserve caller-thread behavior for single-threaded injections.
+            for completed, rel in enumerate(paths, 1):
+                one(rel)
+                if progress:
+                    progress(completed, len(paths), rel)
+            return
+        with ThreadPoolExecutor(max_workers=count, thread_name_prefix="nsr-fetch") as pool:
+            pending = {}
+            remaining = iter(paths)
+            completed = 0
+            try:
+                # Submit only one file per worker; never enqueue the release.
+                for rel in (next(remaining, None) for _ in range(count)):
+                    if rel is not None:
+                        pending[pool.submit(one, rel)] = rel
+                while pending:
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    # Propagate a failed result before replenishing any slots.
+                    for future in done:
+                        future.result()
+                    for future in done:
+                        rel = pending.pop(future)
+                        if not stop.is_set():
+                            completed += 1
+                            if progress:
+                                progress(completed, len(paths), rel)
+                    for _ in done:
+                        if stop.is_set():
+                            break
+                        rel = next(remaining, None)
+                        if rel is not None:
+                            pending[pool.submit(one, rel)] = rel
+            finally:
+                stop.set()
+                for future in pending:
+                    future.cancel()
+    finally:
+        for opener in openers:
+            opener.close()
+
+
 def stage(payload: dict, plan: update.Plan, install_root: str, base: str, *,
           staging: str | None = None, fetch=fetch_to_file, reuse=True,
-          progress=None) -> str:
+          progress=None, workers: int | None = None) -> str:
     """Build a complete, verified copy of the new build in a staging folder.
 
     Every file the manifest lists ends up here, not only the downloaded ones:
@@ -272,8 +462,13 @@ def stage(payload: dict, plan: update.Plan, install_root: str, base: str, *,
     install is touched. `verify_staged` with no `only` is what makes that
     check meaningful - a half-downloaded staging folder cannot pass it.
 
+    Downloads use up to FETCH_WORKERS concurrent workers and persistent HTTP
+    connections. An injected fetch stays on the caller thread by default;
+    workers= opts it into concurrency. Progress reports completed files, in
+    monotonically increasing counts, on the caller thread (including empties).
+
     Returns the staging path. Raises `UpdateError` or `OSError` without having
-    modified the install.
+    modified the install. A failed stage is discarded on the next attempt.
     """
     build = payload["build"]
     staging = staging or os.path.join(install_root, STAGING_DIR)
@@ -283,22 +478,7 @@ def stage(payload: dict, plan: update.Plan, install_root: str, base: str, *,
     os.makedirs(staging, exist_ok=True)
 
     wanted = {f["path"]: f for f in build["files"]}
-    for index, rel in enumerate(plan.fetch, 1):
-        entry = wanted[rel]
-        if progress:
-            progress(index, len(plan.fetch), rel)
-        if entry["size"] == 0:
-            # Nothing to transfer: an empty file's content is fully determined,
-            # and `validate_build` has already pinned its digest. A release
-            # host will not even store a 0-byte asset - GitHub answers "Bad
-            # Content-Length" - so this is written rather than fetched. The
-            # real package has 36 of them, all one object after dedup.
-            os.makedirs(os.path.dirname(_dest(staging, rel)) or ".", exist_ok=True)
-            with open(_dest(staging, rel), "wb"):
-                pass
-            continue
-        fetch(file_url(base, entry["sha256"]), _dest(staging, rel),
-              size=entry["size"], sha256=entry["sha256"])
+    _fetch_files(plan.fetch, wanted, staging, base, fetch, workers, progress)
     if reuse:
         for rel in plan.reuse:
             src, dst = _dest(install_root, rel), _dest(staging, rel)

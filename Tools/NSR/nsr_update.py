@@ -335,8 +335,10 @@ def verify_staged(payload: dict, staging: str, *, only=None) -> list[str]:
 
     Every file the manifest lists is checked by size and hash, not just the
     ones that were downloaded, so a half-applied or locally corrupted staging
-    directory cannot pass. `only` narrows it to a set of paths when the caller
-    is hard-linking or copying the rest in from the current install.
+    directory cannot pass. `only` is a partial diagnostic check, not proof of
+    a complete stage: neither the wire hash nor an earlier install/inventory
+    hash proves a file is still present and unchanged. Stage and swap therefore
+    both check the whole manifest, including hard-linked/copied files.
     """
     bad = []
     for f in payload["build"]["files"]:

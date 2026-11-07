@@ -65,6 +65,7 @@ Self-test (CI):   nsr_launcher.py --selftest [--tk]  builds the UI, waits until 
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -362,6 +363,16 @@ CONTENT_FILE = "nsr-content.txt"  # optional, shipped next to the launcher: cont
 # A start/Join re-checks for content updates only if the last check is older
 # than this, so joining doesn't wait on the network every time.
 CONTENT_RECHECK_S = 300
+# How long one Reborn-discovery answer is reused. Finding Reborn walks the
+# player's drives, and a single startup asks for it four times (source
+# selection, the image build, the controller sync and the texture import). The
+# walk costs milliseconds on a development box but scans %LOCALAPPDATA%,
+# %APPDATA% and Program Files on Windows, so the repeat is worth avoiding.
+# Only a successful walk is reused, and only while the file it found is still
+# there, so a player who installs Reborn and retries is never answered "not
+# found" from a cache; any explicit Locate/Browse action passes its own path and
+# never consults this.
+DISCOVERY_CACHE_S = 20
 
 
 def content_url(folder: str, env=os.environ, games_url: str = "") -> str:
@@ -442,6 +453,14 @@ def save_config(folder: str, cfg: dict) -> None:
 
 
 LOG_NAME = "nsr-launcher.log"
+# Phases shorter than this are not logged. Players report "it sat there for ten
+# minutes" and the log used to say nothing about where the time went: every
+# startup phase is disk or network work on a machine we cannot see, and a friend
+# with a spinning disk or a cross-volume Reborn install pays 5-10x what a
+# development box does on the very same step. Half a second is below anything
+# worth a player's attention but well above the noise, and keeps the 256 KB log
+# from filling with instant phases.
+PHASE_LOG_SECONDS = 0.5
 
 
 def log(folder: str, msg: str) -> None:
@@ -618,6 +637,7 @@ class Launcher:
         # one does, an update must not relaunch: it would leave two launchers.
         self.on_quit = None
         self._build_lock = None   # held while this process builds the game copy
+        self._discovery: dict = {}  # {key: (clock, value)} - see DISCOVERY_CACHE_S
         self._quality_generation = 0  # a new lobby invalidates the previous reader
         self.rev = 0
         self._notice_id = 0
@@ -627,7 +647,15 @@ class Launcher:
         order, first = (("alternating", "stock") if self._source_kind == "owned" else
                         (cfg.get("draft_order", "alternating"), cfg.get("draft_first", "stock")))
         mode_key = "owned_quickstart" if self._source_kind == "owned" else "quickstart"
-        default_mode = "quick-play" if self._source_kind == "owned" else "manual"
+        # Quick Play for both families now. Manual was the compatibility default
+        # from when quickstart was new, and it costs a player who never opens
+        # the picker the whole slow path: about 80 seconds of opening movies that
+        # route version 3 skips, plus hand-navigating title, training and the
+        # modes help before Select Controller. The Reborn route is the qualified
+        # one (it is native Pickup that is still refused), netplay rooms mount
+        # fresh cards regardless, and the picker still offers Manual - which is
+        # what an offline player wants if they are keeping persistent saves.
+        default_mode = "quick-play"
         order = order if order in draftmodes.ORDERS else "alternating"
         first = first if first in draftmodes.FIRSTS else "stock"
         self.state = {
@@ -725,7 +753,11 @@ class Launcher:
         self._set("content", state="idle", version=None, latest=None, changelog="", text="")
 
     def set_source(self, kind: str, image: str | None = None) -> None:
-        """Settings owns source changes; a room, build or running game freezes its source."""
+        """Settings owns source changes; a room, build or running game freezes its source.
+
+        Changing family also invalidates a Reborn lookup cached for the other one.
+        """
+        self.forget_discovery()
         if kind not in ("reborn", "owned"):
             raise ValueError("Choose Reborn install or My own disc image.")
         with self._lock:
@@ -789,6 +821,57 @@ class Launcher:
 
     def _save(self) -> None:
         save_config(self.folder, self.cfg)
+
+    # -- timing --
+    @contextlib.contextmanager
+    def _phase(self, name: str):
+        """Time one named phase into the log, so a slow start is diagnosable.
+
+        Every expensive thing between opening the launcher and reaching a game
+        is disk or network work whose cost depends entirely on the player's
+        machine: hashing a 1.4 GB image, hard-linking (or, across volumes,
+        copying) a 7.5 GB texture library, fetching a release of 2566 small
+        files. On the development box all of that is seconds; on a friend's
+        laptop it is minutes, and we had no way to tell which step was to blame
+        because the log recorded only outcomes. One line per phase is the whole
+        reporting channel - no telemetry, no new consent question - and the
+        player can read it or paste it.
+
+        Timing never changes behaviour: an exception still propagates, and the
+        line is written either way so the phase that failed is also the phase
+        that is timed.
+        """
+        start = self._clock()
+        try:
+            yield
+        finally:
+            spent = self._clock() - start
+            if spent >= PHASE_LOG_SECONDS:
+                log(self.folder, f"phase {name}: {spent:.1f}s")
+
+    def _found_reborn_iso(self) -> str | None:
+        """`find_reborn_iso()`, answered from a recent successful walk.
+
+        One startup asks four times over (source selection, the image build, the
+        controller sync, the texture import) and each ask walks the player's
+        drives. Only a *successful* answer is reused, and only if that file is
+        still there: a cached "not found" is what would outlive a player
+        installing Reborn and then being told again that it is missing, which is
+        a worse bug than a repeated walk. So the fruitless walk is still paid
+        every time - it is the player who already has Reborn, i.e. everyone this
+        is meant to help, whose repeats are removed.
+        """
+        hit = self._discovery.get("reborn_iso")
+        if hit is not None and self._clock() - hit[0] < DISCOVERY_CACHE_S and os.path.isfile(hit[1]):
+            return hit[1]
+        found = self._patcher.find_reborn_iso()
+        if found:
+            self._discovery["reborn_iso"] = (self._clock(), found)
+        return found
+
+    def forget_discovery(self) -> None:
+        """Drop cached Reborn lookups, for when the player says to look again."""
+        self._discovery.clear()
 
     # -- settings --
     def set_name(self, name: str) -> None:
@@ -976,6 +1059,10 @@ class Launcher:
 
     def find_game(self) -> None:
         """Claim setup before scheduling; never fall back across selected families."""
+        # "Find Reborn automatically" is what a player clicks *after* installing
+        # Reborn, so this one always looks again rather than reusing a cached
+        # "not found" from seconds ago.
+        self.forget_discovery()
         with self._lock:
             if self._activity_blocked("preparing a source"):
                 return
@@ -1192,7 +1279,7 @@ class Launcher:
         if not install and self.cfg.get("reborn_iso"):
             install = self._patcher.reborn_install_of(self.cfg["reborn_iso"])
         if not install and search:
-            iso = self._patcher.find_reborn_iso()
+            iso = self._found_reborn_iso()
             install = self._patcher.reborn_install_of(iso) if iso else None
         return install if install and os.path.isdir(install) else None
 
@@ -1329,7 +1416,7 @@ class Launcher:
         iso = self.cfg.get("reborn_iso")
         if iso and os.path.isfile(iso):
             return iso
-        return self._patcher.find_reborn_iso()
+        return self._found_reborn_iso()
 
     def _usable(self, payload: dict) -> bool:
         rel = payload["release"]
@@ -1791,6 +1878,17 @@ class Launcher:
 
     # -- launching --
     def launch(self, start, open_ui: bool = False) -> bool:
+        """Press-Play to Dolphin-running, timed as one phase.
+
+        This is the other half of what a player means by waiting, and it was as
+        invisible in the log as the startup phases were: controller sync, the
+        installed-ratings check, the texture list and the runtime bundle all
+        happen here, between the click and the window appearing.
+        """
+        with self._phase("start the game"):
+            return self._launch(start, open_ui)
+
+    def _launch(self, start, open_ui: bool = False) -> bool:
         if not open_ui and self.need_game():
             return False
         if start and getattr(start, "image_family", ""):
@@ -2397,12 +2495,25 @@ class Launcher:
 
     def reimport_reborn(self) -> None:
         """Settings → Advanced: refresh assets, preserving our ISO and controls."""
+        self.forget_discovery()
         if self._source_kind == "owned":
             self.notify("Using your disc’s original look. Add packs to TexturePacks/GN7E69, then start the game.")
             return
         self._spawn(lambda: self._import_assets_setup(force=True))
 
     def _startup_checks(self) -> None:
+        """Everything between opening the launcher and being able to press Play.
+
+        Each step is timed into the log (see `_phase`). The order is deliberate
+        and the steps are not independent - the content check reads the settled
+        game state, and the automatic build at the end reads what every earlier
+        step decided - so this stays sequential. What the timing is for is
+        telling us *which* step costs a player ten minutes, because the answer
+        differs by machine: a cross-volume texture copy, a 2566-file release
+        download and a 1.4 GB image hash are all minutes on some installs and
+        seconds on others.
+        """
+        startup_began = self._clock()
         # Hashing can take seconds. Freeze the source while it is in flight so
         # a previous family's ready result cannot publish into a newer selection.
         with self._lock:
@@ -2415,13 +2526,16 @@ class Launcher:
                 available = (os.path.isfile(os.path.join(self.folder, patcher.OUTPUT_NAME))
                              or self._reborn_iso() or self._patcher.saved_reborn_install(self.folder))
                 self._select_source("reborn" if available else "owned")
-            self._check_game_now()
-            self.sync_controllers_now(search=True)
+            with self._phase("check game copy"):
+                self._check_game_now()
+            with self._phase("controllers"):
+                self.sync_controllers_now(search=True)
         finally:
             self._release_build_lock()
             self._set("game", busy=False)
         if self.state["game"]["state"] == "ready":
-            self._import_assets_setup()
+            with self._phase("textures"):
+                self._import_assets_setup()
         # What the previous run left behind, resolved in __init__ before
         # anything read the folder; report it here where the UI can see it.
         if self._pending_build == "reverted-interrupted":
@@ -2434,12 +2548,15 @@ class Launcher:
             log(self.folder, "update: a build that never confirmed itself was rolled back")
         if selfupdate.needs_rebuild(self.folder, self.game_dir, self._patcher):
             self._set("build", rebuild=True)
-            self.rebuild_for_recipe()
-        self.update_content_now(user=False)  # auto: install; manual: just report
+            with self._phase("rebuild for new recipe"):
+                self.rebuild_for_recipe()
+        with self._phase("game content update"):
+            self.update_content_now(user=False)  # auto: install; manual: just report
         # The launcher's own update is checked after the game copy, so a
         # player whose game is not ready yet sees that first. It never blocks
         # play: every refusal and failure leaves this version running.
-        self.update_build_now(user=False)
+        with self._phase("launcher update"):
+            self.update_build_now(user=False)
         # One-click start: a missing or outdated game copy is built right away
         # from the Reborn install we can find (what "Find Reborn automatically"
         # does), so players never need to run the separate patcher first. If
@@ -2447,7 +2564,62 @@ class Launcher:
         game = self.state["game"]
         if game.get("state") in ("missing", "stale") and not game.get("busy"):
             log(self.folder, f"startup: game copy {game.get('state')}; building it automatically")
-            self.find_game()
+            with self._phase("build game copy"):
+                self.find_game()
+        # One summary line even when every phase was below the log threshold, so
+        # a report of "it was slow" can always be checked against a number.
+        log(self.folder, f"startup: ready to play after {self._clock() - startup_began:.1f}s")
+        # Deliberately after that line: the whole point is that it runs behind
+        # the Play button rather than in front of it.
+        self._spawn(self._verify_image_now)
+
+    def _verify_image_now(self) -> None:
+        """Confirm the game copy still hashes to what its receipt claims.
+
+        `image_status` now trusts the recorded digest while the file's stat
+        identity is unchanged, which is what took a 1.4 GB read off every
+        single start. Metadata cannot expose bit rot, though, so the full hash
+        still happens - just here, once, in the background. Dropping it instead
+        would be the quiet kind of wrong: a room compares fingerprints, so an
+        image that is no longer the image its fingerprint names desyncs a match
+        rather than failing anything, which is why a failure has to end in a
+        rebuild and not a note.
+
+        Skipped unless the copy is idle and ready. `verify_image` reports False
+        for a change *during* verification too, so running it beside a build or
+        a running game would raise false alarms about work we did ourselves.
+        """
+        if (self.state["game"]["state"] != "ready" or self.state["game"]["busy"]
+                or self._dolphin_running() or self.state["content"]["busy"]
+                or self.state["host"]["state"] != "idle" or self.state["join"]["state"] != "idle"):
+            return
+        # Injectable patcher modules (test doubles) need not provide it; what
+        # they stand in for is the hash, and skipping is the honest answer.
+        verify = getattr(self._patcher, "verify_image", None)
+        if verify is None:
+            return
+        fingerprint = self.state["game"]["fingerprint"]
+        try:
+            with self._phase("verify game copy"):
+                intact = verify(self.game_dir)
+        except OSError as exc:
+            log(self.folder, f"verify: could not read the game copy ({exc})")
+            return
+        if intact:
+            return
+        # A build or an import finishing mid-check reads as a failure, because
+        # the receipt it compares against is the new one. Only report when the
+        # copy we actually checked is still the copy on offer.
+        if (self.state["game"]["fingerprint"] != fingerprint or self.state["game"]["busy"]
+                or self.state["content"]["busy"]):
+            log(self.folder, "verify: the game copy changed while being checked; not reported")
+            return
+        log(self.folder, "verify: the game copy no longer matches its receipt")
+        message = ("Your game copy on disk is no longer the copy its fingerprint names, so it "
+                   "can't be trusted in a room. Rebuild it: Settings \u2192 Advanced \u2192 Rebuild game copy.")
+        if self.state["host"]["state"] == "idle" and self.state["join"]["state"] == "idle":
+            self._set("game", state="stale", fingerprint="", content=None, text=message)
+        self.notify(message, "error")
 
     def startup(self) -> None:
         def setup():

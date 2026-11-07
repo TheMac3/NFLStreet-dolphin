@@ -23,11 +23,11 @@ packages into its Dolphin user folder's Load/Textures/<game id> with hardlinks
 (jsgme.ps-controls, jsgme.xbox-controls) or none for the GameCube art.
 
 What we do: discover_reborn() describes the source only during import. The
-resumable importer hardlinks files on the same volume, otherwise copies and
-verifies size + SHA-256, into Assets/GN7E69/sets/<generation>. An atomic local
-manifest publishes a complete generation. compose() reads that manifest and
-returns local folders only, including either imported prompt choice. No asset
-or manifest is shipped or uploaded. Reborn is never written.
+resumable importer hardlinks files on the same volume, otherwise streams copies
+with source SHA-256 and verifies size, into Assets/GN7E69/sets/<generation>.
+An atomic local manifest publishes a complete generation. compose() reads that
+manifest and returns local folders only, including either imported prompt choice.
+No asset or manifest is shipped or uploaded. Reborn is never written.
 
 Normal startup checks recorded source metadata (mtime_ns + size, directories
 included for additions); it opens no Reborn assets/configs unless that metadata
@@ -325,6 +325,9 @@ STORE_SCHEMA = "nsrb.local-assets.v1"
 STORE_REL = os.path.join("Assets", GAME_ID)
 OWNED_STORE_REL = os.path.join("TexturePacks", GAME_ID, "reborn-hd")
 SPACE_RESERVE = 16 << 20  # manifest, filesystem metadata and copy temporary file
+# A lost journal tail only repeats work: publication never relies on its durability.
+JOURNAL_SYNC_RECORDS = 128
+JOURNAL_SYNC_SECONDS = 2.0
 
 
 class ImportError(OSError):
@@ -345,6 +348,22 @@ def _digest(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
         while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _copy_digest(source: str, target: Path) -> str:
+    """Copy once and hash exactly the source bytes supplied to the writer.
+
+    Closing the output flushes Python's buffers before the caller checks size.
+    Write/close errors propagate; the caller removes the unpublished temporary
+    file. Source stamps and any forced owned pin are checked before publication.
+    Kernel copy offloads cannot supply this digest without another byte pass.
+    """
+    h = hashlib.sha256()
+    with open(source, "rb") as src, target.open("wb") as dst:
+        while chunk := src.read(1 << 20):
+            dst.write(chunk)
             h.update(chunk)
     return h.hexdigest()
 
@@ -555,6 +574,8 @@ def ensure_store(folder: str, install: str | None, env=os.environ, *, force: boo
     Reborn uses Assets; owned=True uses the owned TexturePacks store, only base
     HD PNG/DDS files and verified independent copies, including resumed files.
     Callers serialize imports against gameplay; owned startup never calls here.
+    Journal syncs are batched: an abrupt stop may repeat the unsynced tail, but
+    every record still follows replacement of its verified output file.
     """
     if owned and app_root is not None:
         _owned_destination(Path(app_root).resolve(), Path(folder).absolute())
@@ -615,6 +636,8 @@ def ensure_store(folder: str, install: str | None, env=os.environ, *, force: boo
                     and completed.get(f["relative"], {}).get("stamp") != f["stamp"])
     with journal.open("a", encoding="utf-8") as log:
         log.write("\n")  # separate any torn last record before appending new ones
+        pending = 0
+        last_sync = time.monotonic()
         for f in plan["files"]:
             out = _local_path(dest, f["relative"])
             if owned:
@@ -664,14 +687,12 @@ def ensure_store(folder: str, install: str | None, env=os.environ, *, force: boo
                         method = "copied"
                         _check_space(dest, max(f["size"], remaining) + SPACE_RESERVE, owned=owned)
                         try:
-                            shutil.copyfile(f["source"], tmp)
-                            digest = _digest(Path(f["source"]))
+                            digest = _copy_digest(f["source"], tmp)
                             # A forced owned generation also pins the source hash
                             # before copying. Same-size/timestamp-preserving edits
                             # during the copy must not publish mixed provenance.
                             expected = plan.get("forced_sha256", {}).get(f["source"], digest)
-                            if (tmp.stat().st_size != f["size"] or _digest(tmp) != digest
-                                    or (owned and digest != expected)):
+                            if tmp.stat().st_size != f["size"] or (owned and digest != expected):
                                 action = "the HD copy action in Advanced" if owned else "Re-import from Reborn"
                                 raise ImportError(f"Texture copy verification failed; retry {action}.")
                         except BaseException:
@@ -683,14 +704,23 @@ def ensure_store(folder: str, install: str | None, env=os.environ, *, force: boo
                 os.replace(tmp, out)
                 record = {**f, "method": method, "sha256": digest}
                 log.write(json.dumps(record) + "\n")
-                log.flush()
-                os.fsync(log.fileno())
+                pending += 1
+                now = time.monotonic()
+                if pending >= JOURNAL_SYNC_RECORDS or now - last_sync >= JOURNAL_SYNC_SECONDS:
+                    log.flush()
+                    os.fsync(log.fileno())
+                    pending = 0
+                    last_sync = now
             records.append({**record, "local": f"sets/{generation}/{f['relative']}"})
             done += f["size"]
             if (old_files.get(f["source"], {}).get("stamp") != f["stamp"]
                     and completed.get(f["relative"], {}).get("stamp") != f["stamp"]):
                 remaining -= f["size"]
             report(done, total)
+        # Persist the final partial batch (and separator) before the manifest.
+        # Exceptional exits still close/flush the log; lost records are retried.
+        log.flush()
+        os.fsync(log.fileno())
     if any(_stamp(p) != value for p, value in plan["probes"].items()):
         raise ImportError("Reborn changed during import. Close Reborn and retry; completed files are kept.")
     for layer in plan["layers"]:

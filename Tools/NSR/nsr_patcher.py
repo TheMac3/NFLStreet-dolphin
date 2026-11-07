@@ -21,8 +21,8 @@ with PyInstaller) inside the NFLStreet netplay Dolphin folder, and it:
      temporary file and only replaces nsr-net.iso once the new copy is
      complete, so a failed build never destroys a working image,
   4. writes nsr-image.json (recipe, source/output digests, fingerprint,
-     content version if any; no paths) and shows the result's fingerprint. Netplay needs byte-identical
-     images on every machine, so the lobby compares fingerprints (and this
+     content version if any, image stat identity; no paths) and shows the
+     result's fingerprint. Netplay needs byte-identical images on every machine, so the lobby compares fingerprints (and this
      says whether the image matches the reference build).
 
 The milestone-1 lockstep image (`freeze seed input netplay`) is no longer
@@ -267,7 +267,7 @@ def saved_reborn_install(out_dir: str) -> str | None:
 def write_manifest(out_dir: str, digest_in: str, label: str | None, digest_out: str,
                    content: "nsr_content.Content | None" = None,
                    draft_order: str = "alternating", draft_first: str = "stock") -> None:
-    """nsr-image.json: what nsr-net.iso is. Digests and labels only; no paths
+    """nsr-image.json: image digests, stat identity and labels; no paths
     or Reborn content (release plan 3.1). "content" records the applied
     content update (version, manifest serial, pack digests) or is null."""
     packs = [p["sha256"] for p in content.release["packs"]] if content else []
@@ -277,6 +277,7 @@ def write_manifest(out_dir: str, digest_in: str, label: str | None, digest_out: 
                 "draft_recipe": "gn7e69-r0-draft-v1",
                 "source_label": label, "source_sha256": digest_in,
                 "output_sha256": digest_out, "fingerprint": fingerprint(digest_out),
+                "output_stat": _image_stamp(os.path.join(out_dir, OUTPUT_NAME)),
                 "ratings_pack_sha256": packs[0] if len(packs) == 1 else None,
                 "content": ({"version": content.version, "serial": content.serial, "packs": packs}
                             if content else {"version": 0, "serial": 0, "packs": []}
@@ -419,7 +420,8 @@ def prepare_retail_image(iso: str, out_dir: str, progress=None, *, private_root=
                     "fingerprint": retail_fingerprint(digest, result["variant"]), "patches": list(isopatch.ROLLBACK_SET),
                     "draft_order": "alternating", "draft_first": "stock", "content": None,
                     "source_label": "NFL Street 2 USA rev 0 (" + result["variant"] + ")",
-                    "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+                    "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "output_stat": _image_stamp(partial)}
         temporary_manifest = os.path.join(out_dir, MANIFEST_NAME + ".tmp")
         with open(temporary_manifest, "w") as stream:
             json.dump(manifest, stream, indent=1)
@@ -436,8 +438,10 @@ def prepare_image(iso: str, out_dir: str, progress=None, content: "nsr_content.C
                   content_strict: bool = True, *,
                   draft_order: str = "alternating", draft_first: str = "stock") -> Prepared:
     """Check Reborn's image, build nsr-net.iso in out_dir, fingerprint it.
-    Draft choices are applied after validating a signed content output, and
-    the final fingerprint covers both.
+    Source/output hashes come from the copy for plain builds. Signed content
+    retains its input check before building and a post-edit verification read.
+    Draft choices are applied after validating a signed content output; that
+    one verification read hashes both the signed and planned draft bytes.
     progress(stage, done, total) with stage in {"check", "build", "verify"}.
     Raises isopatch.PatchError if the patches don't fit this Reborn version.
     The build goes to a temporary file that replaces nsr-net.iso only when
@@ -465,7 +469,13 @@ def prepare_image(iso: str, out_dir: str, progress=None, content: "nsr_content.C
             raise isopatch.PatchError("retail v1 supports native content and stock draft policy only")
         return prepare_retail_image(iso, out_dir, progress)
     step = (lambda st: (lambda d, t: progress(st, d, t))) if progress else (lambda st: None)
-    digest_in = sha256(iso, progress=step("check")) if progress else sha256(iso, "checking Reborn image")
+    # Signed content selects/validates its build before patching. Retain this
+    # input pass for content so unsupported releases and recipe/base mismatches
+    # keep their existing refusal order and wording, even on an invalid ISO.
+    # Plain builds learn the source digest from the copy itself.
+    digest_in = None
+    if content:
+        digest_in = sha256(iso, progress=step("check")) if progress else sha256(iso, "checking Reborn image")
     known = KNOWN_INPUTS.get(digest_in)
     build = content.build_for(digest_in) if content else None
     if content and build is None:
@@ -482,26 +492,56 @@ def prepare_image(iso: str, out_dir: str, progress=None, content: "nsr_content.C
     if os.path.abspath(iso) in (os.path.abspath(out), os.path.abspath(tmp)):
         raise isopatch.PatchError("the Reborn image and the output are the same file")
     try:
-        isopatch.build(iso, tmp, set(isopatch.NETPLAY_SET) | (choices if not build else set()),
-                       progress=step("build") if progress else (lambda d, t: _bar("copying + patching", d, t)))
+        result = isopatch.build(iso, tmp, set(isopatch.NETPLAY_SET) | (choices if not build else set()),
+                                progress=step("build") if progress else (lambda d, t: _bar("copying + patching", d, t)))
         if not progress:
             print()
+        # Retain compatibility with older injected builders that return None.
+        # Production isopatch always supplies both streamed digests.
+        copied_source = (result["source_sha256"] if result is not None
+                         else digest_in or sha256(iso, progress=step("check")))
+        if digest_in is not None and copied_source != digest_in:
+            raise isopatch.PatchError("source image changed while copying")
+        digest_in = copied_source
+        known = KNOWN_INPUTS.get(digest_in)
+        digest_out = result["output_sha256"] if result is not None else None
+        draft_plan = None
+        draft_error = None
         if build:
             apply_content(tmp, build, content)
-        digest_out = sha256(tmp, progress=step("verify")) if progress else sha256(tmp, "fingerprinting result")
+            if choices and result is not None:
+                # Hash the signed content image and its planned draft variant
+                # together. The plan does not write anything into tmp, and is
+                # committed only after the signed digest is authenticated.
+                with open(tmp, "rb") as image:
+                    draft_plan = isopatch.PatchPlan(image)
+                    try:
+                        draftmodes.apply(draft_plan, set(isopatch.NETPLAY_SET) | choices)
+                    except Exception as exc:
+                        # A bad signed output must retain precedence over a
+                        # draft guard failure, just as before this optimization.
+                        draft_error = exc
+                    digests = draft_plan.copy_and_hash(progress=step("verify"))
+                digest_out = digests["source_sha256"]
+            else:
+                digest_out = sha256(tmp, progress=step("verify")) if progress else sha256(tmp, "fingerprinting result")
+        elif digest_out is None:
+            digest_out = sha256(tmp, progress=step("verify")) if progress else sha256(tmp, "fingerprinting result")
         if build and digest_out != build["output_sha256"]:
             raise nsr_content.ContentError(
                 f"the updated game copy came out as {fingerprint(digest_out)}, not the expected "
                 f"{fingerprint(build['output_sha256'])}; your current copy was kept")
-        # The signed release authenticates the complete ratings/base image.
-        # Verify that exact digest first, then layer bundled authored draft
-        # code over the verified copy. The final image fingerprint agrees both
-        # content and draft configuration across peers, without weakening the
-        # signed digest check or changing the ratings-only pack format.
+        if draft_error is not None:
+            raise draft_error
         if build and choices:
             with open(tmp, "r+b") as draft_image:
-                draftmodes.apply(draft_image, set(isopatch.NETPLAY_SET) | choices)
-            digest_out = sha256(tmp, progress=step("verify"))
+                if draft_plan is not None:
+                    for offset, data in draft_plan.writes:
+                        draft_image.seek(offset)
+                        draft_image.write(data)
+                else:
+                    draftmodes.apply(draft_image, set(isopatch.NETPLAY_SET) | choices)
+            digest_out = digests["output_sha256"] if draft_plan is not None else sha256(tmp, progress=step("verify"))
         os.replace(tmp, out)
     except BaseException:
         try:
@@ -547,16 +587,60 @@ class ImageStatus:
         return self.kind not in {"legacy", "invalid-retail"}
 
 
+def _image_stamp(path: str) -> list[int] | None:
+    """Match the texture cache's identity, including same-mtime replacements."""
+    try:
+        stat = os.stat(path)
+        return [stat.st_size, stat.st_mtime_ns, stat.st_ino, stat.st_dev]
+    except FileNotFoundError:
+        return None
+
+
+def _image_digest(path: str, manifest: dict, progress=None) -> str:
+    """Trust our receipt only for an unchanged identity; old receipts hash as before."""
+    digest = manifest.get("output_sha256")
+    stamp = manifest.get("output_stat")
+    if (isinstance(digest, str) and len(digest) == 64
+            and all(c in "0123456789abcdef" for c in digest)
+            and isinstance(stamp, list) and len(stamp) == 4
+            and all(type(value) is int for value in stamp)
+            and stamp == _image_stamp(path)):
+        return digest
+    return sha256(path, progress=progress or (lambda d, t: None))
+
+
+def verify_image(out_dir: str, progress=None) -> bool:
+    """Fully verify the recorded digest, even when the image's stat identity matches.
+
+    Intended for a caller's background check after the UI is usable. False
+    means missing image/receipt, changed bytes or a change during verification;
+    I/O errors propagate. The caller must report failure and require a rebuild.
+    Never refresh a receipt to bless a changed image. This detects bit rot that
+    leaves metadata unchanged; the startup cache alone cannot detect it.
+    """
+    path = os.path.join(out_dir, OUTPUT_NAME)
+    manifest = read_manifest(out_dir)
+    before = _image_stamp(path)
+    if before is None:
+        return False
+    digest = sha256(path, progress=progress or (lambda d, t: None))
+    return (digest == manifest.get("output_sha256") and before == _image_stamp(path)
+            and manifest == read_manifest(out_dir))
+
+
 def image_status(out_dir: str, progress=None) -> ImageStatus | None:
-    """Classify an existing nsr-net.iso in out_dir (None if missing). Hashes the
-    whole image (a few seconds) so a stale or damaged copy is never reported
-    as ready."""
+    """Classify nsr-net.iso (None if missing), caching by the build's stat identity.
+
+    Changed images and old receipts require a full hash. Call verify_image in
+    the background as well: metadata cannot expose silent bit rot, and callers
+    must report a verification failure and require a rebuild.
+    """
     path = os.path.join(out_dir, OUTPUT_NAME)
     if not os.path.isfile(path):
         return None
-    digest = sha256(path, progress=progress or (lambda d, t: None))
-    fp = fingerprint(digest)
     manifest = read_manifest(out_dir)
+    digest = _image_digest(path, manifest, progress)
+    fp = fingerprint(digest)
     source = manifest.get("source_sha256") if isinstance(manifest.get("source_sha256"), str) else ""
     if (manifest.get("recipe") == ownimage_build.RECIPE and manifest.get("base_family") == ownimage_build.FAMILY
             and manifest.get("output_sha256") == digest
@@ -591,12 +675,12 @@ def image_status(out_dir: str, progress=None) -> ImageStatus | None:
 
 
 def image_fingerprint(out_dir: str, progress=None) -> str | None:
-    """Fingerprint of an existing nsr-net.iso in out_dir (None if missing)."""
+    """Return the image identity using the stat cache; pair with verify_image."""
     path = os.path.join(out_dir, OUTPUT_NAME)
     if not os.path.isfile(path):
         return None
-    digest = sha256(path, progress=progress or (lambda d, t: None))
     manifest = read_manifest(out_dir)
+    digest = _image_digest(path, manifest, progress)
     if (manifest.get("recipe") == ownimage_build.RECIPE and manifest.get("base_family") == ownimage_build.FAMILY
             and manifest.get("output_sha256") == digest
             and manifest.get("variant") in ("retail", *ownimage.VARIANTS)):

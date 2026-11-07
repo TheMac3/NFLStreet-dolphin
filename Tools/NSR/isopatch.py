@@ -106,6 +106,7 @@ Usage: tools/isopatch.py SRC.iso DST.iso freeze [seed | seedlog] [input [netplay
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import struct
 import sys
@@ -821,21 +822,99 @@ def apply_patches(iso, patches: set[str], *, poll_original: int = REBORN_REMAP, 
     draftmodes.apply(iso, patches)
 
 
-def build(src: str, dst: str, patches: set[str], progress=None) -> None:
-    """Copy src to dst and patch the copy. progress(done_bytes, total) is called
-    during the copy. On a PatchError the partial dst is removed."""
+class PatchPlan:
+    """Seekable view of a read-only image with small, ordered writes in memory.
+
+    Existing guarded patch routines can read their own earlier writes. The
+    stream stays untouched until copy_and_hash splices the plan into a copy,
+    or a caller authenticates its digests and explicitly writes the plan.
+    Plans are same-size only; never buffer a whole image or change its layout.
+    """
+
+    def __init__(self, stream):
+        """Borrow a seekable binary stream; retain only patch bytes and guard reads."""
+        self.stream = stream
+        position = stream.tell()
+        self.size = stream.seek(0, os.SEEK_END)
+        stream.seek(position)
+        self.writes = []
+        self.reads = []
+
+    def seek(self, offset, whence=os.SEEK_SET):
+        """Use the source's file position for existing ISO/DOL mapping helpers."""
+        return self.stream.seek(offset, whence)
+
+    def read(self, size=-1):
+        """Read through earlier planned writes, retaining original bytes as guards."""
+        offset = self.stream.tell()
+        data = self.stream.read(size)
+        self.reads.append((offset, data))
+        return self._splice(data, offset, self.writes)
+
+    def write(self, data):
+        """Stage a same-size overwrite without changing the source stream."""
+        offset = self.stream.tell()
+        if offset < 0 or offset + len(data) > self.size:
+            raise PatchError("patch write extends beyond the image")
+        self.writes.append((offset, bytes(data)))
+        self.stream.seek(offset + len(data))
+        return len(data)
+
+    @staticmethod
+    def _splice(data, offset, writes):
+        """Apply ordered overlapping writes, including those crossing chunk boundaries."""
+        result = None
+        for start, replacement in writes:
+            lo, hi = max(offset, start), min(offset + len(data), start + len(replacement))
+            if lo < hi:
+                if result is None:
+                    result = bytearray(data)
+                result[lo - offset:hi - offset] = replacement[lo - start:hi - start]
+        return bytes(result) if result is not None else data
+
+    def copy_and_hash(self, output=None, progress=None) -> dict[str, str]:
+        """Hash original and planned bytes in one read; optionally write the planned copy.
+
+        Recheck every preflight read against the bytes being copied so a source
+        change cannot bypass an original-instruction guard. Without output this
+        also authenticates two views of a private content image in one pass.
+        """
+        source_hash, output_hash = hashlib.sha256(), hashlib.sha256()
+        self.stream.seek(0)
+        done = 0
+        while chunk := self.stream.read(16 << 20):
+            for start, expected in self.reads:
+                lo, hi = max(done, start), min(done + len(chunk), start + len(expected))
+                if lo < hi and chunk[lo - done:hi - done] != expected[lo - start:hi - start]:
+                    raise PatchError("source image changed while copying")
+            source_hash.update(chunk)
+            patched = self._splice(chunk, done, self.writes)
+            output_hash.update(patched)
+            if output is not None:
+                output.write(patched)
+            done += len(chunk)
+            if progress:
+                progress(done, self.size)
+        if done != self.size:
+            raise PatchError("source image changed while copying")
+        return {"source_sha256": source_hash.hexdigest(), "output_sha256": output_hash.hexdigest()}
+
+
+def build(src: str, dst: str, patches: set[str], progress=None) -> dict[str, str]:
+    """Copy and patch in one pass, returning source_sha256 and output_sha256.
+
+    Callers that ignored the previous None result keep working. Guard checks
+    run through a small in-memory plan before writing; the streamed output
+    digest includes every patch. progress(done_bytes, total) reports the copy.
+    Any failure removes the partial destination.
+    """
     check_patch_set(patches)
-    total = os.path.getsize(src)
     try:
-        with open(src, "rb") as fin, open(dst, "wb") as fout:
-            done = 0
-            while chunk := fin.read(16 << 20):
-                fout.write(chunk)
-                done += len(chunk)
-                if progress:
-                    progress(done, total)
-        with open(dst, "r+b") as iso:
-            apply_patches(iso, patches)
+        with open(src, "rb") as fin:
+            plan = PatchPlan(fin)
+            apply_patches(plan, patches)
+            with open(dst, "wb") as fout:
+                return plan.copy_and_hash(fout, progress)
     except BaseException:
         try:
             os.remove(dst)

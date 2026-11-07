@@ -474,8 +474,17 @@ def _atomic_write(path: str, data: bytes) -> None:
             os.unlink(tmp)
 
 
-def http_get(url: str, limit: int, timeout: float = 6.0) -> bytes:
-    """GET with a byte cap. Raises OSError (offline/HTTP error) or ContentError (too big)."""
+# A healthy release host can take more than six seconds to start its response,
+# especially through GitHub's redirect/CDN path. Match application downloads;
+# this is a socket inactivity timeout, not a deadline for the entire transfer.
+HTTP_TIMEOUT = 30.0
+
+
+def http_get(url: str, limit: int, timeout: float = HTTP_TIMEOUT) -> bytes:
+    """GET with a byte cap and a bounded wait for a slow but working host.
+
+    Raises OSError (offline/HTTP error) or ContentError (too big). No retries.
+    """
     req = urllib.request.Request(url, headers={"User-Agent": "NFLStreetRemastered-content/1",
                                                "Accept": "application/json"})
     try:

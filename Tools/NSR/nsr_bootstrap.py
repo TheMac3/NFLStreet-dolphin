@@ -77,8 +77,7 @@ def resolve_channel(args, folder: str, env=os.environ) -> str:
 
 
 def _say(*parts) -> None:
-    """Print and flush. A download of this size takes minutes, and buffered
-    output means a player (or a log) sees nothing at all until it ends."""
+    """Flush completed-file reports immediately, including piped setup logs."""
     print(*parts, flush=True)
 
 
@@ -88,6 +87,8 @@ def install(folder: str, channel: str, *, keys=None, fetch=None, stream=None,
 
     Raises `selfupdate.UpdateError` for anything that should leave the folder
     as it was, and `OSError` when the release host cannot be reached.
+    The normal stream uses stage's bounded concurrent keep-alive downloads;
+    an injected stream remains serial so existing callers need not be thread safe.
     """
     payload, _raw = selfupdate.fetch_manifest(channel, fetch, keys)
     build = payload["build"]
